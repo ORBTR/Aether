@@ -333,5 +333,12 @@ func (st *noiseStream) SetPriority(weight uint8, dependency uint64) {
 	st.session.sched.SetWeight(st.streamID, weight)
 }
 
+// AvailableCredit exposes the current send-side flow-control credit for
+// this stream. Used by upper layers (gossip) to self-throttle against
+// a near-empty window.
+func (st *noiseStream) AvailableCredit() int64 {
+	return st.window.Available()
+}
+
 // Compile-time interface check
 var _ aether.Stream = (*noiseStream)(nil)

@@ -483,6 +483,31 @@ func DecodeWindowUpdate(data []byte) uint32 {
 	return binary.BigEndian.Uint32(data)
 }
 
+// EncodeCongestion encodes a CongestionPayload for the CONGESTION frame.
+// Wire format: [1 reason][1 severity][2 backoff_ms BE][1 reserved].
+func EncodeCongestion(p CongestionPayload) []byte {
+	data := make([]byte, CongestionPayloadSize)
+	data[0] = byte(p.Reason)
+	data[1] = p.Severity
+	binary.BigEndian.PutUint16(data[2:4], p.BackoffMs)
+	// data[4] reserved, leave zero.
+	return data
+}
+
+// DecodeCongestion decodes a CONGESTION frame payload. Returns a zero-value
+// payload (Reason=Unspecified, Severity=0 "all clear") on short or malformed
+// input — the cautious default avoids senders over-reacting to garbage.
+func DecodeCongestion(data []byte) CongestionPayload {
+	if len(data) < CongestionPayloadSize {
+		return CongestionPayload{}
+	}
+	return CongestionPayload{
+		Reason:    CongestionReason(data[0]),
+		Severity:  data[1],
+		BackoffMs: binary.BigEndian.Uint16(data[2:4]),
+	}
+}
+
 // EncodePriority encodes a PRIORITY frame payload.
 func EncodePriority(p PriorityPayload) []byte {
 	data := make([]byte, PriorityPayloadSize)

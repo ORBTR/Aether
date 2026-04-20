@@ -17,15 +17,37 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
-// DefaultStreamCredit is the initial flow control credit per stream (256 KB).
-// Gossip full-sync payloads can reach ~100-150 KB with 11+ nodes and
-// namespace-qualified records. Must be large enough for the largest
-// single Send() call since flow control currently errors instead of blocking.
-const DefaultStreamCredit int64 = 256 * 1024
+// DefaultStreamCredit is the initial flow control credit per stream (1 MB).
+//
+// Sized to absorb a full startup gossip burst without stalling: on a
+// post-restart reconnect each peer needs a G1 full-state sync (observed
+// ~80 KB per peer), and a fleet of 10 peers produces ~800 KB of outbound
+// gossip in the first second. A smaller initial window (e.g. 256 KB) means
+// the 4th full-sync stalls on ConsumeTimeout, every subsequent gossip
+// retries piles up, and HTTP goroutines sharing the accept path starve —
+// the observed "credit cascade → health-check timeout → Fly restart" loop.
+//
+// 1 MB covers ~12 back-to-back full syncs which is comfortably over the
+// worst startup burst, and the working-set cost is bounded by
+// StreamConfig.InitialCredit (consumers that know they only do small
+// messages can set it lower).
+const DefaultStreamCredit int64 = 1024 * 1024
 
-// DefaultMaxStreamCredit is the maximum credit a stream can accumulate (256 KB).
-// Reduced from 1 MB — no single stream needs more than 256 KB outstanding.
-const DefaultMaxStreamCredit int64 = 256 * 1024
+// DefaultMaxStreamCredit is the initial maximum credit a stream can accumulate.
+// Consumers that know they want a larger initial window set
+// StreamConfig.InitialCredit explicitly.
+const DefaultMaxStreamCredit int64 = 1024 * 1024
+
+// MaxGrowableWindow is the absolute ceiling the window can be grown to at
+// runtime via GrowWindow.
+//
+// The underlying semaphore is constructed at this capacity; effective window
+// size at any point is MaxGrowableWindow - initialDeficit - dataOutstanding.
+// A grow operation reduces initialDeficit (releasing capacity back to the
+// semaphore); a shrink operation increases it (reclaiming from the free
+// portion). 8 MB is enough for BDP on gigabit cross-region links with
+// ~500 ms RTT while bounding worst-case per-peer memory.
+const MaxGrowableWindow int64 = 8 * 1024 * 1024
 
 // AutoGrantThreshold is the fraction of credit consumed before auto-granting.
 // When 25% of the initial credit is consumed, a WINDOW_UPDATE is triggered.
@@ -53,14 +75,20 @@ const ConsumeTimeout = 10 * time.Second
 //
 // Receiver side: grants credit via WINDOW_UPDATE once the sender has consumed
 // AutoGrantThreshold of the initial window. recvCredit tracks outstanding
-// granted-but-not-yet-consumed credit so that grants correctly reset the
-// window instead of pinning at maxSize.
+// granted-but-not-yet-consumed credit so grants correctly reset the window
+// instead of pinning at maxSize.
 //
-// NOTE on future work (Level 3): a long-term direction is to drop the
-// credit-counter model entirely and gate Send on the write queue depth,
-// mirroring QUIC/HTTP/2 stream-level offsets. That's a larger refactor and
-// only makes sense if flow control needs further work — the current design
-// is correct and efficient with the semaphore.
+// Runtime sizing: the underlying semaphore is pre-sized to
+// MaxGrowableWindow. Effective window size is
+// MaxGrowableWindow - initialDeficit - dataOutstanding; GrowWindow/ShrinkWindow
+// move the initialDeficit boundary to resize without rebuilding the
+// semaphore. SetRTT + Stats expose observation inputs for a BDP-based
+// auto-tuner (not wired by default — consumers own the sizing policy).
+//
+// Alternative design: a future direction is to drop the credit counter
+// entirely and gate Send on write-queue depth (QUIC/HTTP/2 style offsets).
+// That's a larger refactor and only makes sense if this design proves
+// inadequate.
 type StreamWindow struct {
 	mu sync.Mutex
 
@@ -79,6 +107,12 @@ type StreamWindow struct {
 	initialDeficit  int64
 	dataOutstanding int64
 
+	// currentWindow is the effective max window today (after any Grow/Shrink
+	// adjustments). Tracked separately from initialSize so that autogrant
+	// capping (ReceiverConsume) reflects the live target, not the
+	// construction-time value. Always equals maxSize - initialDeficit.
+	currentWindow int64
+
 	// Receive-side accounting — drives auto-grant decisions.
 	// recvCredit represents credit we have extended to the sender but that has
 	// not yet been consumed by the data arriving at us. It decreases as we
@@ -88,40 +122,50 @@ type StreamWindow struct {
 	recvCredit  int64
 	consumed    int64
 	lastGrant   int64
+
+	// Auto-tuning hints — advisory data an auto-tuner reads via Stats().
+	// Updated from Consume/ApplyUpdate hot paths, guarded by mu.
+	peakOutstanding int64         // max dataOutstanding observed since last tune
+	lastRTT         time.Duration // most recent observed RTT (from SetRTT)
 }
 
 // NewStreamWindow creates a flow control window with the given initial credit.
+//
+// The underlying semaphore is sized at MaxGrowableWindow (or initialCredit
+// if that's larger — for consumers that want a pre-sized large window).
+// The portion above initialCredit is pre-acquired into `initialDeficit`, so
+// the effective send window matches initialCredit at construction.
+// GrowWindow/ShrinkWindow can later move the deficit boundary to dynamically
+// resize without rebuilding the semaphore.
 func NewStreamWindow(initialCredit int64) *StreamWindow {
 	if initialCredit <= 0 {
 		initialCredit = DefaultStreamCredit
 	}
-	// maxSize must be at least as large as initialCredit to prevent
-	// the window from being immediately capped below the requested size.
-	maxSize := DefaultMaxStreamCredit
-	if initialCredit > maxSize {
-		maxSize = initialCredit
+	// Semaphore capacity is MaxGrowableWindow unless the caller asked for a
+	// larger initial window — we never downsize the growth ceiling below the
+	// starting point.
+	capacity := MaxGrowableWindow
+	if initialCredit > capacity {
+		capacity = initialCredit
 	}
 
-	// The semaphore starts with maxSize capacity fully available. If the caller
-	// wants initialCredit < maxSize, pre-acquire the deficit so the effective
-	// send window matches initialCredit. The deficit is tracked in
-	// initialDeficit and never released — it encodes the configured initial
-	// credit as a permanent reservation. Grants only release the data-in-flight
-	// portion (dataOutstanding), so the effective window never grows past
-	// initialCredit's restoration point.
-	sem := semaphore.NewWeighted(maxSize)
+	sem := semaphore.NewWeighted(capacity)
+	// Pre-acquire the gap between capacity and initialCredit so the
+	// effective window equals initialCredit. This deficit is parked and
+	// only released by an explicit GrowWindow call.
 	var deficit int64
-	if initialCredit < maxSize {
-		deficit = maxSize - initialCredit
+	if initialCredit < capacity {
+		deficit = capacity - initialCredit
 		// Safe: fresh semaphore has full capacity, cannot block.
 		_ = sem.Acquire(context.Background(), deficit)
 	}
 
 	return &StreamWindow{
 		sem:            sem,
-		maxSize:        maxSize,
+		maxSize:        capacity,
 		initialDeficit: deficit,
 		initialSize:    initialCredit,
+		currentWindow:  initialCredit,
 		recvCredit:     initialCredit,
 	}
 }
@@ -149,13 +193,21 @@ func (w *StreamWindow) Consume(ctx context.Context, n int64) error {
 	defer cancel()
 
 	if err := w.sem.Acquire(acquireCtx, n); err != nil {
+		avail := w.Available()
+		dbgFlow.Printf("Consume TIMEOUT need=%d have=%d outstanding=%d maxSize=%d",
+			n, avail, w.dataOutstanding, w.maxSize)
 		return fmt.Errorf("aether flow: insufficient stream credit after %s (need %d, have %d): %w",
-			ConsumeTimeout, n, w.Available(), err)
+			ConsumeTimeout, n, avail, err)
 	}
 
 	w.mu.Lock()
 	w.dataOutstanding += n
+	if w.dataOutstanding > w.peakOutstanding {
+		w.peakOutstanding = w.dataOutstanding
+	}
+	outstanding := w.dataOutstanding
 	w.mu.Unlock()
+	dbgFlow.Printf("Consume OK n=%d outstanding=%d avail=%d", n, outstanding, w.currentWindow-outstanding)
 	return nil
 }
 
@@ -170,25 +222,37 @@ func (w *StreamWindow) ApplyUpdate(credit int64) {
 		return
 	}
 	w.mu.Lock()
-	if credit > w.dataOutstanding {
-		credit = w.dataOutstanding
+	granted := credit
+	if granted > w.dataOutstanding {
+		granted = w.dataOutstanding
 	}
-	w.dataOutstanding -= credit
+	w.dataOutstanding -= granted
+	outstanding := w.dataOutstanding
 	w.mu.Unlock()
-	if credit > 0 {
-		w.sem.Release(credit)
+	if granted > 0 {
+		w.sem.Release(granted)
 	}
+	dbgFlow.Printf("ApplyUpdate credit=%d granted=%d outstanding=%d avail=%d",
+		credit, granted, outstanding, w.maxSize-w.initialDeficit-outstanding)
 }
 
 // ReceiverConsume records that the receiver consumed n bytes of received data.
 // Returns the credit to grant (for a WINDOW_UPDATE) if the threshold is met.
 // Returns 0 if no grant is needed yet.
 //
-// BUG FIX: recvCredit is decremented by n so that the subsequent cap check
-// reflects the truly-outstanding window. The previous implementation never
-// decremented recvCredit; in production where initialCredit == maxSize it
-// pinned at maxSize and every grant became 0 — the receiver never emitted
-// a single WINDOW_UPDATE, causing sender-side starvation.
+// Bug-A fix: recvCredit is decremented by n so the cap check reflects the
+// currently-outstanding granted window. Previously recvCredit was never
+// decremented, pinning at maxSize with initialCredit == maxSize config so
+// every grant became 0 — the receiver never emitted a single WINDOW_UPDATE.
+//
+// Grant consolidation: when the threshold fires, grant enough to restore
+// the sender's outstanding window to full (`currentWindow - recvCredit`)
+// rather than just `sinceLastGrant`. The receiver has authoritative
+// knowledge of the outstanding window, and granting the full remaining
+// gap each time reduces WINDOW_UPDATE frame overhead (bursty senders get
+// one big grant every ~25% consumed instead of many small ones) while
+// keeping the sender's window as full as possible between grants.
+// Threshold still gates WHEN we emit to avoid grant storms.
 func (w *StreamWindow) ReceiverConsume(n int64) int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -199,15 +263,20 @@ func (w *StreamWindow) ReceiverConsume(n int64) int64 {
 
 	threshold := int64(float64(w.initialSize) * AutoGrantThreshold)
 	if sinceLastGrant >= threshold {
-		grant := sinceLastGrant
-		if w.recvCredit+grant > w.maxSize {
-			grant = w.maxSize - w.recvCredit
-		}
-		if grant < 0 {
-			grant = 0
+		// Grant enough to restore sender's outstanding window to the current
+		// target (currentWindow). recvCredit tracks "granted but not yet
+		// consumed" — the gap to currentWindow is how much more we can
+		// safely grant. Use currentWindow (not maxSize) so the auto-tuner
+		// can shrink the effective window by calling ShrinkWindow; the next
+		// grant naturally respects the smaller size.
+		grant := w.currentWindow - w.recvCredit
+		if grant <= 0 {
+			return 0
 		}
 		w.recvCredit += grant
 		w.lastGrant = w.consumed
+		dbgFlow.Printf("ReceiverConsume grant=%d sinceLastGrant=%d consumed=%d recvCredit=%d (restore-to-full)",
+			grant, sinceLastGrant, w.consumed, w.recvCredit)
 		return grant
 	}
 	return 0
@@ -217,13 +286,154 @@ func (w *StreamWindow) ReceiverConsume(n int64) int64 {
 func (w *StreamWindow) Available() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.maxSize - w.initialDeficit - w.dataOutstanding
+	return w.currentWindow - w.dataOutstanding
 }
 
-// receiverCredit returns the credit currently outstanding with the sender
-// (total granted minus data already received). Exported only for tests.
-func (w *StreamWindow) receiverCredit() int64 {
+// CurrentWindow returns the effective send-window target (post any
+// Grow/Shrink adjustments). Exported for metrics and auto-tuning observers.
+func (w *StreamWindow) CurrentWindow() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.recvCredit
+	return w.currentWindow
+}
+
+// GrowWindow increases the stream's effective send window by up to n bytes.
+// Implementation: releases min(n, initialDeficit) of pre-acquired semaphore
+// capacity back to the pool, raising the effective credit ceiling. The
+// actual amount grown is returned (may be less than n if we've already
+// reached the MaxGrowableWindow ceiling).
+//
+// Auto-tune hook: callers observing good RTT + full-utilisation can grow
+// the window to raise BDP-limited throughput. Prefer small increments
+// (e.g. 25% of current) to avoid oscillation.
+//
+// Safe to call from any goroutine.
+func (w *StreamWindow) GrowWindow(n int64) int64 {
+	if n <= 0 {
+		return 0
+	}
+	w.mu.Lock()
+	growable := w.initialDeficit
+	if n > growable {
+		n = growable
+	}
+	if n > 0 {
+		w.initialDeficit -= n
+		w.currentWindow += n
+	}
+	dbgFlow.Printf("GrowWindow by=%d currentWindow=%d deficit=%d", n, w.currentWindow, w.initialDeficit)
+	w.mu.Unlock()
+	if n > 0 {
+		w.sem.Release(n)
+	}
+	return n
+}
+
+// ShrinkWindow decreases the stream's effective send window by up to n bytes.
+// Only shrinks what isn't currently in-flight (best-effort TryAcquire on the
+// semaphore). Returns the actual amount shrunk. A value < n means
+// dataOutstanding was high enough that we couldn't reclaim all of n without
+// blocking an active sender.
+//
+// Counterpart of GrowWindow. Auto-tuners call this when observed utilisation
+// is low (sustained idle credit) or a congestion signal suggests backing off.
+func (w *StreamWindow) ShrinkWindow(n int64) int64 {
+	if n <= 0 {
+		return 0
+	}
+	// Cap against current window so we never push the effective window
+	// below zero (leaves at least 0 bytes — caller policy determines if
+	// that's ever desirable; typically you want a floor well above zero).
+	w.mu.Lock()
+	if n > w.currentWindow {
+		n = w.currentWindow
+	}
+	w.mu.Unlock()
+
+	// Try to acquire the shrink amount from the semaphore (reclaiming the
+	// free portion). If in-flight data plus the shrink amount would exceed
+	// capacity, TryAcquire fails and we return 0.
+	if !w.sem.TryAcquire(n) {
+		return 0
+	}
+	w.mu.Lock()
+	w.initialDeficit += n
+	w.currentWindow -= n
+	dbgFlow.Printf("ShrinkWindow by=%d currentWindow=%d deficit=%d", n, w.currentWindow, w.initialDeficit)
+	w.mu.Unlock()
+	return n
+}
+
+// SetRTT records an observed round-trip time for this stream. Used as input
+// to BDP-based auto-tuning. Purely advisory — no side effect unless an
+// auto-tuner consumes it via Stats().
+func (w *StreamWindow) SetRTT(rtt time.Duration) {
+	if rtt <= 0 {
+		return
+	}
+	w.mu.Lock()
+	w.lastRTT = rtt
+	w.mu.Unlock()
+}
+
+// Stats is a point-in-time snapshot of window state for metrics/auto-tuning.
+type Stats struct {
+	CurrentWindow   int64         // effective max window now
+	Outstanding     int64         // bytes in-flight (acquired but not granted back)
+	PeakOutstanding int64         // high watermark since last ResetPeak
+	RecvCredit      int64         // granted credit not yet consumed on receive
+	Consumed        int64         // total bytes received on this window
+	LastRTT         time.Duration // most recent RTT reported via SetRTT (0 if unknown)
+	GrowthHeadroom  int64         // how much more we could grow (bytes)
+}
+
+// Stats returns a snapshot of the window's state. Cheap: single mu.Lock.
+// Intended for an auto-tuning goroutine to sample at ~10 Hz.
+func (w *StreamWindow) Stats() Stats {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return Stats{
+		CurrentWindow:   w.currentWindow,
+		Outstanding:     w.dataOutstanding,
+		PeakOutstanding: w.peakOutstanding,
+		RecvCredit:      w.recvCredit,
+		Consumed:        w.consumed,
+		LastRTT:         w.lastRTT,
+		GrowthHeadroom:  w.initialDeficit,
+	}
+}
+
+// ResetPeak clears peakOutstanding. Called by an auto-tuner after it samples.
+func (w *StreamWindow) ResetPeak() {
+	w.mu.Lock()
+	w.peakOutstanding = w.dataOutstanding
+	w.mu.Unlock()
+}
+
+// SuggestedWindow applies a simple BDP-based heuristic and returns the
+// target window size for the most recent observation window. Callers can
+// then call GrowWindow/ShrinkWindow by the delta. Returns currentWindow
+// unchanged if RTT is unknown or no data has been observed.
+//
+// Heuristic: target = max(peakOutstanding * 1.5, currentWindow * 0.5),
+// bounded by [initialSize, MaxGrowableWindow]. Reads Stats atomically
+// and does NOT mutate window state — safe for observational use.
+func (w *StreamWindow) SuggestedWindow() int64 {
+	s := w.Stats()
+	if s.LastRTT == 0 || s.PeakOutstanding == 0 {
+		return s.CurrentWindow
+	}
+	// 1.5x peak gives headroom for the next burst; floor at half of current
+	// window to prevent thrashing shrinks.
+	target := s.PeakOutstanding * 3 / 2
+	if floor := s.CurrentWindow / 2; floor > target {
+		target = floor
+	}
+	if target < w.initialSize {
+		target = w.initialSize
+	}
+	if target > MaxGrowableWindow {
+		target = MaxGrowableWindow
+	}
+	return target
 }

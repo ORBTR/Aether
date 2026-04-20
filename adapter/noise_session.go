@@ -150,6 +150,12 @@ type NoiseSession struct {
 	closed    chan struct{}
 	closeOnce sync.Once
 	closeErr  error
+
+	// throttle holds the explicit-CONGESTION signal state from the peer.
+	// Zero value is "no throttle"; handleCongestion updates it on incoming
+	// CONGESTION frames. Send-path consumers can consult Throttle() for
+	// RateFactor/ShouldStall before committing large sends.
+	throttle aether.CongestionThrottle
 }
 
 // NewNoiseSession creates an Aether session over a Noise-encrypted

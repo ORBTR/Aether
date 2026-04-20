@@ -144,6 +144,23 @@ func (c *StreamConn) RemoteAddr() net.Addr {
 // StreamID returns the underlying Aether stream ID for debug logging.
 func (c *StreamConn) StreamID() uint64 { return c.stream.StreamID() }
 
+// AvailableCredit returns the send-side flow-control credit currently
+// available on the underlying stream, or -1 if the stream doesn't expose
+// flow control (e.g. QUIC, which has its own native flow control and
+// bypasses the Aether credit layer).
+//
+// Callers (notably gossip) use this to self-throttle: when credit is low,
+// prefer a delta sync over a full sync to avoid guaranteed ConsumeTimeout
+// stalls. This is an agnostic check — any stream type that exposes an
+// `AvailableCredit() int64` method via the underlying adapter is picked up.
+func (c *StreamConn) AvailableCredit() int64 {
+	type avail interface{ AvailableCredit() int64 }
+	if a, ok := c.stream.(avail); ok {
+		return a.AvailableCredit()
+	}
+	return -1
+}
+
 // ParentContext returns the connection-level context. Useful for callers
 // that need to derive sub-contexts tied to the connection lifetime.
 func (c *StreamConn) ParentContext() context.Context { return c.parentCtx }

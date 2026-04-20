@@ -125,6 +125,7 @@ All multi-byte fields are **big-endian** (network byte order).
 |------|------|---------|-------------|
 | 0x05 | WINDOW | `[Credit:4]` | Grants additional flow control credit (bytes). StreamID=0xFFFFFFFFFFFFFFFF for connection-level. |
 | 0x0A | PRIORITY | `[Weight:1][Dependency:8]` | Changes stream scheduling weight (1-255) and dependency parent. |
+| 0x14 | CONGESTION | `[Reason:1][Severity:1][BackoffMs:2][Reserved:1]` | Explicit sender-slowdown hint. Receiver-emitted when under pressure (queue full, memory high, CPU high, rate-limited, downstream blocked). Severity 0 is "all clear" (drops any active throttle); 1-99 is proportional (sender multiplies send-rate by (100-severity)/100); 100 is full stall. BackoffMs is the hint validity window (0 ⇒ default = severity × 10 ms). StreamID=0xFFFFFFFFFFFFFFFF (connection-level). |
 
 ### 2.5 Connection Health
 
@@ -390,15 +391,15 @@ Implementation: `reliability/packet_replay.go:PacketReplayWindow`
 
 ### 8.1 Stream-Level
 
-- **Initial credit:** 262,144 bytes (256 KB)
-- **Maximum credit:** 262,144 bytes (256 KB) per stream
-- **Auto-grant threshold:** 25% consumed (64 KB) — receiver sends WINDOW after consuming 25% of the initial credit, ensuring credit is replenished after every exchange
-- **Configurable credit:** `StreamConfig.InitialCredit` allows per-stream credit override. File transfer streams use 2 MB; gossip/RPC use the default 256 KB. When set, `DefaultMaxStreamCredit` is raised to match.
-- **Consume() blocking:** `Consume()` blocks up to 10 seconds polling for WINDOW_UPDATE instead of failing immediately on insufficient credit
-- **MinGuaranteedWindow:** 1 KB — small frames (headers, control messages) always pass even when credit is near zero, preventing deadlock when the window floors at zero
-- **Backpressure:** Sender blocks on `Stream.Send()` when credit exhausted. Unblocks on WINDOW frame receipt.
-- **Signal:** WINDOW frame (Type 0x05) with `[Credit:4]` payload, StreamID = target stream.
-- **DeliverToRecvCh:** Uses adaptive backpressure (100ms-200ms timeout). When recvCh is full, the frame is dropped but `ReceiverConsume()` is always called to return flow control credit. This prevents permanent credit drain when a slow consumer causes channel overflow.
+- **Initial credit:** 1,048,576 bytes (1 MB). Sized to absorb a fleet-wide post-restart gossip burst (10 peers × ~80 KB G1 full-sync) without stalling. Lower values caused a cascade where the first few full-syncs drained the window, subsequent sends waited the full `ConsumeTimeout`, gossip goroutines accumulated, and the HTTP accept path starved — health-check timeout → Fly restart loop.
+- **Per-class credit:** consumers set `StreamConfig.InitialCredit` per stream class. Mesh defaults: gossip 1 MB, RPC 256 KB, control 64 KB, keepalive 16 KB. File-transfer streams opt into larger values (e.g. 2 MB).
+- **Runtime resizing:** the underlying semaphore is pre-sized to `MaxGrowableWindow` (8 MB). Effective window = `MaxGrowableWindow - initialDeficit - dataOutstanding`. `GrowWindow(n)` releases n bytes from the parked deficit (raising the ceiling); `ShrinkWindow(n)` reclaims from the free portion (lowering it). No semaphore rebuild, safe mid-connection.
+- **Auto-grant threshold:** 25% of initial window consumed — receiver emits WINDOW when `sinceLastGrant ≥ threshold`. Grant size = `currentWindow - recvCredit` (restore-to-full) so one WINDOW frame refills the sender rather than dribbling many small grants.
+- **Consume() blocking:** `StreamWindow.Consume(ctx, n)` acquires from a `golang.org/x/sync/semaphore.Weighted` with a 10 s deadline (no busy poll). Context-aware cancellation.
+- **MinGuaranteedWindow:** 1 KB — frames at or below this size bypass the semaphore entirely. Not metered, don't consume credit. Keeps in-band control traffic (WINDOW_UPDATE, headers, pings) flowing through a drained data window.
+- **Sender-side tracking:** `dataOutstanding` = credit acquired by Consume but not yet granted back. `ApplyUpdate` caps grants at `dataOutstanding` so we never release past real in-flight, preventing the semaphore from panicking on release-past-capacity.
+- **Receiver-side tracking:** `recvCredit` = credit granted but not yet consumed on receive. Decremented on each `ReceiverConsume(n)` so the auto-grant cap (`currentWindow - recvCredit`) reflects the actual outstanding window. Historical bug: never decrementing `recvCredit` pinned it at maxSize in the production `initialCredit == maxSize` config, so every grant computed to zero and no WINDOW_UPDATE was ever sent.
+- **DeliverToRecvCh:** Uses adaptive backpressure (10–200 ms, scaled by recent drop rate). When `recvCh` is full past the backpressure window, the frame is dropped but `ReceiverConsume()` is always called to return flow control credit. This prevents permanent credit drain when a slow consumer causes channel overflow.
 - **Credit-on-drop:** When a frame is dropped due to full recvCh, the receiver still calls `ReceiverConsume(frameLen)` to return credit to the sender via WINDOW. Without this, dropped frames permanently reduce the available window.
 
 Implementation: `flow/stream_window.go`
@@ -410,6 +411,33 @@ Implementation: `flow/stream_window.go`
 - **Auto-grant threshold:** 25% consumed
 - **Signal:** WINDOW frame with StreamID = `0xFFFFFFFFFFFFFFFF`
 - **Purpose:** Prevents any single stream from starving the connection. All stream sends also consume connection credit.
+
+Implementation: `flow/conn_window.go`
+
+### 8.3 Explicit Congestion Signalling
+
+Beyond the implicit backpressure from withholding grants, receivers can emit an explicit **CONGESTION** frame (Type 0x14) to tell senders to slow down immediately. Used when a receiver detects local pressure that isn't directly reflected in flow-control credit — backlogged recvCh, high memory, CPU saturation, or downstream blockage.
+
+- **Payload:** 5 bytes — `[Reason:1][Severity:1][BackoffMs:2 BE][Reserved:1]`
+- **Reason codes:** Unspecified(0), QueueFull(1), MemoryHigh(2), CPUHigh(3), RateLimit(4), Downstream(5)
+- **Severity:** 0 = "all clear" (drops any active throttle); 1–99 = proportional rate reduction (sender multiplies target rate by `(100 - severity) / 100`); 100 = full stall until backoff window elapses
+- **BackoffMs:** validity window for the hint. 0 defaults to `severity × 10 ms`.
+- **Sender behaviour:** `CongestionThrottle.Apply(payload)` updates internal state; `RateFactor()` returns the current rate multiplier; `ShouldStall()` returns true while severity == 100 within the backoff window. Overlapping hints NEVER shorten an active window (`Apply` only extends).
+- **Scope:** connection-level (StreamID = `0xFFFFFFFFFFFFFFFF`). The throttle applies to all streams on the session.
+
+Implementation: `congestion_signal.go`, `adapter/{tcp,noise_dispatch}.go` (`handleCongestion`, `SendCongestion`).
+
+### 8.4 Auto-Tuning Hooks
+
+`StreamWindow` exposes the observation inputs needed for a BDP-based auto-tuner; the policy itself is consumer-owned.
+
+- **`SetRTT(d time.Duration)`** records the most recent observed RTT for this stream.
+- **`Stats()`** returns `{CurrentWindow, Outstanding, PeakOutstanding, RecvCredit, Consumed, LastRTT, GrowthHeadroom}`. Cheap — a single lock.
+- **`ResetPeak()`** clears `PeakOutstanding` after a sampling tick.
+- **`SuggestedWindow()`** applies the default BDP heuristic: `target = max(peakOutstanding × 1.5, currentWindow × 0.5)`, bounded by `[initialSize, MaxGrowableWindow]`. Returns `currentWindow` unchanged if RTT or peak is unknown. Observational — does not mutate window state.
+- **`GrowWindow(n)` / `ShrinkWindow(n)`** — callers apply the delta.
+
+A typical auto-tuner samples `Stats` at ~10 Hz, compares against `SuggestedWindow`, and calls `GrowWindow` / `ShrinkWindow` with bounded step sizes (e.g. ±25 %) to avoid oscillation.
 
 ---
 

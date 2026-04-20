@@ -69,6 +69,12 @@ type TCPSession struct {
 	streamGC   *aether.StreamGC                // idle stream auto-RESET
 	abuseScore *abuse.Score[aether.NodeID]     // per-peer misbehaviour scoring
 	tickStop   chan struct{}                   // shuts down the housekeeping ticker
+
+	// throttle holds the explicit-CONGESTION signal state received from the
+	// peer. Zero value is "no throttle"; handleCongestion updates it when a
+	// CONGESTION frame arrives. Send-path consumers can consult Throttle()
+	// for RateFactor/ShouldStall before committing to large sends.
+	throttle aether.CongestionThrottle
 }
 
 // tcpStream is a single Aether stream multiplexed over a TCP connection.
@@ -263,6 +269,8 @@ func (s *TCPSession) dispatchFrame(frame *aether.Frame) {
 		// TCP provides native reliability — ACK not used
 	case aether.TypePRIORITY:
 		s.handlePriority(frame)
+	case aether.TypeCONGESTION:
+		s.handleCongestion(frame)
 	}
 }
 
@@ -305,6 +313,7 @@ func (s *TCPSession) sendWindowUpdateAgnostic(streamID uint64, credit uint32) {
 
 // sendWindowUpdate sends a WINDOW_UPDATE frame granting additional credit to the sender.
 func (s *TCPSession) sendWindowUpdate(streamID uint64, credit uint32) {
+	dbgTCP.Printf("WINDOW_UPDATE send stream=%d credit=%d", streamID, credit)
 	payload := aether.EncodeWindowUpdate(credit)
 	frame := &aether.Frame{
 		SenderID:   s.localPeerID,
@@ -314,7 +323,9 @@ func (s *TCPSession) sendWindowUpdate(streamID uint64, credit uint32) {
 		Length:     uint32(len(payload)),
 		Payload:    payload,
 	}
-	s.writeFrame(frame)
+	if err := s.writeFrame(frame); err != nil {
+		dbgTCP.Printf("WINDOW_UPDATE send FAILED stream=%d credit=%d err=%v", streamID, credit, err)
+	}
 }
 
 // registerStream performs an atomic check-and-insert for a freshly-constructed
@@ -478,13 +489,17 @@ func (s *TCPSession) handleReset(frame *aether.Frame) {
 func (s *TCPSession) handleWindowUpdate(frame *aether.Frame) {
 	credit := aether.DecodeWindowUpdate(frame.Payload)
 	if frame.StreamID == aether.StreamConnectionLevel {
+		dbgTCP.Printf("WINDOW_UPDATE recv stream=conn credit=%d", credit)
 		s.connWindow.ApplyUpdate(int64(credit))
 	} else {
 		s.mu.Lock()
 		st, ok := s.streams[frame.StreamID]
 		s.mu.Unlock()
 		if ok {
+			dbgTCP.Printf("WINDOW_UPDATE recv stream=%d credit=%d", frame.StreamID, credit)
 			st.window.ApplyUpdate(int64(credit))
+		} else {
+			dbgTCP.Printf("WINDOW_UPDATE recv for unknown stream=%d credit=%d (DROPPED)", frame.StreamID, credit)
 		}
 	}
 }
@@ -517,6 +532,39 @@ func (s *TCPSession) handleGoAway(frame *aether.Frame) {
 func (s *TCPSession) handlePriority(frame *aether.Frame) {
 	p := aether.DecodePriority(frame.Payload)
 	s.sched.SetWeight(frame.StreamID, p.Weight)
+}
+
+// handleCongestion processes an explicit CONGESTION frame — the peer
+// asking us to slow down. The session stores the hint in its throttle;
+// send-path consumers can check before committing large payloads.
+func (s *TCPSession) handleCongestion(frame *aether.Frame) {
+	p := aether.DecodeCongestion(frame.Payload)
+	s.throttle.Apply(p)
+	dbgTCP.Printf("CONGESTION recv severity=%d reason=%d backoff=%dms",
+		p.Severity, p.Reason, p.BackoffMs)
+}
+
+// SendCongestion emits a CONGESTION frame to the peer. Used when this
+// side detects local pressure (memory high, recvCh backlog, etc.) and
+// wants the remote to back off before packets pile up.
+func (s *TCPSession) SendCongestion(p aether.CongestionPayload) error {
+	payload := aether.EncodeCongestion(p)
+	frame := &aether.Frame{
+		SenderID:   s.localPeerID,
+		ReceiverID: s.remotePeerID,
+		StreamID:   aether.StreamConnectionLevel,
+		Type:       aether.TypeCONGESTION,
+		Length:     uint32(len(payload)),
+		Payload:    payload,
+	}
+	return s.writeFrame(frame)
+}
+
+// Throttle exposes the session's congestion-throttle state. Callers
+// (e.g. gossip scheduler) can consult RateFactor/ShouldStall before
+// dispatching large sends.
+func (s *TCPSession) Throttle() *aether.CongestionThrottle {
+	return &s.throttle
 }
 
 // writeLoop reads from the scheduler and writes frames to the TCP connection.
@@ -976,6 +1024,14 @@ func (st *tcpStream) Reset(reason aether.ResetReason) error {
 
 func (st *tcpStream) SetPriority(weight uint8, dependency uint64) {
 	st.session.sched.SetWeight(st.streamID, weight)
+}
+
+// AvailableCredit exposes the current send-side flow-control credit for
+// this stream. Used by upper layers (gossip) to self-throttle against
+// a near-empty window. TCP-family streams still track a window even though
+// Send ignores timeouts — the value is accurate for scheduling decisions.
+func (st *tcpStream) AvailableCredit() int64 {
+	return st.window.Available()
 }
 
 // ────────────────────────────────────────────────────────────────────────────
