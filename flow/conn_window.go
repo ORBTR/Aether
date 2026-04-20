@@ -12,8 +12,22 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
-// DefaultConnCredit is the initial connection-level credit (1 MB).
-const DefaultConnCredit int64 = 1024 * 1024
+// DefaultConnCredit is the initial connection-level credit (4 MB).
+//
+// Sized to absorb the observed gossip burst pattern: full-state exchanges
+// run ~70-100 KB per round-trip and the receiver only emits a
+// WINDOW_UPDATE after the 25% auto-grant threshold (1 MB for the old
+// default) was consumed — so roughly 4 round-trips of silence before
+// grants started flowing back. Under high-rate gossip (post-restart
+// convergence storm) that produced "insufficient connection credit after
+// 10s" timeouts where observed avail was 40-70 KB vs 72 KB needed —
+// credit WAS flowing back, just not fast enough to keep up with the
+// leading edge of a burst.
+//
+// 4 MB covers ~16 back-to-back 72 KB exchanges before any stall,
+// comfortably more than the grant-emission cycle. Auto-tuning + the
+// 16 MB cap can still grow per-peer as BDP dictates.
+const DefaultConnCredit int64 = 4 * 1024 * 1024
 
 // DefaultMaxConnCredit is the maximum connection-level credit (16 MB).
 const DefaultMaxConnCredit int64 = 16 * 1024 * 1024
