@@ -188,21 +188,27 @@ func TestStreamWindow_ReceiverAutoGrant_ProductionConfig(t *testing.T) {
 
 func TestConnWindow_ConsumeAndAvailable(t *testing.T) {
 	w := NewConnWindow(4096)
+	ctx := context.Background()
 
-	if err := w.Consume(2048); err != nil {
+	if err := w.Consume(ctx, 2048); err != nil {
 		t.Fatalf("consume: %v", err)
 	}
 	if w.Available() != 2048 {
 		t.Errorf("after consume: got %d, want 2048", w.Available())
 	}
 
-	if err := w.Consume(3000); err == nil {
-		t.Error("should error on overconsume")
+	// 3000 > 2048 remaining, but not larger than the growth ceiling, so
+	// Consume blocks up to ConsumeTimeout. Give it a tight deadline so the
+	// test is fast; we only need to prove it errors on sustained exhaustion.
+	tctx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	if err := w.Consume(tctx, 3000); err == nil {
+		t.Error("should error on sustained overconsume")
 	}
 
 	// Escape hatch: tiny frames always pass without metering.
 	avail := w.Available()
-	if err := w.Consume(MinGuaranteedWindow); err != nil {
+	if err := w.Consume(ctx, MinGuaranteedWindow); err != nil {
 		t.Errorf("escape-hatch frame should succeed: %v", err)
 	}
 	if w.Available() != avail {

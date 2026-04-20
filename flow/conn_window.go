@@ -5,8 +5,11 @@
 package flow
 
 import (
+	"context"
 	"fmt"
 	"sync"
+
+	"golang.org/x/sync/semaphore"
 )
 
 // DefaultConnCredit is the initial connection-level credit (1 MB).
@@ -19,21 +22,30 @@ const DefaultMaxConnCredit int64 = 16 * 1024 * 1024
 // Prevents any single stream from starving the connection.
 // All stream sends must also consume from the connection window.
 //
-// Unlike StreamWindow, ConnWindow.Consume does not block: it either
-// succeeds or returns an error immediately. TCP-style backpressure at the
-// stream level absorbs the wait; the connection window is a coarse safety
-// limit, not a pacing mechanism.
+// Both Consume and StreamWindow.Consume block up to ConsumeTimeout waiting
+// for credit via a semaphore. Previously Consume was synchronous (error on
+// exhaustion); that made sense when TCP backpressure at the stream level
+// absorbed pacing, but on Noise-UDP a brief conn-level exhaustion would
+// surface as an immediate error even though a WINDOW_UPDATE was about to
+// arrive. Blocking gives grants time to land.
 //
-// WINDOW_UPDATE semantics match StreamWindow: the wire value is the peer's
-// CUMULATIVE total granted (grantsEmitted) since the connection began.
-// The sender's ApplyUpdate computes the delta against grantsReceived and
-// drops stale / duplicate / reordered frames. This makes conn-level grants
-// loss-tolerant on unreliable transports.
+// WINDOW_UPDATE semantics match StreamWindow: wire value is the peer's
+// CUMULATIVE total granted since stream start. ApplyUpdate computes delta
+// against grantsReceived and drops stale / duplicate / reordered frames.
 type ConnWindow struct {
-	mu          sync.Mutex
-	sendCredit  int64
+	mu sync.Mutex
+
+	// Send-side semaphore, pre-sized to DefaultMaxConnCredit (16 MB).
+	// Effective window = DefaultMaxConnCredit - initialDeficit - dataOutstanding.
+	// ApplyUpdate growth of sendCredit is bounded by grantsReceived / dataOutstanding
+	// so we never Release past capacity.
+	sem             *semaphore.Weighted
+	initialDeficit  int64
+	dataOutstanding int64
+
+	// initialSize is the configured starting credit (e.g. 1 MB); used for
+	// the auto-grant threshold computation.
 	initialSize int64
-	maxSize     int64
 
 	// Receive-side bookkeeping.
 	recvCredit int64
@@ -50,52 +62,70 @@ func NewConnWindow(initialCredit int64) *ConnWindow {
 	if initialCredit <= 0 {
 		initialCredit = DefaultConnCredit
 	}
+	capacity := DefaultMaxConnCredit
+	if initialCredit > capacity {
+		capacity = initialCredit
+	}
+	sem := semaphore.NewWeighted(capacity)
+	var deficit int64
+	if initialCredit < capacity {
+		deficit = capacity - initialCredit
+		_ = sem.Acquire(context.Background(), deficit)
+	}
 	return &ConnWindow{
-		sendCredit:  initialCredit,
-		recvCredit:  initialCredit,
-		initialSize: initialCredit,
-		maxSize:     DefaultMaxConnCredit,
+		sem:            sem,
+		initialDeficit: deficit,
+		initialSize:    initialCredit,
+		recvCredit:     initialCredit,
 	}
 }
 
-// Consume decrements connection-level sender credit.
-// Small frames (≤ MinGuaranteedWindow) bypass accounting entirely — they
-// must always flow to keep WINDOW_UPDATE and control traffic unblocked.
-func (w *ConnWindow) Consume(n int64) error {
+// Consume reserves n bytes of connection-level credit before a Send.
+// Small frames (≤ MinGuaranteedWindow) bypass the semaphore entirely so
+// control traffic (WINDOW_UPDATE, ACK, PING/PONG) always flows. Larger
+// frames block up to ConsumeTimeout waiting for credit via sem.Acquire.
+func (w *ConnWindow) Consume(ctx context.Context, n int64) error {
 	if n <= 0 {
 		return nil
 	}
 	if n <= MinGuaranteedWindow {
 		return nil
 	}
-
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	if n > w.sendCredit {
-		return fmt.Errorf("aether flow: insufficient connection credit (need %d, have %d)", n, w.sendCredit)
+	acquireCtx, cancel := context.WithTimeout(ctx, ConsumeTimeout)
+	defer cancel()
+	if err := w.sem.Acquire(acquireCtx, n); err != nil {
+		return fmt.Errorf("aether flow: insufficient connection credit after %s (need %d, have %d): %w",
+			ConsumeTimeout, n, w.Available(), err)
 	}
-	w.sendCredit -= n
+	w.mu.Lock()
+	w.dataOutstanding += n
+	w.mu.Unlock()
 	return nil
 }
 
 // ApplyUpdate processes a connection-level WINDOW_UPDATE where credit is
 // the peer's cumulative total. Delta = credit - grantsReceived; stale
-// frames (delta ≤ 0) are dropped.
+// frames (delta ≤ 0) are dropped. Positive delta is released back to the
+// semaphore, capped at dataOutstanding so we never release past capacity.
 func (w *ConnWindow) ApplyUpdate(credit int64) {
 	if credit <= 0 {
 		return
 	}
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	if credit <= w.grantsReceived {
+		w.mu.Unlock()
 		return
 	}
 	delta := credit - w.grantsReceived
 	w.grantsReceived = credit
-	w.sendCredit += delta
-	if w.sendCredit > w.maxSize {
-		w.sendCredit = w.maxSize
+	granted := delta
+	if granted > w.dataOutstanding {
+		granted = w.dataOutstanding
+	}
+	w.dataOutstanding -= granted
+	w.mu.Unlock()
+	if granted > 0 {
+		w.sem.Release(granted)
 	}
 }
 
@@ -113,8 +143,8 @@ func (w *ConnWindow) ReceiverConsume(n int64) int64 {
 	threshold := int64(float64(w.initialSize) * AutoGrantThreshold)
 	if sinceLastGrant >= threshold {
 		grant := sinceLastGrant
-		if w.recvCredit+grant > w.maxSize {
-			grant = w.maxSize - w.recvCredit
+		if w.recvCredit+grant > DefaultMaxConnCredit {
+			grant = DefaultMaxConnCredit - w.recvCredit
 		}
 		if grant < 0 {
 			grant = 0
@@ -131,5 +161,5 @@ func (w *ConnWindow) ReceiverConsume(n int64) int64 {
 func (w *ConnWindow) Available() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.sendCredit
+	return DefaultMaxConnCredit - w.initialDeficit - w.dataOutstanding
 }
