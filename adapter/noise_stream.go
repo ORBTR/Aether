@@ -174,7 +174,7 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 	if err := st.window.Consume(ctx, int64(len(data))); err != nil {
 		return fmt.Errorf("stream %d: %w", st.streamID, err)
 	}
-	if err := st.session.connWindow.Consume(int64(len(data))); err != nil {
+	if err := st.session.connWindow.Consume(ctx, int64(len(data))); err != nil {
 		return fmt.Errorf("stream %d conn: %w", st.streamID, err)
 	}
 
