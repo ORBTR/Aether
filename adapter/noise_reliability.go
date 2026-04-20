@@ -1,0 +1,309 @@
+//go:build !js
+
+/*
+ * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@hstles.com
+ */
+package adapter
+
+import (
+	"bytes"
+	"compress/flate"
+	"fmt"
+	"io"
+	"sync"
+	"time"
+
+	"github.com/ORBTR/aether"
+)
+
+// writeLoop reads from the scheduler and writes frames to the Noise
+// connection. Uses the pacer for rate-limited sending (supports both
+// CUBIC and BBR). Parks on the scheduler's wake channel instead of
+// polling — addresses Concern #2 (the previous time.Sleep(1ms) added
+// ~0.5ms latency to every send and burned CPU when idle).
+func (s *NoiseSession) writeLoop() {
+	wake := s.sched.WakeCh()
+	for {
+		// Drain everything currently scheduled before re-parking.
+		for {
+			select {
+			case <-s.closed:
+				return
+			default:
+			}
+
+			frame := s.sched.Dequeue()
+			if frame == nil {
+				break // empty — fall through to park on wake/closed
+			}
+
+			frameSize := int(aether.HeaderSize) + int(frame.Length)
+
+			// Congestion window check — re-enqueue and wait for next ACK
+			// (the ACK path will re-signal wake when it advances cwnd).
+			if !s.congestion().CanSend(int64(frameSize)) {
+				s.sched.Enqueue(frame.StreamID, frame)
+				break
+			}
+
+			// Pacing: park exactly as long as the pacer says.
+			wait := s.pacer.TimeUntilSend(frameSize)
+			if wait > 0 {
+				s.sched.Enqueue(frame.StreamID, frame)
+				select {
+				case <-time.After(wait):
+				case <-s.closed:
+					return
+				}
+				continue
+			}
+
+			s.pacer.OnSend(frameSize)
+
+			if s.opts.FrameLogging {
+				dbgNoise.Printf("TX stream=%d type=%d seq=%d len=%d",
+					frame.StreamID, frame.Type, frame.SeqNo, frame.Length)
+			}
+			s.writeFrame(frame)
+
+			// Update pacer rate from congestion controller after each send
+			if pacingRate := s.congestion().PacingRate(); pacingRate > 0 {
+				s.pacer.SetRate(pacingRate)
+			}
+		}
+
+		// Park until either new work arrives or the session closes.
+		select {
+		case <-s.closed:
+			return
+		case <-wake:
+		}
+	}
+}
+
+// reliabilityTick checks for retransmission timeouts periodically.
+// Single lock scope covers both retransmit dequeue and stall detection so
+// both see the same snapshot of s.streams and avoid redundant lock traffic
+// (addresses Concern #4).
+func (s *NoiseSession) reliabilityTick() {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.closed:
+			return
+		case <-ticker.C:
+			s.mu.Lock()
+			for streamID, st := range s.streams {
+				// Retransmit timeout dequeue
+				if frame := st.retransmitQ.Dequeue(); frame != nil {
+					s.sched.MarkRetransmit(streamID)
+					s.sched.Enqueue(streamID, frame)
+					s.congestion().OnLoss()
+					st.rtt.BackoffRTO()
+				}
+
+				// Stall detection: if no ACK progress for 2×SRTT, probe retransmit
+				if st.sendWindow.InFlight() > 0 {
+					srtt := st.rtt.SRTT()
+					if srtt > 0 {
+						if lastProgress, ok := s.lastProgressAt[streamID]; ok && time.Since(lastProgress) > 2*srtt {
+							if entry := st.sendWindow.GetEntry(st.sendWindow.Base()); entry != nil {
+								s.sched.MarkRetransmit(streamID)
+								s.sched.Enqueue(streamID, entry.Frame)
+								s.lastProgressAt[streamID] = time.Now() // reset to avoid repeated probes
+							}
+						}
+					}
+				}
+			}
+			s.mu.Unlock()
+
+			// PMTU probe timeout check + periodic re-probe (no s.mu needed)
+			if s.pmtuProber.IsProbing() && s.pmtuProber.ProbeTimedOut() {
+				s.pmtuProber.OnProbeTimeout()
+			}
+			if s.pmtuProber.ShouldReprobe() {
+				s.pmtuProber.StartProbe()
+			}
+
+			// Idle session eviction. A session that hasn't seen any inbound
+			// activity for idleTimeout has either been black-holed by the
+			// network or the peer has gone silent — either way we should
+			// reclaim the goroutines + memory instead of holding forever.
+			// Without this, a slow-drip attacker who opens sessions and never
+			// sends a byte pins resources indefinitely. The keepalive ticker
+			// (separate subsystem) normally keeps LastActivity fresh on live
+			// paths, so this threshold only trips on actually-dead sessions.
+			idleTimeout := s.opts.SessionIdleTimeout
+			if idleTimeout <= 0 {
+				idleTimeout = aether.DefaultSessionIdleTimeout
+			}
+			if time.Since(s.healthMon.LastActivity()) > idleTimeout {
+				s.CloseWithError(fmt.Errorf("session idle timeout (%s)", idleTimeout))
+				return
+			}
+
+			// FEC decoder pruning (S2). Without this, FEC_REPAIR flooding
+			// with unique GroupIDs causes unbounded memory growth.
+			// Rate-limited to once per second so the 10ms tick stays cheap.
+			// Both count-based (budget) and age-based (2×SRTT) pruning
+			// must run — a slow trickle below the count cap still
+			// accumulates memory over time.
+			now := time.Now()
+			if now.Sub(s.lastFECPrune) >= time.Second {
+				maxGroups := s.opts.MaxFECGroups
+				if maxGroups <= 0 {
+					maxGroups = aether.DefaultMaxFECGroups
+				}
+				s.fecDecoder.Prune(maxGroups)
+				s.interleavedDecoder.Prune(maxGroups)
+				if s.rsDecoder != nil {
+					s.rsDecoder.Prune(maxGroups)
+				}
+
+				// Age-based cutoff = 2×max(SRTT) across live streams, with
+				// a floor to avoid over-pruning when RTT is unmeasured.
+				// FEC recovery is useless after 2 RTTs — the sender's
+				// retransmit will have already covered any missing frame.
+				age := 2 * s.maxStreamSRTT()
+				if age < 2*time.Second {
+					age = 2 * time.Second
+				}
+				s.fecDecoder.PruneOlderThan(age)
+				s.interleavedDecoder.PruneOlderThan(age)
+				if s.rsDecoder != nil {
+					s.rsDecoder.PruneOlderThan(age)
+				}
+				s.lastFECPrune = now
+			}
+		}
+	}
+}
+
+// writeFrame serializes and writes a single frame to the Noise connection.
+// Applies compression (if enabled and payload > 64 bytes) and encryption (if key set).
+func (s *NoiseSession) writeFrame(frame *aether.Frame) error {
+	// Compression: compress payload if enabled and worthwhile (>64 bytes)
+	// Read the atomic toggle (not opts.Compression) so runtime flips
+	// from SetCompressionEnabled / adaptive CPU controller / agent
+	// netmon link-change handlers take effect immediately without
+	// reconstructing the session.
+	if s.compressionEnabled.Load() && len(frame.Payload) > 64 {
+		compressed := compressPayload(frame.Payload)
+		if len(compressed) < len(frame.Payload) { // only use if smaller
+			frame.Payload = compressed
+			frame.Length = uint32(len(compressed))
+			frame.Flags = frame.Flags.Set(aether.FlagCOMPRESSED)
+		}
+	} else {
+		frame.Flags = frame.Flags.Clear(aether.FlagCOMPRESSED)
+	}
+
+	// Encryption: encrypt payload if key set and enabled
+	if s.encryptor != nil && s.opts.Encryption {
+		if err := s.encryptor.Encrypt(frame); err != nil {
+			return fmt.Errorf("aether encrypt: %w", err)
+		}
+	} else {
+		frame.Flags = frame.Flags.Clear(aether.FlagENCRYPTED)
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	var buf bytes.Buffer
+	if s.opts.HeaderComp {
+		// Control frames (not encrypted, no payload) → 4 bytes
+		if s.compressor.ShouldCompressControl(frame) {
+			s.compressor.EncodeControlShort(&buf, frame)
+			_, err := s.conn.Write(buf.Bytes())
+			return err
+		}
+		// ACK frames → 11 bytes (lite) or 3+N (full)
+		if s.compressor.ShouldCompressACK(frame) {
+			s.compressor.EncodeACKShort(&buf, frame)
+			_, err := s.conn.Write(buf.Bytes())
+			return err
+		}
+		// Encrypted DATA → 9 bytes + Nonce-in-payload
+		if frame.Flags.Has(aether.FlagENCRYPTED) && s.compressor.ShouldCompressData(frame) {
+			s.compressor.EncodeEncryptedDataShort(&buf, frame)
+			_, err := s.conn.Write(buf.Bytes())
+			return err
+		}
+		// Unencrypted DATA → 6-9 bytes
+		if s.compressor.ShouldCompressData(frame) {
+			if frame.Length <= 127 {
+				s.compressor.EncodeDataShortVar(&buf, frame)
+			} else {
+				s.compressor.EncodeDataShort(&buf, frame)
+			}
+			_, err := s.conn.Write(buf.Bytes())
+			return err
+		}
+	}
+
+	// Full 50-byte header (fallback)
+	if _, err := aether.EncodeFrame(&buf, frame); err != nil {
+		return err
+	}
+	s.compressor.RecordFullHeader(frame)
+	_, err := s.conn.Write(buf.Bytes())
+	return err
+}
+
+// flateWriterPool reuses flate.Writer (~32KB each) to avoid per-frame allocation.
+var flateWriterPool = sync.Pool{
+	New: func() interface{} {
+		w, _ := flate.NewWriter(io.Discard, flate.BestSpeed)
+		return w
+	},
+}
+
+// flateReaderPool reuses flate.Reader to avoid per-frame allocation.
+var flateReaderPool = sync.Pool{
+	New: func() interface{} {
+		return flate.NewReader(bytes.NewReader(nil))
+	},
+}
+
+// compressPayload compresses data using DEFLATE (fast, standard library).
+func compressPayload(data []byte) []byte {
+	var buf bytes.Buffer
+	w := flateWriterPool.Get().(*flate.Writer)
+	w.Reset(&buf)
+	if _, err := w.Write(data); err != nil {
+		flateWriterPool.Put(w)
+		return data
+	}
+	if err := w.Close(); err != nil {
+		flateWriterPool.Put(w)
+		return data
+	}
+	flateWriterPool.Put(w)
+	return buf.Bytes()
+}
+
+// decompressPayload decompresses DEFLATE data with a hard cap on output size
+// to defeat compression-bomb attacks (a 64-byte DEFLATE stream can expand to
+// GB; without a cap, a single peer frame can OOM the process). Reads one
+// byte past the cap so over-limit input is detected rather than silently
+// truncated.
+func decompressPayload(data []byte) ([]byte, error) {
+	r := flateReaderPool.Get().(io.ReadCloser)
+	if resetter, ok := r.(flate.Resetter); ok {
+		resetter.Reset(bytes.NewReader(data), nil)
+	}
+	limited := io.LimitReader(r, int64(aether.MaxPayloadSize)+1)
+	result, err := io.ReadAll(limited)
+	flateReaderPool.Put(r)
+	if err != nil {
+		return nil, err
+	}
+	if len(result) > aether.MaxPayloadSize {
+		return nil, fmt.Errorf("aether: decompressed payload exceeds MaxPayloadSize (%d)", aether.MaxPayloadSize)
+	}
+	return result, nil
+}
