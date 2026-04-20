@@ -161,6 +161,12 @@ type NoiseSession struct {
 	// pass. The reliability tick runs every 10 ms but auto-tune only runs
 	// every 10 s — this timestamp rate-limits it inside the tick loop.
 	lastAutoTune time.Time
+
+	// lastGrantRefresh is the wall-clock time of the last periodic
+	// WINDOW_UPDATE re-emission for all live streams on this session.
+	// Breaks the UDP-loss deadlock where a dropped grant stalls the sender
+	// and no further data arrives to re-trigger the threshold.
+	lastGrantRefresh time.Time
 }
 
 // NewNoiseSession creates an Aether session over a Noise-encrypted
@@ -613,6 +619,36 @@ func (s *NoiseSession) maxStreamSRTT() time.Duration {
 		}
 	}
 	return max
+}
+
+// refreshWindowGrants re-emits the current cumulative WINDOW_UPDATE for
+// every live stream plus the connection-level window. Called from
+// reliabilityTick at 2s cadence.
+//
+// The cumulative-grant design (see flow.StreamWindow docs) makes duplicate
+// grants harmless — the peer's ApplyUpdate drops any incoming credit
+// that's ≤ what's already been applied. So re-emitting the same value is
+// always safe, and it recovers from UDP packet loss without needing any
+// ACK / retry logic.
+//
+// Skips streams where no grant has ever been emitted (CurrentGrant == 0)
+// since re-emitting 0 is pointless and would noise the wire.
+func (s *NoiseSession) refreshWindowGrants() {
+	s.mu.Lock()
+	streams := make([]*noiseStream, 0, len(s.streams))
+	for _, st := range s.streams {
+		streams = append(streams, st)
+	}
+	s.mu.Unlock()
+
+	for _, st := range streams {
+		if cg := st.window.CurrentGrant(); cg > 0 {
+			s.sendWindowUpdate(st.streamID, uint64(cg))
+		}
+	}
+	if cg := s.connWindow.CurrentGrant(); cg > 0 {
+		s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(cg))
+	}
 }
 
 // autoTuneWindows feeds per-stream RTT into each stream's flow window and

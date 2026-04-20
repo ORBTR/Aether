@@ -154,6 +154,22 @@ func (s *NoiseSession) reliabilityTick() {
 				s.autoTuneWindows()
 			}
 
+			// Periodic WINDOW_UPDATE re-emission — breaks the UDP-loss
+			// deadlock where a dropped grant stalls the sender, the sender
+			// stops producing data, no new threshold is crossed on our side,
+			// no new grant fires, deadlock. Re-emitting the current cumulative
+			// value from each active stream re-delivers any lost grant; the
+			// peer's ApplyUpdate drops duplicates as stale, so this is
+			// idempotent on happy paths.
+			//
+			// 2 s cadence: fast enough that a stalled sender recovers within
+			// ConsumeTimeout (10 s), slow enough that wire overhead is
+			// negligible (~30-byte frames, one per active stream).
+			if now := time.Now(); now.Sub(s.lastGrantRefresh) >= 2*time.Second {
+				s.lastGrantRefresh = now
+				s.refreshWindowGrants()
+			}
+
 			// FEC decoder pruning (S2). Without this, FEC_REPAIR flooding
 			// with unique GroupIDs causes unbounded memory growth.
 			// Rate-limited to once per second so the 10ms tick stays cheap.

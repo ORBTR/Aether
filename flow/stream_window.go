@@ -326,6 +326,30 @@ func (w *StreamWindow) Available() int64 {
 	return w.currentWindow - w.dataOutstanding
 }
 
+// CurrentGrant returns the current cumulative-emitted value so callers can
+// periodically re-transmit it as a WINDOW_UPDATE. Safe on unreliable
+// transports: the sender's ApplyUpdate drops any re-emit where the
+// cumulative value is not greater than what's already applied, so extra
+// re-emits are idempotent no-ops (correctness-wise) and harmless
+// (wire-overhead-wise, at ~24-byte control frames).
+//
+// The refresh is important because cumulative grants normally only advance
+// when the receiver's threshold is re-crossed by new incoming data. If UDP
+// packet loss drops a WINDOW_UPDATE and the sender stalls, the sender's
+// SIDE stops sending, the receiver therefore stops receiving, no new
+// threshold is crossed, and no new grant fires — deadlock. Periodically
+// re-emitting CurrentGrant breaks that deadlock: a lost grant gets
+// re-transmitted, sender's ApplyUpdate computes a positive delta, the
+// semaphore releases, and the sender can send again.
+//
+// Returns 0 if no grant has ever been emitted (receiver hasn't crossed
+// the threshold at least once yet); re-emitting 0 is pointless.
+func (w *StreamWindow) CurrentGrant() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.grantsEmitted
+}
+
 // CurrentWindow returns the effective send-window target (post any
 // Grow/Shrink adjustments). Exported for metrics and auto-tuning observers.
 func (w *StreamWindow) CurrentWindow() int64 {
