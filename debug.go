@@ -54,3 +54,22 @@ var (
 	dbgGossip    = NewDebugLogger("aether.gossip")
 	dbgTransport = NewDebugLogger("aether.transport")
 )
+
+// autoTuneDisabled caches the AETHER_AUTOTUNE kill switch read at init so
+// every session tick doesn't re-parse the env. Set AETHER_AUTOTUNE=off
+// (or "0", "false", "no", "disable") to disable runtime window tuning on
+// all sessions — windows keep their configured initial size for the
+// lifetime of the session.
+var autoTuneDisabled bool
+
+func init() {
+	switch strings.ToLower(os.Getenv("AETHER_AUTOTUNE")) {
+	case "off", "0", "false", "no", "disable", "disabled":
+		autoTuneDisabled = true
+	}
+}
+
+// AutoTuneDisabled reports whether the flow-control auto-tuner is disabled
+// via the AETHER_AUTOTUNE env var. Session housekeeping ticks consult this
+// before calling any Grow/Shrink on stream windows.
+func AutoTuneDisabled() bool { return autoTuneDisabled }
