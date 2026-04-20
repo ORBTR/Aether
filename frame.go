@@ -40,6 +40,7 @@ const (
 	TypeSTATS          FrameType = 0x11 // Periodic session stats report (RTT, loss, cwnd, etc.)
 	TypeTRACE          FrameType = 0x12 // Distributed RPC trace through mesh hops
 	TypePATH_PROBE     FrameType = 0x13 // Active path measurement + PMTU discovery
+	TypeCONGESTION     FrameType = 0x14 // Explicit congestion signal — sender slowdown hint
 )
 
 // String returns a human-readable name for the frame type.
@@ -81,6 +82,8 @@ func (t FrameType) String() string {
 		return "TRACE"
 	case TypePATH_PROBE:
 		return "PATH_PROBE"
+	case TypeCONGESTION:
+		return "CONGESTION"
 	default:
 		return fmt.Sprintf("UNKNOWN(0x%02X)", byte(t))
 	}
@@ -88,7 +91,7 @@ func (t FrameType) String() string {
 
 // IsValid returns true if the frame type is a known type.
 func (t FrameType) IsValid() bool {
-	return t >= TypeDATA && t <= TypePATH_PROBE
+	return t >= TypeDATA && t <= TypeCONGESTION
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -401,6 +404,36 @@ const AckDelayGranularity = 8
 
 // WindowUpdateSize is the wire size of a WINDOW_UPDATE payload (4 bytes).
 const WindowUpdateSize = 4
+
+// ────────────────────────────────────────────────────────────────────────────
+// CONGESTION payload
+// ────────────────────────────────────────────────────────────────────────────
+
+// CongestionPayloadSize is the wire size of a CONGESTION payload (5 bytes).
+//   [1 byte reason][1 byte severity 0-100][2 bytes backoff_ms][1 byte reserved]
+const CongestionPayloadSize = 5
+
+// CongestionReason identifies why the receiver is signalling congestion.
+type CongestionReason byte
+
+const (
+	CongestionUnspecified  CongestionReason = 0
+	CongestionQueueFull    CongestionReason = 1 // Receiver's recvCh is backlogged
+	CongestionMemoryHigh   CongestionReason = 2 // Receiver near memory pressure
+	CongestionCPUHigh      CongestionReason = 3 // Receiver can't keep up CPU-wise
+	CongestionRateLimit    CongestionReason = 4 // Receiver policy rate-limit
+	CongestionDownstream   CongestionReason = 5 // Receiver can't drain to its downstream
+)
+
+// CongestionPayload is an explicit backpressure hint from receiver to sender.
+// Senders that honour it reduce their send rate by `Severity/100` for
+// `BackoffMs` milliseconds before resuming normal cadence. Severity 100 means
+// "stop entirely for BackoffMs". Severity 0 is an explicit "all clear".
+type CongestionPayload struct {
+	Reason    CongestionReason
+	Severity  uint8  // 0 (clear) to 100 (full stop)
+	BackoffMs uint16 // how long the sender should respect this hint
+}
 
 // ────────────────────────────────────────────────────────────────────────────
 // PRIORITY payload

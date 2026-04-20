@@ -128,14 +128,15 @@ func (s *BrowserWSSession) handleIncoming(payload []byte) {
 
 	switch frame.Type {
 	case aether.TypeDATA:
-		// Deliver data to stream's receive channel
-		select {
-		case st.recvCh <- frame.Payload:
-		default:
-			// Channel full — drop (backpressure)
-		}
+		// Use the agnostic DeliverToRecvCh helper so we get the same
+		// receive-side flow-control accounting (ReceiverConsume → auto grant
+		// via WINDOW_UPDATE) and adaptive backpressure as the TCP/Noise
+		// adapters. Previously this just dropped on a full channel, never
+		// called ReceiverConsume, and never emitted a WINDOW_UPDATE — which
+		// drained the sender's credit with no return grant and eventually
+		// deadlocked flow control.
+		DeliverToRecvCh(st.recvCh, frame.Payload, st.window, st.streamID, s.sendWindowUpdateAgnostic)
 	case aether.TypeWINDOW:
-		// Apply flow control credit update
 		credit := aether.DecodeWindowUpdate(frame.Payload)
 		st.window.ApplyUpdate(int64(credit))
 	case aether.TypeCLOSE:
@@ -143,6 +144,30 @@ func (s *BrowserWSSession) handleIncoming(payload []byte) {
 	case aether.TypeRESET:
 		close(st.recvCh)
 	}
+}
+
+// sendWindowUpdate emits a WINDOW_UPDATE frame to the peer granting additional
+// credit on the given stream. Mirrors TCPSession.sendWindowUpdate.
+func (s *BrowserWSSession) sendWindowUpdate(streamID uint64, credit uint32) {
+	payload := aether.EncodeWindowUpdate(credit)
+	frame := &aether.Frame{
+		SenderID:   s.localPeerID,
+		ReceiverID: s.remotePeerID,
+		StreamID:   streamID,
+		Type:       aether.TypeWINDOW,
+		Length:     uint32(len(payload)),
+		Payload:    payload,
+	}
+	encoded := aether.EncodeFrameToBytes(frame)
+	buf := js.Global().Get("Uint8Array").New(len(encoded))
+	js.CopyBytesToJS(buf, encoded)
+	s.ws.Call("send", buf.Get("buffer"))
+}
+
+// sendWindowUpdateAgnostic adapts sendWindowUpdate to the WindowUpdater
+// signature expected by DeliverToRecvCh.
+func (s *BrowserWSSession) sendWindowUpdateAgnostic(streamID uint64, credit uint32) {
+	s.sendWindowUpdate(streamID, credit)
 }
 
 // OpenStream creates a new multiplexed stream.
@@ -244,6 +269,13 @@ func (st *browserStream) Reset(reason aether.ResetReason) error {
 }
 
 func (st *browserStream) SetPriority(weight uint8, dependency uint64) {}
+
+// AvailableCredit exposes the current send-side flow-control credit for
+// this stream. Parity with the other adapters so upper layers can make
+// agnostic scheduling decisions.
+func (st *browserStream) AvailableCredit() int64 {
+	return st.window.Available()
+}
 
 func (st *browserStream) Conn() net.Conn {
 	st.connOnce.Do(func() { st.connView = NewStreamConn(st) })

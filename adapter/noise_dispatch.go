@@ -175,10 +175,41 @@ func (s *NoiseSession) dispatchFrame(frame *aether.Frame) {
 		s.handlePathProbe(frame)
 	case aether.TypeHANDSHAKE:
 		s.handleHandshake(frame)
+	case aether.TypeCONGESTION:
+		s.handleCongestion(frame)
 	case aether.TypeWHOIS, aether.TypeRENDEZVOUS, aether.TypeNETWORK_CONFIG:
 		// Control plane — deliver to control stream
 		s.deliverToStream(s.layout.Control, frame.Payload)
 	}
+}
+
+// handleCongestion processes an explicit CONGESTION frame — peer-driven
+// sender throttle hint. Session's throttle state is updated; send-path
+// consumers can check it before committing large sends.
+func (s *NoiseSession) handleCongestion(frame *aether.Frame) {
+	p := aether.DecodeCongestion(frame.Payload)
+	s.throttle.Apply(p)
+	dbgNoise.Printf("CONGESTION recv severity=%d reason=%d backoff=%dms",
+		p.Severity, p.Reason, p.BackoffMs)
+}
+
+// SendCongestion emits a CONGESTION frame to the peer.
+func (s *NoiseSession) SendCongestion(p aether.CongestionPayload) error {
+	payload := aether.EncodeCongestion(p)
+	frame := &aether.Frame{
+		SenderID:   s.localPeerID,
+		ReceiverID: s.remotePeerID,
+		StreamID:   aether.StreamConnectionLevel,
+		Type:       aether.TypeCONGESTION,
+		Length:     uint32(len(payload)),
+		Payload:    payload,
+	}
+	return s.writeFrame(frame)
+}
+
+// Throttle exposes the session's congestion-throttle state.
+func (s *NoiseSession) Throttle() *aether.CongestionThrottle {
+	return &s.throttle
 }
 
 func (s *NoiseSession) handleData(frame *aether.Frame) {

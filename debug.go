@@ -10,9 +10,16 @@ import (
 	"strings"
 )
 
-// DebugLogger provides conditional debug logging, enabled by the AETHER_DEBUG
-// environment variable. Set AETHER_DEBUG=* for all, or AETHER_DEBUG=noise,tcp
-// for specific namespaces.
+// DebugLogger provides conditional debug logging, enabled by the DEBUG
+// environment variable. All Aether namespaces are prefixed "aether.*"
+// (e.g. "aether", "aether.gossip", "aether.transport", "aether.flow")
+// so they coexist with the HSTLES Library debug system which uses the
+// same DEBUG var.
+//
+// Set DEBUG=* to enable everything, DEBUG=aether.flow,aether.gossip to
+// scope to specific Aether namespaces, or DEBUG=aether.* to enable all
+// Aether-prefixed namespaces. Namespace matching is substring-based,
+// so "aether" matches "aether.flow" too.
 type DebugLogger struct {
 	namespace string
 	enabled   bool
@@ -21,11 +28,11 @@ type DebugLogger struct {
 var debugNamespaces string
 
 func init() {
-	debugNamespaces = os.Getenv("AETHER_DEBUG")
+	debugNamespaces = os.Getenv("DEBUG")
 }
 
 // NewDebugLogger creates a debug logger for the given namespace.
-// Enabled when AETHER_DEBUG contains the namespace or "*".
+// Enabled when DEBUG contains the namespace or "*".
 func NewDebugLogger(namespace string) *DebugLogger {
 	enabled := debugNamespaces == "*" || strings.Contains(debugNamespaces, namespace)
 	return &DebugLogger{namespace: namespace, enabled: enabled}
