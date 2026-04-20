@@ -177,3 +177,14 @@ func (w *ConnWindow) Available() int64 {
 	defer w.mu.Unlock()
 	return DefaultMaxConnCredit - w.initialDeficit - w.dataOutstanding
 }
+
+// CurrentGrant returns the current cumulative-emitted value so callers can
+// periodically re-transmit it as a connection-level WINDOW_UPDATE. Breaks
+// the UDP-loss-induced deadlock where a dropped grant stalls the sender
+// and no further data arrives to re-trigger the threshold. Returns 0 if
+// no grant has ever been emitted.
+func (w *ConnWindow) CurrentGrant() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.grantsEmitted
+}
