@@ -168,8 +168,10 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 		return fmt.Errorf("stream %d: cannot send", st.streamID)
 	}
 
-	// Flow control: consume stream + connection credit before sending
-	if err := st.window.Consume(int64(len(data))); err != nil {
+	// Flow control: consume stream + connection credit before sending.
+	// Stream window may block waiting for WINDOW_UPDATE (up to ConsumeTimeout);
+	// the connection window is non-blocking and errors immediately if exhausted.
+	if err := st.window.Consume(ctx, int64(len(data))); err != nil {
 		return fmt.Errorf("stream %d: %w", st.streamID, err)
 	}
 	if err := st.session.connWindow.Consume(int64(len(data))); err != nil {

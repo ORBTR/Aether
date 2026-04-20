@@ -899,7 +899,7 @@ func (st *tcpStream) Send(ctx context.Context, data []byte) error {
 	// Aether-level credit limits on TCP/WS adapters. The Consume call is tracked
 	// for metrics but errors are ignored. Only Noise-UDP (unreliable transport)
 	// needs application-level flow control enforcement.
-	_ = st.window.Consume(int64(len(data)))
+	_ = st.window.Consume(ctx, int64(len(data)))
 
 	// MaxFrameSize enforcement (Task 15): split large payloads into
 	// MaxFrameSize-sized chunks so they interleave with other streams
