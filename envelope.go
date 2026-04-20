@@ -68,7 +68,7 @@ func (a *AckFrame) StreamID() uint64 { return a.Stream }
 // WindowUpdate grants additional flow control credit.
 type WindowUpdateFrame struct {
 	Stream uint64
-	Credit uint32
+	Credit uint64 // cumulative total of credit granted since stream start
 }
 
 func (w *WindowUpdateFrame) framePayload() {}

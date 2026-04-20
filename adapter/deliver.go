@@ -13,7 +13,7 @@ import (
 
 // WindowUpdater is called with the stream ID and credit amount to send
 // a WINDOW_UPDATE frame to the remote peer.
-type WindowUpdater func(streamID uint64, credit uint32)
+type WindowUpdater func(streamID uint64, credit uint64)
 
 // DeliveryStats tracks per-stream delivery metrics for monitoring and
 // adaptive behavior. Counters are atomic for lock-free access from
@@ -111,11 +111,14 @@ func DeliverToRecvCh(recvCh chan<- []byte, payload []byte, window *flow.StreamWi
 }
 
 // grantCredit calls ReceiverConsume and sends a WINDOW_UPDATE if the
-// auto-grant threshold is met.
+// auto-grant threshold is met. The returned value from ReceiverConsume is
+// the CUMULATIVE total granted since stream start (not a delta) — it is
+// passed as-is to the WINDOW_UPDATE payload so the sender's ApplyUpdate
+// can compute the delta and drop stale/duplicate frames.
 func grantCredit(window *flow.StreamWindow, payload []byte, streamID uint64, sendUpdate WindowUpdater) {
 	if window != nil && sendUpdate != nil {
 		if grant := window.ReceiverConsume(int64(len(payload))); grant > 0 {
-			sendUpdate(streamID, uint32(grant))
+			sendUpdate(streamID, uint64(grant))
 		}
 	}
 }

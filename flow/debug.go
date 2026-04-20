@@ -10,9 +10,15 @@ import (
 	"strings"
 )
 
-// Flow package debug logger. Mirrors the top-level aether/debug.go logger but
-// avoids the import cycle that would come from importing the parent package.
-// Namespace: "aether.flow". Enable with DEBUG=aether.flow (or DEBUG=*).
+// Flow package debug logger. Mirrors the top-level aether/debug.go matcher
+// without importing the parent package (would create an import cycle).
+// Namespace: "aether.flow".
+//
+// Matching rules (same as aether/debug.go):
+//
+//	DEBUG=*          — everything
+//	DEBUG=aether     — enables aether.flow (ancestor match)
+//	DEBUG=aether.flow — exact match
 var dbgFlow = newDbg("aether.flow")
 
 type dbgLogger struct {
@@ -21,8 +27,18 @@ type dbgLogger struct {
 }
 
 func newDbg(ns string) *dbgLogger {
-	env := os.Getenv("DEBUG")
-	enabled := env == "*" || strings.Contains(env, ns)
+	enabled := false
+	raw := os.Getenv("DEBUG")
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if entry == "*" || ns == entry || strings.HasPrefix(ns, entry+".") {
+			enabled = true
+			break
+		}
+	}
 	return &dbgLogger{prefix: "[" + ns + "] ", enabled: enabled}
 }
 

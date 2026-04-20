@@ -123,6 +123,21 @@ type StreamWindow struct {
 	consumed    int64
 	lastGrant   int64
 
+	// Cumulative-grant accounting — the WINDOW_UPDATE wire value is the
+	// CUMULATIVE total of credit granted since stream start, not a delta.
+	// This makes the grant channel idempotent across loss, duplication, and
+	// reordering on unreliable transports (Noise-UDP): a lost grant is
+	// implicitly retransmitted by the next one (which carries a larger
+	// cumulative value), and duplicates are no-ops after the first.
+	//
+	//   grantsEmitted  — total bytes of credit we (receiver) have granted
+	//                    so far; sent as the wire value on each WINDOW_UPDATE.
+	//   grantsReceived — highest cumulative value we (sender) have seen
+	//                    from peer; any incoming wire value ≤ this is stale
+	//                    and dropped by ApplyUpdate.
+	grantsEmitted  int64
+	grantsReceived int64
+
 	// Auto-tuning hints — advisory data an auto-tuner reads via Stats().
 	// Updated from Consume/ApplyUpdate hot paths, guarded by mu.
 	peakOutstanding int64         // max dataOutstanding observed since last tune
@@ -211,18 +226,35 @@ func (w *StreamWindow) Consume(ctx context.Context, n int64) error {
 	return nil
 }
 
-// ApplyUpdate adds credit from a received WINDOW_UPDATE frame.
-// Called on the sender side when the receiver grants more credit.
-// Grants beyond the currently in-flight data (dataOutstanding) are silently
-// dropped — we never release past what Consume actually acquired, so the
-// effective window never grows above initialCredit's restoration point and
-// the semaphore is never released past its capacity.
+// ApplyUpdate processes a received WINDOW_UPDATE frame, where `credit` is
+// the peer's CUMULATIVE total of credit granted since stream start (not a
+// delta). The function computes the delta since the last applied grant,
+// applies it, and silently drops stale / out-of-order / duplicate frames.
+//
+// Cumulative semantics are why this is loss-tolerant on Noise-UDP: if one
+// WINDOW_UPDATE packet drops, the next one carries a still-larger
+// cumulative value that re-covers what was lost. Duplicates have delta <= 0
+// and return early. A re-ordered older frame also has delta <= 0 (its
+// cumulative value is below what a more-recent frame already set).
+//
+// The delta is further capped at dataOutstanding so we never release the
+// semaphore past what Consume actually acquired — preserves the invariant
+// that Available() <= initialCredit at rest.
 func (w *StreamWindow) ApplyUpdate(credit int64) {
 	if credit <= 0 {
 		return
 	}
 	w.mu.Lock()
-	granted := credit
+	if credit <= w.grantsReceived {
+		// Stale or duplicate — peer's total granted is not higher than what
+		// we've already seen. Drop silently; this is the whole point of the
+		// cumulative scheme.
+		w.mu.Unlock()
+		return
+	}
+	delta := credit - w.grantsReceived
+	w.grantsReceived = credit
+	granted := delta
 	if granted > w.dataOutstanding {
 		granted = w.dataOutstanding
 	}
@@ -232,8 +264,8 @@ func (w *StreamWindow) ApplyUpdate(credit int64) {
 	if granted > 0 {
 		w.sem.Release(granted)
 	}
-	dbgFlow.Printf("ApplyUpdate credit=%d granted=%d outstanding=%d avail=%d",
-		credit, granted, outstanding, w.maxSize-w.initialDeficit-outstanding)
+	dbgFlow.Printf("ApplyUpdate cumulative=%d delta=%d granted=%d outstanding=%d avail=%d",
+		credit, delta, granted, outstanding, w.maxSize-w.initialDeficit-outstanding)
 }
 
 // ReceiverConsume records that the receiver consumed n bytes of received data.
@@ -275,9 +307,14 @@ func (w *StreamWindow) ReceiverConsume(n int64) int64 {
 		}
 		w.recvCredit += grant
 		w.lastGrant = w.consumed
-		dbgFlow.Printf("ReceiverConsume grant=%d sinceLastGrant=%d consumed=%d recvCredit=%d (restore-to-full)",
-			grant, sinceLastGrant, w.consumed, w.recvCredit)
-		return grant
+		// Bump the cumulative counter and return it as the wire value.
+		// Peers interpret the WINDOW_UPDATE credit field as "total granted
+		// since stream start", so a lost packet is recovered by the next
+		// one (which carries a still-larger cumulative value).
+		w.grantsEmitted += grant
+		dbgFlow.Printf("ReceiverConsume grant=%d cumulative=%d sinceLastGrant=%d consumed=%d recvCredit=%d",
+			grant, w.grantsEmitted, sinceLastGrant, w.consumed, w.recvCredit)
+		return w.grantsEmitted
 	}
 	return 0
 }

@@ -307,12 +307,12 @@ func (s *TCPSession) deliverToStream(frame *aether.Frame) {
 }
 
 // sendWindowUpdateAgnostic adapts sendWindowUpdate to the WindowUpdater signature.
-func (s *TCPSession) sendWindowUpdateAgnostic(streamID uint64, credit uint32) {
+func (s *TCPSession) sendWindowUpdateAgnostic(streamID uint64, credit uint64) {
 	s.sendWindowUpdate(streamID, credit)
 }
 
 // sendWindowUpdate sends a WINDOW_UPDATE frame granting additional credit to the sender.
-func (s *TCPSession) sendWindowUpdate(streamID uint64, credit uint32) {
+func (s *TCPSession) sendWindowUpdate(streamID uint64, credit uint64) {
 	dbgTCP.Printf("WINDOW_UPDATE send stream=%d credit=%d", streamID, credit)
 	payload := aether.EncodeWindowUpdate(credit)
 	frame := &aether.Frame{

@@ -68,20 +68,72 @@ func TestStreamWindow_ApplyUpdate(t *testing.T) {
 		t.Fatalf("after exhaust: got %d, want 0", w.Available())
 	}
 
-	// Grant more than was consumed — the cap-at-outstanding behaviour means
-	// only what's outstanding gets released; the surplus is dropped.
+	// Cumulative semantics: ApplyUpdate(credit) treats credit as the peer's
+	// total-ever-granted. Delta = credit - grantsReceived. Grant exactly
+	// testCredit cumulative (== testCredit delta since we've seen 0 before).
+	w.ApplyUpdate(testCredit)
+	if got := w.Available(); got != testCredit {
+		t.Errorf("after full grant: got %d, want %d", got, testCredit)
+	}
+}
+
+func TestStreamWindow_ApplyUpdate_Idempotent(t *testing.T) {
+	w := NewStreamWindow(testCredit)
+	ctx := context.Background()
+
+	if err := w.Consume(ctx, testCredit); err != nil {
+		t.Fatalf("consume: %v", err)
+	}
+
+	// Cumulative grant of testCredit — should fully restore.
+	w.ApplyUpdate(testCredit)
+	if got := w.Available(); got != testCredit {
+		t.Fatalf("first apply: got %d, want %d", got, testCredit)
+	}
+
+	// Consume again and expose the idempotency of a stale retransmit.
+	if err := w.Consume(ctx, testCredit); err != nil {
+		t.Fatalf("re-consume: %v", err)
+	}
+	// Re-applying the SAME cumulative value must be a no-op (delta <= 0).
+	// This is the core property that makes the grant channel tolerant of
+	// duplicate/reordered WINDOW_UPDATE frames on lossy Noise-UDP.
+	w.ApplyUpdate(testCredit)
+	if got := w.Available(); got != 0 {
+		t.Errorf("stale re-apply should be no-op: got %d, want 0", got)
+	}
+
+	// A new cumulative value does advance.
 	w.ApplyUpdate(2 * testCredit)
 	if got := w.Available(); got != testCredit {
-		t.Errorf("after over-grant: got %d, want %d (cap at initial)", got, testCredit)
+		t.Errorf("after advance: got %d, want %d", got, testCredit)
+	}
+}
+
+func TestStreamWindow_ApplyUpdate_LossRecovery(t *testing.T) {
+	// Simulates the loss scenario on Noise-UDP: receiver emits several
+	// cumulative grants, only the final one arrives. The sender should still
+	// recover to the same state as if all grants had been delivered.
+	w := NewStreamWindow(testCredit)
+	ctx := context.Background()
+	if err := w.Consume(ctx, testCredit); err != nil {
+		t.Fatalf("consume: %v", err)
+	}
+
+	// Grants 1 and 2 "lost" — sender only receives grant 3 (cumulative testCredit).
+	w.ApplyUpdate(testCredit)
+	if got := w.Available(); got != testCredit {
+		t.Errorf("loss-recovery: got %d, want %d (final grant must recover all)", got, testCredit)
 	}
 }
 
 func TestStreamWindow_ApplyUpdate_Capped(t *testing.T) {
 	w := NewStreamWindow(testCredit)
-	// Grant far more than maxSize; Available must never exceed it.
+	// Cumulative grant far larger than what's outstanding; the release must
+	// cap at dataOutstanding (which is 0 here) so Available stays == initial.
 	w.ApplyUpdate(DefaultMaxStreamCredit + 1000)
 	if w.Available() > DefaultMaxStreamCredit {
-		t.Errorf("should cap at max: got %d", w.Available())
+		t.Errorf("should cap at outstanding: got %d", w.Available())
 	}
 }
 
@@ -94,11 +146,22 @@ func TestStreamWindow_ReceiverAutoGrant(t *testing.T) {
 		t.Errorf("small consume: got grant %d, want 0", grant)
 	}
 
-	// Threshold = testCredit * 0.25 = 4 KB. Consume past it.
+	// Threshold = testCredit * 0.25. Consume past it — the returned value is
+	// the CUMULATIVE total granted (always > 0 on first successful grant).
 	threshold := int64(float64(testCredit) * AutoGrantThreshold)
-	grant = w.ReceiverConsume(threshold + 100) // total 100 + threshold+100
+	grant = w.ReceiverConsume(threshold + 100)
 	if grant == 0 {
 		t.Error("should grant after exceeding threshold")
+	}
+	firstGrant := grant
+
+	// Next receive that crosses the threshold again bumps the cumulative.
+	grant2 := w.ReceiverConsume(threshold + 100)
+	if grant2 == 0 {
+		t.Error("second grant should fire")
+	}
+	if grant2 <= firstGrant {
+		t.Errorf("cumulative counter must increase: first=%d second=%d", firstGrant, grant2)
 	}
 }
 
