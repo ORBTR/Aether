@@ -1,0 +1,56 @@
+version: 2
+
+registries:
+  hstles-private:
+    type: git
+    url: https://github.com/hstles
+    username: x-access-token
+    password: ${{ secrets.HSTLES_LIB_TOKEN }}
+  hstles-private-upper:
+    type: git
+    url: https://github.com/HSTLES
+    username: x-access-token
+    password: ${{ secrets.HSTLES_LIB_TOKEN }}
+  orbtr-private:
+    type: git
+    url: https://github.com/orbtr
+    username: x-access-token
+    password: ${{ secrets.ORBTR_LIB_TOKEN }}
+  orbtr-private-upper:
+    type: git
+    url: https://github.com/ORBTR
+    username: x-access-token
+    password: ${{ secrets.ORBTR_LIB_TOKEN }}
+
+updates:
+  # Go modules
+  - package-ecosystem: "gomod"
+    directory: "/"
+    registries:
+      - hstles-private
+      - hstles-private-upper
+      - orbtr-private
+      - orbtr-private-upper
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "automated"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+
+  # GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "ci"
+    commit-message:
+      prefix: "ci"

@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package aether.grpc.v1;
+
+option go_package = "github.com/ORBTR/aether/grpc/pb";
+
+// TransportService provides bidirectional streaming for mesh transport.
+service TransportService {
+  // Stream establishes a bidirectional stream for sending/receiving mesh packets.
+  rpc Stream(stream Frame) returns (stream Frame);
+
+  // Ping checks connectivity and measures latency.
+  rpc Ping(PingRequest) returns (PingResponse);
+}
+
+// Frame represents a single transport frame.
+message Frame {
+  uint64 frame_id = 1;
+  bytes data = 2;
+  FrameType type = 3;
+  repeated uint64 acked_frames = 4;
+}
+
+enum FrameType {
+  FRAME_TYPE_UNSPECIFIED = 0;
+  FRAME_TYPE_DATA = 1;
+  FRAME_TYPE_PING = 2;
+  FRAME_TYPE_PONG = 3;
+  FRAME_TYPE_HANDSHAKE = 4;
+  FRAME_TYPE_CLOSE = 5;
+}
+
+message PingRequest {
+  int64 timestamp_ns = 1;
+  string node_id = 2;
+}
+
+message PingResponse {
+  int64 client_timestamp_ns = 1;
+  int64 server_timestamp_ns = 2;
+  string node_id = 3;
+}
+
+message Handshake {
+  bytes public_key = 1;
+  bytes signature = 2;
+  bytes challenge = 3;
+  uint32 version = 4;
+}

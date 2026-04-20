@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package aether.rpc.v1;
+
+option go_package = "github.com/ORBTR/aether/rpc/pb";
+
+// RPCRequest represents a direct RPC call over the mesh network.
+message RPCRequest {
+  string id = 1;
+  string handler = 2;
+  bytes payload = 3;
+  map<string, string> context = 4;
+  int64 timeout_ns = 5;          // nanoseconds (Duration)
+  string session_id = 6;
+  string trace_id = 7;
+  int32 hops = 8;                // forwarding hop counter, max 6
+
+  // Intelligent routing fields
+  string target_node_id = 9;     // ultimate destination node
+  repeated string route_list = 10; // ordered remaining hops [next, ..., target]
+  string request_nonce = 11;     // unique per parallel probe (dedup key)
+  int64 deadline = 12;           // absolute deadline (unix nanos)
+}
+
+// RPCResponse represents the result of an RPC call.
+message RPCResponse {
+  string id = 1;
+  bool success = 2;
+  bytes payload = 3;
+  string error = 4;
+  int64 latency_ns = 5;         // nanoseconds (Duration)
+  map<string, string> metadata = 6;
+}
