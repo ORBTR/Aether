@@ -145,6 +145,15 @@ func (s *NoiseSession) reliabilityTick() {
 				return
 			}
 
+			// Flow-control auto-tune. Rate-limited to every 10s (the 10ms
+			// tick is far too chatty for window adjustments). Disabled via
+			// AETHER_AUTOTUNE=off. Feeds session RTT into each stream's
+			// window then applies a bounded grow/shrink.
+			if now := time.Now(); now.Sub(s.lastAutoTune) >= 10*time.Second {
+				s.lastAutoTune = now
+				s.autoTuneWindows()
+			}
+
 			// FEC decoder pruning (S2). Without this, FEC_REPAIR flooding
 			// with unique GroupIDs causes unbounded memory growth.
 			// Rate-limited to once per second so the 10ms tick stays cheap.

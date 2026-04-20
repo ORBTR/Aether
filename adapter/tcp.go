@@ -789,12 +789,17 @@ func (s *TCPSession) CloseWithError(err error) error {
 
 // housekeepingTick runs the protocol-agnostic periodic maintenance
 // that NoiseSession's reliabilityTick does (minus the Noise-specific
-// reliability work). Two concerns per tick:
+// reliability work). Three concerns per tick:
 //
 //  1. **Idle session eviction** — session with no inbound activity for
 //     `opts.SessionIdleTimeout` is closed so goroutines + memory are
 //     reclaimed. Matches the Noise adapter's policy exactly.
-//  2. **Keepalive nudge** — TCP relies on native keepalive which the
+//  2. **Flow-control auto-tune** — feeds the session's observed RTT
+//     into each stream's window and applies a bounded window resize
+//     based on `SuggestedWindow()`. Gated by AETHER_AUTOTUNE env var
+//     (set to "off" to disable) so we can kill it in production if it
+//     misbehaves.
+//  3. **Keepalive nudge** — TCP relies on native keepalive which the
 //     OS usually has tuned to hours; we don't reimplement it here,
 //     but RecordActivity gets called on every incoming frame so the
 //     idle check above stays accurate under real traffic.
@@ -821,7 +826,56 @@ func (s *TCPSession) housekeepingTick() {
 				s.CloseWithError(fmt.Errorf("session idle timeout (%s)", idle))
 				return
 			}
+			s.autoTuneWindows()
 		}
+	}
+}
+
+// autoTuneWindows feeds session RTT into each stream's window and applies
+// a bounded resize based on SuggestedWindow. Called from housekeepingTick.
+// Disabled when AETHER_AUTOTUNE=off. Safe to call concurrently with sends
+// because GrowWindow/ShrinkWindow use the semaphore's own locks.
+func (s *TCPSession) autoTuneWindows() {
+	if aether.AutoTuneDisabled() {
+		return
+	}
+	_, avgRTT := s.healthMon.RTT()
+	if avgRTT <= 0 {
+		return
+	}
+	s.mu.Lock()
+	streams := make([]*tcpStream, 0, len(s.streams))
+	for _, st := range s.streams {
+		streams = append(streams, st)
+	}
+	s.mu.Unlock()
+	for _, st := range streams {
+		st.window.SetRTT(avgRTT)
+		current := st.window.CurrentWindow()
+		suggested := st.window.SuggestedWindow()
+		if suggested == current {
+			continue
+		}
+		// Bound each adjustment to ±25 % of current to avoid oscillation.
+		delta := suggested - current
+		maxStep := current / 4
+		if delta > maxStep {
+			delta = maxStep
+		} else if delta < -maxStep {
+			delta = -maxStep
+		}
+		if delta > 0 {
+			if grown := st.window.GrowWindow(delta); grown > 0 {
+				dbgTCP.Printf("autoTune stream=%d grow=%d current=%d rtt=%s",
+					st.streamID, grown, current+grown, avgRTT)
+			}
+		} else if delta < 0 {
+			if shrunk := st.window.ShrinkWindow(-delta); shrunk > 0 {
+				dbgTCP.Printf("autoTune stream=%d shrink=%d current=%d rtt=%s",
+					st.streamID, shrunk, current-shrunk, avgRTT)
+			}
+		}
+		st.window.ResetPeak()
 	}
 }
 

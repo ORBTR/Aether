@@ -156,6 +156,11 @@ type NoiseSession struct {
 	// CONGESTION frames. Send-path consumers can consult Throttle() for
 	// RateFactor/ShouldStall before committing large sends.
 	throttle aether.CongestionThrottle
+
+	// lastAutoTune is the wall-clock time of the last flow-control auto-tune
+	// pass. The reliability tick runs every 10 ms but auto-tune only runs
+	// every 10 s — this timestamp rate-limits it inside the tick loop.
+	lastAutoTune time.Time
 }
 
 // NewNoiseSession creates an Aether session over a Noise-encrypted
@@ -608,6 +613,63 @@ func (s *NoiseSession) maxStreamSRTT() time.Duration {
 		}
 	}
 	return max
+}
+
+// autoTuneWindows feeds per-stream RTT into each stream's flow window and
+// applies a bounded grow/shrink based on SuggestedWindow. Called from
+// reliabilityTick at 10s cadence. Disabled when AETHER_AUTOTUNE=off.
+// Uses per-stream reliability-engine SRTT (more accurate than session RTT
+// for Noise); falls back to healthMon RTT if the stream has no samples yet.
+func (s *NoiseSession) autoTuneWindows() {
+	if aether.AutoTuneDisabled() {
+		return
+	}
+	_, sessionAvgRTT := s.healthMon.RTT()
+
+	s.mu.Lock()
+	streams := make([]*noiseStream, 0, len(s.streams))
+	for _, st := range s.streams {
+		streams = append(streams, st)
+	}
+	s.mu.Unlock()
+
+	for _, st := range streams {
+		// Prefer per-stream SRTT when available — reliability engine observes
+		// ACK timing which is more precise than keepalive PING/PONG.
+		rtt := st.rtt.SRTT()
+		if rtt <= 0 {
+			rtt = sessionAvgRTT
+		}
+		if rtt <= 0 {
+			continue
+		}
+		st.window.SetRTT(rtt)
+
+		current := st.window.CurrentWindow()
+		suggested := st.window.SuggestedWindow()
+		if suggested == current {
+			continue
+		}
+		delta := suggested - current
+		maxStep := current / 4 // ±25 % per tick
+		if delta > maxStep {
+			delta = maxStep
+		} else if delta < -maxStep {
+			delta = -maxStep
+		}
+		if delta > 0 {
+			if grown := st.window.GrowWindow(delta); grown > 0 {
+				dbgNoise.Printf("autoTune stream=%d grow=%d current=%d rtt=%s",
+					st.streamID, grown, current+grown, rtt)
+			}
+		} else if delta < 0 {
+			if shrunk := st.window.ShrinkWindow(-delta); shrunk > 0 {
+				dbgNoise.Printf("autoTune stream=%d shrink=%d current=%d rtt=%s",
+					st.streamID, shrunk, current-shrunk, rtt)
+			}
+		}
+		st.window.ResetPeak()
+	}
 }
 
 // Compile-time interface check
