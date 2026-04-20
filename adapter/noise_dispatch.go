@@ -246,7 +246,7 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 		// Connection-level flow control: track aggregate consumption.
 		// Stream 0 WINDOW_UPDATE = connection-level grant (HTTP/2 convention).
 		if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
-			s.sendWindowUpdate(aether.StreamConnectionLevel, uint32(grant))
+			s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
 		}
 	}
 
@@ -437,7 +437,7 @@ func (s *NoiseSession) handleImplicitOpen(frame *aether.Frame) {
 	for _, payload := range delivered {
 		DeliverToRecvCh(st.recvCh, payload, st.window, st.streamID, s.sendWindowUpdateAgnostic)
 		if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
-			s.sendWindowUpdate(aether.StreamConnectionLevel, uint32(grant))
+			s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
 		}
 	}
 }
@@ -650,7 +650,7 @@ func (s *NoiseSession) RecordCEBytes(n int) {
 }
 
 // sendWindowUpdate sends a WINDOW_UPDATE frame granting additional credit to the sender.
-func (s *NoiseSession) sendWindowUpdate(streamID uint64, credit uint32) {
+func (s *NoiseSession) sendWindowUpdate(streamID uint64, credit uint64) {
 	payload := aether.EncodeWindowUpdate(credit)
 	frame := &aether.Frame{
 		SenderID:   s.localPeerID,
@@ -664,7 +664,7 @@ func (s *NoiseSession) sendWindowUpdate(streamID uint64, credit uint32) {
 }
 
 // sendWindowUpdateAgnostic adapts sendWindowUpdate to the WindowUpdater signature.
-func (s *NoiseSession) sendWindowUpdateAgnostic(streamID uint64, credit uint32) {
+func (s *NoiseSession) sendWindowUpdateAgnostic(streamID uint64, credit uint64) {
 	s.sendWindowUpdate(streamID, credit)
 }
 
@@ -676,7 +676,7 @@ func (s *NoiseSession) deliverToStream(streamID uint64, payload []byte) {
 	if ok {
 		DeliverToRecvCh(st.recvCh, payload, st.window, streamID, s.sendWindowUpdateAgnostic)
 		if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
-			s.sendWindowUpdate(aether.StreamConnectionLevel, uint32(grant))
+			s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
 		}
 	}
 }

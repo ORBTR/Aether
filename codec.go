@@ -468,19 +468,23 @@ func DecodeCompositeACK(data []byte) *CompositeACK {
 	return ack
 }
 
-// EncodeWindowUpdate encodes a credit grant for a WINDOW_UPDATE frame payload.
-func EncodeWindowUpdate(credit uint32) []byte {
+// EncodeWindowUpdate encodes a cumulative credit grant for a WINDOW_UPDATE
+// frame payload. See WindowUpdateSize for why this carries a cumulative
+// 64-bit total rather than a 32-bit delta.
+func EncodeWindowUpdate(credit uint64) []byte {
 	data := make([]byte, WindowUpdateSize)
-	binary.BigEndian.PutUint32(data, credit)
+	binary.BigEndian.PutUint64(data, credit)
 	return data
 }
 
-// DecodeWindowUpdate decodes a credit grant from a WINDOW_UPDATE frame payload.
-func DecodeWindowUpdate(data []byte) uint32 {
+// DecodeWindowUpdate decodes a cumulative credit grant from a WINDOW_UPDATE
+// frame payload. Returns 0 on short input — the sender's ApplyUpdate then
+// treats it as a stale/duplicate frame and drops it.
+func DecodeWindowUpdate(data []byte) uint64 {
 	if len(data) < WindowUpdateSize {
 		return 0
 	}
-	return binary.BigEndian.Uint32(data)
+	return binary.BigEndian.Uint64(data)
 }
 
 // EncodeCongestion encodes a CongestionPayload for the CONGESTION frame.

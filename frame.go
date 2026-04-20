@@ -402,8 +402,21 @@ const AckDelayGranularity = 8
 // WINDOW_UPDATE payload
 // ────────────────────────────────────────────────────────────────────────────
 
-// WindowUpdateSize is the wire size of a WINDOW_UPDATE payload (4 bytes).
-const WindowUpdateSize = 4
+// WindowUpdateSize is the wire size of a WINDOW_UPDATE payload (8 bytes).
+//
+// The payload carries a CUMULATIVE total of credit granted since the stream
+// started (not a per-WINDOW_UPDATE delta). Cumulative semantics make the
+// grant channel idempotent across loss / duplication / reordering on
+// unreliable transports — the sender's ApplyUpdate compares the incoming
+// cumulative value against the highest-seen-so-far and applies only the
+// positive delta. A single lost WINDOW_UPDATE packet is implicitly recovered
+// by the next one, which carries a still-larger cumulative value.
+//
+// The field is uint64 rather than uint32 because cumulative totals can grow
+// past 4 GB over long-lived sessions (the previous 4-byte wire format would
+// wrap, making post-wrap grants appear stale to the sender and deadlocking
+// the stream after ~40 hours of heavy gossip traffic).
+const WindowUpdateSize = 8
 
 // ────────────────────────────────────────────────────────────────────────────
 // CONGESTION payload

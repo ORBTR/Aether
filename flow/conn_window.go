@@ -23,14 +23,26 @@ const DefaultMaxConnCredit int64 = 16 * 1024 * 1024
 // succeeds or returns an error immediately. TCP-style backpressure at the
 // stream level absorbs the wait; the connection window is a coarse safety
 // limit, not a pacing mechanism.
+//
+// WINDOW_UPDATE semantics match StreamWindow: the wire value is the peer's
+// CUMULATIVE total granted (grantsEmitted) since the connection began.
+// The sender's ApplyUpdate computes the delta against grantsReceived and
+// drops stale / duplicate / reordered frames. This makes conn-level grants
+// loss-tolerant on unreliable transports.
 type ConnWindow struct {
 	mu          sync.Mutex
 	sendCredit  int64
-	recvCredit  int64
 	initialSize int64
 	maxSize     int64
-	consumed    int64
-	lastGrant   int64
+
+	// Receive-side bookkeeping.
+	recvCredit int64
+	consumed   int64
+	lastGrant  int64
+
+	// Cumulative grant counters — identical semantics to StreamWindow.
+	grantsEmitted  int64
+	grantsReceived int64
 }
 
 // NewConnWindow creates a connection-level flow control window.
@@ -54,7 +66,6 @@ func (w *ConnWindow) Consume(n int64) error {
 		return nil
 	}
 	if n <= MinGuaranteedWindow {
-		// Escape hatch — small frames always pass, no metering.
 		return nil
 	}
 
@@ -68,23 +79,29 @@ func (w *ConnWindow) Consume(n int64) error {
 	return nil
 }
 
-// ApplyUpdate adds credit from a connection-level WINDOW_UPDATE.
+// ApplyUpdate processes a connection-level WINDOW_UPDATE where credit is
+// the peer's cumulative total. Delta = credit - grantsReceived; stale
+// frames (delta ≤ 0) are dropped.
 func (w *ConnWindow) ApplyUpdate(credit int64) {
+	if credit <= 0 {
+		return
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.sendCredit += credit
+	if credit <= w.grantsReceived {
+		return
+	}
+	delta := credit - w.grantsReceived
+	w.grantsReceived = credit
+	w.sendCredit += delta
 	if w.sendCredit > w.maxSize {
 		w.sendCredit = w.maxSize
 	}
 }
 
-// ReceiverConsume records receiver consumption and returns grant amount if threshold met.
-//
-// BUG FIX: recvCredit is decremented by n so that the cap check reflects
-// currently-outstanding window. The previous version never decremented
-// recvCredit — at connection level the bug was less severe because
-// initialSize (1 MB) < maxSize (16 MB), so ~15 MB of grants flowed before
-// pinning at max, but it still degraded eventually.
+// ReceiverConsume records receiver consumption and returns the CUMULATIVE
+// grant total if the threshold is met (0 otherwise). Cumulative return
+// value makes the wire grant idempotent across loss.
 func (w *ConnWindow) ReceiverConsume(n int64) int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -104,7 +121,8 @@ func (w *ConnWindow) ReceiverConsume(n int64) int64 {
 		}
 		w.recvCredit += grant
 		w.lastGrant = w.consumed
-		return grant
+		w.grantsEmitted += grant
+		return w.grantsEmitted
 	}
 	return 0
 }

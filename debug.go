@@ -16,26 +16,71 @@ import (
 // so they coexist with the HSTLES Library debug system which uses the
 // same DEBUG var.
 //
-// Set DEBUG=* to enable everything, DEBUG=aether.flow,aether.gossip to
-// scope to specific Aether namespaces, or DEBUG=aether.* to enable all
-// Aether-prefixed namespaces. Namespace matching is substring-based,
-// so "aether" matches "aether.flow" too.
+// Matching is hierarchical with comma-separated entries:
+//
+//	DEBUG=*                           — enable every namespace
+//	DEBUG=aether                      — enable aether + all aether.* descendants
+//	DEBUG=aether.flow                 — enable aether.flow + aether.flow.* descendants
+//	DEBUG=aether.flow,aether.gossip   — enable both explicitly
+//
+// An entry matches a namespace when the namespace equals the entry or
+// starts with "entry.". Prior versions used plain substring matching in
+// the wrong direction, so DEBUG=aether did not enable aether.flow.
 type DebugLogger struct {
 	namespace string
 	enabled   bool
 }
 
-var debugNamespaces string
+// debugEntries is the parsed list of comma-separated DEBUG entries
+// (populated at package init). A nil/empty slice means nothing is enabled.
+// The literal "*" entry short-circuits matchAnyDebugEntry to always true.
+var debugEntries []string
 
 func init() {
-	debugNamespaces = os.Getenv("DEBUG")
+	debugEntries = parseDebugEntries(os.Getenv("DEBUG"))
+}
+
+// parseDebugEntries splits the DEBUG env var on commas, trims whitespace,
+// and drops empty entries. Exported-looking "parse" style so tests can drive it.
+func parseDebugEntries(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := parts[:0]
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// matchesAnyDebugEntry reports whether the given namespace matches any
+// entry in debugEntries. An entry matches when:
+//   - entry == "*" (enable everything), or
+//   - namespace == entry (exact match), or
+//   - namespace starts with entry + "." (entry is an ancestor).
+func matchesAnyDebugEntry(namespace string) bool {
+	for _, e := range debugEntries {
+		if e == "*" {
+			return true
+		}
+		if namespace == e {
+			return true
+		}
+		if strings.HasPrefix(namespace, e+".") {
+			return true
+		}
+	}
+	return false
 }
 
 // NewDebugLogger creates a debug logger for the given namespace.
-// Enabled when DEBUG contains the namespace or "*".
+// Enabled when DEBUG matches the namespace or any ancestor (see top-of-file doc).
 func NewDebugLogger(namespace string) *DebugLogger {
-	enabled := debugNamespaces == "*" || strings.Contains(debugNamespaces, namespace)
-	return &DebugLogger{namespace: namespace, enabled: enabled}
+	return &DebugLogger{namespace: namespace, enabled: matchesAnyDebugEntry(namespace)}
 }
 
 // Printf logs a formatted message if this namespace is enabled.

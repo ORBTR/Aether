@@ -148,7 +148,7 @@ func (s *BrowserWSSession) handleIncoming(payload []byte) {
 
 // sendWindowUpdate emits a WINDOW_UPDATE frame to the peer granting additional
 // credit on the given stream. Mirrors TCPSession.sendWindowUpdate.
-func (s *BrowserWSSession) sendWindowUpdate(streamID uint64, credit uint32) {
+func (s *BrowserWSSession) sendWindowUpdate(streamID uint64, credit uint64) {
 	payload := aether.EncodeWindowUpdate(credit)
 	frame := &aether.Frame{
 		SenderID:   s.localPeerID,
@@ -166,7 +166,7 @@ func (s *BrowserWSSession) sendWindowUpdate(streamID uint64, credit uint32) {
 
 // sendWindowUpdateAgnostic adapts sendWindowUpdate to the WindowUpdater
 // signature expected by DeliverToRecvCh.
-func (s *BrowserWSSession) sendWindowUpdateAgnostic(streamID uint64, credit uint32) {
+func (s *BrowserWSSession) sendWindowUpdateAgnostic(streamID uint64, credit uint64) {
 	s.sendWindowUpdate(streamID, credit)
 }
 
