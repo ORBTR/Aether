@@ -8,12 +8,21 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ORBTR/aether"
 	"github.com/ORBTR/aether/flow"
 )
 
 // WindowUpdater is called with the stream ID and credit amount to send
 // a WINDOW_UPDATE frame to the remote peer.
 type WindowUpdater func(streamID uint64, credit uint64)
+
+// CongestionSignaler is called by the delivery path to emit an explicit
+// CONGESTION frame back to the sender when the receive-side queue drops a
+// frame after backpressure expires. Optional: callers that pass nil get
+// the pre-existing behaviour (silent drop + grant). Agnostic across
+// transports — both NoiseSession and TCPSession implement SendCongestion
+// and can plug the same callback shape in here.
+type CongestionSignaler func(payload aether.CongestionPayload) error
 
 // DeliveryStats tracks per-stream delivery metrics for monitoring and
 // adaptive behavior. Counters are atomic for lock-free access from
@@ -68,6 +77,36 @@ const (
 //
 // stats is optional — pass nil if metrics are not needed.
 func DeliverToRecvCh(recvCh chan<- []byte, payload []byte, window *flow.StreamWindow, streamID uint64, sendUpdate WindowUpdater, stats ...*DeliveryStats) bool {
+	return DeliverToRecvChWithSignals(recvCh, payload, window, streamID, sendUpdate, nil, stats...)
+}
+
+// DeliverToRecvChWithSignals is the full-featured variant that also emits a
+// CONGESTION frame back to the sender when a drop occurs. Callers that
+// wire this get receiver-driven backpressure: the sender's existing
+// CongestionThrottle applies the returned pacing without waiting for the
+// session-level stuck detector.
+//
+// sendCongestion may be nil — in which case behaviour matches DeliverToRecvCh
+// (silent drop + grant, preserving the pre-signal contract).
+//
+// The CONGESTION payload emitted on drop uses severity scaled by the
+// observed drop rate:
+//   - Drop rate < 10% : severity = 50, reason = QueueFull, backoff = 200 ms
+//   - Drop rate ≥ 10% : severity = 80, reason = Downstream, backoff = 500 ms
+//
+// These were picked to keep the signal actionable without flapping:
+// moderate severity on the first drop so the sender tapers, higher
+// severity under sustained pressure. Sender's CongestionThrottle.Apply
+// already merges multiple signals so repeated fires don't compound.
+func DeliverToRecvChWithSignals(
+	recvCh chan<- []byte,
+	payload []byte,
+	window *flow.StreamWindow,
+	streamID uint64,
+	sendUpdate WindowUpdater,
+	sendCongestion CongestionSignaler,
+	stats ...*DeliveryStats,
+) bool {
 	// Fast path: non-blocking delivery
 	select {
 	case recvCh <- payload:
@@ -82,10 +121,12 @@ func DeliverToRecvCh(recvCh chan<- []byte, payload []byte, window *flow.StreamWi
 	// Slow path: recvCh full — adaptive backpressure.
 	// Check recent drop rate to decide how long to wait.
 	wait := maxBackpressure
+	sustained := false
 	if len(stats) > 0 && stats[0] != nil {
 		stats[0].Backpressure.Add(1)
 		if stats[0].DropRate() >= dropRateThreshold {
 			wait = minBackpressure // sustained overload — don't stall
+			sustained = true
 		}
 	}
 
@@ -105,6 +146,23 @@ func DeliverToRecvCh(recvCh chan<- []byte, payload []byte, window *flow.StreamWi
 		if len(stats) > 0 && stats[0] != nil {
 			stats[0].Dropped.Add(1)
 			stats[0].BytesDropped.Add(int64(len(payload)))
+		}
+		// Receiver-driven backpressure: signal the sender to slow down so
+		// future frames arrive at a pace the application can actually
+		// drain. Severity + backoff scale with whether this is a one-off
+		// slowdown or sustained pressure.
+		if sendCongestion != nil {
+			p := aether.CongestionPayload{
+				Reason:    aether.CongestionQueueFull,
+				Severity:  50,
+				BackoffMs: 200,
+			}
+			if sustained {
+				p.Reason = aether.CongestionDownstream
+				p.Severity = 80
+				p.BackoffMs = 500
+			}
+			_ = sendCongestion(p)
 		}
 		return false
 	}

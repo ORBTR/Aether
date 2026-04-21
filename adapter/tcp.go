@@ -287,7 +287,7 @@ func (s *TCPSession) deliverToStream(frame *aether.Frame) {
 		dbgTCP.Printf("deliverToStream: no stream for ID=%d, dropping %d bytes", frame.StreamID, frame.Length)
 		return // unknown stream, drop
 	}
-	delivered := DeliverToRecvCh(st.recvCh, frame.Payload, st.window, frame.StreamID, s.sendWindowUpdateAgnostic)
+	delivered := DeliverToRecvChWithSignals(st.recvCh, frame.Payload, st.window, frame.StreamID, s.sendWindowUpdateAgnostic, s.SendCongestion)
 	if delivered {
 		// ACK-observe: track metrics (no wire ACK, no retransmit)
 		if st.observe != nil {

@@ -242,7 +242,7 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 	// Reliability: insert into receive window for reordering
 	delivered := st.recvWindow.Insert(frame.SeqNo, frame.Payload)
 	for _, payload := range delivered {
-		DeliverToRecvCh(st.recvCh, payload, st.window, st.streamID, s.sendWindowUpdateAgnostic)
+		DeliverToRecvChWithSignals(st.recvCh, payload, st.window, st.streamID, s.sendWindowUpdateAgnostic, s.SendCongestion)
 		// Connection-level flow control: track aggregate consumption.
 		// Stream 0 WINDOW_UPDATE = connection-level grant (HTTP/2 convention).
 		if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
@@ -451,7 +451,7 @@ func (s *NoiseSession) handleImplicitOpen(frame *aether.Frame) {
 	// Deliver the data
 	delivered := st.recvWindow.Insert(frame.SeqNo, frame.Payload)
 	for _, payload := range delivered {
-		DeliverToRecvCh(st.recvCh, payload, st.window, st.streamID, s.sendWindowUpdateAgnostic)
+		DeliverToRecvChWithSignals(st.recvCh, payload, st.window, st.streamID, s.sendWindowUpdateAgnostic, s.SendCongestion)
 		if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
 			s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
 		}
@@ -698,7 +698,7 @@ func (s *NoiseSession) deliverToStream(streamID uint64, payload []byte) {
 	st, ok := s.streams[streamID]
 	s.mu.Unlock()
 	if ok {
-		DeliverToRecvCh(st.recvCh, payload, st.window, streamID, s.sendWindowUpdateAgnostic)
+		DeliverToRecvChWithSignals(st.recvCh, payload, st.window, streamID, s.sendWindowUpdateAgnostic, s.SendCongestion)
 		if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
 			s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
 		}
