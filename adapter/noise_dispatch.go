@@ -362,10 +362,26 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 		s.sched.Wake()
 	}
 
-	// Track BaseACK progress for stall detection
-	if prev, ok := s.lastBaseACK[frame.StreamID]; !ok || ack.BaseACK > prev {
-		s.lastBaseACK[frame.StreamID] = ack.BaseACK
-		s.lastProgressAt[frame.StreamID] = time.Now()
+	// Track BaseACK progress for stall detection. State lives on the stream
+	// (not a session-level map) so it dies with the stream. Atomic CAS on
+	// lastBaseACKSeen keeps concurrent handleACK calls monotonic without
+	// holding s.mu.
+	for {
+		prev := st.lastBaseACKSeen.Load()
+		if ack.BaseACK <= prev {
+			break
+		}
+		if st.lastBaseACKSeen.CompareAndSwap(prev, ack.BaseACK) {
+			now := time.Now()
+			st.lastProgressAtUnixNano.Store(now.UnixNano())
+			// Session-level stall detector: any stream making progress
+			// resets the session-wide no-progress clock. Guarded by s.mu
+			// because reliabilityTick reads this under the same lock.
+			s.mu.Lock()
+			s.lastAnyProgressAt = now
+			s.mu.Unlock()
+			break
+		}
 	}
 }
 
@@ -447,25 +463,33 @@ func (s *NoiseSession) handleClose(frame *aether.Frame) {
 	s.mu.Lock()
 	st, ok := s.streams[frame.StreamID]
 	s.mu.Unlock()
-	if ok {
-		st.state.Transition(aether.EventRecvFIN)
-		if !st.state.IsOpen() {
-			// Flush final ACK before closing (confirms last received frames)
-			if st.ackEngine != nil {
-				st.ackEngine.Flush()
-				st.ackEngine.Stop()
-			}
-			// Drain remaining buffered out-of-order frames before closing
-			remaining := st.recvWindow.Drain()
-			for _, payload := range remaining {
-				select {
-				case st.recvCh <- payload:
-				default:
-				}
-			}
-			close(st.recvCh)
+	if !ok {
+		return
+	}
+	st.state.Transition(aether.EventRecvFIN)
+	if st.state.IsOpen() {
+		return // half-closed; wait for local Close/Reset to tear down
+	}
+	// Fully closed: flush final ACK, drain, and release all session-level
+	// trackers. Before this fix, the s.streams entry lingered indefinitely
+	// (only handleReset removed it), leaving the engine + send window +
+	// streamGC map entry pinned.
+	if st.ackEngine != nil {
+		st.ackEngine.Flush()
+		st.ackEngine.Stop()
+	}
+	remaining := st.recvWindow.Drain()
+	for _, payload := range remaining {
+		select {
+		case st.recvCh <- payload:
+		default:
 		}
 	}
+	close(st.recvCh)
+	s.mu.Lock()
+	delete(s.streams, frame.StreamID)
+	s.mu.Unlock()
+	s.releaseStream(frame.StreamID)
 }
 
 func (s *NoiseSession) handleReset(frame *aether.Frame) {
@@ -479,7 +503,7 @@ func (s *NoiseSession) handleReset(frame *aether.Frame) {
 	if ok {
 		st.state.Transition(aether.EventRecvReset)
 		close(st.recvCh)
-		s.sched.Unregister(frame.StreamID)
+		s.releaseStream(frame.StreamID)
 	}
 }
 

@@ -94,6 +94,7 @@ func (s *NoiseSession) reliabilityTick() {
 		case <-s.closed:
 			return
 		case <-ticker.C:
+			anyInFlight := false
 			s.mu.Lock()
 			for streamID, st := range s.streams {
 				// Retransmit timeout dequeue
@@ -104,21 +105,59 @@ func (s *NoiseSession) reliabilityTick() {
 					st.rtt.BackoffRTO()
 				}
 
-				// Stall detection: if no ACK progress for 2×SRTT, probe retransmit
+				// Stall detection: if no ACK progress for 2×SRTT, probe retransmit.
+				// Progress state lives on the stream (per-stream atomic); a
+				// zero nanos value means "no progress observed yet" and is
+				// treated as not-probing.
 				if st.sendWindow.InFlight() > 0 {
+					anyInFlight = true
 					srtt := st.rtt.SRTT()
 					if srtt > 0 {
-						if lastProgress, ok := s.lastProgressAt[streamID]; ok && time.Since(lastProgress) > 2*srtt {
+						lastProgressNs := st.lastProgressAtUnixNano.Load()
+						if lastProgressNs != 0 && time.Since(time.Unix(0, lastProgressNs)) > 2*srtt {
 							if entry := st.sendWindow.GetEntry(st.sendWindow.Base()); entry != nil {
 								s.sched.MarkRetransmit(streamID)
 								s.sched.Enqueue(streamID, entry.Frame)
-								s.lastProgressAt[streamID] = time.Now() // reset to avoid repeated probes
+								st.lastProgressAtUnixNano.Store(time.Now().UnixNano()) // reset to avoid repeated probes
 							}
 						}
 					}
 				}
 			}
+
+			// Session-level stall detector. When there is data in-flight on
+			// at least one stream AND the session-wide lastAnyProgressAt
+			// marker hasn't advanced past SessionStallThreshold, the path
+			// has gone silent for long enough that per-stream probing has
+			// also failed (probes go over the same broken path). Close the
+			// session with ErrSessionStuck so the owning connection manager
+			// (HSTLES mesh_connection / PeerConnectionManager) can treat
+			// this as a protocol-grade failure and fall back to the next
+			// transport (Noise-UDP → QUIC → WebSocket → gRPC → TLS) rather
+			// than thrashing forever on a black-holed path.
+			//
+			// Threshold is comfortably larger than the worst cross-region
+			// retransmit cycle + the periodic WINDOW_UPDATE re-emission
+			// cadence, so a transient blip cannot trigger it.
+			//
+			// lastAnyProgressAt is seeded at session start via the first
+			// tick (zero value is replaced with "now" so a brand-new
+			// session can't trip the check before traffic starts).
+			stallThreshold := s.opts.SessionStallThreshold
+			if stallThreshold == 0 {
+				stallThreshold = aether.DefaultSessionStallThreshold
+			}
+			if s.lastAnyProgressAt.IsZero() {
+				s.lastAnyProgressAt = time.Now()
+			}
+			sessionStuck := stallThreshold > 0 && anyInFlight &&
+				time.Since(s.lastAnyProgressAt) > stallThreshold
 			s.mu.Unlock()
+			if sessionStuck {
+				dbgNoise.Printf("session stuck: no ACK progress for %s with data in-flight — closing for transport fallback", stallThreshold)
+				s.CloseWithError(aether.ErrSessionStuck)
+				return
+			}
 
 			// PMTU probe timeout check + periodic re-probe (no s.mu needed)
 			if s.pmtuProber.IsProbing() && s.pmtuProber.ProbeTimedOut() {
@@ -280,6 +319,8 @@ func (s *NoiseSession) writeFrame(frame *aether.Frame) error {
 }
 
 // flateWriterPool reuses flate.Writer (~32KB each) to avoid per-frame allocation.
+// Writers are retargeted to io.Discard on Put so the pool doesn't keep the
+// caller's buf alive between uses.
 var flateWriterPool = sync.Pool{
 	New: func() interface{} {
 		w, _ := flate.NewWriter(io.Discard, flate.BestSpeed)
@@ -288,10 +329,31 @@ var flateWriterPool = sync.Pool{
 }
 
 // flateReaderPool reuses flate.Reader to avoid per-frame allocation.
+// Readers are retargeted to an empty source on Put (same rationale).
 var flateReaderPool = sync.Pool{
 	New: func() interface{} {
 		return flate.NewReader(bytes.NewReader(nil))
 	},
+}
+
+// emptyFlateSource is a shared, immutable reader used to re-target pooled
+// flate.Readers on Put so they don't retain the caller's input buffer.
+var emptyFlateSource = bytes.NewReader(nil)
+
+// putFlateWriter returns w to the pool after re-targeting it to io.Discard
+// so the pool entry doesn't keep the compressed output buffer alive.
+func putFlateWriter(w *flate.Writer) {
+	w.Reset(io.Discard)
+	flateWriterPool.Put(w)
+}
+
+// putFlateReader returns r to the pool after re-targeting it to an empty
+// source so the pool entry doesn't keep the compressed input buffer alive.
+func putFlateReader(r io.ReadCloser) {
+	if resetter, ok := r.(flate.Resetter); ok {
+		_ = resetter.Reset(emptyFlateSource, nil)
+	}
+	flateReaderPool.Put(r)
 }
 
 // compressPayload compresses data using DEFLATE (fast, standard library).
@@ -300,14 +362,14 @@ func compressPayload(data []byte) []byte {
 	w := flateWriterPool.Get().(*flate.Writer)
 	w.Reset(&buf)
 	if _, err := w.Write(data); err != nil {
-		flateWriterPool.Put(w)
+		putFlateWriter(w)
 		return data
 	}
 	if err := w.Close(); err != nil {
-		flateWriterPool.Put(w)
+		putFlateWriter(w)
 		return data
 	}
-	flateWriterPool.Put(w)
+	putFlateWriter(w)
 	return buf.Bytes()
 }
 
@@ -323,7 +385,7 @@ func decompressPayload(data []byte) ([]byte, error) {
 	}
 	limited := io.LimitReader(r, int64(aether.MaxPayloadSize)+1)
 	result, err := io.ReadAll(limited)
-	flateReaderPool.Put(r)
+	putFlateReader(r)
 	if err != nil {
 		return nil, err
 	}

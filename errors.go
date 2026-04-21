@@ -45,4 +45,37 @@ var (
 	ErrTargetNotFound  = errors.New("transport: relay target not found")
 	ErrTicketExpired   = errors.New("transport: session ticket expired")
 	ErrTicketInvalid   = errors.New("transport: session ticket invalid")
+
+	// ErrSessionStuck signals that a session has persistently been unable
+	// to make forward progress (e.g. sustained Consume timeouts on the
+	// send path while in-flight frames sit unACKed) long past any
+	// recovery horizon. The session closes itself with this error so the
+	// owning connection manager can treat the current path as broken and
+	// downgrade to the next protocol grade (Noise-UDP → QUIC → WebSocket
+	// → gRPC → TLS) rather than thrashing forever on a black-holed path.
+	//
+	// Use SessionCloseErr(session) or errors.Is(...) to detect.
+	ErrSessionStuck = errors.New("transport: session stuck (no forward progress)")
 )
+
+// CloseErrorReporter is the optional interface implemented by Session
+// adapters that can report the reason their session closed. Use
+// SessionCloseErr as the accessor — it tolerates adapters that don't
+// implement this interface by returning nil.
+type CloseErrorReporter interface {
+	// CloseErr returns the error the session was closed with, or nil
+	// if it closed cleanly (or is still open).
+	CloseErr() error
+}
+
+// SessionCloseErr returns the close-reason error for sessions whose
+// adapter implements CloseErrorReporter. Returns nil for adapters that
+// don't track this (QUIC, WebSocket currently) and for sessions that
+// closed cleanly. Agnostic accessor — callers never need a type switch
+// between NoiseSession/TCPSession/etc.
+func SessionCloseErr(s Session) error {
+	if r, ok := s.(CloseErrorReporter); ok {
+		return r.CloseErr()
+	}
+	return nil
+}

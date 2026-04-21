@@ -182,6 +182,19 @@ type SessionOptions struct {
 	// but never send data.
 	// 0 = use DefaultSessionIdleTimeout.
 	SessionIdleTimeout time.Duration
+
+	// SessionStallThreshold is the deadline after which a session that
+	// has in-flight data but no ACK progress on any stream is declared
+	// "stuck" and closed with ErrSessionStuck. The connection manager is
+	// expected to treat this as a signal to fall back to the next
+	// protocol grade (Noise-UDP → QUIC → WebSocket → gRPC → TLS) rather
+	// than thrash on a black-holed path — typical on cross-region UDP
+	// with asymmetric packet loss where even periodic WINDOW_UPDATE
+	// re-emission can't recover the stream.
+	//
+	// 0 = use DefaultSessionStallThreshold. Set to a negative value to
+	// disable stall detection entirely.
+	SessionStallThreshold time.Duration
 }
 
 // DefaultMaxConcurrentStreams is the default per-session stream cap for
@@ -196,6 +209,15 @@ const DefaultMaxFECGroups = 256
 // enforced at the session level so the connection's goroutines are
 // reclaimed, not just individual streams.
 const DefaultSessionIdleTimeout = 5 * time.Minute
+
+// DefaultSessionStallThreshold is the deadline after which a session
+// that has data in-flight but no ACK progress on any stream is
+// declared stuck. Tuned to be comfortably larger than the worst
+// expected cross-region RTT × retransmit cycle (5-10 s observed) plus
+// the periodic WINDOW_UPDATE re-emission interval (2 s) — at 30 s a
+// stuck session has missed roughly 15 re-emissions and is not going to
+// recover on its own.
+const DefaultSessionStallThreshold = 30 * time.Second
 
 // DefaultSessionOptions returns production-safe defaults. Call this
 // and then override individual fields to customise — e.g.
@@ -248,6 +270,12 @@ func NormalizeSessionOptions(opts SessionOptions) SessionOptions {
 	}
 	if opts.SessionIdleTimeout <= 0 {
 		opts.SessionIdleTimeout = DefaultSessionIdleTimeout
+	}
+	// SessionStallThreshold: only normalise zero (unset). Negative means
+	// "explicitly disabled" and is passed through untouched so callers
+	// can opt out of stall detection entirely.
+	if opts.SessionStallThreshold == 0 {
+		opts.SessionStallThreshold = DefaultSessionStallThreshold
 	}
 	if opts.CongestionAlgo == "" {
 		opts.CongestionAlgo = "cubic"

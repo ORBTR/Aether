@@ -124,9 +124,10 @@ type NoiseSession struct {
 	// Stream GC — resets idle streams after timeout (exempts well-known 0-3)
 	streamGC *aether.StreamGC
 
-	// Stall detection — per-stream tracking for 2×SRTT no-progress probe
-	lastBaseACK    map[uint64]uint32    // stream → last seen BaseACK
-	lastProgressAt map[uint64]time.Time // stream → when BaseACK last advanced
+	// Stall-detection state moved onto noiseStream as atomic fields — see
+	// lastBaseACKSeen / lastProgressAtUnixNano on noiseStream. Colocation
+	// ties the tracker lifetime to the stream (no leak on close) and
+	// removes the unsynchronised map write that lived here before.
 
 	// FEC prune scheduling — rate-limit decoder GC to ~1/sec (S2).
 	// Without pruning, FECDecoder.groups grows unbounded under adversarial
@@ -167,6 +168,16 @@ type NoiseSession struct {
 	// Breaks the UDP-loss deadlock where a dropped grant stalls the sender
 	// and no further data arrives to re-trigger the threshold.
 	lastGrantRefresh time.Time
+
+	// lastAnyProgressAt is the wall-clock time that any stream on this
+	// session most recently made ACK-progress (i.e. BaseACK advanced).
+	// When zero it's seeded to session-start. Consulted by the session-
+	// level stall detector: if every in-flight stream sits without
+	// progress past SessionStallThreshold the session closes itself with
+	// ErrSessionStuck so the owning connection manager can fall back to
+	// a lower-grade transport (e.g. Noise-UDP → WS) rather than thrash
+	// on a black-holed path. Updated under s.mu during reliabilityTick.
+	lastAnyProgressAt time.Time
 }
 
 // NewNoiseSession creates an Aether session over a Noise-encrypted
@@ -226,8 +237,6 @@ func NewNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 	// operator dashboard) can replace this via SetAbuseScoreRegistry.
 	s.abuseScore = abuse.New[aether.NodeID](abuse.DefaultConfig())
 
-	s.lastBaseACK = make(map[uint64]uint32)
-	s.lastProgressAt = make(map[uint64]time.Time)
 	s.migrator = migration.NewMigrator()
 	s.packetReplay = reliability.NewPacketReplayWindow()
 	s.connID, _ = aether.GenerateConnectionID()
@@ -235,12 +244,21 @@ func NewNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 	s.streamGC = aether.NewStreamGC(aether.DefaultStreamIdleTimeout, func(streamID uint64) {
 		dbgNoise.Printf("StreamGC: resetting idle stream %d", streamID)
 		s.mu.Lock()
-		if st, ok := s.streams[streamID]; ok {
-			st.Reset(aether.ResetTimeout)
+		st, ok := s.streams[streamID]
+		if ok {
 			delete(s.streams, streamID)
 		}
 		s.mu.Unlock()
-		s.sched.Unregister(streamID)
+		if ok {
+			// Send RESET to the peer. st.Reset also calls sched.Unregister,
+			// but we then run releaseStream to idempotently clean up every
+			// session-side tracker (sched + streamGC). The streamGC sweep
+			// itself deletes this stream from its own map right after
+			// invoking this callback, so Unregister here is a no-op on
+			// that side but harmless.
+			_ = st.Reset(aether.ResetTimeout)
+		}
+		s.releaseStream(streamID)
 	})
 
 	// PMTU prober sends PATH_PROBE frames to discover maximum segment size
@@ -396,6 +414,30 @@ func (s *NoiseSession) GoAway(ctx context.Context, reason aether.GoAwayReason, m
 	return s.writeFrame(frame)
 }
 
+// releaseStream performs the session-side cleanup that every stream
+// termination path needs: unregister from the scheduler and from the
+// idle-stream GC. Callers must already have removed the stream from
+// s.streams under s.mu (and closed recvCh where appropriate) — this
+// helper intentionally does neither so it can be called from the GC
+// sweep (which cannot re-acquire s.mu) and the RESET/CLOSE handlers
+// (which run under different lock disciplines).
+//
+// All operations are idempotent: calling for a streamID that was
+// already unregistered is a no-op on both the scheduler and the GC.
+func (s *NoiseSession) releaseStream(streamID uint64) {
+	s.sched.Unregister(streamID)
+	if s.streamGC != nil {
+		s.streamGC.Unregister(streamID)
+	}
+}
+
+// CloseErr returns the error the session was closed with, or nil if it
+// was closed cleanly (or is still open). Safe to call after Close; the
+// underlying field is only written inside closeOnce.Do.
+func (s *NoiseSession) CloseErr() error {
+	return s.closeErr
+}
+
 func (s *NoiseSession) Close() error {
 	return s.CloseWithError(nil)
 }
@@ -406,6 +448,9 @@ func (s *NoiseSession) CloseWithError(err error) error {
 			s.closeErr = err
 		}
 		close(s.closed)
+		if s.streamGC != nil {
+			s.streamGC.Stop()
+		}
 		s.conn.Close()
 	})
 	return nil
