@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/semaphore"
@@ -49,11 +50,29 @@ const DefaultMaxStreamCredit int64 = 1024 * 1024
 // ~500 ms RTT while bounding worst-case per-peer memory.
 const MaxGrowableWindow int64 = 8 * 1024 * 1024
 
-// AutoGrantThreshold is the fraction of credit consumed before auto-granting.
-// When 25% of the initial credit is consumed, a WINDOW_UPDATE is triggered.
-// Must be low enough that a single gossip exchange (~100KB) triggers a grant
-// before the next exchange starts (gossip interval is 10s).
+// AutoGrantThreshold is the steady-state fraction of credit consumed before
+// auto-granting. When 25% of the initial credit has accumulated since the
+// last grant, a WINDOW_UPDATE fires. This is the THRESHOLD trigger — one of
+// three independent triggers that fire WINDOW_UPDATE (see ReceiverConsume).
 const AutoGrantThreshold = 0.25
+
+// EagerGrantPayloadFraction: if a single received payload is at least this
+// fraction of the grant threshold, fire the grant immediately instead of
+// waiting for the threshold to accumulate. Handles convergence-burst and
+// large-exchange patterns (e.g. full-state gossip frames) where one 70 KB
+// payload can already stall the sender before the next one arrives. This is
+// the EAGER trigger — purely additive to AutoGrantThreshold (doesn't change
+// steady-state behaviour, only accelerates the first grant on bursty paths).
+const EagerGrantPayloadFraction = 0.5
+
+// LowWatermarkFraction: if recvCredit (outstanding grants not yet consumed
+// by the sender's ACK-trip-back) drops below this fraction of currentWindow,
+// fire the grant now regardless of sinceLastGrant. recvCredit tells us how
+// close the sender is to stalling — waiting for a percentage-of-consumed
+// threshold is the wrong signal when a single big payload can push the
+// sender past the brink. This is the WATERMARK trigger — belt-and-braces
+// with the EAGER trigger for paths that the EAGER rule happens to miss.
+const LowWatermarkFraction = 0.25
 
 // MinGuaranteedWindow is the escape hatch for flow control deadlock prevention.
 // Frames at or below this size (control headers, ACKs, keepalive hints) bypass
@@ -142,6 +161,15 @@ type StreamWindow struct {
 	// Updated from Consume/ApplyUpdate hot paths, guarded by mu.
 	peakOutstanding int64         // max dataOutstanding observed since last tune
 	lastRTT         time.Duration // most recent observed RTT (from SetRTT)
+
+	// Grant-trigger telemetry — count how often each of the three
+	// WINDOW_UPDATE triggers fired. Exposed via Stats() so operators can
+	// tell at a glance whether bursts (EagerGrants) or steady-state
+	// consumption (ThresholdGrants) or pre-stall pressure (WatermarkGrants)
+	// is driving the grant channel. Atomic so Stats() is lock-free.
+	thresholdGrants uint64
+	eagerGrants     uint64
+	watermarkGrants uint64
 }
 
 // NewStreamWindow creates a flow control window with the given initial credit.
@@ -294,29 +322,69 @@ func (w *StreamWindow) ReceiverConsume(n int64) int64 {
 	sinceLastGrant := w.consumed - w.lastGrant
 
 	threshold := int64(float64(w.initialSize) * AutoGrantThreshold)
-	if sinceLastGrant >= threshold {
-		// Grant enough to restore sender's outstanding window to the current
-		// target (currentWindow). recvCredit tracks "granted but not yet
-		// consumed" — the gap to currentWindow is how much more we can
-		// safely grant. Use currentWindow (not maxSize) so the auto-tuner
-		// can shrink the effective window by calling ShrinkWindow; the next
-		// grant naturally respects the smaller size.
-		grant := w.currentWindow - w.recvCredit
-		if grant <= 0 {
-			return 0
-		}
-		w.recvCredit += grant
-		w.lastGrant = w.consumed
-		// Bump the cumulative counter and return it as the wire value.
-		// Peers interpret the WINDOW_UPDATE credit field as "total granted
-		// since stream start", so a lost packet is recovered by the next
-		// one (which carries a still-larger cumulative value).
-		w.grantsEmitted += grant
-		dbgFlow.Printf("ReceiverConsume grant=%d cumulative=%d sinceLastGrant=%d consumed=%d recvCredit=%d",
-			grant, w.grantsEmitted, sinceLastGrant, w.consumed, w.recvCredit)
-		return w.grantsEmitted
+
+	// Three-trigger grant emission — the sender stalls when recvCredit is
+	// exhausted, so we fire under any of the following conditions. Each
+	// trigger is independently sufficient; they never fight each other
+	// because any one firing calls grantLocked which advances lastGrant +
+	// recvCredit atomically.
+	//
+	//   1. THRESHOLD: sinceLastGrant >= 25% of initial. The steady-state
+	//      trigger. Handles sustained low-rate traffic where the receiver
+	//      accumulates a lot of small payloads between grants.
+	//
+	//   2. EAGER: this single payload is >= 50% of the threshold. Handles
+	//      bursts where one 70 KB full-state gossip exchange can already
+	//      stall a 1 MB window before the NEXT payload arrives — without
+	//      this trigger the first grant has to wait for a second big
+	//      payload, which can push the sender past its timeout.
+	//
+	//   3. WATERMARK: recvCredit (outstanding unconsumed-on-sender-side
+	//      credit) has dropped below 25% of currentWindow. Direct signal
+	//      of imminent sender stall — if 75%+ of what we granted is still
+	//      unconsumed, the sender is at the brink regardless of what
+	//      sinceLastGrant thinks. Belt-and-braces with EAGER for paths
+	//      where neither THRESHOLD nor EAGER happen to fire in time.
+	lowWatermark := int64(float64(w.currentWindow) * LowWatermarkFraction)
+	eagerPayloadFloor := int64(float64(threshold) * EagerGrantPayloadFraction)
+	switch {
+	case sinceLastGrant >= threshold:
+		return w.grantLocked(sinceLastGrant, "threshold")
+	case n >= eagerPayloadFloor && sinceLastGrant > 0:
+		return w.grantLocked(sinceLastGrant, "eager")
+	case w.recvCredit < lowWatermark && sinceLastGrant > 0:
+		return w.grantLocked(sinceLastGrant, "watermark")
 	}
 	return 0
+}
+
+// grantLocked emits a WINDOW_UPDATE grant and advances cumulative
+// accounting. Caller must hold w.mu. Returns the cumulative wire value
+// (grantsEmitted), or 0 if no grant was actually produced (guarded by the
+// currentWindow - recvCredit gap which can be ≤ 0 when the window has
+// been shrunk below the current outstanding).
+//
+// trigger is "threshold" / "eager" / "watermark" and drives the telemetry
+// counters surfaced through Stats() for observability.
+func (w *StreamWindow) grantLocked(sinceLastGrant int64, trigger string) int64 {
+	grant := w.currentWindow - w.recvCredit
+	if grant <= 0 {
+		return 0
+	}
+	w.recvCredit += grant
+	w.lastGrant = w.consumed
+	w.grantsEmitted += grant
+	switch trigger {
+	case "threshold":
+		atomic.AddUint64(&w.thresholdGrants, 1)
+	case "eager":
+		atomic.AddUint64(&w.eagerGrants, 1)
+	case "watermark":
+		atomic.AddUint64(&w.watermarkGrants, 1)
+	}
+	dbgFlow.Printf("ReceiverConsume grant=%d cumulative=%d trigger=%s sinceLastGrant=%d consumed=%d recvCredit=%d",
+		grant, w.grantsEmitted, trigger, sinceLastGrant, w.consumed, w.recvCredit)
+	return w.grantsEmitted
 }
 
 // Available returns the sender's remaining credit.
@@ -446,6 +514,14 @@ type Stats struct {
 	Consumed        int64         // total bytes received on this window
 	LastRTT         time.Duration // most recent RTT reported via SetRTT (0 if unknown)
 	GrowthHeadroom  int64         // how much more we could grow (bytes)
+
+	// Grant-trigger breakdown — how many WINDOW_UPDATEs each trigger has
+	// fired since stream start. Useful for telling apart steady-state
+	// (threshold dominates), bursty (eager dominates), and pre-stall
+	// (watermark fires) traffic patterns on a per-stream basis.
+	ThresholdGrants uint64
+	EagerGrants     uint64
+	WatermarkGrants uint64
 }
 
 // Stats returns a snapshot of the window's state. Cheap: single mu.Lock.
@@ -461,6 +537,9 @@ func (w *StreamWindow) Stats() Stats {
 		Consumed:        w.consumed,
 		LastRTT:         w.lastRTT,
 		GrowthHeadroom:  w.initialDeficit,
+		ThresholdGrants: atomic.LoadUint64(&w.thresholdGrants),
+		EagerGrants:     atomic.LoadUint64(&w.eagerGrants),
+		WatermarkGrants: atomic.LoadUint64(&w.watermarkGrants),
 	}
 }
 

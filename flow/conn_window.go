@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/sync/semaphore"
 )
@@ -69,6 +70,12 @@ type ConnWindow struct {
 	// Cumulative grant counters — identical semantics to StreamWindow.
 	grantsEmitted  int64
 	grantsReceived int64
+
+	// Grant-trigger telemetry — mirrors StreamWindow. See the three-
+	// trigger comment on StreamWindow.ReceiverConsume for rationale.
+	thresholdGrants uint64
+	eagerGrants     uint64
+	watermarkGrants uint64
 }
 
 // NewConnWindow creates a connection-level flow control window.
@@ -144,8 +151,18 @@ func (w *ConnWindow) ApplyUpdate(credit int64) {
 }
 
 // ReceiverConsume records receiver consumption and returns the CUMULATIVE
-// grant total if the threshold is met (0 otherwise). Cumulative return
-// value makes the wire grant idempotent across loss.
+// grant total if any of the three grant triggers fire (0 otherwise).
+//
+// Three triggers mirror StreamWindow.ReceiverConsume — see that doc-comment
+// for the full rationale. Summary:
+//   - THRESHOLD: sinceLastGrant >= 25% of initial (steady-state)
+//   - EAGER:     this single payload >= 50% of threshold (burst)
+//   - WATERMARK: recvCredit < 25% of initialSize (pre-stall)
+//
+// Conn-level typically carries aggregate gossip traffic where per-stream
+// flow control is the main gate, but the conn window still stalls the
+// whole connection if it runs dry faster than grants return — so the same
+// three-trigger logic applies here.
 func (w *ConnWindow) ReceiverConsume(n int64) int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -155,20 +172,42 @@ func (w *ConnWindow) ReceiverConsume(n int64) int64 {
 	sinceLastGrant := w.consumed - w.lastGrant
 
 	threshold := int64(float64(w.initialSize) * AutoGrantThreshold)
-	if sinceLastGrant >= threshold {
-		grant := sinceLastGrant
-		if w.recvCredit+grant > DefaultMaxConnCredit {
-			grant = DefaultMaxConnCredit - w.recvCredit
-		}
-		if grant < 0 {
-			grant = 0
-		}
-		w.recvCredit += grant
-		w.lastGrant = w.consumed
-		w.grantsEmitted += grant
-		return w.grantsEmitted
+	lowWatermark := int64(float64(w.initialSize) * LowWatermarkFraction)
+	eagerPayloadFloor := int64(float64(threshold) * EagerGrantPayloadFraction)
+	switch {
+	case sinceLastGrant >= threshold:
+		return w.grantLocked(sinceLastGrant, "threshold")
+	case n >= eagerPayloadFloor && sinceLastGrant > 0:
+		return w.grantLocked(sinceLastGrant, "eager")
+	case w.recvCredit < lowWatermark && sinceLastGrant > 0:
+		return w.grantLocked(sinceLastGrant, "watermark")
 	}
 	return 0
+}
+
+// grantLocked emits a grant and advances cumulative accounting. Caller
+// must hold w.mu. Returns 0 if the effective grant would be non-positive
+// (e.g. recvCredit already at the cap).
+func (w *ConnWindow) grantLocked(sinceLastGrant int64, trigger string) int64 {
+	grant := sinceLastGrant
+	if w.recvCredit+grant > DefaultMaxConnCredit {
+		grant = DefaultMaxConnCredit - w.recvCredit
+	}
+	if grant <= 0 {
+		return 0
+	}
+	w.recvCredit += grant
+	w.lastGrant = w.consumed
+	w.grantsEmitted += grant
+	switch trigger {
+	case "threshold":
+		atomic.AddUint64(&w.thresholdGrants, 1)
+	case "eager":
+		atomic.AddUint64(&w.eagerGrants, 1)
+	case "watermark":
+		atomic.AddUint64(&w.watermarkGrants, 1)
+	}
+	return w.grantsEmitted
 }
 
 // Available returns the sender's remaining connection credit.
@@ -176,6 +215,36 @@ func (w *ConnWindow) Available() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return DefaultMaxConnCredit - w.initialDeficit - w.dataOutstanding
+}
+
+// ConnStats is a point-in-time snapshot of conn-window state for metrics.
+type ConnStats struct {
+	Outstanding     int64
+	RecvCredit      int64
+	Consumed        int64
+	GrantsEmitted   int64
+	GrantsReceived  int64
+	ThresholdGrants uint64
+	EagerGrants     uint64
+	WatermarkGrants uint64
+}
+
+// Stats returns a snapshot of the conn window's state. Lock-free read of
+// atomic counters + single mu.Lock for the non-atomic fields.
+func (w *ConnWindow) Stats() ConnStats {
+	w.mu.Lock()
+	out := ConnStats{
+		Outstanding:    w.dataOutstanding,
+		RecvCredit:     w.recvCredit,
+		Consumed:       w.consumed,
+		GrantsEmitted:  w.grantsEmitted,
+		GrantsReceived: w.grantsReceived,
+	}
+	w.mu.Unlock()
+	out.ThresholdGrants = atomic.LoadUint64(&w.thresholdGrants)
+	out.EagerGrants = atomic.LoadUint64(&w.eagerGrants)
+	out.WatermarkGrants = atomic.LoadUint64(&w.watermarkGrants)
+	return out
 }
 
 // CurrentGrant returns the current cumulative-emitted value so callers can
