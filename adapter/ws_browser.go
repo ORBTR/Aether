@@ -36,6 +36,13 @@ type BrowserWSSession struct {
 	mu      sync.Mutex
 	sched   *scheduler.Scheduler
 	closed  chan struct{}
+
+	// throttle holds the explicit-CONGESTION signal state from the peer.
+	// Zero value is "no throttle"; handleCongestion updates it on incoming
+	// CONGESTION frames. Send-path consumers can consult Throttle() for
+	// RateFactor / ShouldStall before committing large sends — parity
+	// with NoiseSession / TCPSession.
+	throttle aether.CongestionThrottle
 }
 
 // browserStream wraps a logical stream over the browser WebSocket.
@@ -128,22 +135,65 @@ func (s *BrowserWSSession) handleIncoming(payload []byte) {
 
 	switch frame.Type {
 	case aether.TypeDATA:
-		// Use the agnostic DeliverToRecvCh helper so we get the same
-		// receive-side flow-control accounting (ReceiverConsume → auto grant
-		// via WINDOW_UPDATE) and adaptive backpressure as the TCP/Noise
-		// adapters. Previously this just dropped on a full channel, never
-		// called ReceiverConsume, and never emitted a WINDOW_UPDATE — which
-		// drained the sender's credit with no return grant and eventually
-		// deadlocked flow control.
-		DeliverToRecvCh(st.recvCh, frame.Payload, st.window, st.streamID, s.sendWindowUpdateAgnostic)
+		// Use the agnostic DeliverToRecvChWithSignals helper so we get
+		// the same three-trigger grant emission, adaptive backpressure,
+		// and receiver-driven CONGESTION feedback as the TCP / Noise
+		// adapters. The SendCongestion callback emits a CONGESTION
+		// frame back to the sender when this side has to drop due to
+		// a saturated recvCh — parity with the other adapters.
+		DeliverToRecvChWithSignals(st.recvCh, frame.Payload, st.window, st.streamID,
+			s.sendWindowUpdateAgnostic, s.SendCongestion)
 	case aether.TypeWINDOW:
 		credit := aether.DecodeWindowUpdate(frame.Payload)
 		st.window.ApplyUpdate(int64(credit))
+	case aether.TypeCONGESTION:
+		// Peer signalled explicit backpressure — apply to the session-wide
+		// throttle so the send path paces appropriately. Matches the
+		// handleCongestion path in NoiseSession / TCPSession.
+		s.handleCongestion(frame)
 	case aether.TypeCLOSE:
 		close(st.recvCh)
 	case aether.TypeRESET:
 		close(st.recvCh)
 	}
+}
+
+// handleCongestion processes an explicit CONGESTION frame. Mirrors the
+// NoiseSession / TCPSession equivalents — shared payload decoding, shared
+// throttle type, so the browser path paces the same way under peer load.
+func (s *BrowserWSSession) handleCongestion(frame *aether.Frame) {
+	p := aether.DecodeCongestion(frame.Payload)
+	s.throttle.Apply(p)
+}
+
+// SendCongestion emits a CONGESTION frame to the peer. Called by
+// DeliverToRecvChWithSignals when the receive side has to drop due to
+// backpressure; the sender's CongestionThrottle picks up the signal and
+// paces accordingly. Agnostic with NoiseSession.SendCongestion /
+// TCPSession.SendCongestion so the DeliverToRecvChWithSignals callback
+// shape plugs in unchanged.
+func (s *BrowserWSSession) SendCongestion(p aether.CongestionPayload) error {
+	payload := aether.EncodeCongestion(p)
+	frame := &aether.Frame{
+		SenderID:   s.localPeerID,
+		ReceiverID: s.remotePeerID,
+		StreamID:   aether.StreamConnectionLevel,
+		Type:       aether.TypeCONGESTION,
+		Length:     uint32(len(payload)),
+		Payload:    payload,
+	}
+	encoded := aether.EncodeFrameToBytes(frame)
+	buf := js.Global().Get("Uint8Array").New(len(encoded))
+	js.CopyBytesToJS(buf, encoded)
+	s.ws.Call("send", buf.Get("buffer"))
+	return nil
+}
+
+// Throttle exposes the session's congestion-throttle state. Callers
+// (e.g. gossip scheduler) can consult RateFactor / ShouldStall before
+// dispatching large sends. Parity with NoiseSession.Throttle / TCPSession.Throttle.
+func (s *BrowserWSSession) Throttle() *aether.CongestionThrottle {
+	return &s.throttle
 }
 
 // sendWindowUpdate emits a WINDOW_UPDATE frame to the peer granting additional

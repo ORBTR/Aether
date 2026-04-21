@@ -7,6 +7,7 @@ package aether
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 )
 
 // StreamState represents the lifecycle state of an Aether stream.
@@ -80,11 +81,46 @@ type StreamStateMachine struct {
 	state    StreamState
 	localFIN bool // we sent FIN
 	peerFIN  bool // peer sent FIN
+
+	// Byte counters — atomic.Uint64 for lock-free metric reads. Call
+	// RecordSend / RecordRecv from the data path (once per DATA frame)
+	// to surface per-stream throughput without threading a separate
+	// metrics hook. See StreamStats for the snapshot shape.
+	bytesSent atomic.Uint64
+	bytesRecv atomic.Uint64
 }
 
 // NewStreamStateMachine creates a state machine in the Idle state.
 func NewStreamStateMachine() *StreamStateMachine {
 	return &StreamStateMachine{state: StreamIdle}
+}
+
+// RecordSend increments the sent-bytes counter. Lock-free.
+func (s *StreamStateMachine) RecordSend(n int) {
+	if n > 0 {
+		s.bytesSent.Add(uint64(n))
+	}
+}
+
+// RecordRecv increments the received-bytes counter. Lock-free.
+func (s *StreamStateMachine) RecordRecv(n int) {
+	if n > 0 {
+		s.bytesRecv.Add(uint64(n))
+	}
+}
+
+// StreamStats is a point-in-time snapshot of per-stream byte counters.
+type StreamStats struct {
+	BytesSent uint64
+	BytesRecv uint64
+}
+
+// Stats returns the current byte counters. Lock-free.
+func (s *StreamStateMachine) Stats() StreamStats {
+	return StreamStats{
+		BytesSent: s.bytesSent.Load(),
+		BytesRecv: s.bytesRecv.Load(),
+	}
 }
 
 // State returns the current stream state.
