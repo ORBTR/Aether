@@ -91,6 +91,15 @@ func (t *CongestionThrottle) RateFactor() float64 {
 	return float64(100-int(t.severity)) / 100.0
 }
 
+// TotalHits returns the cumulative number of CONGESTION hints applied
+// since construction. Lock-free — safe to call from metric sampling paths
+// without contending with Apply. Surfaces the counter that Snapshot()
+// already exposes, for consumers that only need the hit count and don't
+// want to materialise a full state struct on every sample.
+func (t *CongestionThrottle) TotalHits() uint64 {
+	return t.hits.Load()
+}
+
 // RemainingBackoff returns the remaining duration of the active backoff
 // window, or zero if no hint is active.
 func (t *CongestionThrottle) RemainingBackoff() time.Duration {

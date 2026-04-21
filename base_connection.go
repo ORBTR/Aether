@@ -18,7 +18,13 @@ type BaseConnection struct {
 	Conn       net.Conn
 	proto      Protocol
 	mu         sync.Mutex
-	onClose    func()
+	// onCloseFns is a slice so multiple independent consumers (stream GC,
+	// session multipath promoter, metrics subscribers) can all register
+	// teardown callbacks without clobbering each other. Previously this
+	// was a single `func()` whose second registration silently overwrote
+	// the first — a latent correctness bug surfaced by the v0.0.168
+	// stack-wide review.
+	onCloseFns []func()
 	initialRTT time.Duration // TCP handshake / dial RTT for cross-region latency
 }
 
@@ -85,12 +91,20 @@ func (s *BaseConnection) Receive(ctx context.Context) ([]byte, error) {
 	}
 }
 
-// Close terminates the session.
+// Close terminates the session. Invokes every registered OnClose callback
+// in the order they were registered. A panic in one callback does not
+// prevent later callbacks from running, so a broken subscriber can't break
+// a later subscriber's teardown.
 func (s *BaseConnection) Close() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.onClose != nil {
-		s.onClose()
+	fns := s.onCloseFns
+	s.onCloseFns = nil
+	s.mu.Unlock()
+	for _, fn := range fns {
+		func() {
+			defer func() { _ = recover() }()
+			fn()
+		}()
 	}
 	return s.Conn.Close()
 }
@@ -111,11 +125,16 @@ func (s *BaseConnection) SetInitialRTT(d time.Duration) { s.initialRTT = d }
 // InitialRTT returns the dial/handshake RTT. Returns 0 if not measured.
 func (s *BaseConnection) InitialRTT() time.Duration { return s.initialRTT }
 
-// OnClose registers a callback to be called when the session is closed.
+// OnClose registers a callback to be invoked when the session is closed.
+// Multiple registrations are supported — every registered callback fires,
+// in the order they were registered. Nil is ignored.
 func (s *BaseConnection) OnClose(f func()) {
+	if f == nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.onClose = f
+	s.onCloseFns = append(s.onCloseFns, f)
 }
 
 // Read implements io.Reader
