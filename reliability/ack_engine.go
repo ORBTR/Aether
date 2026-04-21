@@ -60,6 +60,18 @@ type ACKEngine struct {
 	// RTT callback for adaptive thresholds (first-after-idle, bitmap sizing)
 	rttFn func() time.Duration
 
+	// currentGrantFn returns the stream window's CUMULATIVE grant so the
+	// ACK engine can piggyback it on the next CompositeACK via the
+	// CACKHasWindowCredit extension (1D). When set AND the returned value
+	// is > lastEmittedCredit, the ACK carries the credit and we advance
+	// lastEmittedCredit; otherwise the flag is omitted (the peer already
+	// got this cumulative value on a previous ACK or WINDOW_UPDATE).
+	//
+	// Optional: nil means "no piggyback on this engine" — the stream
+	// window continues to emit standalone WINDOW_UPDATE frames.
+	currentGrantFn     func() int64
+	lastEmittedCredit  uint64
+
 	// Delayed ACK timer
 	timerMu   sync.Mutex
 	timer     *time.Timer
@@ -78,6 +90,15 @@ func NewACKEngine(rw *RecvWindow, policy ACKPolicy, sendFn func(*aether.Composit
 		timerStop:  make(chan struct{}),
 	}
 	return e
+}
+
+// SetWindowCreditFn registers the cumulative-grant getter used to
+// piggyback WINDOW_UPDATE credit on CompositeACKs (1D). Pass nil to
+// disable piggybacking. Safe to call any time.
+func (e *ACKEngine) SetWindowCreditFn(fn func() int64) {
+	e.mu.Lock()
+	e.currentGrantFn = fn
+	e.mu.Unlock()
 }
 
 // OnDataReceived is called when a data frame arrives.
@@ -244,6 +265,19 @@ func (e *ACKEngine) buildLocked() *aether.CompositeACK {
 	if lossRate > 0 {
 		ack.LossRate = lossRate
 		ack.Flags |= aether.CACKHasLossDensity
+	}
+
+	// Window-credit piggyback (1D). If the stream window has granted new
+	// cumulative credit since the last ACK we sent, attach it so the
+	// sender's ApplyUpdate can release flow-control credit without a
+	// separate WINDOW_UPDATE round-trip. Cumulative semantics mean
+	// duplicates (ACK retransmits, reordered ACKs) are safe.
+	if e.currentGrantFn != nil {
+		if grant := uint64(e.currentGrantFn()); grant > e.lastEmittedCredit {
+			ack.WindowCredit = grant
+			ack.Flags |= aether.CACKHasWindowCredit
+			e.lastEmittedCredit = grant
+		}
 	}
 
 	return ack

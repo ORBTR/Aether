@@ -59,7 +59,12 @@ const (
 )
 
 // DeliverToRecvCh delivers a payload to a stream's receive channel with
-// correct flow control accounting and adaptive backpressure.
+// adaptive backpressure. On a successful delivery no grant is emitted
+// here — the stream's Receive() path records consumption through a
+// grantDebouncer so grants advertise application-level progress, not
+// transport-level arrival (the 1B design from the mesh-stabilization
+// plan). On a drop, credit is granted directly for the dropped bytes to
+// prevent permanent sender stall.
 //
 // Design:
 //  1. Fast path: non-blocking send to recvCh (zero latency on the readLoop)
@@ -70,10 +75,9 @@ const (
 //  3. After backpressure expires: drop the frame but grant credit anyway
 //     to prevent permanent sender stall
 //
-// Credit is granted on delivery AND on drop (after backpressure). This
-// prevents the flow control drain bug while bounding wasted bandwidth.
-// The adaptive backpressure gives the application time to catch up without
-// stalling the readLoop (which serves ALL streams) under sustained load.
+// The adaptive backpressure gives the application time to catch up
+// without stalling the readLoop (which serves ALL streams) under
+// sustained load.
 //
 // stats is optional — pass nil if metrics are not needed.
 func DeliverToRecvCh(recvCh chan<- []byte, payload []byte, window *flow.StreamWindow, streamID uint64, sendUpdate WindowUpdater, stats ...*DeliveryStats) bool {
@@ -87,7 +91,12 @@ func DeliverToRecvCh(recvCh chan<- []byte, payload []byte, window *flow.StreamWi
 // session-level stuck detector.
 //
 // sendCongestion may be nil — in which case behaviour matches DeliverToRecvCh
-// (silent drop + grant, preserving the pre-signal contract).
+// (silent drop + drop-path grant).
+//
+// Successful deliveries do NOT grant credit here. The stream's Receive()
+// path owns that via a grantDebouncer (per the 1B design); grants
+// advertise application-level progress so a slow consumer actually
+// backpressures the sender.
 //
 // The CONGESTION payload emitted on drop uses severity scaled by the
 // observed drop rate:
@@ -107,10 +116,9 @@ func DeliverToRecvChWithSignals(
 	sendCongestion CongestionSignaler,
 	stats ...*DeliveryStats,
 ) bool {
-	// Fast path: non-blocking delivery
+	// Fast path: non-blocking delivery. No grant here — Receive() owns it.
 	select {
 	case recvCh <- payload:
-		grantCredit(window, payload, streamID, sendUpdate)
 		if len(stats) > 0 && stats[0] != nil {
 			stats[0].Delivered.Add(1)
 		}
@@ -134,15 +142,15 @@ func DeliverToRecvChWithSignals(
 	defer timer.Stop()
 	select {
 	case recvCh <- payload:
-		grantCredit(window, payload, streamID, sendUpdate)
 		if len(stats) > 0 && stats[0] != nil {
 			stats[0].Delivered.Add(1)
 		}
 		return true
 	case <-timer.C:
 		// Application didn't drain in time — drop frame, grant credit
-		// to prevent permanent sender stall.
-		grantCredit(window, payload, streamID, sendUpdate)
+		// directly to prevent permanent sender stall (the dropped bytes
+		// will never reach Receive(), so the debouncer won't see them).
+		dropGrantCredit(window, payload, streamID, sendUpdate)
 		if len(stats) > 0 && stats[0] != nil {
 			stats[0].Dropped.Add(1)
 			stats[0].BytesDropped.Add(int64(len(payload)))
@@ -168,12 +176,17 @@ func DeliverToRecvChWithSignals(
 	}
 }
 
-// grantCredit calls ReceiverConsume and sends a WINDOW_UPDATE if the
-// auto-grant threshold is met. The returned value from ReceiverConsume is
-// the CUMULATIVE total granted since stream start (not a delta) — it is
-// passed as-is to the WINDOW_UPDATE payload so the sender's ApplyUpdate
-// can compute the delta and drop stale/duplicate frames.
-func grantCredit(window *flow.StreamWindow, payload []byte, streamID uint64, sendUpdate WindowUpdater) {
+// dropGrantCredit accounts for bytes that never reached the application
+// (dropped after backpressure expired) by calling ReceiverConsume and
+// emitting a WINDOW_UPDATE if any trigger fires. This path MUST remain
+// direct — it runs in the delivery goroutine, not a reader goroutine, so
+// the grantDebouncer (which lives on the reader side) wouldn't see these
+// bytes otherwise and the sender would stall forever on permanently-lost
+// credit.
+//
+// Used only on the drop path. Successful deliveries let the reader's
+// debouncer handle grants.
+func dropGrantCredit(window *flow.StreamWindow, payload []byte, streamID uint64, sendUpdate WindowUpdater) {
 	if window != nil && sendUpdate != nil {
 		if grant := window.ReceiverConsume(int64(len(payload))); grant > 0 {
 			sendUpdate(streamID, uint64(grant))

@@ -60,6 +60,14 @@ type NoiseSession struct {
 	healthMon  *health.Monitor
 	sched      *scheduler.Scheduler
 	connWindow *flow.ConnWindow
+	// connGrantDebouncer coalesces conn-level WINDOW_UPDATE emissions
+	// driven by application reads across ALL streams on this session.
+	// When stream.Receive() records consumed bytes, both the per-stream
+	// debouncer AND this session-wide debouncer fire in parallel; the
+	// conn-level one emits a single StreamConnectionLevel grant per
+	// coalesce window no matter how many streams are actively reading.
+	// Design: 1B in docs/plans/2026-04-21-mesh-stabilization.md.
+	connGrantDebouncer *grantDebouncer
 	// cong is the active congestion controller. Stored behind an
 	// atomic.Pointer so SetCongestionController can swap it safely
 	// while handleACK / writeLoop / reliabilityTick concurrently read.
@@ -207,6 +215,8 @@ func NewNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 		sched:              scheduler.NewScheduler(),
 		connWindow:         flow.NewConnWindow(0),
 		pacer:              selectPacer(opts),
+		// connGrantDebouncer initialized below after s is assigned, because
+		// the grantable + sendUpdate bindings reference s itself.
 		fecEncoder:         reliability.NewFECEncoder(reliability.DefaultFECGroupSize),
 		fecDecoder:         reliability.NewFECDecoder(),
 		interleavedEncoder: reliability.NewInterleavedFECEncoder(reliability.DefaultFECGroupSize),
@@ -220,6 +230,16 @@ func NewNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 	// table. Streams opt in via StreamConfig.FECLevel = FECReedSolomon.
 	s.rsEncoder, _ = reliability.NewRSEncoder(reliability.DefaultRSDataShards, reliability.DefaultRSParityShards)
 	s.rsDecoder, _ = reliability.NewRSDecoder(reliability.DefaultRSDataShards, reliability.DefaultRSParityShards)
+
+	// Session-wide conn-level grant debouncer (1B). Immediate-flush floor
+	// at 50% of DefaultConnCredit so burst patterns don't wait the full
+	// coalesce window when the sender is close to the conn-level edge.
+	s.connGrantDebouncer = newGrantDebouncer(
+		s.connWindow,
+		s.sendWindowUpdateAgnostic,
+		aether.StreamConnectionLevel,
+		int64(float64(flow.DefaultConnCredit)*GrantImmediateFraction),
+	)
 
 	// Initial congestion controller — stored atomically so the setter
 	// can swap without racing the ACK / write / tick paths.
@@ -450,6 +470,12 @@ func (s *NoiseSession) CloseWithError(err error) error {
 		close(s.closed)
 		if s.streamGC != nil {
 			s.streamGC.Stop()
+		}
+		// Flush any pending conn-level grant so the peer gets credit for
+		// bytes the application did consume, even if the session is
+		// tearing down. Idempotent; safe even if never initialized.
+		if s.connGrantDebouncer != nil {
+			s.connGrantDebouncer.Close()
 		}
 		s.conn.Close()
 	})

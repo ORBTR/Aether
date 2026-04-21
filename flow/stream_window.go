@@ -74,6 +74,17 @@ const EagerGrantPayloadFraction = 0.5
 // with the EAGER trigger for paths that the EAGER rule happens to miss.
 const LowWatermarkFraction = 0.25
 
+// GrantMaxInterval caps the maximum time between grants when the receiver has
+// consumed any bytes since the last grant. This is the TIMED trigger — the
+// 4th independent grant trigger. It fires purely on elapsed wall-clock time
+// to cover the small-payload + large-window failure mode that none of
+// THRESHOLD, EAGER, or WATERMARK catch. Concrete example: a gossip stream
+// with 4 MB InitialCredit processing 70 KB exchanges. THRESHOLD needs 1 MB
+// (≥15 payloads), EAGER needs payload ≥ 512 KB (never fires), WATERMARK
+// needs recvCredit < 1 MB (≥42 payloads consumed). With this trigger a
+// grant fires after at most GrantMaxInterval regardless of payload sizing.
+const GrantMaxInterval = 1 * time.Second
+
 // MinGuaranteedWindow is the escape hatch for flow control deadlock prevention.
 // Frames at or below this size (control headers, ACKs, keepalive hints) bypass
 // credit accounting entirely: they never block waiting for credit and never
@@ -154,22 +165,34 @@ type StreamWindow struct {
 	//   grantsReceived — highest cumulative value we (sender) have seen
 	//                    from peer; any incoming wire value ≤ this is stale
 	//                    and dropped by ApplyUpdate.
+	//   ackReleased    — cumulative bytes released through the ACK-driven
+	//                    path (1C). Purely observational; the release is
+	//                    still capped at dataOutstanding so it composes
+	//                    safely with ApplyUpdate's release path.
 	grantsEmitted  int64
 	grantsReceived int64
+	ackReleased    int64
 
 	// Auto-tuning hints — advisory data an auto-tuner reads via Stats().
 	// Updated from Consume/ApplyUpdate hot paths, guarded by mu.
 	peakOutstanding int64         // max dataOutstanding observed since last tune
 	lastRTT         time.Duration // most recent observed RTT (from SetRTT)
 
-	// Grant-trigger telemetry — count how often each of the three
+	// Grant-trigger telemetry — count how often each of the four
 	// WINDOW_UPDATE triggers fired. Exposed via Stats() so operators can
 	// tell at a glance whether bursts (EagerGrants) or steady-state
 	// consumption (ThresholdGrants) or pre-stall pressure (WatermarkGrants)
-	// is driving the grant channel. Atomic so Stats() is lock-free.
+	// or wall-clock gap (TimedGrants) is driving the grant channel. Atomic
+	// so Stats() is lock-free.
 	thresholdGrants uint64
 	eagerGrants     uint64
 	watermarkGrants uint64
+	timedGrants     uint64
+
+	// lastGrantTime is the wall-clock time of the most recent grantLocked
+	// call. Drives the TIMED trigger; also initialized at construction so
+	// a brand-new stream can't fire TIMED on the very first payload.
+	lastGrantTime time.Time
 }
 
 // NewStreamWindow creates a flow control window with the given initial credit.
@@ -210,6 +233,7 @@ func NewStreamWindow(initialCredit int64) *StreamWindow {
 		initialSize:    initialCredit,
 		currentWindow:  initialCredit,
 		recvCredit:     initialCredit,
+		lastGrantTime:  time.Now(),
 	}
 }
 
@@ -252,6 +276,41 @@ func (w *StreamWindow) Consume(ctx context.Context, n int64) error {
 	w.mu.Unlock()
 	dbgFlow.Printf("Consume OK n=%d outstanding=%d avail=%d", n, outstanding, w.currentWindow-outstanding)
 	return nil
+}
+
+// ReleaseOnACK releases sender-side credit corresponding to bytes the
+// peer has acknowledged via the reliability layer's CompositeACK path
+// (independent of WINDOW_UPDATE). ACKs are loss-tolerant via their own
+// retransmission, so flow-control credit delivered through them is
+// strictly more robust than credit delivered through bare WINDOW_UPDATE
+// frames which can be dropped on lossy UDP paths.
+//
+// ackedBytesDelta is the byte sum of entries newly acknowledged in this
+// ACK (not cumulative). Caller (the adapter's handleACK) computes this
+// by summing Frame.Length over the `acked` slice returned by
+// SendWindow.ProcessCompositeACK.
+//
+// The release is capped at dataOutstanding so ACK-path and WINDOW_UPDATE
+// path together never over-release. Whichever path delivers credit first
+// for a given byte wins; the other sees dataOutstanding already reduced
+// and releases nothing extra. This is the 1C design from the mesh-
+// stabilization plan.
+func (w *StreamWindow) ReleaseOnACK(ackedBytesDelta int64) {
+	if ackedBytesDelta <= 0 {
+		return
+	}
+	w.mu.Lock()
+	release := ackedBytesDelta
+	if release > w.dataOutstanding {
+		release = w.dataOutstanding
+	}
+	w.dataOutstanding -= release
+	w.ackReleased += release
+	w.mu.Unlock()
+	if release > 0 {
+		w.sem.Release(release)
+	}
+	dbgFlow.Printf("ReleaseOnACK delta=%d released=%d ackReleasedTotal=%d", ackedBytesDelta, release, w.ackReleased)
 }
 
 // ApplyUpdate processes a received WINDOW_UPDATE frame, where `credit` is
@@ -323,11 +382,11 @@ func (w *StreamWindow) ReceiverConsume(n int64) int64 {
 
 	threshold := int64(float64(w.initialSize) * AutoGrantThreshold)
 
-	// Three-trigger grant emission — the sender stalls when recvCredit is
+	// Four-trigger grant emission — the sender stalls when recvCredit is
 	// exhausted, so we fire under any of the following conditions. Each
 	// trigger is independently sufficient; they never fight each other
 	// because any one firing calls grantLocked which advances lastGrant +
-	// recvCredit atomically.
+	// recvCredit + lastGrantTime atomically.
 	//
 	//   1. THRESHOLD: sinceLastGrant >= 25% of initial. The steady-state
 	//      trigger. Handles sustained low-rate traffic where the receiver
@@ -345,6 +404,15 @@ func (w *StreamWindow) ReceiverConsume(n int64) int64 {
 	//      unconsumed, the sender is at the brink regardless of what
 	//      sinceLastGrant thinks. Belt-and-braces with EAGER for paths
 	//      where neither THRESHOLD nor EAGER happen to fire in time.
+	//
+	//   4. TIMED: wall-clock gap since lastGrantTime >= GrantMaxInterval
+	//      AND sinceLastGrant > 0. Covers the small-payload + large-window
+	//      failure mode where the other three triggers have size floors
+	//      that don't fire. With a 4 MB gossip stream and 70 KB payloads,
+	//      THRESHOLD needs ~15 payloads, EAGER never fires, WATERMARK
+	//      needs ~42 payloads. TIMED guarantees a grant within 1 s of any
+	//      consumed byte, making the grant channel robust to any
+	//      payload-size × window-size combination.
 	lowWatermark := int64(float64(w.currentWindow) * LowWatermarkFraction)
 	eagerPayloadFloor := int64(float64(threshold) * EagerGrantPayloadFraction)
 	switch {
@@ -354,6 +422,8 @@ func (w *StreamWindow) ReceiverConsume(n int64) int64 {
 		return w.grantLocked(sinceLastGrant, "eager")
 	case w.recvCredit < lowWatermark && sinceLastGrant > 0:
 		return w.grantLocked(sinceLastGrant, "watermark")
+	case sinceLastGrant > 0 && time.Since(w.lastGrantTime) >= GrantMaxInterval:
+		return w.grantLocked(sinceLastGrant, "timed")
 	}
 	return 0
 }
@@ -374,6 +444,7 @@ func (w *StreamWindow) grantLocked(sinceLastGrant int64, trigger string) int64 {
 	w.recvCredit += grant
 	w.lastGrant = w.consumed
 	w.grantsEmitted += grant
+	w.lastGrantTime = time.Now()
 	switch trigger {
 	case "threshold":
 		atomic.AddUint64(&w.thresholdGrants, 1)
@@ -381,6 +452,8 @@ func (w *StreamWindow) grantLocked(sinceLastGrant int64, trigger string) int64 {
 		atomic.AddUint64(&w.eagerGrants, 1)
 	case "watermark":
 		atomic.AddUint64(&w.watermarkGrants, 1)
+	case "timed":
+		atomic.AddUint64(&w.timedGrants, 1)
 	}
 	dbgFlow.Printf("ReceiverConsume grant=%d cumulative=%d trigger=%s sinceLastGrant=%d consumed=%d recvCredit=%d",
 		grant, w.grantsEmitted, trigger, sinceLastGrant, w.consumed, w.recvCredit)
@@ -517,11 +590,13 @@ type Stats struct {
 
 	// Grant-trigger breakdown — how many WINDOW_UPDATEs each trigger has
 	// fired since stream start. Useful for telling apart steady-state
-	// (threshold dominates), bursty (eager dominates), and pre-stall
-	// (watermark fires) traffic patterns on a per-stream basis.
+	// (threshold dominates), bursty (eager dominates), pre-stall
+	// (watermark fires), and small-payload-large-window (timed fires)
+	// traffic patterns on a per-stream basis.
 	ThresholdGrants uint64
 	EagerGrants     uint64
 	WatermarkGrants uint64
+	TimedGrants     uint64
 }
 
 // Stats returns a snapshot of the window's state. Cheap: single mu.Lock.
@@ -540,6 +615,7 @@ func (w *StreamWindow) Stats() Stats {
 		ThresholdGrants: atomic.LoadUint64(&w.thresholdGrants),
 		EagerGrants:     atomic.LoadUint64(&w.eagerGrants),
 		WatermarkGrants: atomic.LoadUint64(&w.watermarkGrants),
+		TimedGrants:     atomic.LoadUint64(&w.timedGrants),
 	}
 }
 

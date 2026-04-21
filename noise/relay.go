@@ -250,7 +250,7 @@ func (l *noiseListener) handleRelayedHandshake(relayConn *noiseConn, sourceNodeI
 	// - cs2 is for responder→initiator (responder uses for send)
 	cfg := aether.DefaultSessionConfig()
 	nc := &noiseConn{
-		udp:              relayConn.udp, // Share the UDP conn
+		conn:             relayConn.conn, // Share the substrate conn (UDP on native, DC/WS on browser)
 		remote:           relayConn.remote,
 		remoteNode:       remoteNode,
 		send:             cs2,

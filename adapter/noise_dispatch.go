@@ -242,11 +242,16 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 	// Reliability: insert into receive window for reordering
 	delivered := st.recvWindow.Insert(frame.SeqNo, frame.Payload)
 	for _, payload := range delivered {
-		DeliverToRecvChWithSignals(st.recvCh, payload, st.window, st.streamID, s.sendWindowUpdateAgnostic, s.SendCongestion)
-		// Connection-level flow control: track aggregate consumption.
-		// Stream 0 WINDOW_UPDATE = connection-level grant (HTTP/2 convention).
-		if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
-			s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
+		ok := DeliverToRecvChWithSignals(st.recvCh, payload, st.window, st.streamID, s.sendWindowUpdateAgnostic, s.SendCongestion)
+		// Conn-level flow control (1B): successful delivery grants credit
+		// at application-read time via the session debouncer (Receive →
+		// connGrantDebouncer.Record). On drop, the debouncer will never
+		// see these bytes so we must grant directly here to prevent a
+		// permanent conn-level stall.
+		if !ok {
+			if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
+				s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
+			}
 		}
 	}
 
@@ -334,6 +339,13 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	// delivery rate. Falls back to OnAck (degraded path) for CUBIC or
 	// when the sample is missing (e.g. retransmitted entries).
 	srtt := st.rtt.SRTT()
+	// Always sum acked bytes once — used both for the CUBIC OnAck call
+	// below and for the 1C ACK-driven flow-control credit release that
+	// happens regardless of congestion controller choice.
+	var ackedBytes int64
+	for _, entry := range acked {
+		ackedBytes += int64(entry.Frame.Length)
+	}
 	if bbr, ok := s.congestion().(*congestion.BBRController); ok {
 		for _, entry := range acked {
 			if sample, ok := entry.BBRSample.(congestion.DeliveryRateSample); ok {
@@ -343,16 +355,35 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 			}
 		}
 	} else {
-		var ackedBytes int64
-		for _, entry := range acked {
-			ackedBytes += int64(entry.Frame.Length)
-		}
 		s.congestion().OnAck(ackedBytes, srtt)
+	}
+	// 1C: ACK-driven flow-control credit release. Every byte the peer
+	// has acknowledged is no longer in-flight on this stream, so credit
+	// can be returned to the sender NOW regardless of whether a matching
+	// WINDOW_UPDATE frame has arrived. This closes the stuck-credit gap
+	// on lossy Noise-UDP paths where WINDOW_UPDATE packets can be
+	// dropped — ACKs have their own cumulative-retransmit path and are
+	// fundamentally more robust.
+	//
+	// Per-stream and per-conn windows both get the same delta. Each caps
+	// at its own dataOutstanding, so ACK-path + WINDOW_UPDATE-path
+	// together never over-release (see StreamWindow.ReleaseOnACK).
+	if ackedBytes > 0 {
+		st.window.ReleaseOnACK(ackedBytes)
+		s.connWindow.ReleaseOnACK(ackedBytes)
 	}
 	// ECN feedback (#15): peer reported CE-marked bytes since last ACK.
 	// Notify the controller so it can react one RTT before queue overflow.
 	if ack.Flags&aether.CACKHasECN != 0 && ack.CEBytes > 0 {
 		s.congestion().OnCE(int64(ack.CEBytes))
+	}
+	// 1D: piggybacked stream-level WINDOW_UPDATE. Same cumulative
+	// semantics as a standalone WINDOW_UPDATE frame — ApplyUpdate drops
+	// stale/duplicate values via its grantsReceived cursor and caps the
+	// release at dataOutstanding so it composes safely with 1C's
+	// ACK-driven release.
+	if ack.Flags&aether.CACKHasWindowCredit != 0 && ack.WindowCredit > 0 {
+		st.window.ApplyUpdate(int64(ack.WindowCredit))
 	}
 	// Congestion window may have advanced — wake the writeLoop so it
 	// re-evaluates `CanSend`. Without this, frames re-enqueued after a
@@ -451,9 +482,12 @@ func (s *NoiseSession) handleImplicitOpen(frame *aether.Frame) {
 	// Deliver the data
 	delivered := st.recvWindow.Insert(frame.SeqNo, frame.Payload)
 	for _, payload := range delivered {
-		DeliverToRecvChWithSignals(st.recvCh, payload, st.window, st.streamID, s.sendWindowUpdateAgnostic, s.SendCongestion)
-		if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
-			s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
+		ok := DeliverToRecvChWithSignals(st.recvCh, payload, st.window, st.streamID, s.sendWindowUpdateAgnostic, s.SendCongestion)
+		// Drop-only conn-level credit (1B): see handleData.
+		if !ok {
+			if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
+				s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
+			}
 		}
 	}
 }
@@ -486,6 +520,7 @@ func (s *NoiseSession) handleClose(frame *aether.Frame) {
 		}
 	}
 	close(st.recvCh)
+	st.teardown()
 	s.mu.Lock()
 	delete(s.streams, frame.StreamID)
 	s.mu.Unlock()
@@ -502,6 +537,7 @@ func (s *NoiseSession) handleReset(frame *aether.Frame) {
 	s.mu.Unlock()
 	if ok {
 		st.state.Transition(aether.EventRecvReset)
+		st.teardown()
 		close(st.recvCh)
 		s.releaseStream(frame.StreamID)
 	}
@@ -698,9 +734,12 @@ func (s *NoiseSession) deliverToStream(streamID uint64, payload []byte) {
 	st, ok := s.streams[streamID]
 	s.mu.Unlock()
 	if ok {
-		DeliverToRecvChWithSignals(st.recvCh, payload, st.window, streamID, s.sendWindowUpdateAgnostic, s.SendCongestion)
-		if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
-			s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
+		delivered := DeliverToRecvChWithSignals(st.recvCh, payload, st.window, streamID, s.sendWindowUpdateAgnostic, s.SendCongestion)
+		// Drop-only conn-level credit (1B): see handleData.
+		if !delivered {
+			if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
+				s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
+			}
 		}
 	}
 }

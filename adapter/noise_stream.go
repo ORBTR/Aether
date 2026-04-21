@@ -31,6 +31,17 @@ type noiseStream struct {
 	recvCh   chan []byte
 	window   *flow.StreamWindow
 
+	// grantDebouncer coalesces stream-level WINDOW_UPDATE emissions driven
+	// by application reads on this stream. When Receive() successfully
+	// returns a payload to the application, it records the byte count in
+	// the debouncer; the debouncer fires ReceiverConsume on a 25ms
+	// coalesce window (or immediately for bursts above 50% of the
+	// stream's initial credit). Design: 1B in the mesh-stabilization
+	// plan — moves grant emission from frame-receipt (the old location,
+	// inside DeliverToRecvChWithSignals) to application-read, giving true
+	// application-level backpressure.
+	grantDebouncer *grantDebouncer
+
 	// Per-stream reliability engine (Noise has NO native reliability)
 	engine      *reliability.Engine
 	ackEngine   *reliability.ACKEngine       // adaptive ACK generation
@@ -112,12 +123,34 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 		rtt:         eng.RTT,
 		replay:      eng.Replay,
 	}
+	// Per-stream grant debouncer (1B). Immediate-flush floor at 50% of the
+	// stream's initial credit so burst reads drain the pending total
+	// without waiting the full coalesce window when the sender is close
+	// to the stream-window edge.
+	initialCredit := cfg.InitialCredit
+	if initialCredit <= 0 {
+		initialCredit = flow.DefaultStreamCredit
+	}
+	st.grantDebouncer = newGrantDebouncer(
+		st.window,
+		s.sendWindowUpdateAgnostic,
+		streamID,
+		int64(float64(initialCredit)*GrantImmediateFraction),
+	)
 	// Initialize ACK engine with adaptive policy — sends Composite ACKs
 	// Pass RTT callback for first-after-idle threshold scaling
 	st.ackEngine = reliability.NewACKEngine(eng.RecvWin, reliability.DefaultACKPolicy(), func(cack *aether.CompositeACK) {
 		s.sendCompositeACK(st, cack)
 	}, func() time.Duration {
 		return eng.RTT.SRTT()
+	})
+	// 1D: piggyback the stream window's cumulative WINDOW_UPDATE grant on
+	// outgoing CompositeACKs via CACKHasWindowCredit. Eliminates a
+	// separate WINDOW_UPDATE frame when the receiver has granted new
+	// credit, and — because ACKs have their own cumulative retransmit
+	// path — makes the grant delivery fundamentally loss-tolerant.
+	st.ackEngine.SetWindowCreditFn(func() int64 {
+		return st.window.CurrentGrant()
 	})
 
 	// Atomic admission + insert. Keeping these in one locked section
@@ -294,6 +327,13 @@ func (st *noiseStream) Receive(ctx context.Context) ([]byte, error) {
 			// the fragment magic, buffer it and return assembled payload
 			// only when all fragments have arrived.
 			if IsFragment(data) {
+				// Record credit for the raw fragment bytes even if the
+				// assembled payload isn't ready yet — the sender consumed
+				// window credit to transmit them and must get it back as
+				// the receiver progresses, not only on final reassembly.
+				// Otherwise a multi-fragment payload would stall the
+				// sender for the full reassembly span.
+				st.recordReceive(int64(len(data)))
 				// The receive channel does not carry the originating frame's
 				// SeqNo, so pass 0 — the per-stream FragmentBuffer will use
 				// its own monotonic counter to keep group keys unique.
@@ -309,6 +349,11 @@ func (st *noiseStream) Receive(ctx context.Context) ([]byte, error) {
 				}
 				return assembled, nil
 			}
+			// Non-fragmented payload — record credit for the bytes now
+			// that the application has received them. This advances both
+			// the stream-level and conn-level flow-control windows from
+			// the application's perspective (true consume-driven grants).
+			st.recordReceive(int64(len(data)))
 			return data, nil
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -318,8 +363,30 @@ func (st *noiseStream) Receive(ctx context.Context) ([]byte, error) {
 	}
 }
 
+// recordReceive advances flow-control credit accounting for bytes the
+// application has actually received on this stream. Both the per-stream
+// debouncer AND the session-wide conn-level debouncer get the same byte
+// count — stream grants reflect per-stream progress and conn grants
+// reflect aggregate progress across all streams on this session.
+//
+// Debouncers coalesce multiple calls into one WINDOW_UPDATE per coalesce
+// window, so rapid back-to-back Receive()s don't produce one wire frame
+// per payload. See grant_debouncer.go for the coalescing policy.
+func (st *noiseStream) recordReceive(n int64) {
+	if n <= 0 {
+		return
+	}
+	if st.grantDebouncer != nil {
+		st.grantDebouncer.Record(n)
+	}
+	if st.session != nil && st.session.connGrantDebouncer != nil {
+		st.session.connGrantDebouncer.Record(n)
+	}
+}
+
 func (st *noiseStream) Close() error {
 	st.state.Transition(aether.EventSendFIN)
+	st.teardown()
 	frame := &aether.Frame{
 		SenderID:   st.session.localPeerID,
 		ReceiverID: st.session.remotePeerID,
@@ -327,6 +394,16 @@ func (st *noiseStream) Close() error {
 		Type:       aether.TypeCLOSE,
 	}
 	return st.session.writeFrame(frame)
+}
+
+// teardown releases per-stream resources that must not outlive the
+// stream itself — currently the grant debouncer's timer goroutine +
+// pending-flush. Idempotent; safe to call from every termination path
+// (Close, Reset, handleClose, handleReset, streamGC sweep).
+func (st *noiseStream) teardown() {
+	if st.grantDebouncer != nil {
+		st.grantDebouncer.Close()
+	}
 }
 
 func (st *noiseStream) Reset(reason aether.ResetReason) error {
@@ -346,6 +423,7 @@ func (st *noiseStream) Reset(reason aether.ResetReason) error {
 	// now released here so local Reset is fully symmetric with
 	// the peer-initiated handleReset path.
 	err := st.session.writeFrame(frame)
+	st.teardown()
 	st.session.mu.Lock()
 	if _, ok := st.session.streams[st.streamID]; ok {
 		delete(st.session.streams, st.streamID)

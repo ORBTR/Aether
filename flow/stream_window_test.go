@@ -244,3 +244,190 @@ func TestConnWindow_SustainedGrants(t *testing.T) {
 		t.Fatal("Bug A regression: no grants emitted over 20 large-receive iterations")
 	}
 }
+
+// Regression test for the TIMED (4th) grant trigger.
+//
+// Scenario that motivated it: a gossip stream with InitialCredit = 4 MB
+// processing 70 KB payloads at ~10 s gossip intervals. The other three
+// triggers have size floors that don't fire for small payloads on a big
+// window:
+//   - THRESHOLD: sinceLastGrant >= 25% × 4 MB = 1 MB → needs ~15 payloads
+//   - EAGER: single payload >= 50% × 1 MB = 512 KB → never fires at 70 KB
+//   - WATERMARK: recvCredit < 25% × 4 MB = 1 MB → needs ~42 payloads consumed
+//
+// With the TIMED trigger (GrantMaxInterval = 1 s), a grant fires at most
+// 1 s after any consumed byte regardless of payload size or window size.
+// The sender can never stall for longer than GrantMaxInterval purely due
+// to small-payload/large-window mismatch.
+func TestStreamWindow_TimedTrigger_LargeWindow_SmallPayload(t *testing.T) {
+	const (
+		bigWindow     = 4 * 1024 * 1024 // 4 MB — production gossip config
+		smallPayload  = 70 * 1024       // 70 KB — observed gossip exchange size
+		payloadsFed   = 3               // <15 needed for THRESHOLD, <42 for WATERMARK
+		waitForTimed  = GrantMaxInterval + 100*time.Millisecond
+	)
+
+	w := NewStreamWindow(bigWindow)
+
+	// Feed a few payloads — none of THRESHOLD / EAGER / WATERMARK should fire.
+	// Small payloads on a big window: none of the size-based triggers hit.
+	for i := 0; i < payloadsFed; i++ {
+		if grant := w.ReceiverConsume(smallPayload); grant != 0 {
+			t.Fatalf("payload %d: expected no immediate grant (size-based triggers shouldn't fire), got %d", i, grant)
+		}
+	}
+
+	// Confirm Stats show zero grants via any trigger so far.
+	stats := w.Stats()
+	if g := stats.ThresholdGrants + stats.EagerGrants + stats.WatermarkGrants + stats.TimedGrants; g != 0 {
+		t.Fatalf("expected 0 grants before GrantMaxInterval elapsed, got threshold=%d eager=%d watermark=%d timed=%d",
+			stats.ThresholdGrants, stats.EagerGrants, stats.WatermarkGrants, stats.TimedGrants)
+	}
+
+	// Wait past GrantMaxInterval. The next ReceiverConsume should fire
+	// the TIMED trigger because sinceLastGrant > 0 AND the wall-clock
+	// gap has crossed the threshold.
+	time.Sleep(waitForTimed)
+
+	grant := w.ReceiverConsume(smallPayload)
+	if grant == 0 {
+		t.Fatal("TIMED trigger did not fire after GrantMaxInterval elapsed with data consumed")
+	}
+
+	stats = w.Stats()
+	if stats.TimedGrants != 1 {
+		t.Errorf("TimedGrants counter: got %d, want 1", stats.TimedGrants)
+	}
+	// Other counters should remain zero — this scenario exclusively
+	// exercises the TIMED path.
+	if stats.ThresholdGrants != 0 || stats.EagerGrants != 0 || stats.WatermarkGrants != 0 {
+		t.Errorf("unexpected non-TIMED grant: threshold=%d eager=%d watermark=%d",
+			stats.ThresholdGrants, stats.EagerGrants, stats.WatermarkGrants)
+	}
+}
+
+// Negative test: TIMED must NOT fire when no bytes have been consumed
+// since the last grant, even if GrantMaxInterval has elapsed. This
+// prevents an empty-stream from emitting redundant no-op grants
+// forever in the background.
+func TestStreamWindow_TimedTrigger_NoConsumeNoGrant(t *testing.T) {
+	w := NewStreamWindow(DefaultStreamCredit)
+
+	// Wait past the interval without any ReceiverConsume calls.
+	time.Sleep(GrantMaxInterval + 100*time.Millisecond)
+
+	// A zero-byte consume must not trigger anything.
+	if grant := w.ReceiverConsume(0); grant != 0 {
+		t.Errorf("zero-byte consume fired a grant: %d", grant)
+	}
+	if g := w.Stats().TimedGrants; g != 0 {
+		t.Errorf("TimedGrants counter: got %d, want 0 (no consumption happened)", g)
+	}
+}
+
+// 1C regression: ReleaseOnACK releases sender credit via the reliability-
+// layer ACK path independent of WINDOW_UPDATE. Caps at dataOutstanding
+// so it composes safely with ApplyUpdate (both paths can fire; neither
+// over-releases).
+func TestStreamWindow_ReleaseOnACK_ReleasesCredit(t *testing.T) {
+	w := NewStreamWindow(testCredit)
+	ctx := context.Background()
+
+	if err := w.Consume(ctx, testCredit); err != nil {
+		t.Fatalf("consume: %v", err)
+	}
+	if a := w.Available(); a != 0 {
+		t.Fatalf("after full consume: Available got %d, want 0", a)
+	}
+
+	// ACK half the bytes — releases half the credit back to the sender.
+	w.ReleaseOnACK(testCredit / 2)
+	if a := w.Available(); a != testCredit/2 {
+		t.Errorf("after ReleaseOnACK(half): Available got %d, want %d", a, testCredit/2)
+	}
+
+	// ACK another half — releases the remaining half. Total released =
+	// initialCredit, dataOutstanding back to zero.
+	w.ReleaseOnACK(testCredit / 2)
+	if a := w.Available(); a != testCredit {
+		t.Errorf("after ReleaseOnACK(all): Available got %d, want %d", a, testCredit)
+	}
+}
+
+// ReleaseOnACK must never release past dataOutstanding. If a WINDOW_UPDATE
+// already freed the credit, a later ACK for the same bytes must be a no-op.
+func TestStreamWindow_ReleaseOnACK_CapsAtDataOutstanding(t *testing.T) {
+	w := NewStreamWindow(testCredit)
+	ctx := context.Background()
+
+	if err := w.Consume(ctx, testCredit); err != nil {
+		t.Fatalf("consume: %v", err)
+	}
+
+	// WINDOW_UPDATE releases everything first.
+	// Simulate receiver granting full refill via cumulative mechanism:
+	//   grantsEmitted becomes testCredit → peer sends it → ApplyUpdate(testCredit).
+	// Here we synthesize the effect directly.
+	w.ApplyUpdate(testCredit)
+	if a := w.Available(); a != testCredit {
+		t.Fatalf("after ApplyUpdate(all): Available got %d, want %d", a, testCredit)
+	}
+
+	// ACK for the same bytes arrives AFTER WINDOW_UPDATE — must be no-op.
+	w.ReleaseOnACK(testCredit)
+	if a := w.Available(); a != testCredit {
+		t.Errorf("ReleaseOnACK over-released: Available got %d, want %d", a, testCredit)
+	}
+}
+
+// Symmetric test for ConnWindow ReleaseOnACK.
+func TestConnWindow_ReleaseOnACK(t *testing.T) {
+	w := NewConnWindow(DefaultConnCredit)
+	ctx := context.Background()
+
+	if err := w.Consume(ctx, DefaultConnCredit/2); err != nil {
+		t.Fatalf("consume: %v", err)
+	}
+
+	beforeAvail := w.Available()
+	w.ReleaseOnACK(DefaultConnCredit / 4)
+	afterAvail := w.Available()
+	if afterAvail-beforeAvail != DefaultConnCredit/4 {
+		t.Errorf("ReleaseOnACK delta wrong: before=%d after=%d diff=%d, want +%d",
+			beforeAvail, afterAvail, afterAvail-beforeAvail, DefaultConnCredit/4)
+	}
+
+	// Releasing more than remaining outstanding caps correctly.
+	w.ReleaseOnACK(DefaultConnCredit) // much more than what's still outstanding
+	finalAvail := w.Available()
+	if finalAvail > DefaultConnCredit {
+		t.Errorf("Available exceeded initial credit: got %d, want ≤ %d", finalAvail, DefaultConnCredit)
+	}
+}
+
+// TIMED trigger on ConnWindow mirrors the stream-level behaviour. Same
+// rationale: small per-stream payloads aggregating at the conn level can
+// still leave the conn-level sinceLastGrant below the THRESHOLD floor
+// under bursty-but-low-volume traffic.
+func TestConnWindow_TimedTrigger_Fires(t *testing.T) {
+	w := NewConnWindow(DefaultConnCredit)
+
+	// Feed small payloads — DefaultConnCredit is 4 MB, threshold = 1 MB,
+	// so 3 × 70 KB (210 KB total) stays well under all size-based triggers.
+	for i := 0; i < 3; i++ {
+		if grant := w.ReceiverConsume(70 * 1024); grant != 0 {
+			t.Fatalf("payload %d: unexpected immediate grant %d", i, grant)
+		}
+	}
+
+	// Wait past GrantMaxInterval.
+	time.Sleep(GrantMaxInterval + 100*time.Millisecond)
+
+	grant := w.ReceiverConsume(70 * 1024)
+	if grant == 0 {
+		t.Fatal("conn-level TIMED trigger did not fire")
+	}
+	if g := w.Stats().TimedGrants; g != 1 {
+		t.Errorf("ConnWindow TimedGrants: got %d, want 1", g)
+	}
+}

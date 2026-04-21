@@ -85,12 +85,48 @@ type tcpStream struct {
 	state    *aether.StreamStateMachine
 	recvCh   chan []byte
 	window   *flow.StreamWindow
-	observe  *reliability.ObserveEngine // ACK-observe metrics (no enforcement)
-	localSeq uint32                     // monotonic counter (TCP doesn't set SeqNo)
-	closed   bool
-	mu       sync.Mutex
-	connOnce sync.Once
-	connView net.Conn // cached net.Conn wrapper
+	// grantDebouncer coalesces stream-level WINDOW_UPDATE emissions driven
+	// by application reads (1B in the mesh-stabilization plan). Lazily
+	// attached by attachGrantDebouncer after struct construction because
+	// the session method references must reach the initialized receiver.
+	// TCP's reliable bytestream absorbs transport-level pacing, but stream
+	// credit still gates the app-level read flow so we debounce here too
+	// for parity with the noise adapter.
+	grantDebouncer *grantDebouncer
+	observe        *reliability.ObserveEngine // ACK-observe metrics (no enforcement)
+	localSeq       uint32                     // monotonic counter (TCP doesn't set SeqNo)
+	closed         bool
+	mu             sync.Mutex
+	connOnce       sync.Once
+	connView       net.Conn // cached net.Conn wrapper
+}
+
+// attachGrantDebouncer initializes st.grantDebouncer bound to st.window
+// and st.session.sendWindowUpdateAgnostic. Called after the stream is
+// fully constructed + registered so the session back-reference is live.
+// Safe to call once per stream; no-op if already attached.
+func (st *tcpStream) attachGrantDebouncer() {
+	if st.grantDebouncer != nil || st.window == nil || st.session == nil {
+		return
+	}
+	initialCredit := st.config.InitialCredit
+	if initialCredit <= 0 {
+		initialCredit = flow.DefaultStreamCredit
+	}
+	st.grantDebouncer = newGrantDebouncer(
+		st.window,
+		st.session.sendWindowUpdateAgnostic,
+		st.streamID,
+		int64(float64(initialCredit)*GrantImmediateFraction),
+	)
+}
+
+// teardown releases per-stream resources that must not outlive the
+// stream itself. Idempotent.
+func (st *tcpStream) teardown() {
+	if st.grantDebouncer != nil {
+		st.grantDebouncer.Close()
+	}
 }
 
 // NewTCPSession creates an Aether session over a TCP-family connection.
@@ -405,6 +441,7 @@ func (s *TCPSession) handleOpen(frame *aether.Frame) {
 	if st != candidate {
 		return
 	}
+	st.attachGrantDebouncer()
 	st.state.Transition(aether.EventRecvOpen)
 
 	s.sched.Register(frame.StreamID, payload.Priority, payload.Dependency)
@@ -448,6 +485,7 @@ func (s *TCPSession) handleImplicitOpen(frame *aether.Frame) {
 	if st != candidate {
 		return
 	}
+	st.attachGrantDebouncer()
 	st.state.Transition(aether.EventRecvData)
 
 	s.sched.Register(frame.StreamID, cfg.Priority, cfg.Dependency)
@@ -465,6 +503,7 @@ func (s *TCPSession) handleClose(frame *aether.Frame) {
 	if ok {
 		st.state.Transition(aether.EventRecvFIN)
 		if !st.state.IsOpen() {
+			st.teardown()
 			close(st.recvCh)
 		}
 	}
@@ -481,6 +520,7 @@ func (s *TCPSession) handleReset(frame *aether.Frame) {
 	s.compressor.RemoveStream(frame.StreamID)
 	if ok {
 		st.state.Transition(aether.EventRecvReset)
+		st.teardown()
 		close(st.recvCh)
 		s.sched.Unregister(frame.StreamID)
 	}
@@ -683,6 +723,7 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 	if s.registerStream(st, false) == nil {
 		return nil, fmt.Errorf("stream %d: registerStream returned nil", cfg.StreamID)
 	}
+	st.attachGrantDebouncer()
 
 	s.sched.Register(cfg.StreamID, cfg.Priority, cfg.Dependency)
 
@@ -1054,6 +1095,12 @@ func (st *tcpStream) Receive(ctx context.Context) ([]byte, error) {
 		if !ok {
 			return nil, io.EOF
 		}
+		// Consume-driven grant (1B): record the app-consumed bytes in the
+		// stream-level debouncer so WINDOW_UPDATE emission advances with
+		// application progress, not frame-receipt.
+		if st.grantDebouncer != nil {
+			st.grantDebouncer.Record(int64(len(data)))
+		}
 		return data, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -1064,6 +1111,7 @@ func (st *tcpStream) Receive(ctx context.Context) ([]byte, error) {
 
 func (st *tcpStream) Close() error {
 	st.state.Transition(aether.EventSendFIN)
+	st.teardown()
 	frame := &aether.Frame{
 		SenderID:   st.session.localPeerID,
 		ReceiverID: st.session.remotePeerID,
@@ -1075,6 +1123,7 @@ func (st *tcpStream) Close() error {
 
 func (st *tcpStream) Reset(reason aether.ResetReason) error {
 	st.state.Transition(aether.EventSendReset)
+	st.teardown()
 	payload := aether.EncodeReset(reason)
 	frame := &aether.Frame{
 		SenderID:   st.session.localPeerID,
