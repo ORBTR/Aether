@@ -112,13 +112,14 @@ func TestDecodeFrame_RejectsOversizedPayload(t *testing.T) {
 }
 
 // TestEncodeDecodeCompositeACK_RoundTrip covers the ACK v2 format with
-// all extension bits, including the S1 caps and the ECN extension (#15).
+// all extension bits: S1 caps, ECN (#15), and the 1D window-credit
+// piggyback extension.
 func TestEncodeDecodeCompositeACK_RoundTrip(t *testing.T) {
 	ack := &CompositeACK{
 		BaseACK:  1000,
 		AckDelay: 42,
 		Bitmap:   make([]byte, 8),
-		Flags:    CACKHasExtRanges | CACKHasDropped | CACKHasLossDensity | CACKHasECN | CACKHasGaps,
+		Flags:    CACKHasExtRanges | CACKHasDropped | CACKHasLossDensity | CACKHasECN | CACKHasGaps | CACKHasWindowCredit,
 		ExtRanges: []SACKBlock{
 			{Start: 2000, End: 2005},
 			{Start: 3000, End: 3100},
@@ -126,8 +127,9 @@ func TestEncodeDecodeCompositeACK_RoundTrip(t *testing.T) {
 		DroppedRanges: []SACKBlock{
 			{Start: 500, End: 510},
 		},
-		LossRate: 1234,
-		CEBytes:  4096,
+		LossRate:     1234,
+		CEBytes:      4096,
+		WindowCredit: 8_388_608, // 8 MB cumulative grant
 	}
 	ack.Bitmap[0] = 0b10101010
 	ack.Bitmap[4] = 0b01010101
@@ -161,6 +163,51 @@ func TestEncodeDecodeCompositeACK_RoundTrip(t *testing.T) {
 	}
 	if decoded.CEBytes != ack.CEBytes {
 		t.Errorf("CEBytes: got %d want %d (ECN round-trip)", decoded.CEBytes, ack.CEBytes)
+	}
+	if decoded.WindowCredit != ack.WindowCredit {
+		t.Errorf("WindowCredit: got %d want %d (1D round-trip)", decoded.WindowCredit, ack.WindowCredit)
+	}
+}
+
+// 1D round-trip with only the window-credit flag — isolates the new
+// extension from other extension bits so a decode-order bug specific to
+// the window-credit path can be pinned precisely.
+func TestCompositeACK_WithWindowCredit_RoundTripIsolated(t *testing.T) {
+	ack := &CompositeACK{
+		BaseACK:      500,
+		AckDelay:     10,
+		Flags:        CACKHasWindowCredit,
+		WindowCredit: 1_234_567_890,
+	}
+	decoded := DecodeCompositeACK(EncodeCompositeACK(ack))
+	if decoded == nil {
+		t.Fatal("decode returned nil")
+	}
+	if decoded.WindowCredit != ack.WindowCredit {
+		t.Errorf("isolated WindowCredit round-trip: got %d want %d",
+			decoded.WindowCredit, ack.WindowCredit)
+	}
+	if decoded.Flags&CACKHasWindowCredit == 0 {
+		t.Error("CACKHasWindowCredit flag missing after round-trip")
+	}
+}
+
+// 1D: when the flag is NOT set, WindowCredit stays zero on decode. This
+// is the boundary test that catches a bug where the decoder might read
+// stale bytes from the stream because an unguarded 8-byte read ignores
+// the flag.
+func TestCompositeACK_WithoutWindowCredit_StaysZero(t *testing.T) {
+	ack := &CompositeACK{
+		BaseACK:  500,
+		AckDelay: 10,
+		Flags:    0, // no extensions
+	}
+	decoded := DecodeCompositeACK(EncodeCompositeACK(ack))
+	if decoded == nil {
+		t.Fatal("decode returned nil")
+	}
+	if decoded.WindowCredit != 0 {
+		t.Errorf("WindowCredit should be 0 when flag not set, got %d", decoded.WindowCredit)
 	}
 }
 

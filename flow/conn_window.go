@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/sync/semaphore"
 )
@@ -71,11 +72,16 @@ type ConnWindow struct {
 	grantsEmitted  int64
 	grantsReceived int64
 
-	// Grant-trigger telemetry — mirrors StreamWindow. See the three-
+	// Grant-trigger telemetry — mirrors StreamWindow. See the four-
 	// trigger comment on StreamWindow.ReceiverConsume for rationale.
 	thresholdGrants uint64
 	eagerGrants     uint64
 	watermarkGrants uint64
+	timedGrants     uint64
+
+	// lastGrantTime drives the TIMED trigger; initialized at construction
+	// so a brand-new conn can't fire TIMED on the very first payload.
+	lastGrantTime time.Time
 }
 
 // NewConnWindow creates a connection-level flow control window.
@@ -98,6 +104,7 @@ func NewConnWindow(initialCredit int64) *ConnWindow {
 		initialDeficit: deficit,
 		initialSize:    initialCredit,
 		recvCredit:     initialCredit,
+		lastGrantTime:  time.Now(),
 	}
 }
 
@@ -122,6 +129,27 @@ func (w *ConnWindow) Consume(ctx context.Context, n int64) error {
 	w.dataOutstanding += n
 	w.mu.Unlock()
 	return nil
+}
+
+// ReleaseOnACK releases connection-level sender credit corresponding to
+// bytes the peer acknowledged. Delta-based (caller passes sum of newly-
+// acked Frame.Length), capped at dataOutstanding so ACK-path and
+// WINDOW_UPDATE-path together never over-release. 1C design — see the
+// StreamWindow.ReleaseOnACK doc-comment for full rationale.
+func (w *ConnWindow) ReleaseOnACK(ackedBytesDelta int64) {
+	if ackedBytesDelta <= 0 {
+		return
+	}
+	w.mu.Lock()
+	release := ackedBytesDelta
+	if release > w.dataOutstanding {
+		release = w.dataOutstanding
+	}
+	w.dataOutstanding -= release
+	w.mu.Unlock()
+	if release > 0 {
+		w.sem.Release(release)
+	}
 }
 
 // ApplyUpdate processes a connection-level WINDOW_UPDATE where credit is
@@ -151,18 +179,20 @@ func (w *ConnWindow) ApplyUpdate(credit int64) {
 }
 
 // ReceiverConsume records receiver consumption and returns the CUMULATIVE
-// grant total if any of the three grant triggers fire (0 otherwise).
+// grant total if any of the four grant triggers fire (0 otherwise).
 //
-// Three triggers mirror StreamWindow.ReceiverConsume — see that doc-comment
+// Four triggers mirror StreamWindow.ReceiverConsume — see that doc-comment
 // for the full rationale. Summary:
 //   - THRESHOLD: sinceLastGrant >= 25% of initial (steady-state)
 //   - EAGER:     this single payload >= 50% of threshold (burst)
 //   - WATERMARK: recvCredit < 25% of initialSize (pre-stall)
+//   - TIMED:     wall-clock gap since lastGrantTime >= GrantMaxInterval
+//     when any bytes have been consumed (small-payload-large-window gap)
 //
 // Conn-level typically carries aggregate gossip traffic where per-stream
 // flow control is the main gate, but the conn window still stalls the
 // whole connection if it runs dry faster than grants return — so the same
-// three-trigger logic applies here.
+// trigger logic applies here.
 func (w *ConnWindow) ReceiverConsume(n int64) int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -181,6 +211,8 @@ func (w *ConnWindow) ReceiverConsume(n int64) int64 {
 		return w.grantLocked(sinceLastGrant, "eager")
 	case w.recvCredit < lowWatermark && sinceLastGrant > 0:
 		return w.grantLocked(sinceLastGrant, "watermark")
+	case sinceLastGrant > 0 && time.Since(w.lastGrantTime) >= GrantMaxInterval:
+		return w.grantLocked(sinceLastGrant, "timed")
 	}
 	return 0
 }
@@ -199,6 +231,7 @@ func (w *ConnWindow) grantLocked(sinceLastGrant int64, trigger string) int64 {
 	w.recvCredit += grant
 	w.lastGrant = w.consumed
 	w.grantsEmitted += grant
+	w.lastGrantTime = time.Now()
 	switch trigger {
 	case "threshold":
 		atomic.AddUint64(&w.thresholdGrants, 1)
@@ -206,6 +239,8 @@ func (w *ConnWindow) grantLocked(sinceLastGrant int64, trigger string) int64 {
 		atomic.AddUint64(&w.eagerGrants, 1)
 	case "watermark":
 		atomic.AddUint64(&w.watermarkGrants, 1)
+	case "timed":
+		atomic.AddUint64(&w.timedGrants, 1)
 	}
 	return w.grantsEmitted
 }
@@ -227,6 +262,7 @@ type ConnStats struct {
 	ThresholdGrants uint64
 	EagerGrants     uint64
 	WatermarkGrants uint64
+	TimedGrants     uint64
 }
 
 // Stats returns a snapshot of the conn window's state. Lock-free read of
@@ -244,6 +280,7 @@ func (w *ConnWindow) Stats() ConnStats {
 	out.ThresholdGrants = atomic.LoadUint64(&w.thresholdGrants)
 	out.EagerGrants = atomic.LoadUint64(&w.eagerGrants)
 	out.WatermarkGrants = atomic.LoadUint64(&w.watermarkGrants)
+	out.TimedGrants = atomic.LoadUint64(&w.timedGrants)
 	return out
 }
 

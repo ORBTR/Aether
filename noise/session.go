@@ -43,7 +43,16 @@ func extractNoiseConn(session aether.Connection) (*noiseConn, error) {
 }
 
 type noiseConn struct {
-	udp        *net.UDPConn
+	// conn is the substrate carrying Noise-encrypted frames. UDP is the
+	// primary concrete type (listener + dial paths both pass a
+	// *net.UDPConn), but widening to net.Conn lets browser-transport
+	// (WASM) supply an RTCDataChannel wrapper or a WebSocket wrapper
+	// via noise.DialOverConn / AcceptOverConn without duplicating the
+	// whole session layer. Only the three methods Read / Write / Close
+	// + LocalAddr are used through this field — all generic net.Conn.
+	// UDP-specific methods (WriteToUDP) live in writeFunc which the
+	// listener path sets from its own concrete *net.UDPConn.
+	conn       net.Conn
 	remote     *net.UDPAddr
 	remoteNode aether.NodeID // Added for Relay
 	send       *noise.CipherState
@@ -97,7 +106,7 @@ func newNoiseConnDial(conn *net.UDPConn, remote *net.UDPAddr, remoteNode aether.
 		inboxSize = vl1.DefaultInboxSize
 	}
 	nc := &noiseConn{
-		udp:        conn,
+		conn:       conn,
 		remote:     remote,
 		remoteNode: remoteNode,
 		send:       send,
@@ -128,7 +137,7 @@ func newNoiseConnListener(ptr *noiseListener, send, recv *noise.CipherState, rem
 		inboxSize = vl1.DefaultInboxSize
 	}
 	nc := &noiseConn{
-		udp:        udpConn,
+		conn:       udpConn,
 		remote:     remote,
 		remoteNode: remoteNode,
 		send:       send,
@@ -163,7 +172,7 @@ func (c *noiseConn) enableExplicitNonce() {
 func (c *noiseConn) runReader() {
 	buf := make([]byte, c.maxPacket)
 	for {
-		n, err := c.udp.Read(buf)
+		n, err := c.conn.Read(buf)
 		if err != nil {
 			// Deadline timeouts are not fatal — the gossip layer sets
 			// temporary deadlines for exchange windows. Just retry.
@@ -606,7 +615,7 @@ func (s *noiseConnSession) Receive(ctx context.Context) ([]byte, error) {
 func (s *noiseConnSession) Close() error                  { return s.conn.Close() }
 func (s *noiseConnSession) RemoteAddr() net.Addr           { return s.conn.RemoteAddr() }
 func (s *noiseConnSession) RemoteNodeID() aether.NodeID    { return s.nodeID }
-func (s *noiseConnSession) NetConn() net.Conn              { return s.conn.udp }
+func (s *noiseConnSession) NetConn() net.Conn              { return s.conn.conn }
 func (s *noiseConnSession) Protocol() aether.Protocol      { return aether.ProtoNoise }
 func (s *noiseConnSession) OnClose(fn func())              { /* noise lifecycle managed by transport */ }
 

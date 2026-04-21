@@ -347,12 +347,13 @@ const MaxSACKBlocks = 4
 type CompositeACKFlags byte
 
 const (
-	CACKHasExtRanges   CompositeACKFlags = 0x01 // Extended SACK ranges follow (max 8)
-	CACKHasDropped     CompositeACKFlags = 0x02 // Dropped ranges follow (max 4, sorted, non-overlapping, merged)
-	CACKHasLossDensity CompositeACKFlags = 0x04 // 2-byte advisory loss rate follows
-	CACKHasECN         CompositeACKFlags = 0x08 // ECN extension: 4-byte CE-marked-byte counter (Concern #15)
-	CACKInvertedBitmap CompositeACKFlags = 0x10 // Reserved for future use: bit=1 means MISSING. Interleaved FEC (FECInterleaved) now handles burst loss recovery via two offset XOR groups in the FEC layer; this flag is kept for forward-compatibility with a potential future ACK-layer loss signaling mode.
-	CACKHasGaps        CompositeACKFlags = 0x20 // Receive window has gaps. ACK-lite (BitmapLen=0) ONLY valid when HasGaps=0
+	CACKHasExtRanges    CompositeACKFlags = 0x01 // Extended SACK ranges follow (max 8)
+	CACKHasDropped      CompositeACKFlags = 0x02 // Dropped ranges follow (max 4, sorted, non-overlapping, merged)
+	CACKHasLossDensity  CompositeACKFlags = 0x04 // 2-byte advisory loss rate follows
+	CACKHasECN          CompositeACKFlags = 0x08 // ECN extension: 4-byte CE-marked-byte counter (Concern #15)
+	CACKInvertedBitmap  CompositeACKFlags = 0x10 // Reserved for future use: bit=1 means MISSING. Interleaved FEC (FECInterleaved) now handles burst loss recovery via two offset XOR groups in the FEC layer; this flag is kept for forward-compatibility with a potential future ACK-layer loss signaling mode.
+	CACKHasGaps         CompositeACKFlags = 0x20 // Receive window has gaps. ACK-lite (BitmapLen=0) ONLY valid when HasGaps=0
+	CACKHasWindowCredit CompositeACKFlags = 0x40 // Window-credit extension: 8-byte cumulative stream-level WINDOW_UPDATE grant piggybacked on the ACK (1D). Eliminates a separate WINDOW_UPDATE frame when the receiver has granted new credit for this stream. Sender applies via StreamWindow.ApplyUpdate with the same cumulative semantics as a standalone WINDOW_UPDATE.
 )
 
 // FlagCOMPOSITE_ACK is set on TypeACK frames that use the Composite ACK format.
@@ -375,6 +376,7 @@ type CompositeACK struct {
 	DroppedRanges []SACKBlock // ranges receiver has dropped (max 4)
 	LossRate      uint16      // loss% × 100 over last 256 packets (0-10000). Advisory only.
 	CEBytes       uint32      // ECN: cumulative bytes of CE-marked packets observed since last ACK (#15)
+	WindowCredit  uint64      // Cumulative stream-level WINDOW_UPDATE grant piggybacked on this ACK (1D). Same semantics as the WINDOW_UPDATE frame payload: cumulative, not delta; sender's ApplyUpdate drops stale/duplicate values via the grantsReceived cursor.
 }
 
 // Valid bitmap lengths in bytes.
