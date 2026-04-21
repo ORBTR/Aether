@@ -782,9 +782,21 @@ func (s *TCPSession) CloseWithError(err error) error {
 				close(s.tickStop)
 			}
 		}
+		if s.streamGC != nil {
+			s.streamGC.Stop()
+		}
 		s.conn.Close()
 	})
 	return nil
+}
+
+// CloseErr returns the error the session was closed with, or nil if it
+// was closed cleanly (or is still open). Satisfies the optional
+// aether.CloseErrorReporter interface so the HSTLES connection manager
+// can trigger grade-based transport fallback when it sees
+// aether.ErrSessionStuck (or another fatal close reason).
+func (s *TCPSession) CloseErr() error {
+	return s.closeErr
 }
 
 // housekeepingTick runs the protocol-agnostic periodic maintenance

@@ -22,6 +22,7 @@ type StreamGC struct {
 	idleTimeout  time.Duration
 	resetFn      func(streamID uint64) // callback to reset idle stream
 	stopCh       chan struct{}
+	stopOnce     sync.Once
 }
 
 // NewStreamGC creates a stream garbage collector.
@@ -73,9 +74,13 @@ func (g *StreamGC) Start() {
 	}
 }
 
-// Stop halts the GC.
+// Stop halts the GC. Idempotent — safe to call multiple times and from
+// multiple goroutines. Exiting the goroutine breaks the root chain that
+// pinned the owning session via resetFn's closure.
 func (g *StreamGC) Stop() {
-	close(g.stopCh)
+	g.stopOnce.Do(func() {
+		close(g.stopCh)
+	})
 }
 
 // sweep checks all tracked streams for idle timeout.

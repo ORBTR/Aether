@@ -42,6 +42,21 @@ type noiseStream struct {
 	fragBuf     *FragmentBuffer              // reassembly buffer for fragmented payloads
 	connOnce    sync.Once                    // thread-safe Conn() init
 	conn        net.Conn                     // cached net.Conn wrapper
+
+	// Stall-detection progress markers, updated in handleACK and consulted
+	// in reliabilityTick. Colocated with the stream so they die with it
+	// (no session-level map to clean up) and atomic so handleACK can write
+	// without contending on s.mu.
+	//
+	// lastBaseACKSeen: largest BaseACK value seen for this stream so far
+	// (wraps with the uint32 SeqNo space — monotonic comparison uses the
+	// prev<new check).
+	//
+	// lastProgressAtUnixNano: time.Now().UnixNano() at the instant
+	// lastBaseACKSeen advanced. Zero means "no progress observed yet",
+	// which the tick treats as "don't probe".
+	lastBaseACKSeen        atomic.Uint32
+	lastProgressAtUnixNano atomic.Int64
 }
 
 // createStream creates a new stream with full reliability infrastructure via Engine.
@@ -325,8 +340,19 @@ func (st *noiseStream) Reset(reason aether.ResetReason) error {
 		Length:     uint32(len(payload)),
 		Payload:    payload,
 	}
-	st.session.sched.Unregister(st.streamID)
-	return st.session.writeFrame(frame)
+	// Send the wire RESET first, then clean up local session state.
+	// Previously only sched.Unregister was called, which left the
+	// s.streams entry and the streamGC tracker alive — both are
+	// now released here so local Reset is fully symmetric with
+	// the peer-initiated handleReset path.
+	err := st.session.writeFrame(frame)
+	st.session.mu.Lock()
+	if _, ok := st.session.streams[st.streamID]; ok {
+		delete(st.session.streams, st.streamID)
+	}
+	st.session.mu.Unlock()
+	st.session.releaseStream(st.streamID)
+	return err
 }
 
 func (st *noiseStream) SetPriority(weight uint8, dependency uint64) {
