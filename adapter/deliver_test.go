@@ -17,13 +17,13 @@ import (
 	"github.com/ORBTR/aether/flow"
 )
 
-// 1B end-to-end: a slow consumer takes meaningfully longer to refill
-// the sender's credit than a fast consumer. That's what application-
-// level backpressure MEANS — credit availability on the sender side
-// tracks the receiver's actual consumption rate, not the arrival rate
-// of frames into recvCh. Under the old receive-driven model, grants
-// emitted as soon as a frame landed in recvCh, so a slow consumer gave
-// no signal to the sender at all.
+// End-to-end assertion that application-read-driven grants produce real
+// backpressure: a slow consumer takes meaningfully longer to refill the
+// sender's credit than a fast consumer. That's what application-level
+// backpressure MEANS — credit availability on the sender side tracks
+// the receiver's actual consumption rate, not the arrival rate of
+// frames into recvCh. If grants emitted as soon as a frame landed in
+// recvCh, a slow consumer would give no signal to the sender at all.
 //
 // Strategy:
 //   - Sender drains its full 4 MB window with 20 × 128 KB payloads.
@@ -113,8 +113,9 @@ func TestConsumeDrivenGrants_SlowConsumerBackpressuresSender(t *testing.T) {
 
 	// Backpressure assertion: a 10 ms-per-payload slow consumer MUST
 	// take noticeably longer to refill than an instant consumer. If
-	// they're the same, grant emission is decoupled from application
-	// reads (the old bug).
+	// they're the same, grant emission is no longer driven by
+	// application reads — meaning the sender gets credit regardless of
+	// whether the application has consumed anything.
 	if slow < fast {
 		t.Errorf("slow consumer refilled FASTER than fast (%v < %v) — should never happen",
 			slow, fast)

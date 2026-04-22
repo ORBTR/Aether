@@ -18,7 +18,7 @@ const (
 	FECNone        FECLevel = 0 // No FEC
 	FECBasicXOR    FECLevel = 1 // XOR, group=4, recovers 1 loss (25% overhead)
 	FECInterleaved FECLevel = 2 // Interleaved XOR: 2 offset groups, recovers burst of 2 (50% overhead)
-	FECReedSolomon FECLevel = 3 // Reed-Solomon RS(k,m): recovers up to m losses per group (Concern #8)
+	FECReedSolomon FECLevel = 3 // Reed-Solomon RS(k,m): recovers up to m losses per group
 )
 
 // InterleavedFECEncoder generates interleaved XOR-based FEC repair packets.

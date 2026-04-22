@@ -28,14 +28,32 @@ const (
 	// MaxGroupsPerStream caps the number of concurrent fragment groups
 	// being reassembled on a single stream. Without this, a peer sending
 	// index=0 fragments with never-completing totals would grow the
-	// per-stream groups map without bound.
-	MaxGroupsPerStream = 16
+	// per-stream groups map without bound. Realistic workloads never
+	// interleave more than 1-2 fragmented messages on a stream at
+	// once; 4 leaves headroom for reasonable reordering scenarios
+	// without amplifying per-stream buffer memory.
+	MaxGroupsPerStream = 4
 
 	// MaxStreamsInFragBuffer caps how many streams can appear in the
 	// fragment buffer at once. Secondary defence against a flood of
 	// single-fragment open-and-abandon groups spread across fresh
 	// stream IDs.
 	MaxStreamsInFragBuffer = 1024
+
+	// DefaultFragBufferMaxBytes caps the total bytes held across all
+	// in-progress fragment groups in one FragmentBuffer. Prevents a
+	// peer from pinning arbitrary memory by opening many near-complete
+	// groups and never sending the final fragment. 512 KB covers any
+	// realistic single-message reassembly (max ~306 KB at 1200-byte
+	// MSS) with headroom for a couple of overlapping groups.
+	DefaultFragBufferMaxBytes int64 = 512 * 1024
+
+	// DefaultFragGroupMaxAge caps how long an incomplete group may
+	// linger before being garbage-collected by the next Add call. The
+	// per-buffer `timeout` field still overrides this when set, but in
+	// the default configuration groups older than this are dropped
+	// eagerly to reclaim their bytes.
+	DefaultFragGroupMaxAge = 30 * time.Second
 )
 
 // SplitPayload splits a large payload into MSS-sized fragments.
@@ -94,17 +112,27 @@ func ParseFragmentHeader(data []byte) (index, total uint8, payload []byte, err e
 
 // FragmentBuffer reassembles fragmented payloads, scoped per-stream so
 // concurrent messages on different streams (or interleaved retransmits on
-// the same stream) cannot corrupt each other's groups. Concern #18.
+// the same stream) cannot corrupt each other's groups.
 //
 // Group key = SeqNo of the first fragment (index=0). The reliability layer
 // guarantees in-order delivery within a stream, so when an index=0 fragment
 // arrives we know its SeqNo identifies a brand-new message; subsequent
 // fragments (index > 0) join whichever group is currently being assembled
 // on that stream.
+//
+// Memory bounds: the buffer enforces three independent caps that together
+// bound worst-case memory. MaxStreamsInFragBuffer caps the top-level map,
+// MaxGroupsPerStream caps the per-stream group map, and
+// maxBufferedBytes caps the cumulative bytes held across all groups.
+// A group older than groupMaxAge is garbage-collected on the next Add
+// call regardless of whether any more fragments arrive for it.
 type FragmentBuffer struct {
-	mu      sync.Mutex
-	streams map[uint64]*streamFragmentState
-	timeout time.Duration
+	mu               sync.Mutex
+	streams          map[uint64]*streamFragmentState
+	timeout          time.Duration
+	maxBufferedBytes int64
+	groupMaxAge      time.Duration
+	bufferedBytes    int64
 }
 
 type streamFragmentState struct {
@@ -119,14 +147,42 @@ type fragmentGroup struct {
 	total     int
 	received  int
 	created   time.Time
+	bytes     int64 // sum of len(fragment) across populated slots
 }
 
-// NewFragmentBuffer creates a reassembly buffer.
+// NewFragmentBuffer creates a reassembly buffer with default byte and
+// age caps (DefaultFragBufferMaxBytes, DefaultFragGroupMaxAge).
 func NewFragmentBuffer() *FragmentBuffer {
 	return &FragmentBuffer{
-		streams: make(map[uint64]*streamFragmentState),
-		timeout: fragTimeout,
+		streams:          make(map[uint64]*streamFragmentState),
+		timeout:          fragTimeout,
+		maxBufferedBytes: DefaultFragBufferMaxBytes,
+		groupMaxAge:      DefaultFragGroupMaxAge,
 	}
+}
+
+// SetMaxBufferedBytes overrides the cumulative byte cap across all
+// in-progress groups. Pass 0 to disable the byte cap (discouraged; the
+// frame-count caps alone do not bound payload bytes).
+func (fb *FragmentBuffer) SetMaxBufferedBytes(max int64) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	if max < 0 {
+		max = 0
+	}
+	fb.maxBufferedBytes = max
+}
+
+// SetGroupMaxAge overrides the per-group staleness cap. Groups older
+// than this are garbage-collected lazily on the next Add. Pass 0 to
+// disable age-based pruning (falls back to `timeout` only).
+func (fb *FragmentBuffer) SetGroupMaxAge(d time.Duration) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	if d < 0 {
+		d = 0
+	}
+	fb.groupMaxAge = d
 }
 
 // Add processes a fragment and returns the reassembled payload when all
@@ -153,11 +209,20 @@ func (fb *FragmentBuffer) Add(streamID uint64, seqNo uint32, data []byte) ([]byt
 		fb.streams[streamID] = ss
 	}
 
-	// Prune expired groups across all streams (cheap; most streams have 0–1 groups).
+	// Prune expired groups across all streams (cheap; most streams have
+	// 0-1 groups). A group is expired when either the legacy `timeout`
+	// elapses or the newer `groupMaxAge` cap elapses — whichever is
+	// shorter. Reclaiming bytes here is how the buffer recovers when a
+	// peer opens lots of near-complete groups and never finishes.
 	now := time.Now()
+	ageCap := fb.timeout
+	if fb.groupMaxAge > 0 && (ageCap == 0 || fb.groupMaxAge < ageCap) {
+		ageCap = fb.groupMaxAge
+	}
 	for sid, st := range fb.streams {
 		for k, g := range st.groups {
-			if now.Sub(g.created) > fb.timeout {
+			if ageCap > 0 && now.Sub(g.created) > ageCap {
+				fb.bufferedBytes -= g.bytes
 				delete(st.groups, k)
 			}
 		}
@@ -166,12 +231,26 @@ func (fb *FragmentBuffer) Add(streamID uint64, seqNo uint32, data []byte) ([]byt
 			delete(fb.streams, sid)
 		}
 	}
+	if fb.bufferedBytes < 0 {
+		fb.bufferedBytes = 0
+	}
 
 	// Per-stream cap check — refuse new-group admission rather than grow
 	// unbounded. Existing groups (index > 0 joining their current group)
 	// still proceed since they don't add a new map entry.
 	if index == 0 && len(ss.groups) >= MaxGroupsPerStream {
 		return nil, fmt.Errorf("fragment buffer: stream %d groups cap %d reached", streamID, MaxGroupsPerStream)
+	}
+
+	// Byte cap check — reject fragments that would push cumulative
+	// buffered bytes past the configured limit. Frames already part of
+	// the current group still pay this cost, so a small cap combined
+	// with many-fragment messages could starve legitimate senders;
+	// operators who hit this should tune maxBufferedBytes upward rather
+	// than lowering fragment sizes.
+	if fb.maxBufferedBytes > 0 && fb.bufferedBytes+int64(len(payload)) > fb.maxBufferedBytes {
+		return nil, fmt.Errorf("fragment buffer: byte cap %d reached (buffered=%d, incoming=%d)",
+			fb.maxBufferedBytes, fb.bufferedBytes, len(payload))
 	}
 
 	// index=0 → new group. Caller can either supply the originating frame's
@@ -210,10 +289,19 @@ func (fb *FragmentBuffer) Add(streamID uint64, seqNo uint32, data []byte) ([]byt
 		return nil, fmt.Errorf("fragment index %d >= total %d", index, group.total)
 	}
 
-	if group.fragments[index] == nil {
+	// Track per-group and buffer-wide byte usage. Replacing an existing
+	// slot (duplicate fragment) nets to zero; installing a new slot
+	// increases both counters by len(payload).
+	prevLen := 0
+	if group.fragments[index] != nil {
+		prevLen = len(group.fragments[index])
+	} else {
 		group.received++
 	}
 	group.fragments[index] = payload
+	delta := int64(len(payload) - prevLen)
+	group.bytes += delta
+	fb.bufferedBytes += delta
 
 	if group.received < group.total {
 		return nil, nil // more fragments needed
@@ -227,6 +315,10 @@ func (fb *FragmentBuffer) Add(streamID uint64, seqNo uint32, data []byte) ([]byt
 	assembled := make([]byte, 0, totalLen)
 	for _, f := range group.fragments {
 		assembled = append(assembled, f...)
+	}
+	fb.bufferedBytes -= group.bytes
+	if fb.bufferedBytes < 0 {
+		fb.bufferedBytes = 0
 	}
 	delete(ss.groups, groupKey)
 	if groupKey == ss.current {

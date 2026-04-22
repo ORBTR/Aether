@@ -165,10 +165,11 @@ func TestStreamWindow_ReceiverAutoGrant(t *testing.T) {
 	}
 }
 
-// Regression test for Bug A: in production, NewStreamWindow is called with
-// DefaultStreamCredit (256 KB), which equals DefaultMaxStreamCredit. The
-// earlier implementation pinned recvCredit at maxSize from construction, so
-// ReceiverConsume always returned 0 — no WINDOW_UPDATEs ever flowed.
+// Regression test: NewStreamWindow called with DefaultStreamCredit
+// (which equals DefaultMaxStreamCredit) must still produce grants. A
+// receiver that pinned recvCredit at maxSize from construction would
+// make ReceiverConsume return 0 forever, so no WINDOW_UPDATEs would
+// flow and the sender would stall after initial credit exhausts.
 func TestStreamWindow_ReceiverAutoGrant_ProductionConfig(t *testing.T) {
 	w := NewStreamWindow(DefaultStreamCredit) // initial == max (the real-world case)
 
@@ -176,7 +177,7 @@ func TestStreamWindow_ReceiverAutoGrant_ProductionConfig(t *testing.T) {
 	// Simulate enough receive activity to cross the threshold.
 	grant := w.ReceiverConsume(threshold + 1024)
 	if grant == 0 {
-		t.Fatal("Bug A regression: receiver returned 0 grant when initialCredit == maxSize — sender would never get WINDOW_UPDATE")
+		t.Fatal("receiver returned 0 grant when initialCredit == maxSize — sender would never get WINDOW_UPDATE")
 	}
 
 	// Further receipts should also produce grants, not drift to 0.
@@ -226,22 +227,22 @@ func TestConnWindow_ReceiverAutoGrant(t *testing.T) {
 	}
 }
 
-// Regression test for Bug A at the connection level: when receive flow is
+// Regression test at the connection level: when receive flow is
 // sustained, grants must continue to emit — they must not pin at zero once
 // recvCredit has aggregated to maxSize.
 func TestConnWindow_SustainedGrants(t *testing.T) {
 	w := NewConnWindow(DefaultConnCredit)
 
-	// Drive enough receive volume that the old bug (recvCredit never
-	// decremented) would cause grants to become 0 after the first few rounds.
-	// Here we expect grants to keep flowing as long as data keeps arriving.
+	// Drive enough receive volume that a receiver which never decremented
+	// recvCredit would have grants decay to 0 after the first few rounds.
+	// We expect grants to keep flowing as long as data keeps arriving.
 	total := int64(0)
 	for i := 0; i < 20; i++ {
 		g := w.ReceiverConsume(DefaultConnCredit / 2) // 512 KB per step
 		total += g
 	}
 	if total == 0 {
-		t.Fatal("Bug A regression: no grants emitted over 20 large-receive iterations")
+		t.Fatal("no grants emitted over 20 large-receive iterations")
 	}
 }
 
@@ -325,9 +326,9 @@ func TestStreamWindow_TimedTrigger_NoConsumeNoGrant(t *testing.T) {
 	}
 }
 
-// 1C regression: ReleaseOnACK releases sender credit via the reliability-
-// layer ACK path independent of WINDOW_UPDATE. Caps at dataOutstanding
-// so it composes safely with ApplyUpdate (both paths can fire; neither
+// ReleaseOnACK releases sender credit via the reliability-layer ACK
+// path independent of WINDOW_UPDATE. Caps at dataOutstanding so it
+// composes safely with ApplyUpdate (both paths can fire; neither
 // over-releases).
 func TestStreamWindow_ReleaseOnACK_ReleasesCredit(t *testing.T) {
 	w := NewStreamWindow(testCredit)

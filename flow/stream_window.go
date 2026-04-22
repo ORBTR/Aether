@@ -117,7 +117,7 @@ const ConsumeTimeout = 10 * time.Second
 //
 // Alternative design: a future direction is to drop the credit counter
 // entirely and gate Send on write-queue depth (QUIC/HTTP/2 style offsets).
-// That's a larger refactor and only makes sense if this design proves
+// Only worth considering if the current credit-based design proves
 // inadequate.
 type StreamWindow struct {
 	mu sync.Mutex
@@ -166,9 +166,10 @@ type StreamWindow struct {
 	//                    from peer; any incoming wire value ≤ this is stale
 	//                    and dropped by ApplyUpdate.
 	//   ackReleased    — cumulative bytes released through the ACK-driven
-	//                    path (1C). Purely observational; the release is
-	//                    still capped at dataOutstanding so it composes
-	//                    safely with ApplyUpdate's release path.
+	//                    (ReleaseOnACK) path. Purely observational; the
+	//                    release is still capped at dataOutstanding so
+	//                    it composes safely with ApplyUpdate's release
+	//                    path.
 	grantsEmitted  int64
 	grantsReceived int64
 	ackReleased    int64
@@ -204,13 +205,32 @@ type StreamWindow struct {
 // GrowWindow/ShrinkWindow can later move the deficit boundary to dynamically
 // resize without rebuilding the semaphore.
 func NewStreamWindow(initialCredit int64) *StreamWindow {
+	return NewStreamWindowWithCap(initialCredit, 0)
+}
+
+// NewStreamWindowWithCap is like NewStreamWindow but also bounds the
+// semaphore capacity (growth ceiling) at `maxCredit`. Streams carrying
+// small messages (gossip, control, keepalive) can use a small cap to
+// bound worst-case per-stream memory — the auto-tuner will never grow
+// the window above maxCredit regardless of RTT/BDP. A maxCredit of 0
+// falls back to the package-level MaxGrowableWindow ceiling.
+//
+// maxCredit is silently raised to initialCredit if the caller passes a
+// cap smaller than the starting window: the starting window always
+// wins, otherwise the construction invariants (semaphore capacity ≥
+// initialCredit) break.
+func NewStreamWindowWithCap(initialCredit, maxCredit int64) *StreamWindow {
 	if initialCredit <= 0 {
 		initialCredit = DefaultStreamCredit
 	}
-	// Semaphore capacity is MaxGrowableWindow unless the caller asked for a
-	// larger initial window — we never downsize the growth ceiling below the
-	// starting point.
+	// Semaphore capacity is MaxGrowableWindow unless the caller asked
+	// for a larger initial window OR explicitly capped growth via
+	// maxCredit. maxCredit <= 0 means "use the package default"; a
+	// positive value smaller than MaxGrowableWindow tightens the cap.
 	capacity := MaxGrowableWindow
+	if maxCredit > 0 {
+		capacity = maxCredit
+	}
 	if initialCredit > capacity {
 		capacity = initialCredit
 	}
@@ -293,8 +313,7 @@ func (w *StreamWindow) Consume(ctx context.Context, n int64) error {
 // The release is capped at dataOutstanding so ACK-path and WINDOW_UPDATE
 // path together never over-release. Whichever path delivers credit first
 // for a given byte wins; the other sees dataOutstanding already reduced
-// and releases nothing extra. This is the 1C design from the mesh-
-// stabilization plan.
+// and releases nothing extra.
 func (w *StreamWindow) ReleaseOnACK(ackedBytesDelta int64) {
 	if ackedBytesDelta <= 0 {
 		return
@@ -359,10 +378,11 @@ func (w *StreamWindow) ApplyUpdate(credit int64) {
 // Returns the credit to grant (for a WINDOW_UPDATE) if the threshold is met.
 // Returns 0 if no grant is needed yet.
 //
-// Bug-A fix: recvCredit is decremented by n so the cap check reflects the
-// currently-outstanding granted window. Previously recvCredit was never
-// decremented, pinning at maxSize with initialCredit == maxSize config so
-// every grant became 0 — the receiver never emitted a single WINDOW_UPDATE.
+// recvCredit must be decremented by n here so the cap check in the
+// grant computation reflects the currently-outstanding granted window.
+// Without this decrement, recvCredit pins at maxSize when initialCredit
+// == maxSize, every grant computes as 0, and the receiver never emits a
+// WINDOW_UPDATE.
 //
 // Grant consolidation: when the threshold fires, grant enough to restore
 // the sender's outstanding window to full (`currentWindow - recvCredit`)
@@ -632,8 +652,11 @@ func (w *StreamWindow) ResetPeak() {
 // unchanged if RTT is unknown or no data has been observed.
 //
 // Heuristic: target = max(peakOutstanding * 1.5, currentWindow * 0.5),
-// bounded by [initialSize, MaxGrowableWindow]. Reads Stats atomically
-// and does NOT mutate window state — safe for observational use.
+// bounded by [initialSize, maxSize]. The upper bound tracks the
+// per-stream growth cap (set via NewStreamWindowWithCap) rather than
+// the package default, so caller-imposed memory caps are honoured.
+// Reads Stats atomically and does NOT mutate window state — safe for
+// observational use.
 func (w *StreamWindow) SuggestedWindow() int64 {
 	s := w.Stats()
 	if s.LastRTT == 0 || s.PeakOutstanding == 0 {
@@ -648,8 +671,8 @@ func (w *StreamWindow) SuggestedWindow() int64 {
 	if target < w.initialSize {
 		target = w.initialSize
 	}
-	if target > MaxGrowableWindow {
-		target = MaxGrowableWindow
+	if target > w.maxSize {
+		target = w.maxSize
 	}
 	return target
 }

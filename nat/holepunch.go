@@ -3,7 +3,7 @@
  * Queries: licensing@hstles.com
  */
 
-// Coordinated NAT hole-punching (Concern #13 sub-phase 5b).
+// Coordinated NAT hole-punching.
 //
 // Provides the primitives both peers need to coordinate simultaneous
 // outbound UDP probes through their respective NATs. The actual

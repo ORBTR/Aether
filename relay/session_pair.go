@@ -32,7 +32,6 @@ type BytePipe interface {
 // versa, preserving full Aether framing. The relay never decrypts,
 // inspects, or modifies frames.
 //
-// This is the 5.3 half of the browser-transport architecture plan.
 // On relay.orbtr.io's `/mesh/aether-ws` accept path, the browser-side
 // argument is an aether.Connection produced by noise.AcceptOverConn;
 // the agent-side argument is an aether.Stream opened on the relay's

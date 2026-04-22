@@ -39,7 +39,6 @@ type Scheduler struct {
 	// can park on a select instead of polling with time.Sleep(1ms).
 	// Buffered at 1: a single pending signal collapses any number of
 	// Enqueue events that landed before the writeLoop drained.
-	// See _implementation_plan.md Concern #2.
 	wakeCh chan struct{}
 }
 

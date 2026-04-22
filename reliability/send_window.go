@@ -15,7 +15,7 @@ import (
 // Caps preventing CPU exhaustion from malicious Composite ACK frames.
 // An attacker post-authentication could otherwise craft an ACK that pins
 // the send CPU for seconds by claiming a huge cumulative jump or range.
-// See _SECURITY.md §3.2 / plan item S1.
+// See _SECURITY.md §3.2.
 const (
 	// MaxACKCumulativeJump caps the distance between the current send-window
 	// base and ack.BaseACK. A normal peer's BaseACK advances by small numbers
@@ -37,11 +37,11 @@ type SendEntry struct {
 	Retries int
 	Acked   bool
 
-	// BBRv2 per-packet delivery-rate sample (Concern #3). Stamped at
-	// send time by the adapter via congestion.BBRController.OnSend, read
-	// back by the adapter when the matching ACK arrives so it can call
-	// OnAckSampled instead of the degraded OnAck path. Opaque value —
-	// the SendWindow doesn't introspect it.
+	// BBRv2 per-packet delivery-rate sample. Stamped at send time by the
+	// adapter via congestion.BBRController.OnSend, read back by the
+	// adapter when the matching ACK arrives so it can call OnAckSampled
+	// instead of the degraded OnAck path. Opaque value — the SendWindow
+	// doesn't introspect it.
 	BBRSample interface{}
 }
 
@@ -56,7 +56,7 @@ type SendWindow struct {
 
 	// Atomic counter of Composite ACKs rejected due to validation failures
 	// (out-of-range BaseACK jump, oversized range, invalid bitmap length).
-	// See _SECURITY.md §3.2 / plan item S1.
+	// See _SECURITY.md §3.2.
 	suspiciousACKs uint64
 }
 
@@ -77,17 +77,28 @@ func NewSendWindow(maxSize int) *SendWindow {
 // Add stores a frame in the window and assigns the next SeqNo.
 // Returns the assigned SeqNo. The frame's SeqNo field is updated in-place.
 func (w *SendWindow) Add(frame *aether.Frame) uint32 {
+	seq, _ := w.AddEntry(frame)
+	return seq
+}
+
+// AddEntry is like Add but also returns the live *SendEntry so callers
+// (e.g. RetransmitQueue.EnqueueFromSend) can share the allocation
+// instead of building a parallel record with the same frame pointer.
+// The returned entry remains owned by the SendWindow; ACK paths may
+// clear it and callers must not retain the pointer past an Ack/Drop.
+func (w *SendWindow) AddEntry(frame *aether.Frame) (uint32, *SendEntry) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	seq := w.next
 	frame.SeqNo = seq
-	w.entries[seq] = &SendEntry{
+	entry := &SendEntry{
 		Frame:  frame,
 		SentAt: time.Now(),
 	}
+	w.entries[seq] = entry
 	w.next++
-	return seq
+	return seq, entry
 }
 
 // Ack marks a single SeqNo as acknowledged and returns the entry (for RTT calculation).
@@ -163,7 +174,7 @@ func (w *SendWindow) GetEntry(seqNo uint32) *SendEntry {
 func (w *SendWindow) ProcessCompositeACK(ack *aether.CompositeACK, reorderThreshold int) (acked []*SendEntry, nacks []uint32) {
 	// Validate bitmap length per spec: must be one of {0, 4, 8, 16, 32}
 	// bytes (i.e. {0, 32, 64, 128, 256} bits). Reject otherwise to prevent
-	// attacker-controlled scan loops. See _SECURITY.md §3.2 / plan item S1.
+	// attacker-controlled scan loops. See _SECURITY.md §3.2.
 	if !validBitmapLens[len(ack.Bitmap)] {
 		atomic.AddUint64(&w.suspiciousACKs, 1)
 		return nil, nil

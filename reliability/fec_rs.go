@@ -3,7 +3,7 @@
  * Queries: licensing@hstles.com
  */
 
-// Reed-Solomon FEC (Concern #8 — _implementation_plan.md).
+// Reed-Solomon FEC.
 //
 // RS(k, n) encodes k data shards into n total shards (n-k parity shards).
 // Any k of n shards can reconstruct the originals — meaning up to (n-k)

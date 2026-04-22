@@ -20,7 +20,7 @@ import (
 // TestNoiseRoundTrip tests a simple request/response exchange.
 func TestNoiseRoundTrip(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		t.Skip("Skipping on Windows: shared-socket UDP handshake dispatch is timing-sensitive (see Concern #G13)")
+		t.Skip("Skipping on Windows: shared-socket UDP handshake dispatch is timing-sensitive")
 	}
 	_, serverPriv, _ := ed25519.GenerateKey(rand.Reader)
 	serverPub := serverPriv.Public().(ed25519.PublicKey)

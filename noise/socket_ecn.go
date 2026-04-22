@@ -6,11 +6,11 @@
  */
 
 // ECN (Explicit Congestion Notification) receive-side plumbing for the
-// Noise-UDP transport — Concern #15, receive-side.
+// Noise-UDP transport.
 //
-// Protocol layer (wired earlier): `NoiseSession.RecordCEBytes(n)` folds
-// CE-marked byte counts into the next outbound CompositeACK via the
-// CACKHasECN flag + CEBytes field. The remote sender's adapter calls
+// Protocol layer: `NoiseSession.RecordCEBytes(n)` folds CE-marked byte
+// counts into the next outbound CompositeACK via the CACKHasECN flag +
+// CEBytes field. The remote sender's adapter calls
 // `congestion.Controller.OnCE(bytes)`, which CUBIC/BBR use to react one
 // RTT before queue overflow.
 //

@@ -20,10 +20,8 @@ type BaseConnection struct {
 	mu         sync.Mutex
 	// onCloseFns is a slice so multiple independent consumers (stream GC,
 	// session multipath promoter, metrics subscribers) can all register
-	// teardown callbacks without clobbering each other. Previously this
-	// was a single `func()` whose second registration silently overwrote
-	// the first — a latent correctness bug surfaced by the v0.0.168
-	// stack-wide review.
+	// teardown callbacks without clobbering each other. A single func()
+	// field would let a second registration silently overwrite the first.
 	onCloseFns []func()
 	initialRTT time.Duration // TCP handshake / dial RTT for cross-region latency
 }

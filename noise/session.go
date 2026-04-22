@@ -218,9 +218,10 @@ func (c *noiseConn) decryptAndDeliver(msg []byte) error {
 
 	switch msgType {
 	case relay.PacketTypeData:
-		// Double-select pattern: check closed first, then try send (Concern #7).
-		// This avoids the race between Close() and inbox send that previously
-		// required defer recover().
+		// Double-select pattern: check closed first, then try send. This
+		// avoids the race between Close() and inbox send that would
+		// otherwise require defer recover() to swallow sends on a closed
+		// channel.
 		select {
 		case <-c.closed:
 			return io.ErrClosedPipe
