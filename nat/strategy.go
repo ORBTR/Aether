@@ -3,7 +3,7 @@
  * Queries: licensing@hstles.com
  */
 
-// NAT strategy engine (Concern #13 sub-phase 5e).
+// NAT strategy engine.
 //
 // Glue layer that picks the right traversal method given both peers'
 // NATBehaviour, then runs them through the appropriate primitive

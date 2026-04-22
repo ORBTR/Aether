@@ -21,17 +21,17 @@ import (
 // It orchestrates: sequence assignment, ACK/SACK processing, retransmission,
 // RTT estimation, FEC encoding/decoding, and anti-replay protection.
 //
-// FEC mode (Concern #8): when EngineConfig.FECMode == FECReedSolomon,
-// `RSEnc` / `RSDec` are populated and the XOR `FEC`/`FECDec` fields stay
-// nil. When the mode is FECBasicXOR (or zero), the legacy XOR fields are
-// populated and `RSEnc`/`RSDec` stay nil. Callers that touch these fields
+// FEC mode: when EngineConfig.FECMode == FECReedSolomon, `RSEnc` /
+// `RSDec` are populated and the XOR `FEC`/`FECDec` fields stay nil.
+// When the mode is FECBasicXOR (or zero), the XOR fields are populated
+// and `RSEnc`/`RSDec` stay nil. Callers that touch these fields
 // directly should check both.
 //
-// Locking model (Concern #10): split into send-side and recv-side locks
-// so a busy receiver doesn't block the sender (and vice-versa) on
-// high-throughput streams. Each sub-component still has its own internal
-// lock — these mutexes only protect the engine-level orchestration that
-// touches multiple sub-components in one critical section.
+// Locking model: split into send-side and recv-side locks so a busy
+// receiver doesn't block the sender (and vice-versa) on high-throughput
+// streams. Each sub-component still has its own internal lock — these
+// mutexes only protect the engine-level orchestration that touches
+// multiple sub-components in one critical section.
 //
 //   sendMu — protects orchestration around SendWin / RetransmitQ
 //   recvMu — protects orchestration around RecvWin / Replay
@@ -68,7 +68,7 @@ type EngineConfig struct {
 	FECGroupSize int           // 0 = no FEC, >0 = XOR group size
 	// FECMode selects the FEC implementation. Defaults to FECBasicXOR
 	// when FECGroupSize > 0. Set to FECReedSolomon to switch the engine
-	// to k=FECGroupSize, m=FECParityShards Reed-Solomon (Concern #8).
+	// to k=FECGroupSize, m=FECParityShards Reed-Solomon.
 	FECMode FECLevel
 	// FECParityShards is the m parameter for Reed-Solomon. Ignored when
 	// FECMode != FECReedSolomon. Default: DefaultRSParityShards.
@@ -132,12 +132,15 @@ func (e *Engine) Send(frame *aether.Frame) uint32 {
 	e.sendMu.Lock()
 	defer e.sendMu.Unlock()
 
-	seqNo := e.SendWin.Add(frame)
+	seqNo, entry := e.SendWin.AddEntry(frame)
 	frame.SeqNo = seqNo
 
-	// Enqueue for retransmission (unless unreliable/best-effort)
+	// Enqueue for retransmission (unless unreliable/best-effort). Share
+	// the send-side entry so both queues reference one backing struct
+	// instead of two — saves an allocation per send and keeps metadata
+	// (BBRSample, Retries) consistent across the ACK/retransmit paths.
 	if e.Reliability == aether.ReliableOrdered || e.Reliability == aether.ReliableUnordered {
-		e.RetransmitQ.Enqueue(frame)
+		e.RetransmitQ.EnqueueFromSend(entry)
 	}
 
 	return seqNo

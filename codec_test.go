@@ -112,8 +112,8 @@ func TestDecodeFrame_RejectsOversizedPayload(t *testing.T) {
 }
 
 // TestEncodeDecodeCompositeACK_RoundTrip covers the ACK v2 format with
-// all extension bits: S1 caps, ECN (#15), and the 1D window-credit
-// piggyback extension.
+// all extension bits: the caps defense (see _SECURITY.md §3.2), ECN,
+// and the window-credit piggyback extension.
 func TestEncodeDecodeCompositeACK_RoundTrip(t *testing.T) {
 	ack := &CompositeACK{
 		BaseACK:  1000,
@@ -165,11 +165,11 @@ func TestEncodeDecodeCompositeACK_RoundTrip(t *testing.T) {
 		t.Errorf("CEBytes: got %d want %d (ECN round-trip)", decoded.CEBytes, ack.CEBytes)
 	}
 	if decoded.WindowCredit != ack.WindowCredit {
-		t.Errorf("WindowCredit: got %d want %d (1D round-trip)", decoded.WindowCredit, ack.WindowCredit)
+		t.Errorf("WindowCredit round-trip: got %d want %d", decoded.WindowCredit, ack.WindowCredit)
 	}
 }
 
-// 1D round-trip with only the window-credit flag — isolates the new
+// Round-trip with only the window-credit flag set — isolates the
 // extension from other extension bits so a decode-order bug specific to
 // the window-credit path can be pinned precisely.
 func TestCompositeACK_WithWindowCredit_RoundTripIsolated(t *testing.T) {
@@ -192,10 +192,10 @@ func TestCompositeACK_WithWindowCredit_RoundTripIsolated(t *testing.T) {
 	}
 }
 
-// 1D: when the flag is NOT set, WindowCredit stays zero on decode. This
-// is the boundary test that catches a bug where the decoder might read
-// stale bytes from the stream because an unguarded 8-byte read ignores
-// the flag.
+// When the window-credit flag is NOT set, WindowCredit must stay zero
+// on decode. This is the boundary test that catches an unguarded 8-byte
+// read path where the decoder could consume stream bytes belonging to a
+// later frame because it ignores the flag.
 func TestCompositeACK_WithoutWindowCredit_StaysZero(t *testing.T) {
 	ack := &CompositeACK{
 		BaseACK:  500,

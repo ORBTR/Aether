@@ -5,9 +5,9 @@
 
 // Build-tag agnostic: these functions run the Noise XX handshake over
 // any connected net.Conn (UDP, WebRTC DataChannel wrapper, WebSocket,
-// TCP, net.Pipe). They are the 5.2 half of the browser-transport
-// architecture plan — the WASM package calls DialOverConn with a DC-
-// or WSS-backed net.Conn, the relay and agent call AcceptOverConn.
+// TCP, net.Pipe). Browser WASM calls DialOverConn with a DataChannel-
+// or WebSocket-backed net.Conn; the relay and agent call AcceptOverConn
+// on the other side.
 
 package noise
 

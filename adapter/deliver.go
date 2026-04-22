@@ -62,9 +62,8 @@ const (
 // adaptive backpressure. On a successful delivery no grant is emitted
 // here — the stream's Receive() path records consumption through a
 // grantDebouncer so grants advertise application-level progress, not
-// transport-level arrival (the 1B design from the mesh-stabilization
-// plan). On a drop, credit is granted directly for the dropped bytes to
-// prevent permanent sender stall.
+// transport-level arrival. On a drop, credit is granted directly for the
+// dropped bytes to prevent permanent sender stall.
 //
 // Design:
 //  1. Fast path: non-blocking send to recvCh (zero latency on the readLoop)
@@ -94,9 +93,8 @@ func DeliverToRecvCh(recvCh chan<- []byte, payload []byte, window *flow.StreamWi
 // (silent drop + drop-path grant).
 //
 // Successful deliveries do NOT grant credit here. The stream's Receive()
-// path owns that via a grantDebouncer (per the 1B design); grants
-// advertise application-level progress so a slow consumer actually
-// backpressures the sender.
+// path owns that via a grantDebouncer; grants advertise application-
+// level progress so a slow consumer actually backpressures the sender.
 //
 // The CONGESTION payload emitted on drop uses severity scaled by the
 // observed drop rate:

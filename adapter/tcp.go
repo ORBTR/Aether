@@ -28,7 +28,7 @@ import (
 // DefaultTCPMaxConcurrentStreams is the stream cap for TCP/WS/gRPC
 // sessions (lower than Noise-UDP because one TCP conn is a narrower
 // pipe and the head-of-line blocking risk from too many streams is higher).
-// See _SECURITY.md §3.12 / plan item S5.
+// See _SECURITY.md §3.12.
 const DefaultTCPMaxConcurrentStreams = 256
 
 // TCPSession implements Session over a TCP/TLS connection.
@@ -61,7 +61,7 @@ type TCPSession struct {
 	closeErr  error
 
 	// streamRefused counts peer-initiated OPEN requests rejected because
-	// MaxConcurrentStreams was reached. See _SECURITY.md §3.12 / S5.
+	// MaxConcurrentStreams was reached. See _SECURITY.md §3.12.
 	streamRefused uint64
 
 	// Protocol-agnostic capabilities (cross-adapter parity with Noise —
@@ -86,12 +86,11 @@ type tcpStream struct {
 	recvCh   chan []byte
 	window   *flow.StreamWindow
 	// grantDebouncer coalesces stream-level WINDOW_UPDATE emissions driven
-	// by application reads (1B in the mesh-stabilization plan). Lazily
-	// attached by attachGrantDebouncer after struct construction because
-	// the session method references must reach the initialized receiver.
-	// TCP's reliable bytestream absorbs transport-level pacing, but stream
-	// credit still gates the app-level read flow so we debounce here too
-	// for parity with the noise adapter.
+	// by application reads. Lazily attached by attachGrantDebouncer after
+	// struct construction because the session method references must reach
+	// the initialized receiver. TCP's reliable bytestream absorbs
+	// transport-level pacing, but stream credit still gates the app-level
+	// read flow so we debounce here too for parity with the noise adapter.
 	grantDebouncer *grantDebouncer
 	observe        *reliability.ObserveEngine // ACK-observe metrics (no enforcement)
 	localSeq       uint32                     // monotonic counter (TCP doesn't set SeqNo)
@@ -428,7 +427,7 @@ func (s *TCPSession) handleOpen(frame *aether.Frame) {
 		session: s,
 		state:   aether.NewStreamStateMachine(),
 		recvCh:  make(chan []byte, recvChCapacity(frame.StreamID)),
-		window:  flow.NewStreamWindow(0),
+		window:  flow.NewStreamWindowWithCap(0, 0),
 		observe: reliability.NewObserveEngine(),
 	}
 	st := s.registerStream(candidate, true /* enforceRemoteCap */)
@@ -474,7 +473,7 @@ func (s *TCPSession) handleImplicitOpen(frame *aether.Frame) {
 		session:  s,
 		state:    aether.NewStreamStateMachine(),
 		recvCh:   make(chan []byte, recvChCapacity(frame.StreamID)),
-		window:   flow.NewStreamWindow(cfg.InitialCredit),
+		window:   flow.NewStreamWindowWithCap(cfg.InitialCredit, cfg.MaxCredit),
 		observe:  reliability.NewObserveEngine(),
 	}
 	st := s.registerStream(candidate, true /* enforceRemoteCap */)
@@ -714,7 +713,7 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 		session:  s,
 		state:    aether.NewStreamStateMachine(),
 		recvCh:   make(chan []byte, recvChCapacity(cfg.StreamID)),
-		window:   flow.NewStreamWindow(cfg.InitialCredit),
+		window:   flow.NewStreamWindowWithCap(cfg.InitialCredit, cfg.MaxCredit),
 		observe:  reliability.NewObserveEngine(),
 	}
 	st.state.Transition(aether.EventSendOpen)
@@ -1095,7 +1094,7 @@ func (st *tcpStream) Receive(ctx context.Context) ([]byte, error) {
 		if !ok {
 			return nil, io.EOF
 		}
-		// Consume-driven grant (1B): record the app-consumed bytes in the
+		// Consume-driven grant: record the app-consumed bytes in the
 		// stream-level debouncer so WINDOW_UPDATE emission advances with
 		// application progress, not frame-receipt.
 		if st.grantDebouncer != nil {

@@ -101,7 +101,7 @@ func (m *Manager) EnableRedundantRealtime() {
 
 // EnableWeightedLoadBalance activates Level 3 — non-REALTIME frames are
 // distributed across active+standby paths proportional to each path's
-// quality score (function of Quality, RTT, and Loss). Concern #16.
+// quality score (function of Quality, RTT, and Loss).
 //
 // REALTIME traffic continues to use the primary path (or both, if Level 2
 // is also enabled) — the weighted distribution is for INTERACTIVE/BULK

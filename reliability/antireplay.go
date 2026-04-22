@@ -16,7 +16,7 @@ const ReplayWindowSize = 64
 // Per-stream rekey happens long before this (RekeyAfterBytes = 1 GiB ≈ 1M
 // frames), so any jump past ~2B SeqNos is a wraparound attack — the uint32
 // space is 4B, half of that is definitely forged.
-// See _SECURITY.md §3.3 / plan item S8.
+// See _SECURITY.md §3.3.
 const SeqNoWrapThreshold uint32 = 1 << 31
 
 // ReplayWindow implements a sliding window for anti-replay protection.

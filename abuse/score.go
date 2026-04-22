@@ -4,10 +4,10 @@
  */
 
 // Package abuse implements per-peer behavioural scoring with a circuit
-// breaker for cross-subsystem misbehaviour. See _SECURITY.md §3.6, §3.9
-// and plan item S7 — the goal is a single dial operators can read ("this
-// peer is misbehaving, drop it") instead of relying on each subsystem to
-// enforce its own per-feature cap.
+// breaker for cross-subsystem misbehaviour. See _SECURITY.md §3.6 and
+// §3.9. The goal is a single dial operators can read ("this peer is
+// misbehaving, drop it") instead of relying on each subsystem to enforce
+// its own per-feature cap.
 //
 // Scores accrue on observed bad behaviour and decay exponentially while
 // the peer is quiet. When a peer exceeds its threshold, callers should

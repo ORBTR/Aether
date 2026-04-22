@@ -28,19 +28,17 @@ import (
 )
 
 // HandshakeAddressMigration is an alias for aether.HandshakeAddressMigration.
-// Kept for backward compatibility — prefer aether.HandshakeAddressMigration directly.
+// Prefer the root-package constant directly for new code.
 const HandshakeAddressMigration = aether.HandshakeAddressMigration
 
 // MigrationPayloadSize is the fixed size of a migration handshake payload.
 // [ConnectionID:8][Nonce:8][Timestamp:8][NewAddr_IP:16][NewAddr_Port:2][HMAC-SHA256:32] = 74 bytes
 //
-// Aether is not yet deployed, so the wire format was bumped directly (no
-// capability negotiation needed). Concern S4 — see _SECURITY.md §3.11.
-//
-// Without a nonce + timestamp the HMAC was deterministic over (ConnID, IP,
-// Port), so a captured migration payload could be replayed forever from any
-// observer. The nonce makes each migration unique; the timestamp gives a
-// time-bound TTL; the per-session seen-set rejects replays even within TTL.
+// See _SECURITY.md §3.11. Without a nonce + timestamp the HMAC would be
+// deterministic over (ConnID, IP, Port), so a captured migration payload
+// could be replayed forever from any observer. The nonce makes each
+// migration unique; the timestamp gives a time-bound TTL; the
+// per-session seen-set rejects replays even within TTL.
 const MigrationPayloadSize = 74
 
 // MigrationTokenTTL is the maximum age of a migration token. Older tokens

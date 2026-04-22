@@ -3,7 +3,7 @@
  * Queries: licensing@hstles.com
  */
 
-// UPnP / NAT-PMP / PCP port mapping interface (Concern #13 sub-phase 5d).
+// UPnP / NAT-PMP / PCP port mapping interface.
 //
 // The interface is defined here; concrete implementations live in build-
 // tagged files because they pull in OS-specific protocol libraries.

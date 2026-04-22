@@ -128,7 +128,7 @@ var _ PacingPolicy = (*Pacer)(nil)
 var _ PacingPolicy = (*SendTimePacer)(nil)
 
 // ────────────────────────────────────────────────────────────────────────────
-// SendTimePacer — send-time-based pacing (Concern #14)
+// SendTimePacer — send-time-based pacing
 // ────────────────────────────────────────────────────────────────────────────
 
 // SendTimePacer paces frames by computing each packet's earliest send time

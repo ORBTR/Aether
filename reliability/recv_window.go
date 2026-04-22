@@ -12,25 +12,52 @@ import (
 	"github.com/ORBTR/aether"
 )
 
+// DefaultRecvWindowMaxBytes is the default byte cap for a RecvWindow's
+// reorder buffer when the caller doesn't specify one. A 64-entry
+// reorder buffer with 64 KB payloads could otherwise reach 4 MB per
+// stream, which multiplies hard against peer count × stream count.
+// 512 KB is comfortable for normal reorder depths while bounding
+// per-stream worst-case memory.
+const DefaultRecvWindowMaxBytes int64 = 512 * 1024
+
 // RecvWindow tracks received frames on the receiver side, reorders out-of-order
 // frames, and generates SACK blocks for selective acknowledgment.
 type RecvWindow struct {
 	mu           sync.Mutex
-	expected     uint32                      // next expected SeqNo (cumulative ACK point)
-	buffer       map[uint32][]byte           // out-of-order frames: SeqNo → payload
-	bufTime      map[uint32]time.Time        // out-of-order frames: SeqNo → buffer arrival time
-	maxGap       int                         // max reorder buffer size
-	maxAge       time.Duration               // max time a frame can sit in reorder buffer (0 = unlimited)
-	lastRecvTime time.Time                   // when the last data frame was received (for ACK delay)
-	dropCount    uint64                      // atomic: frames dropped due to reorder buffer full (Concern #11)
+	expected     uint32               // next expected SeqNo (cumulative ACK point)
+	buffer       map[uint32][]byte    // out-of-order frames: SeqNo → payload
+	bufTime      map[uint32]time.Time // out-of-order frames: SeqNo → buffer arrival time
+	maxGap       int                  // max reorder buffer size (frame count)
+	maxBytes     int64                // max total bytes buffered (0 = unlimited)
+	bufferedBytes int64               // current sum of buffered payload bytes
+	maxAge       time.Duration        // max time a frame can sit in reorder buffer (0 = unlimited)
+	lastRecvTime time.Time            // when the last data frame was received (for ACK delay)
+	dropCount    uint64               // atomic: frames dropped due to reorder buffer full
 }
 
-// NewRecvWindow creates a receive window with the given maximum reorder gap.
+// NewRecvWindow creates a receive window with the given maximum reorder
+// gap (frame count). The byte cap defaults to DefaultRecvWindowMaxBytes.
+// Callers wanting a tighter or looser byte cap should use
+// NewRecvWindowWithCap.
 func NewRecvWindow(maxGap int) *RecvWindow {
+	return NewRecvWindowWithCap(maxGap, DefaultRecvWindowMaxBytes)
+}
+
+// NewRecvWindowWithCap creates a receive window with an explicit byte
+// cap on the reorder buffer in addition to the frame-count cap. Out-of-
+// order frames that would push bufferedBytes past maxBytes are rejected
+// the same way as frames that would exceed maxGap (dropCount bumped,
+// caller can observe via DropsCount). Passing maxBytes <= 0 disables
+// the byte cap (frame-count cap still applies).
+func NewRecvWindowWithCap(maxGap int, maxBytes int64) *RecvWindow {
+	if maxBytes < 0 {
+		maxBytes = 0
+	}
 	return &RecvWindow{
-		buffer:  make(map[uint32][]byte),
-		bufTime: make(map[uint32]time.Time),
-		maxGap:  maxGap,
+		buffer:   make(map[uint32][]byte),
+		bufTime:  make(map[uint32]time.Time),
+		maxGap:   maxGap,
+		maxBytes: maxBytes,
 	}
 }
 
@@ -70,6 +97,7 @@ func (w *RecvWindow) Insert(seqNo uint32, payload []byte) [][]byte {
 			// MaxAge check: drop frames that sat in the buffer too long
 			if w.maxAge > 0 {
 				if arrived, hasTime := w.bufTime[w.expected]; hasTime && time.Since(arrived) > w.maxAge {
+					w.bufferedBytes -= int64(len(p))
 					delete(w.buffer, w.expected)
 					delete(w.bufTime, w.expected)
 					w.expected++
@@ -77,23 +105,32 @@ func (w *RecvWindow) Insert(seqNo uint32, payload []byte) [][]byte {
 				}
 			}
 			delivered = append(delivered, p)
+			w.bufferedBytes -= int64(len(p))
 			delete(w.buffer, w.expected)
 			delete(w.bufTime, w.expected)
 			w.expected++
 		}
+		if w.bufferedBytes < 0 {
+			w.bufferedBytes = 0
+		}
 		return delivered
 	}
 
-	// Out-of-order: buffer it with arrival timestamp
-	if len(w.buffer) < w.maxGap {
-		w.buffer[seqNo] = copyPayload(payload)
-		w.bufTime[seqNo] = time.Now()
-	} else {
-		// Buffer full — drop. Tracked via atomic counter so callers can
-		// observe reorder-buffer pressure. Oldest entries eventually
-		// time out via maxAge.
+	// Out-of-order: buffer it with arrival timestamp, subject to both
+	// the frame-count cap and the byte cap. A byte cap breach is treated
+	// the same as a frame-count breach — drop with dropCount++.
+	payloadLen := int64(len(payload))
+	if len(w.buffer) >= w.maxGap {
 		atomic.AddUint64(&w.dropCount, 1)
+		return nil
 	}
+	if w.maxBytes > 0 && w.bufferedBytes+payloadLen > w.maxBytes {
+		atomic.AddUint64(&w.dropCount, 1)
+		return nil
+	}
+	w.buffer[seqNo] = copyPayload(payload)
+	w.bufTime[seqNo] = time.Now()
+	w.bufferedBytes += payloadLen
 	return nil
 }
 
@@ -293,6 +330,7 @@ func (w *RecvWindow) Drain() [][]byte {
 	}
 	w.buffer = make(map[uint32][]byte)
 	w.bufTime = make(map[uint32]time.Time)
+	w.bufferedBytes = 0
 
 	return delivered
 }

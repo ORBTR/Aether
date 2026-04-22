@@ -103,15 +103,15 @@ type SessionMetrics struct {
 	FECRecoveries uint64        // frames recovered via FEC (without retransmit)
 	ReplayRejects uint64        // frames rejected by anti-replay window
 
-	// Security observability — hardening counters from Phase 6.
-	// See _SECURITY.md for the attack classes each addresses.
-	SuspiciousACKs  uint64 // S1 §3.2  — Composite ACKs rejected as malformed/oversized
-	FECGroupsEvicted uint64 // S2 §3.5 — FEC groups evicted by count/age pruning
-	StreamRefused   uint64 // S5 §3.12 — incoming stream opens rejected at cap
-	SeqNoWraps      uint64 // S8 §3.3  — SeqNo jumps rejected as wrap-attack
-	RecvWindowDrops uint64 // #11      — reorder-buffer overflow drops (total across streams)
-	DecryptErrors   uint64 // #5       — decryption failures on incoming packets
-	InboxDrops      uint64 // #6       — packets dropped because the session inbox was full
+	// Security observability counters. See _SECURITY.md for the attack
+	// classes each addresses.
+	SuspiciousACKs   uint64 // §3.2  — Composite ACKs rejected as malformed/oversized
+	FECGroupsEvicted uint64 // §3.5  — FEC groups evicted by count/age pruning
+	StreamRefused    uint64 // §3.12 — incoming stream opens rejected at cap
+	SeqNoWraps       uint64 // §3.3  — SeqNo jumps rejected as wrap-attack
+	RecvWindowDrops  uint64 //       — reorder-buffer overflow drops (total across streams)
+	DecryptErrors    uint64 //       — decryption failures on incoming packets
+	InboxDrops       uint64 //       — packets dropped because the session inbox was full
 
 	// Per-stream observe metrics (ACK-observe mode — pure observation, no enforcement).
 	// Available on all transport types. Keyed by stream ID.
@@ -204,6 +204,14 @@ type StreamConfig struct {
 	// 0 = use DefaultStreamCredit (256KB). Non-zero overrides the default.
 	// File transfer streams should use 2MB+ for throughput (40MB/s at 50ms RTT).
 	InitialCredit int64
+
+	// MaxCredit bounds how large the auto-tuner may grow this stream's
+	// send window. 0 = use the package-level MaxGrowableWindow ceiling.
+	// Streams that carry small messages (gossip, control) should set a
+	// small ceiling to bound worst-case per-stream memory; streams that
+	// carry bulk data should leave this at 0 to let the BDP heuristic
+	// take them up to the package default.
+	MaxCredit int64
 
 	// FECLevel sets the forward error correction level for this stream.
 	// Default: FECBasicXOR for Noise-UDP, FECNone for others.

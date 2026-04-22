@@ -3,12 +3,12 @@
  * Queries: licensing@hstles.com
  */
 
-// RFC 5780 NAT behaviour discovery (Concern #13 sub-phase 5a).
+// RFC 5780 NAT behaviour discovery.
 //
-// Replaces the previous Open/FullCone/Symmetric ternary classification
-// with the full RFC 5780 model: two independent axes (Mapping × Filtering)
-// produce a richer NAT type that the hole-punching layer can use to pick
-// the right strategy.
+// Uses the full RFC 5780 model: two independent axes (Mapping × Filtering)
+// produce a richer NAT type than the Open/FullCone/Symmetric ternary,
+// giving the hole-punching layer enough information to pick the right
+// strategy.
 //
 // Mapping behaviour — where does the reflexive address go?
 //   EIM   Endpoint-Independent Mapping       (Full Cone outer behaviour)

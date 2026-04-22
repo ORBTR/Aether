@@ -66,7 +66,6 @@ type NoiseSession struct {
 	// debouncer AND this session-wide debouncer fire in parallel; the
 	// conn-level one emits a single StreamConnectionLevel grant per
 	// coalesce window no matter how many streams are actively reading.
-	// Design: 1B in docs/plans/2026-04-21-mesh-stabilization.md.
 	connGrantDebouncer *grantDebouncer
 	// cong is the active congestion controller. Stored behind an
 	// atomic.Pointer so SetCongestionController can swap it safely
@@ -79,7 +78,7 @@ type NoiseSession struct {
 	// because each stream independently chooses its FECLevel:
 	//   FECBasicXOR    → fecEncoder       / fecDecoder
 	//   FECInterleaved → interleavedEnc/Dec
-	//   FECReedSolomon → rsEncoder        / rsDecoder   (Concern #8)
+	//   FECReedSolomon → rsEncoder        / rsDecoder
 	fecEncoder         *reliability.FECEncoder
 	fecDecoder         *reliability.FECDecoder
 	interleavedEncoder *reliability.InterleavedFECEncoder
@@ -97,10 +96,10 @@ type NoiseSession struct {
 	packetReplay *reliability.PacketReplayWindow
 
 	// streamRefused counts peer-initiated OPEN / implicit-OPEN requests
-	// rejected because the MaxConcurrentStreams cap is reached (S5).
+	// rejected because the MaxConcurrentStreams cap is reached.
 	streamRefused uint64
 
-	// ECN observation (#15). The receive path increments ceObservedBytes
+	// ECN observation. The receive path increments ceObservedBytes
 	// when an inbound packet's IP/IPv6 TOS field carries the CE codepoint
 	// (0x03). The next outbound CompositeACK reads-and-resets this counter
 	// into its CEBytes extension so the sender can call cong.OnCE.
@@ -118,10 +117,10 @@ type NoiseSession struct {
 	// high load.
 	compressionEnabled atomic.Bool
 
-	// Peer abuse scoring (S7 — _SECURITY.md §3.6/§3.9/§3.12). Session
-	// tracks the remote peer's misbehaviour across subsystems (decrypt
-	// errors, crafted ACKs, replay attempts, stream-cap violations, etc.)
-	// and trips a circuit breaker when the score exceeds the threshold.
+	// Peer abuse scoring (_SECURITY.md §3.6/§3.9/§3.12). Session tracks
+	// the remote peer's misbehaviour across subsystems (decrypt errors,
+	// crafted ACKs, replay attempts, stream-cap violations, etc.) and
+	// trips a circuit breaker when the score exceeds the threshold.
 	// `reportAbuse` is the adapter-level hook wired into the counter
 	// increment sites. Defaults to a per-session registry (1 entry); call
 	// SetAbuseScoreRegistry to share one registry across many sessions so
@@ -137,7 +136,7 @@ type NoiseSession struct {
 	// ties the tracker lifetime to the stream (no leak on close) and
 	// removes the unsynchronised map write that lived here before.
 
-	// FEC prune scheduling — rate-limit decoder GC to ~1/sec (S2).
+	// FEC prune scheduling — rate-limit decoder GC to ~1/sec.
 	// Without pruning, FECDecoder.groups grows unbounded under adversarial
 	// FEC_REPAIR flooding with unique GroupIDs. See _SECURITY.md §3.5.
 	lastFECPrune time.Time
@@ -231,8 +230,8 @@ func NewNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 	s.rsEncoder, _ = reliability.NewRSEncoder(reliability.DefaultRSDataShards, reliability.DefaultRSParityShards)
 	s.rsDecoder, _ = reliability.NewRSDecoder(reliability.DefaultRSDataShards, reliability.DefaultRSParityShards)
 
-	// Session-wide conn-level grant debouncer (1B). Immediate-flush floor
-	// at 50% of DefaultConnCredit so burst patterns don't wait the full
+	// Session-wide conn-level grant debouncer. Immediate-flush floor at
+	// 50% of DefaultConnCredit so burst patterns don't wait the full
 	// coalesce window when the sender is close to the conn-level edge.
 	s.connGrantDebouncer = newGrantDebouncer(
 		s.connWindow,
@@ -329,7 +328,7 @@ func selectCongestionController(opts aether.SessionOptions) congestion.Controlle
 // selectPacer chooses the right pacing policy for the configured congestion
 // algorithm: SendTimePacer for BBR (matches BBR's send-time scheduling
 // model), token-bucket Pacer for CUBIC (CUBIC has no pacing model so
-// burst-tolerant token-bucket is fine). Concern #14.
+// burst-tolerant token-bucket is fine).
 func selectPacer(opts aether.SessionOptions) congestion.PacingPolicy {
 	algo := opts.CongestionAlgo
 	if algo == "" {

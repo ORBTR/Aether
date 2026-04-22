@@ -3,7 +3,7 @@
  * Queries: licensing@hstles.com
  */
 
-// Birthday-paradox port-prediction punching (Concern #13 sub-phase 5c).
+// Birthday-paradox port-prediction punching.
 //
 // Used when both peers have address+port-dependent mapping (symmetric NAT).
 // Each side opens N source ports and probes M candidate destination ports

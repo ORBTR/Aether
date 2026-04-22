@@ -367,10 +367,11 @@ func EncodeCompositeACK(ack *CompositeACK) []byte {
 		off += 4
 	}
 
-	// Optional: Window credit (1D) — 8-byte cumulative stream WINDOW_UPDATE
-	// grant. Placed AFTER ECN so older receivers that decode as far as
-	// they understand and stop (per the truncation-tolerant decoder) can
-	// still handle all earlier extensions.
+	// Optional: Window credit — 8-byte cumulative stream WINDOW_UPDATE
+	// grant piggybacked on the ACK. Placed AFTER ECN so older receivers
+	// that decode as far as they understand and stop (per the
+	// truncation-tolerant decoder) can still handle all earlier
+	// extensions.
 	if ack.Flags&CACKHasWindowCredit != 0 {
 		binary.BigEndian.PutUint64(data[off:off+8], ack.WindowCredit)
 		off += 8
@@ -478,7 +479,7 @@ func DecodeCompositeACK(data []byte) *CompositeACK {
 		}
 	}
 
-	// Optional: Window credit (1D) — 8-byte cumulative stream-level grant.
+	// Optional: Window credit — 8-byte cumulative stream-level grant.
 	if ack.Flags&CACKHasWindowCredit != 0 {
 		if off+8 <= len(data) {
 			ack.WindowCredit = binary.BigEndian.Uint64(data[off : off+8])

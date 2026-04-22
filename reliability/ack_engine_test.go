@@ -12,11 +12,11 @@ import (
 	"github.com/ORBTR/aether"
 )
 
-// 1D regression: when a window-credit getter is attached and it returns
-// a value larger than the engine's last-emitted credit, the built
-// CompositeACK MUST carry CACKHasWindowCredit + the current cumulative
-// grant in WindowCredit. Subsequent builds at the same cumulative grant
-// MUST NOT re-emit (duplicate suppression via lastEmittedCredit).
+// When a window-credit getter is attached and it returns a value larger
+// than the engine's last-emitted credit, the built CompositeACK MUST
+// carry CACKHasWindowCredit + the current cumulative grant in
+// WindowCredit. Subsequent builds at the same cumulative grant MUST NOT
+// re-emit (duplicate suppression via lastEmittedCredit).
 func TestACKEngine_BuildCompositeACK_PiggyBacksWindowCredit(t *testing.T) {
 	rw := NewRecvWindow(64)
 	var sent *aether.CompositeACK
@@ -61,10 +61,10 @@ func TestACKEngine_BuildCompositeACK_PiggyBacksWindowCredit(t *testing.T) {
 	_ = sent // sendACK callback not exercised here — BuildCompositeACK is direct
 }
 
-// 1D: when the window getter returns 0 (no grant yet), the piggyback
-// flag MUST NOT be set. Otherwise the peer's ApplyUpdate would be
-// called with credit=0 which is a silent no-op but wastes wire space
-// + a flag bit on every ACK until the first grant arrives.
+// When the window getter returns 0 (no grant yet), the piggyback flag
+// MUST NOT be set. Otherwise the peer's ApplyUpdate would be called
+// with credit=0 which is a silent no-op but wastes wire space + a flag
+// bit on every ACK until the first grant arrives.
 func TestACKEngine_BuildCompositeACK_NoCreditOmitsFlag(t *testing.T) {
 	rw := NewRecvWindow(64)
 	e := NewACKEngine(rw, DefaultACKPolicy(), func(*aether.CompositeACK) {},
@@ -81,7 +81,7 @@ func TestACKEngine_BuildCompositeACK_NoCreditOmitsFlag(t *testing.T) {
 	}
 }
 
-// 1D: SetWindowCreditFn(nil) disables piggybacking — matches the
+// SetWindowCreditFn(nil) disables piggybacking — matches the
 // "pass nil to disable" contract in the public API.
 func TestACKEngine_BuildCompositeACK_NilGetterDisables(t *testing.T) {
 	rw := NewRecvWindow(64)

@@ -243,8 +243,8 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 	delivered := st.recvWindow.Insert(frame.SeqNo, frame.Payload)
 	for _, payload := range delivered {
 		ok := DeliverToRecvChWithSignals(st.recvCh, payload, st.window, st.streamID, s.sendWindowUpdateAgnostic, s.SendCongestion)
-		// Conn-level flow control (1B): successful delivery grants credit
-		// at application-read time via the session debouncer (Receive →
+		// Conn-level flow control: successful delivery grants credit at
+		// application-read time via the session debouncer (Receive →
 		// connGrantDebouncer.Record). On drop, the debouncer will never
 		// see these bytes so we must grant directly here to prevent a
 		// permanent conn-level stall.
@@ -333,14 +333,14 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 		}
 	}
 
-	// BBRv2 per-packet sampling (Concern #3). When the active controller
-	// is BBR and the acked entry carries a stamped DeliveryRateSample,
-	// route through OnAckSampled so the controller can compute true
-	// delivery rate. Falls back to OnAck (degraded path) for CUBIC or
-	// when the sample is missing (e.g. retransmitted entries).
+	// BBRv2 per-packet sampling. When the active controller is BBR and
+	// the acked entry carries a stamped DeliveryRateSample, route through
+	// OnAckSampled so the controller can compute true delivery rate.
+	// Falls back to OnAck (degraded path) for CUBIC or when the sample is
+	// missing (e.g. retransmitted entries).
 	srtt := st.rtt.SRTT()
 	// Always sum acked bytes once — used both for the CUBIC OnAck call
-	// below and for the 1C ACK-driven flow-control credit release that
+	// below and for the ACK-driven flow-control credit release that
 	// happens regardless of congestion controller choice.
 	var ackedBytes int64
 	for _, entry := range acked {
@@ -357,9 +357,9 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	} else {
 		s.congestion().OnAck(ackedBytes, srtt)
 	}
-	// 1C: ACK-driven flow-control credit release. Every byte the peer
-	// has acknowledged is no longer in-flight on this stream, so credit
-	// can be returned to the sender NOW regardless of whether a matching
+	// ACK-driven flow-control credit release. Every byte the peer has
+	// acknowledged is no longer in-flight on this stream, so credit can
+	// be returned to the sender NOW regardless of whether a matching
 	// WINDOW_UPDATE frame has arrived. This closes the stuck-credit gap
 	// on lossy Noise-UDP paths where WINDOW_UPDATE packets can be
 	// dropped — ACKs have their own cumulative-retransmit path and are
@@ -372,16 +372,16 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 		st.window.ReleaseOnACK(ackedBytes)
 		s.connWindow.ReleaseOnACK(ackedBytes)
 	}
-	// ECN feedback (#15): peer reported CE-marked bytes since last ACK.
-	// Notify the controller so it can react one RTT before queue overflow.
+	// ECN feedback: peer reported CE-marked bytes since last ACK. Notify
+	// the controller so it can react one RTT before queue overflow.
 	if ack.Flags&aether.CACKHasECN != 0 && ack.CEBytes > 0 {
 		s.congestion().OnCE(int64(ack.CEBytes))
 	}
-	// 1D: piggybacked stream-level WINDOW_UPDATE. Same cumulative
-	// semantics as a standalone WINDOW_UPDATE frame — ApplyUpdate drops
-	// stale/duplicate values via its grantsReceived cursor and caps the
-	// release at dataOutstanding so it composes safely with 1C's
-	// ACK-driven release.
+	// Piggybacked stream-level WINDOW_UPDATE. Same cumulative semantics
+	// as a standalone WINDOW_UPDATE frame — ApplyUpdate drops stale/
+	// duplicate values via its grantsReceived cursor and caps the release
+	// at dataOutstanding so it composes safely with the ACK-driven
+	// release above.
 	if ack.Flags&aether.CACKHasWindowCredit != 0 && ack.WindowCredit > 0 {
 		st.window.ApplyUpdate(int64(ack.WindowCredit))
 	}
@@ -426,7 +426,7 @@ func (s *NoiseSession) handleFECRepair(frame *aether.Frame) {
 	// The receiver doesn't know which FEC mode the sender used for this
 	// group until it sees the repair frame, so we feed the repair into
 	// every decoder; at most one actually reconstructs.
-	//   1. Reed-Solomon — RS(k,m) recovers up to m losses (Concern #8)
+	//   1. Reed-Solomon — RS(k,m) recovers up to m losses
 	//   2. Interleaved XOR — burst loss across offset groups
 	//   3. Basic XOR — single loss per group
 	// RSDecoder.AddRepair returns [][]byte (one slice per recovered data
@@ -483,7 +483,7 @@ func (s *NoiseSession) handleImplicitOpen(frame *aether.Frame) {
 	delivered := st.recvWindow.Insert(frame.SeqNo, frame.Payload)
 	for _, payload := range delivered {
 		ok := DeliverToRecvChWithSignals(st.recvCh, payload, st.window, st.streamID, s.sendWindowUpdateAgnostic, s.SendCongestion)
-		// Drop-only conn-level credit (1B): see handleData.
+		// Drop-only conn-level credit: see handleData.
 		if !ok {
 			if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
 				s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
@@ -505,9 +505,10 @@ func (s *NoiseSession) handleClose(frame *aether.Frame) {
 		return // half-closed; wait for local Close/Reset to tear down
 	}
 	// Fully closed: flush final ACK, drain, and release all session-level
-	// trackers. Before this fix, the s.streams entry lingered indefinitely
-	// (only handleReset removed it), leaving the engine + send window +
-	// streamGC map entry pinned.
+	// trackers. Without this path the s.streams entry would linger until
+	// handleReset (the only other removal path), leaving the engine +
+	// send window + streamGC map entry pinned for the lifetime of the
+	// session.
 	if st.ackEngine != nil {
 		st.ackEngine.Flush()
 		st.ackEngine.Stop()
@@ -691,7 +692,7 @@ func (s *NoiseSession) sendCompositeACK(st *noiseStream, cack *aether.CompositeA
 		StreamID:   st.streamID,
 		Type:       aether.TypeACK,
 		Flags:      aether.FlagCOMPOSITE_ACK, // marks as Composite ACK format
-		AckNo:      cack.BaseACK,             // piggyback in header for backward compat
+		AckNo:      cack.BaseACK,             // mirror the cumulative ACK in the header field for peers that only decode the header
 		Length:     uint32(len(payload)),
 		Payload:    payload,
 	}
@@ -700,8 +701,8 @@ func (s *NoiseSession) sendCompositeACK(st *noiseStream, cack *aether.CompositeA
 
 // RecordCEBytes is called by the receive socket layer when an inbound
 // packet's IP/IPv6 TOS field carries the CE codepoint (0x03). The bytes
-// are folded into the next outbound CompositeACK via CEBytes/CACKHasECN.
-// Concern #15.
+// are folded into the next outbound CompositeACK via CEBytes/CACKHasECN
+// so the sender's congestion controller sees the ECN signal.
 func (s *NoiseSession) RecordCEBytes(n int) {
 	if n <= 0 {
 		return
@@ -735,7 +736,7 @@ func (s *NoiseSession) deliverToStream(streamID uint64, payload []byte) {
 	s.mu.Unlock()
 	if ok {
 		delivered := DeliverToRecvChWithSignals(st.recvCh, payload, st.window, streamID, s.sendWindowUpdateAgnostic, s.SendCongestion)
-		// Drop-only conn-level credit (1B): see handleData.
+		// Drop-only conn-level credit: see handleData.
 		if !delivered {
 			if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
 				s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))

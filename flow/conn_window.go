@@ -134,8 +134,9 @@ func (w *ConnWindow) Consume(ctx context.Context, n int64) error {
 // ReleaseOnACK releases connection-level sender credit corresponding to
 // bytes the peer acknowledged. Delta-based (caller passes sum of newly-
 // acked Frame.Length), capped at dataOutstanding so ACK-path and
-// WINDOW_UPDATE-path together never over-release. 1C design — see the
-// StreamWindow.ReleaseOnACK doc-comment for full rationale.
+// WINDOW_UPDATE-path together never over-release. See
+// StreamWindow.ReleaseOnACK for the full rationale (same approach at
+// stream scope).
 func (w *ConnWindow) ReleaseOnACK(ackedBytesDelta int64) {
 	if ackedBytesDelta <= 0 {
 		return

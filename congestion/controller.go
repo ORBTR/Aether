@@ -24,13 +24,10 @@ type Controller interface {
 	// ECN extension on a Composite ACK. bytesMarked is the cumulative
 	// CE-byte count observed since the last ACK. Implementations should
 	// react like a mild loss signal (CWND reduction) without retransmit.
-	// Concern #15 — _implementation_plan.md.
 	//
-	// NOTE: the receive-side socket plumbing (IP_RECVTOS / IPV6_RECVTCLASS
-	// + per-OS cmsg parsing) is platform-specific and lives in a follow-up
-	// build-tagged file (noise/ecn_*.go). The protocol scaffolding —
-	// ACK extension flag, controller hook, sender wiring — is in place
-	// today and works against any peer that also tracks CE bytes.
+	// The receive-side socket plumbing (IP_RECVTOS / IPV6_RECVTCLASS +
+	// per-OS cmsg parsing) is platform-specific and lives in build-tagged
+	// noise/socket_ecn_*.go files.
 	OnCE(bytesMarked int64)
 
 	// CWND returns the current congestion window in bytes.

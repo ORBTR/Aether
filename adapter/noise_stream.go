@@ -34,12 +34,12 @@ type noiseStream struct {
 	// grantDebouncer coalesces stream-level WINDOW_UPDATE emissions driven
 	// by application reads on this stream. When Receive() successfully
 	// returns a payload to the application, it records the byte count in
-	// the debouncer; the debouncer fires ReceiverConsume on a 25ms
+	// the debouncer; the debouncer fires ReceiverConsume on a 25 ms
 	// coalesce window (or immediately for bursts above 50% of the
-	// stream's initial credit). Design: 1B in the mesh-stabilization
-	// plan — moves grant emission from frame-receipt (the old location,
-	// inside DeliverToRecvChWithSignals) to application-read, giving true
-	// application-level backpressure.
+	// stream's initial credit). Emission is driven by application-read,
+	// not frame-receipt inside DeliverToRecvChWithSignals, so grants
+	// advertise real application progress and a slow consumer
+	// backpressures the sender.
 	grantDebouncer *grantDebouncer
 
 	// Per-stream reliability engine (Noise has NO native reliability)
@@ -114,7 +114,7 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 		session:     s,
 		state:       aether.NewStreamStateMachine(),
 		recvCh:      make(chan []byte, recvChCapacity(streamID)),
-		window:      flow.NewStreamWindow(cfg.InitialCredit),
+		window:      flow.NewStreamWindowWithCap(cfg.InitialCredit, cfg.MaxCredit),
 		engine:      eng,
 		fragBuf:     NewFragmentBuffer(),
 		sendWindow:  eng.SendWin,
@@ -123,7 +123,7 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 		rtt:         eng.RTT,
 		replay:      eng.Replay,
 	}
-	// Per-stream grant debouncer (1B). Immediate-flush floor at 50% of the
+	// Per-stream grant debouncer. Immediate-flush floor at 50% of the
 	// stream's initial credit so burst reads drain the pending total
 	// without waiting the full coalesce window when the sender is close
 	// to the stream-window edge.
@@ -144,7 +144,7 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 	}, func() time.Duration {
 		return eng.RTT.SRTT()
 	})
-	// 1D: piggyback the stream window's cumulative WINDOW_UPDATE grant on
+	// Piggyback the stream window's cumulative WINDOW_UPDATE grant on
 	// outgoing CompositeACKs via CACKHasWindowCredit. Eliminates a
 	// separate WINDOW_UPDATE frame when the receiver has granted new
 	// credit, and — because ACKs have their own cumulative retransmit
@@ -262,7 +262,7 @@ func (st *noiseStream) sendSingleFrame(ctx context.Context, data []byte) error {
 	seqNo := st.sendWindow.Add(frame)
 	frame.SeqNo = seqNo
 
-	// BBRv2 sample stamping (Concern #3). When the active controller is
+	// BBRv2 per-packet sample stamping. When the active controller is
 	// BBR, ask it to mint a per-packet DeliveryRateSample and store it on
 	// the SendEntry for OnAckSampled to recover later. CUBIC ignores the
 	// hook (interface assertion fails silently).
@@ -323,9 +323,9 @@ func (st *noiseStream) Receive(ctx context.Context) ([]byte, error) {
 			if !ok {
 				return nil, io.EOF
 			}
-			// Fragment reassembly (Task 12): if the payload starts with
-			// the fragment magic, buffer it and return assembled payload
-			// only when all fragments have arrived.
+			// Fragment reassembly: if the payload starts with the fragment
+			// magic, buffer it and return the assembled payload only when
+			// all fragments have arrived.
 			if IsFragment(data) {
 				// Record credit for the raw fragment bytes even if the
 				// assembled payload isn't ready yet — the sender consumed
@@ -337,7 +337,7 @@ func (st *noiseStream) Receive(ctx context.Context) ([]byte, error) {
 				// The receive channel does not carry the originating frame's
 				// SeqNo, so pass 0 — the per-stream FragmentBuffer will use
 				// its own monotonic counter to keep group keys unique.
-				// Stream-scoped state (Concern #18) prevents cross-stream
+				// Stream-scoped FragmentBuffer state prevents cross-stream
 				// collisions; per-stream sequencing relies on the
 				// reliability layer delivering frames in order.
 				assembled, err := st.fragBuf.Add(st.streamID, 0, data)

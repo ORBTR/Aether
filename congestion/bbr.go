@@ -3,10 +3,8 @@
  * Queries: licensing@hstles.com
  */
 
-// BBRv2 congestion controller (Concern #3 — _implementation_plan.md).
-//
-// Replaces the previous ~270-line sketch with a per-packet delivery-rate
-// sampling model:
+// BBRv2 congestion controller built around per-packet delivery-rate
+// sampling:
 //   - DeliveryRateSample stamped at send time, evaluated on ACK
 //   - RoundCounter advancing once per RTT-equivalent
 //   - Inflight tracking (inflightBytes / inflightHi)
@@ -15,9 +13,10 @@
 //   - 200 ms ProbeRTT every 10 s
 //   - Startup exit on 3 rounds without BtlBw growth (RFC-aligned)
 //
-// The Controller interface (OnAck/OnLoss/OnCE/CWND/CanSend/PacingRate/SetMSS)
-// is unchanged so existing call sites keep working. Per-packet sample
-// stamping happens via the SendWindow integration described in the plan.
+// Per-packet sample stamping happens via SendWindow.SendEntry.BBRSample:
+// the adapter calls BBRController.OnSend at send time, stores the
+// returned sample on the entry, and hands it back to OnAckSampled when
+// the matching ACK arrives.
 package congestion
 
 import (

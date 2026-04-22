@@ -62,8 +62,8 @@ type ACKEngine struct {
 
 	// currentGrantFn returns the stream window's CUMULATIVE grant so the
 	// ACK engine can piggyback it on the next CompositeACK via the
-	// CACKHasWindowCredit extension (1D). When set AND the returned value
-	// is > lastEmittedCredit, the ACK carries the credit and we advance
+	// CACKHasWindowCredit extension. When set AND the returned value is
+	// > lastEmittedCredit, the ACK carries the credit and we advance
 	// lastEmittedCredit; otherwise the flag is omitted (the peer already
 	// got this cumulative value on a previous ACK or WINDOW_UPDATE).
 	//
@@ -93,8 +93,8 @@ func NewACKEngine(rw *RecvWindow, policy ACKPolicy, sendFn func(*aether.Composit
 }
 
 // SetWindowCreditFn registers the cumulative-grant getter used to
-// piggyback WINDOW_UPDATE credit on CompositeACKs (1D). Pass nil to
-// disable piggybacking. Safe to call any time.
+// piggyback WINDOW_UPDATE credit on CompositeACKs. Pass nil to disable
+// piggybacking. Safe to call any time.
 func (e *ACKEngine) SetWindowCreditFn(fn func() int64) {
 	e.mu.Lock()
 	e.currentGrantFn = fn
@@ -267,7 +267,7 @@ func (e *ACKEngine) buildLocked() *aether.CompositeACK {
 		ack.Flags |= aether.CACKHasLossDensity
 	}
 
-	// Window-credit piggyback (1D). If the stream window has granted new
+	// Window-credit piggyback. If the stream window has granted new
 	// cumulative credit since the last ACK we sent, attach it so the
 	// sender's ApplyUpdate can release flow-control credit without a
 	// separate WINDOW_UPDATE round-trip. Cumulative semantics mean

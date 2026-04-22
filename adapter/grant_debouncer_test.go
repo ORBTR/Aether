@@ -45,8 +45,8 @@ func (f *fakeWindow) snapshot() (calls int, total int64) {
 	return f.calls, f.totalBytes
 }
 
-// Regression test for 1B — the coalesce window collapses a burst of
-// small Record calls into a single ReceiverConsume + WINDOW_UPDATE.
+// The coalesce window collapses a burst of small Record calls into a
+// single ReceiverConsume + WINDOW_UPDATE.
 func TestGrantDebouncer_CoalescesBurst(t *testing.T) {
 	fw := &fakeWindow{grant: 4096} // any non-zero cumulative grant
 	var updates atomic.Uint64
@@ -168,10 +168,11 @@ func TestGrantDebouncer_ZeroGrantNoWireUpdate(t *testing.T) {
 }
 
 // Real-window integration: a gossip-like pattern (4 MB initial, 70 KB
-// payloads, 10 s gossip intervals) used to stall because the three size-
+// payloads, 10 s gossip intervals) would stall because the three size-
 // based triggers all have floors the gossip traffic doesn't hit. With
-// the debouncer batching consume calls AND the TIMED trigger from 1A, a
-// grant fires within GrantMaxInterval regardless of pattern.
+// the debouncer batching consume calls AND the TIMED trigger (see
+// GrantMaxInterval), a grant fires within GrantMaxInterval regardless
+// of pattern.
 func TestGrantDebouncer_WithRealWindow_LargeWindowSmallPayload(t *testing.T) {
 	const (
 		bigWindow    = 4 * 1024 * 1024

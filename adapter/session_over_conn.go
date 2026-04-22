@@ -29,9 +29,9 @@
 //     has to live in adapter. That's this file.
 //
 // The two entry points (DialSessionOverConn / AcceptSessionOverConn)
-// are what the browser transport architecture plan's section 4.3
-// describes as `noise.DialOverConn(...) → adapter.NewSession(...)` —
-// now collapsed into a single call for callers.
+// collapse the two-step `noise.DialOverConn(...) → adapter.NewSession(...)`
+// pattern into a single call so callers don't have to know about the
+// layered construction.
 
 package adapter
 
@@ -94,14 +94,11 @@ func wrapPostHandshakeAsSession(aetherConn aether.Connection, localNodeID aether
 // browser-specific piece that uses syscall/js); this function then
 // runs Noise over it + adds the session layer.
 //
-// Kept for backwards compatibility with Minerva + any other WASM
-// consumers that used the previous DialBrowserWS → *BrowserWSSession
-// path. The return type is now *NoiseSession — any code that used to
-// hold *BrowserWSSession should switch to *NoiseSession or
-// aether.Session, both of which expose OpenStream / AcceptStream
-// identically. The underlying browser WS → net.Conn wrapping is now
-// the caller's responsibility (and lives in each endpoint's WASM
-// package per the browser-transport-architecture plan section 4.1).
+// The return type is *NoiseSession — callers that previously held
+// *BrowserWSSession should switch to *NoiseSession or aether.Session,
+// both of which expose OpenStream / AcceptStream identically. The
+// underlying browser WS → net.Conn wrapping is the caller's
+// responsibility and lives in each endpoint's WASM package.
 func DialSessionOverBrowserWS(ctx context.Context, localNodeID aether.NodeID, staticPriv, staticPub []byte, conn net.Conn, opts aether.SessionOptions) (*NoiseSession, error) {
 	return DialSessionOverConn(ctx, noise.DialConnConfig{
 		LocalNodeID: localNodeID,

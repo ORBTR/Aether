@@ -20,8 +20,8 @@ import (
 // writeLoop reads from the scheduler and writes frames to the Noise
 // connection. Uses the pacer for rate-limited sending (supports both
 // CUBIC and BBR). Parks on the scheduler's wake channel instead of
-// polling — addresses Concern #2 (the previous time.Sleep(1ms) added
-// ~0.5ms latency to every send and burned CPU when idle).
+// polling — polling with time.Sleep(1ms) adds ~0.5 ms latency to every
+// send and burns CPU when idle.
 func (s *NoiseSession) writeLoop() {
 	wake := s.sched.WakeCh()
 	for {
@@ -84,8 +84,7 @@ func (s *NoiseSession) writeLoop() {
 
 // reliabilityTick checks for retransmission timeouts periodically.
 // Single lock scope covers both retransmit dequeue and stall detection so
-// both see the same snapshot of s.streams and avoid redundant lock traffic
-// (addresses Concern #4).
+// both see the same snapshot of s.streams and avoid redundant lock traffic.
 func (s *NoiseSession) reliabilityTick() {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
