@@ -22,8 +22,13 @@ type FileStore struct {
 	dir string
 }
 
-// fileEntry is the on-disk JSON format for a resume token.
+// fileEntry is the on-disk JSON format for a resume token. The
+// PeerID is recorded alongside the ticket data so List can recover
+// the canonical peer identity even when the filename has been
+// sanitised (sanitizePeerID is lossy — multiple distinct peer IDs
+// can collide onto the same filename).
 type fileEntry struct {
+	PeerID     string `json:"peer_id,omitempty"`
 	TokenData  []byte `json:"token"`
 	SessionKey []byte `json:"key"`
 }
@@ -42,6 +47,7 @@ func (s *FileStore) Save(peerID string, token *Token, sessionKey []byte) error {
 	defer s.mu.Unlock()
 
 	entry := fileEntry{
+		PeerID:     peerID,
 		TokenData:  token.Encode(),
 		SessionKey: sessionKey,
 	}
@@ -90,6 +96,40 @@ func (s *FileStore) Delete(peerID string) error {
 		return nil // already deleted
 	}
 	return err
+}
+
+// List walks the store directory and returns the peer IDs embedded
+// in each valid entry file. Files that fail to parse are skipped so
+// a single corrupted entry doesn't block boot-time reconnection.
+func (s *FileStore) List() ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	dirents, err := os.ReadDir(s.dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("resume: list store dir: %w", err)
+	}
+	out := make([]string, 0, len(dirents))
+	for _, d := range dirents {
+		if d.IsDir() || filepath.Ext(d.Name()) != ".json" {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(s.dir, d.Name()))
+		if err != nil {
+			continue
+		}
+		var entry fileEntry
+		if err := json.Unmarshal(data, &entry); err != nil {
+			continue
+		}
+		if entry.PeerID != "" {
+			out = append(out, entry.PeerID)
+		}
+	}
+	return out, nil
 }
 
 // sanitizePeerID replaces characters unsafe for filenames.

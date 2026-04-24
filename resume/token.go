@@ -140,6 +140,12 @@ type Store interface {
 	Save(peerID string, token *Token, sessionKey []byte) error
 	Load(peerID string) (*Token, []byte, error) // returns token + session key
 	Delete(peerID string) error
+
+	// List returns the peer IDs with currently-stored resume tokens.
+	// Order is unspecified. Callers typically use this on boot to
+	// kick off 0-RTT reconnection attempts against previously-known
+	// peers before waiting on gossip discovery.
+	List() ([]string, error)
 }
 
 // MemoryStore is an in-memory token store (lost on restart).
@@ -180,4 +186,15 @@ func (s *MemoryStore) Delete(peerID string) error {
 	defer s.mu.Unlock()
 	delete(s.tokens, peerID)
 	return nil
+}
+
+// List returns the peer IDs with currently-stored tokens.
+func (s *MemoryStore) List() ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]string, 0, len(s.tokens))
+	for id := range s.tokens {
+		out = append(out, id)
+	}
+	return out, nil
 }
