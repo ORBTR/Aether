@@ -216,15 +216,37 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 		return fmt.Errorf("stream %d: cannot send", st.streamID)
 	}
 
+	n := int64(len(data))
+
 	// Flow control: consume stream + connection credit before sending.
 	// Stream window may block waiting for WINDOW_UPDATE (up to ConsumeTimeout);
 	// the connection window is non-blocking and errors immediately if exhausted.
-	if err := st.window.Consume(ctx, int64(len(data))); err != nil {
+	//
+	// Both reservations must be released if any subsequent step fails —
+	// otherwise the credit that we acquired but never delivered to the
+	// wire leaks permanently (the peer never sees the bytes, so no
+	// WINDOW_UPDATE will ever return them). Without the release we
+	// reproduce the production-observed drain of a 1 MB stream window
+	// to ~40 KB after 13 failed exchanges.
+	if err := st.window.Consume(ctx, n); err != nil {
 		return fmt.Errorf("stream %d: %w", st.streamID, err)
 	}
-	if err := st.session.connWindow.Consume(ctx, int64(len(data))); err != nil {
+	streamCredited := true
+	defer func() {
+		if streamCredited {
+			st.window.ReleaseUnsent(n)
+		}
+	}()
+
+	if err := st.session.connWindow.Consume(ctx, n); err != nil {
 		return fmt.Errorf("stream %d conn: %w", st.streamID, err)
 	}
+	connCredited := true
+	defer func() {
+		if connCredited {
+			st.session.connWindow.ReleaseUnsent(n)
+		}
+	}()
 
 	// MTU-aware fragmentation (Task 12): split large payloads into MSS-sized
 	// fragments so each fragment is a single UDP packet (no IP fragmentation).
@@ -239,11 +261,20 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 				return err
 			}
 		}
+		// All fragments accepted — credit is now legitimately outstanding
+		// and will be released by the peer's WINDOW_UPDATE / ACK paths.
+		streamCredited = false
+		connCredited = false
 		return nil
 	}
 
 	// Small payload — send as single frame (existing fast path)
-	return st.sendSingleFrame(ctx, data)
+	if err := st.sendSingleFrame(ctx, data); err != nil {
+		return err
+	}
+	streamCredited = false
+	connCredited = false
+	return nil
 }
 
 // sendSingleFrame sends one frame (original small payload or one fragment).

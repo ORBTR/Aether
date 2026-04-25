@@ -153,6 +153,34 @@ func (w *ConnWindow) ReleaseOnACK(ackedBytesDelta int64) {
 	}
 }
 
+// ReleaseUnsent returns credit reserved by Consume that never reached
+// the wire — connection-level mirror of StreamWindow.ReleaseUnsent.
+// Use when a stream-level Send fails after both stream and conn
+// credit were acquired but before the bytes were handed to the
+// transport. Without this release path, every failed Send permanently
+// leaks payload-size bytes from the connection-aggregate window, the
+// same drain pattern that produced the production
+// "insufficient stream credit" stall (the conn window participates
+// in that stall whenever a stream Send fails its second Consume).
+//
+// Capped at dataOutstanding so over-release composes safely with
+// ApplyUpdate / ReleaseOnACK paths.
+func (w *ConnWindow) ReleaseUnsent(n int64) {
+	if n <= 0 {
+		return
+	}
+	w.mu.Lock()
+	release := n
+	if release > w.dataOutstanding {
+		release = w.dataOutstanding
+	}
+	w.dataOutstanding -= release
+	w.mu.Unlock()
+	if release > 0 {
+		w.sem.Release(release)
+	}
+}
+
 // ApplyUpdate processes a connection-level WINDOW_UPDATE where credit is
 // the peer's cumulative total. Delta = credit - grantsReceived; stale
 // frames (delta ≤ 0) are dropped. Positive delta is released back to the

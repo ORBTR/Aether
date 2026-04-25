@@ -332,6 +332,39 @@ func (w *StreamWindow) ReleaseOnACK(ackedBytesDelta int64) {
 	dbgFlow.Printf("ReleaseOnACK delta=%d released=%d ackReleasedTotal=%d", ackedBytesDelta, release, w.ackReleased)
 }
 
+// ReleaseUnsent returns credit reserved by Consume that never reached
+// the wire. Use when a Send-path layer downstream of stream-window
+// Consume rejects the bytes (e.g. connection-window Consume fails,
+// frame serialisation errors, the stream is closed mid-Send).
+//
+// Without this release path, every failed Send permanently shrinks
+// the stream's effective window by payload-size — the "credit leak"
+// that produced the production-observed `insufficient stream credit
+// after 10s (need 76306, have 41452)` failures. The peer never
+// generates a WINDOW_UPDATE for bytes it never received, so nothing
+// else recovers the credit.
+//
+// Capped at dataOutstanding so over-release composes safely with
+// ApplyUpdate / ReleaseOnACK paths — whichever release runs first
+// returns its share; later releases find dataOutstanding already
+// reduced and become no-ops.
+func (w *StreamWindow) ReleaseUnsent(n int64) {
+	if n <= 0 {
+		return
+	}
+	w.mu.Lock()
+	release := n
+	if release > w.dataOutstanding {
+		release = w.dataOutstanding
+	}
+	w.dataOutstanding -= release
+	w.mu.Unlock()
+	if release > 0 {
+		w.sem.Release(release)
+	}
+	dbgFlow.Printf("ReleaseUnsent requested=%d released=%d", n, release)
+}
+
 // ApplyUpdate processes a received WINDOW_UPDATE frame, where `credit` is
 // the peer's CUMULATIVE total of credit granted since stream start (not a
 // delta). The function computes the delta since the last applied grant,
