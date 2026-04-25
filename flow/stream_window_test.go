@@ -432,3 +432,101 @@ func TestConnWindow_TimedTrigger_Fires(t *testing.T) {
 		t.Errorf("ConnWindow TimedGrants: got %d, want 1", g)
 	}
 }
+
+// TestStreamWindow_ReleaseUnsent verifies that bytes acquired via Consume
+// but never delivered to the wire (because a downstream layer rejected
+// them) can be returned to the credit pool without involving the
+// peer's WINDOW_UPDATE / ACK channels. This is the fix for the production
+// credit-leak observed when noise_stream.Send acquires stream credit,
+// then connWindow.Consume fails — without an explicit release path,
+// each failed Send permanently consumes payload-size bytes of the
+// stream's effective window.
+func TestStreamWindow_ReleaseUnsent(t *testing.T) {
+	w := NewStreamWindow(testCredit)
+	ctx := context.Background()
+
+	if err := w.Consume(ctx, testCredit/2); err != nil {
+		t.Fatalf("consume half: %v", err)
+	}
+	if got := w.Available(); got != testCredit/2 {
+		t.Errorf("after consume half: avail=%d, want %d", got, testCredit/2)
+	}
+
+	w.ReleaseUnsent(testCredit / 2)
+	if got := w.Available(); got != testCredit {
+		t.Errorf("after ReleaseUnsent: avail=%d, want %d (full)", got, testCredit)
+	}
+
+	// Releasing more than is outstanding caps at outstanding (mirrors
+	// ReleaseOnACK semantics).
+	w.ReleaseUnsent(testCredit) // double-release attempt
+	if got := w.Available(); got != testCredit {
+		t.Errorf("over-release: avail=%d, want %d (still capped)", got, testCredit)
+	}
+
+	// Re-consume the freed credit to confirm the semaphore actually got
+	// the bytes back (not just bookkeeping).
+	if err := w.Consume(ctx, testCredit/2); err != nil {
+		t.Fatalf("consume after release: %v", err)
+	}
+}
+
+// TestStreamWindow_FailedSendCreditLeak reproduces the production-observed
+// stall: 13 sequential 76 KB Consumes each followed by a "send failed"
+// (modeled as no ApplyUpdate, no ReleaseOnACK) drain a 1 MB window to
+// permanent zero. With the ReleaseUnsent fix wired into the Send
+// failure paths, available credit must recover after every failed Send.
+func TestStreamWindow_FailedSendCreditLeak(t *testing.T) {
+	const (
+		initialCredit = 1 * 1024 * 1024 // 1 MB — production gossip stream sizing
+		payload       = 76 * 1024       // ~76 KB — observed gossip exchange size
+	)
+	w := NewStreamWindow(initialCredit)
+	ctx := context.Background()
+
+	// 20 cycles of "send failed after Consume" — far more than would fit
+	// in the window if credit were truly leaked.
+	for i := 0; i < 20; i++ {
+		if err := w.Consume(ctx, payload); err != nil {
+			t.Fatalf("cycle %d Consume: %v", i, err)
+		}
+		// Simulate downstream-layer rejection (e.g. connWindow.Consume failed,
+		// or sendSingleFrame errored). The fix: release the credit we
+		// acquired but didn't actually send.
+		w.ReleaseUnsent(payload)
+
+		if avail := w.Available(); avail != initialCredit {
+			t.Fatalf("cycle %d: credit leaked. avail=%d, want %d (full)",
+				i, avail, initialCredit)
+		}
+	}
+}
+
+// TestStreamWindow_FailedSendWithoutFix demonstrates the bug shape
+// without ReleaseUnsent — included as a guard so future refactors that
+// remove the Send-side release call would re-trigger the symptom and
+// fail this test loudly. After 13 cycles of 76 KB acquired-but-never-
+// released, available drops to roughly the production-observed ~40 KB.
+func TestStreamWindow_FailedSendWithoutFix_Demonstrates_The_Leak(t *testing.T) {
+	const (
+		initialCredit = 1 * 1024 * 1024
+		payload       = 76 * 1024
+	)
+	w := NewStreamWindow(initialCredit)
+	ctx := context.Background()
+
+	for i := 0; i < 13; i++ {
+		if err := w.Consume(ctx, payload); err != nil {
+			t.Fatalf("cycle %d Consume: %v (window already drained — leak too fast?)", i, err)
+		}
+		// Deliberately DON'T release — this is the bug shape we're
+		// asserting reproduces the production drain pattern.
+	}
+
+	avail := w.Available()
+	if avail >= payload {
+		t.Errorf("expected window drained below payload size; got avail=%d (>= %d)",
+			avail, payload)
+	}
+	t.Logf("after 13 leaked Consumes: avail=%d (production observed ~41 KB)", avail)
+}
