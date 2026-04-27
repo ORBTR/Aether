@@ -466,24 +466,44 @@ func (s *NoiseSession) Close() error {
 
 func (s *NoiseSession) CloseWithError(err error) error {
 	s.closeOnce.Do(func() {
-		// Capture immediate caller (file:line) so we can correlate which
-		// code path tore down the session — distinguishes keepalive
-		// timeout, stream-stuck, application Close(), transport-level
-		// teardown, etc. when investigating session-close cascades.
-		_, callerFile, callerLine, callerOK := runtime.Caller(2)
-		caller := "?"
-		if callerOK {
-			if idx := strings.LastIndex(callerFile, "/"); idx >= 0 {
-				callerFile = callerFile[idx+1:]
+		// Capture caller stack (3 frames) to find the actual close
+		// trigger. Frame 0 is this anonymous fn, frame 1 is sync.Once,
+		// frame 2+ are the actual callers — show 3 levels so we can
+		// distinguish keepalive timeout vs stream-stuck vs reliability
+		// watchdog vs application Close(). Without this we got
+		// "once.go:69" which tells us nothing.
+		callerChain := ""
+		var pcs [4]uintptr
+		n := runtime.Callers(3, pcs[:])
+		if n > 0 {
+			frames := runtime.CallersFrames(pcs[:n])
+			for i := 0; i < 3; i++ {
+				frame, more := frames.Next()
+				file := frame.File
+				if idx := strings.LastIndex(file, "/"); idx >= 0 {
+					file = file[idx+1:]
+				}
+				if callerChain != "" {
+					callerChain += "<-"
+				}
+				callerChain += fmt.Sprintf("%s:%d", file, frame.Line)
+				if !more {
+					break
+				}
 			}
-			caller = fmt.Sprintf("%s:%d", callerFile, callerLine)
 		}
 		remoteShort := string(s.remoteNodeID)
 		if len(remoteShort) > 14 {
 			remoteShort = remoteShort[:14] + "..."
 		}
-		log.Printf("[SESSION-CLOSE] noise peer=%s err=%v caller=%s",
-			remoteShort, err, caller)
+		// Snapshot watchdog-relevant state at close time so we can see
+		// why the watchdog thought the session was stuck.
+		stallSince := "n/a"
+		if !s.lastAnyProgressAt.IsZero() {
+			stallSince = fmt.Sprintf("%v", time.Since(s.lastAnyProgressAt))
+		}
+		log.Printf("[SESSION-CLOSE] noise peer=%s err=%v stalled=%s callers=%s",
+			remoteShort, err, stallSince, callerChain)
 		if err != nil {
 			s.closeErr = err
 		}
