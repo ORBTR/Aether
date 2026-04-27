@@ -11,11 +11,19 @@
 package reliability
 
 import (
+	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ORBTR/aether"
 )
+
+// ackEmitCount counts ACK emissions across all engines globally.
+// Periodically logged so we can observe whether ACKs are being
+// generated at all on a node (vs being dropped on the wire).
+var ackEmitCount atomic.Uint64
+var lastAckLogAt atomic.Int64 // unix nanos of last log emission
 
 // ACKPolicy controls when ACKs are sent.
 type ACKPolicy struct {
@@ -222,6 +230,22 @@ func (e *ACKEngine) flushLocked() {
 
 	if e.sendACK != nil {
 		e.sendACK(ack)
+		// Counter-bump per emission. Periodically logged so we can
+		// observe ACK production rate at the receiver side. If this
+		// counter is incrementing while peers' sendBase still stays
+		// at 0, ACKs are being generated but lost in transit (or
+		// inbound on peer). If this counter never moves, ACKs aren't
+		// being generated at all (engine policy never fires).
+		count := ackEmitCount.Add(1)
+		nowNano := time.Now().UnixNano()
+		lastNano := lastAckLogAt.Load()
+		if nowNano-lastNano > int64(60*time.Second) && lastAckLogAt.CompareAndSwap(lastNano, nowNano) {
+			baseStr := uint32(0)
+			if ack != nil {
+				baseStr = ack.BaseACK
+			}
+			log.Printf("[ACK-EMIT] cumulative=%d sample baseACK=%d", count, baseStr)
+		}
 	}
 }
 

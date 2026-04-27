@@ -107,6 +107,20 @@ func (s *NoiseSession) reliabilityTick() {
 			emitHealth := time.Since(lastHealthDump) > 60*time.Second
 			if emitHealth {
 				lastHealthDump = time.Now()
+				// Also dump per-session inboxDrops counter once per
+				// 60s window. If inbox-drops are growing, the noise
+				// listener is dropping inbound packets because our
+				// per-session inbox channel is full — meaning the
+				// consumer (NoiseSession.readLoop) is starved. Direct
+				// evidence for the ACK-loss / s.mu-contention theory.
+				if dropper, ok := s.conn.(interface{ InboxDrops() uint64 }); ok {
+					remoteShort := string(s.remoteNodeID)
+					if len(remoteShort) > 14 {
+						remoteShort = remoteShort[:14] + "..."
+					}
+					log.Printf("[INBOX-HEALTH] peer=%s inboxDrops=%d streams=%d",
+						remoteShort, dropper.InboxDrops(), len(s.streams))
+				}
 			}
 
 			for streamID, st := range s.streams {
