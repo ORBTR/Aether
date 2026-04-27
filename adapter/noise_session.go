@@ -9,8 +9,11 @@ package adapter
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"os"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -463,6 +466,24 @@ func (s *NoiseSession) Close() error {
 
 func (s *NoiseSession) CloseWithError(err error) error {
 	s.closeOnce.Do(func() {
+		// Capture immediate caller (file:line) so we can correlate which
+		// code path tore down the session — distinguishes keepalive
+		// timeout, stream-stuck, application Close(), transport-level
+		// teardown, etc. when investigating session-close cascades.
+		_, callerFile, callerLine, callerOK := runtime.Caller(2)
+		caller := "?"
+		if callerOK {
+			if idx := strings.LastIndex(callerFile, "/"); idx >= 0 {
+				callerFile = callerFile[idx+1:]
+			}
+			caller = fmt.Sprintf("%s:%d", callerFile, callerLine)
+		}
+		remoteShort := string(s.remoteNodeID)
+		if len(remoteShort) > 14 {
+			remoteShort = remoteShort[:14] + "..."
+		}
+		log.Printf("[SESSION-CLOSE] noise peer=%s err=%v caller=%s",
+			remoteShort, err, caller)
 		if err != nil {
 			s.closeErr = err
 		}
