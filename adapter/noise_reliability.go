@@ -85,45 +85,65 @@ func (s *NoiseSession) writeLoop() {
 }
 
 // reliabilityTick checks for retransmission timeouts periodically.
-// Single lock scope covers both retransmit dequeue and stall detection so
-// both see the same snapshot of s.streams and avoid redundant lock traffic.
+//
+// Lock discipline: previously this function held s.mu across the full
+// stream iteration (potentially 50+ streams). Inbound ACK frames hitting
+// handleACK during that window blocked on s.mu, and the resulting
+// readLoop stall caused the per-session noiseConn.inbox to fill, which
+// caused the noise listener to drop inbound packets — including ACKs.
+// Result: fleet-wide ACK starvation (sendBase=0, progressAge=n/a) while
+// session-level Pings (handled pre-aether at the noise transport layer)
+// continued to work.
+//
+// Fix: snapshot the stream list under a brief lock, then iterate without
+// holding s.mu. Per-stream state is already atomic where the contention-
+// sensitive readers (handleACK CAS loop, etc.) need it. session-level
+// state (s.lastAnyProgressAt) is touched briefly under lock at the end.
 func (s *NoiseSession) reliabilityTick() {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	var lastHealthDump time.Time
+	type streamSnap struct {
+		id uint64
+		st *noiseStream
+	}
 	for {
 		select {
 		case <-s.closed:
 			return
 		case <-ticker.C:
 			anyInFlight := false
-			s.mu.Lock()
 
-			// Periodic per-stream health dump every 60s. Captures send
-			// window fill, recv window fill, in-flight counts, and last-
-			// progress age per stream — diagnoses stream-level credit
-			// stalls where the session is alive but specific streams
-			// (typically gossip=0 or rpc=1) stop making forward progress.
+			// Periodic per-stream health dump every 60s.
 			emitHealth := time.Since(lastHealthDump) > 60*time.Second
 			if emitHealth {
 				lastHealthDump = time.Now()
-				// Also dump per-session inboxDrops counter once per
-				// 60s window. If inbox-drops are growing, the noise
-				// listener is dropping inbound packets because our
-				// per-session inbox channel is full — meaning the
-				// consumer (NoiseSession.readLoop) is starved. Direct
-				// evidence for the ACK-loss / s.mu-contention theory.
+			}
+
+			// Snapshot the stream list under a brief lock so we can
+			// process per-stream work without contending with handleACK
+			// / handleData / OpenStream which all acquire s.mu.
+			s.mu.Lock()
+			snap := make([]streamSnap, 0, len(s.streams))
+			for streamID, st := range s.streams {
+				snap = append(snap, streamSnap{id: streamID, st: st})
+			}
+			streamsCount := len(s.streams)
+			s.mu.Unlock()
+
+			if emitHealth {
 				if dropper, ok := s.conn.(interface{ InboxDrops() uint64 }); ok {
 					remoteShort := string(s.remoteNodeID)
 					if len(remoteShort) > 14 {
 						remoteShort = remoteShort[:14] + "..."
 					}
 					log.Printf("[INBOX-HEALTH] peer=%s inboxDrops=%d streams=%d",
-						remoteShort, dropper.InboxDrops(), len(s.streams))
+						remoteShort, dropper.InboxDrops(), streamsCount)
 				}
 			}
 
-			for streamID, st := range s.streams {
+			for _, e := range snap {
+				streamID, st := e.id, e.st
 				// Retransmit timeout dequeue
 				if frame := st.retransmitQ.Dequeue(); frame != nil {
 					s.sched.MarkRetransmit(streamID)
@@ -132,10 +152,7 @@ func (s *NoiseSession) reliabilityTick() {
 					st.rtt.BackoffRTO()
 				}
 
-				// Stall detection: if no ACK progress for 2×SRTT, probe retransmit.
-				// Progress state lives on the stream (per-stream atomic); a
-				// zero nanos value means "no progress observed yet" and is
-				// treated as not-probing.
+				// Stall detection: per-stream atomic reads/writes — no s.mu needed.
 				if st.sendWindow.InFlight() > 0 {
 					anyInFlight = true
 					srtt := st.rtt.SRTT()
@@ -145,16 +162,13 @@ func (s *NoiseSession) reliabilityTick() {
 							if entry := st.sendWindow.GetEntry(st.sendWindow.Base()); entry != nil {
 								s.sched.MarkRetransmit(streamID)
 								s.sched.Enqueue(streamID, entry.Frame)
-								st.lastProgressAtUnixNano.Store(time.Now().UnixNano()) // reset to avoid repeated probes
+								st.lastProgressAtUnixNano.Store(time.Now().UnixNano())
 							}
 						}
 					}
 				}
 
-				// Periodic per-stream health snapshot — only when the
-				// 60s wall-clock window has elapsed. Logs send/recv
-				// credit, in-flight, and last-progress age. Helps
-				// diagnose stream-level forward-progress stalls.
+				// Periodic per-stream health snapshot.
 				if emitHealth {
 					inFlight := st.sendWindow.InFlight()
 					lastProgressNs := st.lastProgressAtUnixNano.Load()
@@ -171,34 +185,20 @@ func (s *NoiseSession) reliabilityTick() {
 				}
 			}
 
-			// Session-level stall detector. When there is data in-flight on
-			// at least one stream AND the session-wide lastAnyProgressAt
-			// marker hasn't advanced past SessionStallThreshold, the path
-			// has gone silent for long enough that per-stream probing has
-			// also failed (probes go over the same broken path). Close the
-			// session with ErrSessionStuck so the owning connection manager
-			// (HSTLES mesh_connection / PeerConnectionManager) can treat
-			// this as a protocol-grade failure and fall back to the next
-			// transport (Noise-UDP → QUIC → WebSocket → gRPC → TLS) rather
-			// than thrashing forever on a black-holed path.
-			//
-			// Threshold is comfortably larger than the worst cross-region
-			// retransmit cycle + the periodic WINDOW_UPDATE re-emission
-			// cadence, so a transient blip cannot trigger it.
-			//
-			// lastAnyProgressAt is seeded at session start via the first
-			// tick (zero value is replaced with "now" so a brand-new
-			// session can't trip the check before traffic starts).
+			// Session-level stall detector. Re-acquire lock briefly to
+			// touch s.lastAnyProgressAt safely.
 			stallThreshold := s.opts.SessionStallThreshold
 			if stallThreshold == 0 {
 				stallThreshold = aether.DefaultSessionStallThreshold
 			}
+			s.mu.Lock()
 			if s.lastAnyProgressAt.IsZero() {
 				s.lastAnyProgressAt = time.Now()
 			}
-			sessionStuck := stallThreshold > 0 && anyInFlight &&
-				time.Since(s.lastAnyProgressAt) > stallThreshold
+			lastProgressAt := s.lastAnyProgressAt
 			s.mu.Unlock()
+			sessionStuck := stallThreshold > 0 && anyInFlight &&
+				time.Since(lastProgressAt) > stallThreshold
 			if sessionStuck {
 				// Probe-before-close: a stalled session might be a
 				// transient-ACK-loss false positive (e.g., a brief CPU
