@@ -9,6 +9,7 @@ package adapter
 import (
 	"bytes"
 	"compress/flate"
+	"context"
 	"fmt"
 	"io"
 	"sync"
@@ -153,7 +154,28 @@ func (s *NoiseSession) reliabilityTick() {
 				time.Since(s.lastAnyProgressAt) > stallThreshold
 			s.mu.Unlock()
 			if sessionStuck {
-				dbgNoise.Printf("session stuck: no ACK progress for %s with data in-flight — closing for transport fallback", stallThreshold)
+				// Probe-before-close: a stalled session might be a
+				// transient-ACK-loss false positive (e.g., a brief CPU
+				// pause delayed our processing of inbound ACKs). Send
+				// a Ping with a short deadline; if it round-trips, the
+				// path is alive and we reset the stall clock instead
+				// of declaring the session stuck. This dramatically
+				// reduces session-close cascades caused by local
+				// transient stalls (GC, lock contention) that affect
+				// many sessions simultaneously.
+				probeCtx, probeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+				_, probeErr := s.Ping(probeCtx)
+				probeCancel()
+				if probeErr == nil {
+					// Path is alive — reset the stall clock and continue.
+					s.mu.Lock()
+					s.lastAnyProgressAt = time.Now()
+					s.mu.Unlock()
+					dbgNoise.Printf("session stall threshold exceeded but Ping succeeded — false positive, reset stall clock")
+					continue
+				}
+				dbgNoise.Printf("session stuck: no ACK progress for %s with data in-flight, Ping also failed (%v) — closing for transport fallback",
+					stallThreshold, probeErr)
 				s.CloseWithError(aether.ErrSessionStuck)
 				return
 			}
