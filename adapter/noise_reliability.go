@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"sync"
 	"time"
 
@@ -89,6 +90,7 @@ func (s *NoiseSession) writeLoop() {
 func (s *NoiseSession) reliabilityTick() {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
+	var lastHealthDump time.Time
 	for {
 		select {
 		case <-s.closed:
@@ -96,6 +98,17 @@ func (s *NoiseSession) reliabilityTick() {
 		case <-ticker.C:
 			anyInFlight := false
 			s.mu.Lock()
+
+			// Periodic per-stream health dump every 60s. Captures send
+			// window fill, recv window fill, in-flight counts, and last-
+			// progress age per stream — diagnoses stream-level credit
+			// stalls where the session is alive but specific streams
+			// (typically gossip=0 or rpc=1) stop making forward progress.
+			emitHealth := time.Since(lastHealthDump) > 60*time.Second
+			if emitHealth {
+				lastHealthDump = time.Now()
+			}
+
 			for streamID, st := range s.streams {
 				// Retransmit timeout dequeue
 				if frame := st.retransmitQ.Dequeue(); frame != nil {
@@ -122,6 +135,25 @@ func (s *NoiseSession) reliabilityTick() {
 							}
 						}
 					}
+				}
+
+				// Periodic per-stream health snapshot — only when the
+				// 60s wall-clock window has elapsed. Logs send/recv
+				// credit, in-flight, and last-progress age. Helps
+				// diagnose stream-level forward-progress stalls.
+				if emitHealth {
+					inFlight := st.sendWindow.InFlight()
+					lastProgressNs := st.lastProgressAtUnixNano.Load()
+					progressAge := "n/a"
+					if lastProgressNs != 0 {
+						progressAge = fmt.Sprintf("%v", time.Since(time.Unix(0, lastProgressNs)))
+					}
+					remoteShort := string(s.remoteNodeID)
+					if len(remoteShort) > 14 {
+						remoteShort = remoteShort[:14] + "..."
+					}
+					log.Printf("[STREAM-HEALTH] peer=%s stream=%d inflight=%d sendBase=%d progressAge=%s",
+						remoteShort, streamID, inFlight, st.sendWindow.Base(), progressAge)
 				}
 			}
 
