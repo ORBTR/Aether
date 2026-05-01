@@ -408,7 +408,34 @@ func (s *NoiseSession) Capabilities() aether.Capabilities {
 	return aether.CapabilitiesForProtocol(aether.ProtoNoise)
 }
 
+// Ping sends a PING frame and waits briefly for any inbound activity
+// (PONG response or any other frame) before reporting the cached RTT.
+//
+// Pre-v0.0.22 returned the cached health.Monitor RTT immediately after
+// writeFrame returned nil, regardless of whether the peer was actually
+// reachable. That made keepalive blind to zombie sessions: the session's
+// `closed` channel could be closed (IsClosed=true) but s.conn.Write
+// queued the frame into a buffered writer that surfaced the network
+// error several seconds later — by which time keepalive's per-tick
+// retry budget was already spent on stale "OK" responses, and avg RTT
+// was the snapshot from the last completed PING/PONG round-trip.
+//
+// v0.0.22:
+//   1. Fast-fail if IsClosed already — avoids syscall for known-dead
+//      sessions and lets keepalive distinguish "stuck send" from
+//      "session torn down".
+//   2. Capture LastActivity before writeFrame, then poll until either
+//      ctx fires, IsClosed flips, the activity timestamp advances, or
+//      a 2 s ceiling is reached (clamped by ctx deadline if shorter).
+//      Any inbound frame counts as "alive" — we deliberately don't
+//      track per-PING seqNo to avoid adding state. False positives
+//      (peer happens to send something else within 2 s) are fine for
+//      the keepalive use case; the goal is detecting silence.
 func (s *NoiseSession) Ping(ctx context.Context) (time.Duration, error) {
+	if s.IsClosed() {
+		return 0, aether.ErrSessionClosed
+	}
+	before := s.healthMon.LastActivity()
 	frame := &aether.Frame{
 		SenderID:   s.localPeerID,
 		ReceiverID: s.remotePeerID,
@@ -419,8 +446,29 @@ func (s *NoiseSession) Ping(ctx context.Context) (time.Duration, error) {
 	if err := s.writeFrame(frame); err != nil {
 		return 0, err
 	}
-	_, avg := s.healthMon.RTT()
-	return avg, nil
+	deadline := time.Now().Add(2 * time.Second)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
+		deadline = dl
+	}
+	pollTicker := time.NewTicker(50 * time.Millisecond)
+	defer pollTicker.Stop()
+	for {
+		if s.IsClosed() {
+			return 0, aether.ErrSessionClosed
+		}
+		if s.healthMon.LastActivity().After(before) {
+			_, avg := s.healthMon.RTT()
+			return avg, nil
+		}
+		if !time.Now().Before(deadline) {
+			return 0, fmt.Errorf("aether: ping timeout (no inbound activity)")
+		}
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-pollTicker.C:
+		}
+	}
 }
 
 func (s *NoiseSession) GoAway(ctx context.Context, reason aether.GoAwayReason, message string) error {

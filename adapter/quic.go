@@ -180,8 +180,21 @@ func (s *QUICSession) Capabilities() aether.Capabilities {
 	return aether.CapabilitiesForProtocol(aether.ProtoQUIC)
 }
 
+// Ping reports session liveness for keepalive. QUIC has its own
+// transport-layer keepalive so we don't write an aether-level PING
+// frame, but we DO need to surface session death to callers — pre-v0.0.22
+// returned the cached RTT regardless of whether the underlying QUIC
+// connection had been torn down, leaving zombie sessions registered
+// in the connection manager indefinitely. Now we check IsClosed plus
+// the underlying QUIC connection's context, which fires on transport
+// close, idle timeout, or peer-initiated CONNECTION_CLOSE.
 func (s *QUICSession) Ping(ctx context.Context) (time.Duration, error) {
-	// QUIC doesn't expose ping directly — use health monitor
+	if s.IsClosed() {
+		return 0, aether.ErrSessionClosed
+	}
+	if err := s.conn.Context().Err(); err != nil {
+		return 0, aether.ErrSessionClosed
+	}
 	_, avg := s.healthMon.RTT()
 	return avg, nil
 }
