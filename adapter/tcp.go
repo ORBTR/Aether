@@ -772,7 +772,14 @@ func (s *TCPSession) Capabilities() aether.Capabilities {
 	return aether.CapabilitiesForProtocol(s.proto)
 }
 
+// Ping sends a PING frame and waits for inbound activity (PONG or any
+// other frame) before reporting RTT. Mirrors NoiseSession.Ping — see
+// that comment for the zombie-session detection rationale.
 func (s *TCPSession) Ping(ctx context.Context) (time.Duration, error) {
+	if s.IsClosed() {
+		return 0, aether.ErrSessionClosed
+	}
+	before := s.healthMon.LastActivity()
 	start := time.Now()
 	frame := &aether.Frame{
 		SenderID:   s.localPeerID,
@@ -784,10 +791,29 @@ func (s *TCPSession) Ping(ctx context.Context) (time.Duration, error) {
 	if err := s.writeFrame(frame); err != nil {
 		return 0, err
 	}
-	// Note: actual RTT measurement requires waiting for PONG.
-	// For now, return the health monitor's average RTT.
-	_, avg := s.healthMon.RTT()
-	return avg, nil
+	deadline := time.Now().Add(2 * time.Second)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
+		deadline = dl
+	}
+	pollTicker := time.NewTicker(50 * time.Millisecond)
+	defer pollTicker.Stop()
+	for {
+		if s.IsClosed() {
+			return 0, aether.ErrSessionClosed
+		}
+		if s.healthMon.LastActivity().After(before) {
+			_, avg := s.healthMon.RTT()
+			return avg, nil
+		}
+		if !time.Now().Before(deadline) {
+			return 0, fmt.Errorf("aether: ping timeout (no inbound activity)")
+		}
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-pollTicker.C:
+		}
+	}
 }
 
 func (s *TCPSession) GoAway(ctx context.Context, reason aether.GoAwayReason, message string) error {
