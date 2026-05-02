@@ -264,15 +264,18 @@ func (s *NoiseSession) reliabilityTick() {
 						}
 					}
 				}
+				sessionAge := time.Since(s.createdAt)
+				warmupActive := warmupGrace > 0 && sessionAge < warmupGrace
 				if probeOK {
 					s.mu.Lock()
 					s.lastAnyProgressAt = time.Now()
 					s.mu.Unlock()
-					dbgNoise.Printf("session stall threshold exceeded but Ping succeeded — false positive, reset stall clock")
+					log.Printf("[STALL-DETECT] false-positive peer=%s age=%v warmup=%v effThresh=%s",
+						s.remoteNodeID.Short(), sessionAge, warmupActive, effectiveThreshold)
 					continue
 				}
-				dbgNoise.Printf("session stuck: no ACK progress for %s with data in-flight, %d Pings also failed (last err: %v) — closing for transport fallback",
-					stallThreshold, probeAttempts, lastProbeErr)
+				log.Printf("[STALL-DETECT] confirmed-stuck peer=%s age=%v warmup=%v effThresh=%s probesFailed=%d lastErr=%v — closing for fallback",
+					s.remoteNodeID.Short(), sessionAge, warmupActive, effectiveThreshold, probeAttempts, lastProbeErr)
 				s.CloseWithError(aether.ErrSessionStuck)
 				return
 			}
