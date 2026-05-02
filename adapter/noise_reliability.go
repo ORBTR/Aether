@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/ORBTR/aether"
+	"github.com/ORBTR/aether/congestion"
 )
 
 // writeLoop reads from the scheduler and writes frames to the Noise
@@ -68,6 +69,14 @@ func (s *NoiseSession) writeLoop() {
 					frame.StreamID, frame.Type, frame.SeqNo, frame.Length)
 			}
 			s.writeFrame(frame)
+
+			// Notify congestion controller of the send. CUBIC accumulates
+			// prr_out for PRR; BBR's OnSend stamps a delivery-rate sample
+			// internally. The returned sample is used by ACK paths that
+			// already stamp BBRSample on SendEntry — handled in the
+			// upstream send-path that owns the SendEntry pointer (here we
+			// only see the frame, not the entry, so we just notify).
+			_ = s.congestion().OnSend(int64(frameSize))
 
 			// Update pacer rate from congestion controller after each send
 			if pacingRate := s.congestion().PacingRate(); pacingRate > 0 {
@@ -142,30 +151,93 @@ func (s *NoiseSession) reliabilityTick() {
 				}
 			}
 
+			tickNow := time.Now()
+			mssBytes := int64(s.MSS())
+			if mssBytes <= 0 {
+				mssBytes = 1400
+			}
 			for _, e := range snap {
 				streamID, st := e.id, e.st
-				// Retransmit timeout dequeue
+				// RTO-driven retransmit (safety net). Pre-RACK, this path
+				// also called OnLoss — every retransmit collapsed cwnd by
+				// 30%, which produced the cwnd-stuck-at-floor pattern
+				// FLOW-DIAG caught in production. RACK now owns the
+				// loss-signal authority; RTO is just a re-send mechanism
+				// for ACK-starved sessions where RACK has nothing to
+				// work with (no fack established yet). BackoffRTO still
+				// runs so the RTO interval grows on persistent loss.
 				if frame := st.retransmitQ.Dequeue(); frame != nil {
 					s.sched.MarkRetransmit(streamID)
 					s.sched.Enqueue(streamID, frame)
-					s.congestion().OnLoss()
+					st.sendWindow.BumpXmitTime(frame.SeqNo, tickNow)
 					st.rtt.BackoffRTO()
 				}
 
-				// Stall detection: per-stream atomic reads/writes — no s.mu needed.
-				if st.sendWindow.InFlight() > 0 {
+				// Refresh RACK + TLP RTT estimates each tick so the
+				// reorder window and probe timeout track current SRTT.
+				srtt := st.rtt.SRTT()
+				if srtt > 0 {
+					st.rack.UpdateRTT(srtt)
+					st.tlp.UpdateSRTT(srtt)
+				}
+
+				// RACK loss detection (RFC 8985). DetectLost returns the
+				// seqs whose XmitTime is >= reoWnd older than fack — i.e.
+				// presumed lost via time-based ordering rather than
+				// dupack count. Each lost seq is bumped + re-enqueued and
+				// we call OnLossWithPipe ONCE per tick (not once per
+				// declared seq) — CUBIC's PRR seeds itself from the pipe
+				// snapshot taken at this moment.
+				inFlight := st.sendWindow.InFlight()
+				if inFlight > 0 {
 					anyInFlight = true
-					srtt := st.rtt.SRTT()
-					if srtt > 0 {
-						lastProgressNs := st.lastProgressAtUnixNano.Load()
-						if lastProgressNs != 0 && time.Since(time.Unix(0, lastProgressNs)) > 2*srtt {
-							if entry := st.sendWindow.GetEntry(st.sendWindow.Base()); entry != nil {
+					rawSnap := st.sendWindow.SnapshotEntries()
+					rackSnap := make([]congestion.SendEntrySnapshot, 0, len(rawSnap))
+					for _, re := range rawSnap {
+						rackSnap = append(rackSnap, congestion.SendEntrySnapshot{Seq: re.Seq, XmitTime: re.XmitTime})
+					}
+					lost, _ := st.rack.DetectLost(rackSnap, tickNow)
+					if len(lost) > 0 {
+						pipe := int64(inFlight) * mssBytes
+						for _, seq := range lost {
+							if entry := st.sendWindow.GetEntry(seq); entry != nil {
 								s.sched.MarkRetransmit(streamID)
 								s.sched.Enqueue(streamID, entry.Frame)
-								st.lastProgressAtUnixNano.Store(time.Now().UnixNano())
+								st.sendWindow.BumpXmitTime(seq, tickNow)
 							}
 						}
+						s.congestion().OnLossWithPipe(pipe)
 					}
+
+					// TLP — fire one probe outside cwnd if PTO elapsed
+					// without an ACK. The probe is the highest in-flight
+					// seq's frame (RFC 8985 §7.4: probe with the latest
+					// data so the receiver's ACK reveals the gap).
+					if st.tlp.ShouldProbe(tickNow) {
+						highSeq := st.sendWindow.Next() - 1
+						if entry := st.sendWindow.GetEntry(highSeq); entry != nil {
+							s.sched.MarkRetransmit(streamID)
+							s.sched.Enqueue(streamID, entry.Frame)
+							st.sendWindow.BumpXmitTime(highSeq, tickNow)
+							st.tlp.MarkProbeSent(highSeq)
+							log.Printf("[TLP] peer=%s stream=%d probeSeq=%d inFlight=%d cwnd=%d",
+								s.remoteNodeID.Short(), streamID, highSeq, inFlight, s.congestion().CWND())
+						}
+					}
+
+					// Re-arm TLP based on the freshest XmitTime in the
+					// in-flight set. PendingProbe state internally
+					// suppresses spurious re-arming while a probe is
+					// outstanding.
+					var newest time.Time
+					for _, re := range rawSnap {
+						if re.XmitTime.After(newest) {
+							newest = re.XmitTime
+						}
+					}
+					st.tlp.Arm(newest)
+				} else {
+					st.tlp.Disarm()
 				}
 
 				// Periodic per-stream health snapshot.
@@ -270,9 +342,29 @@ func (s *NoiseSession) reliabilityTick() {
 					s.mu.Lock()
 					s.lastAnyProgressAt = time.Now()
 					s.mu.Unlock()
-					log.Printf("[STALL-DETECT] false-positive peer=%s age=%v warmup=%v effThresh=%s",
-						s.remoteNodeID.Short(), sessionAge, warmupActive, effectiveThreshold)
+					// Persistent-congestion exit (RFC 9002 §7.6 analog):
+					// the path is provably alive because Ping returned, so
+					// the cumulative OnLoss reductions that drove cwnd to
+					// the floor were diagnosing transient loss as
+					// persistent congestion. Restore cwnd so the
+					// reliability layer can drain its in-flight backlog
+					// instead of deadlocking on cwnd <= inFlight.
+					//
+					// Without this, every probe-rescue resets only the
+					// stall clock — cwnd stays collapsed, reliability
+					// can't make progress, the next stall fires within
+					// effThresh again, and we loop until probe-before-
+					// close eventually fails and the session is killed.
+					prevCwnd := s.congestion().CWND()
+					s.congestion().ResetCWND()
+					newCwnd := s.congestion().CWND()
+					log.Printf("[STALL-DETECT] false-positive peer=%s age=%v warmup=%v effThresh=%s cwnd=%d→%d (persistent-congestion exit)",
+						s.remoteNodeID.Short(), sessionAge, warmupActive, effectiveThreshold, prevCwnd, newCwnd)
 					s.dumpFlowDiagOnStall("false-positive")
+					// Wake the writeLoop so it re-evaluates CanSend with
+					// the freshly-reset cwnd. Without this, the deadlock
+					// would persist until the next external send.
+					s.sched.Wake()
 					continue
 				}
 				log.Printf("[STALL-DETECT] confirmed-stuck peer=%s age=%v warmup=%v effThresh=%s probesFailed=%d lastErr=%v — closing for fallback",

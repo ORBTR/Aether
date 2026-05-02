@@ -623,6 +623,8 @@ func (s *NoiseSession) dumpFlowDiagOnStall(reason string) {
 		flowStats   flow.Stats
 		srtt        time.Duration
 		progressAge time.Duration
+		rack        congestion.State
+		tlp         congestion.TLPState
 	}
 
 	s.mu.Lock()
@@ -648,6 +650,12 @@ func (s *NoiseSession) dumpFlowDiagOnStall(reason string) {
 		if pn := st.lastProgressAtUnixNano.Load(); pn != 0 {
 			row.progressAge = now.Sub(time.Unix(0, pn))
 		}
+		if st.rack != nil {
+			row.rack = st.rack.Snapshot()
+		}
+		if st.tlp != nil {
+			row.tlp = st.tlp.Snapshot()
+		}
 		rows = append(rows, row)
 	}
 	autoTuneAge := now.Sub(s.lastAutoTune)
@@ -672,7 +680,15 @@ func (s *NoiseSession) dumpFlowDiagOnStall(reason string) {
 		connStats.WatermarkGrants, connStats.TimedGrants,
 		len(rows))
 	for _, r := range rows {
-		log.Printf("[FLOW-DIAG] %s stream=%d inFlight=%d send{base=%d next=%d} recv{exp=%d buf=%d drops=%d} flow{cur=%d out=%d credit=%d cons=%d thr=%d eag=%d wm=%d tim=%d} srtt=%v progressAge=%v",
+		var fackAge time.Duration
+		if !r.rack.LastDeliveredAt.IsZero() {
+			fackAge = now.Sub(r.rack.LastDeliveredAt)
+		}
+		var tlpScheduledIn time.Duration
+		if !r.tlp.ScheduledAt.IsZero() {
+			tlpScheduledIn = r.tlp.ScheduledAt.Sub(now)
+		}
+		log.Printf("[FLOW-DIAG] %s stream=%d inFlight=%d send{base=%d next=%d} recv{exp=%d buf=%d drops=%d} flow{cur=%d out=%d credit=%d cons=%d thr=%d eag=%d wm=%d tim=%d} srtt=%v progressAge=%v rack{fackSeq=%d fackAge=%v reoWnd=%v marked=%d} tlp{scheduledIn=%v probePending=%v probes=%d pto=%v}",
 			remoteShort, r.id, r.inFlight,
 			r.sendBase, r.sendNext,
 			r.recvExp, r.recvBuffered, r.recvDrops,
@@ -680,7 +696,9 @@ func (s *NoiseSession) dumpFlowDiagOnStall(reason string) {
 			r.flowStats.RecvCredit, r.flowStats.Consumed,
 			r.flowStats.ThresholdGrants, r.flowStats.EagerGrants,
 			r.flowStats.WatermarkGrants, r.flowStats.TimedGrants,
-			r.srtt, r.progressAge)
+			r.srtt, r.progressAge,
+			r.rack.FackSeq, fackAge, r.rack.ReoWnd, r.rack.MarkedLost,
+			tlpScheduledIn, r.tlp.ProbePending, r.tlp.ConsecutiveProbes, r.tlp.PTO)
 	}
 }
 

@@ -319,18 +319,53 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 		}
 	}
 
-	// Remove acked from retransmit queue
+	// Remove acked from retransmit queue, and feed RACK its delivery
+	// timestamps. RACK uses XmitTime (set in sendWindow.Add /
+	// BumpXmitTime), not SentAt, so we get the freshest transmission
+	// of each acked seq — critical for retransmits where the original
+	// xmit time would mis-classify a recently-delivered ACK.
+	ackTime := time.Now()
 	for _, entry := range acked {
 		st.retransmitQ.Remove(entry.Frame.SeqNo)
+		st.rack.Ack(entry.Frame.SeqNo, entry.XmitTime, ackTime)
+	}
+	if len(acked) > 0 {
+		// Any ACK reset TLP — network is responsive, we don't need
+		// to count consecutive probes against the cap.
+		st.tlp.AnyAckReceived()
+		// If the just-ACKed seq matches the in-flight TLP probe,
+		// clear the pending-probe state so the next ShouldProbe
+		// can fire when warranted.
+		if probeSeq, pending := st.tlp.PendingProbeSeq(); pending {
+			for _, e := range acked {
+				if e.Frame.SeqNo == probeSeq {
+					st.tlp.MarkProbeAcked()
+					break
+				}
+			}
+		}
 	}
 
-	// Implicit NACKs — fast retransmit (bitmap gaps beyond reorder threshold)
-	for _, nackSeqNo := range nacks {
-		if entry := st.sendWindow.GetEntry(nackSeqNo); entry != nil {
-			s.sched.MarkRetransmit(frame.StreamID)
-			s.sched.Enqueue(frame.StreamID, entry.Frame)
-			s.congestion().OnLoss()
+	// Implicit NACKs — fast retransmit (bitmap gaps beyond reorder
+	// threshold). RACK will also catch these on the next tick, but the
+	// peer's explicit NACK is faster — we trust their gap report and
+	// retransmit now. OnLossWithPipe is idempotent within a recovery
+	// window (see CUBICController.OnLossWithPipe) so RACK's later
+	// declaration on the same seq won't compound the cwnd reduction.
+	if len(nacks) > 0 {
+		mss := int64(s.MSS())
+		if mss <= 0 {
+			mss = 1400
 		}
+		pipe := int64(st.sendWindow.InFlight()) * mss
+		for _, nackSeqNo := range nacks {
+			if entry := st.sendWindow.GetEntry(nackSeqNo); entry != nil {
+				s.sched.MarkRetransmit(frame.StreamID)
+				s.sched.Enqueue(frame.StreamID, entry.Frame)
+				st.sendWindow.BumpXmitTime(nackSeqNo, ackTime)
+			}
+		}
+		s.congestion().OnLossWithPipe(pipe)
 	}
 
 	// BBRv2 per-packet sampling. When the active controller is BBR and
