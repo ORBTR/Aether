@@ -272,10 +272,12 @@ func (s *NoiseSession) reliabilityTick() {
 					s.mu.Unlock()
 					log.Printf("[STALL-DETECT] false-positive peer=%s age=%v warmup=%v effThresh=%s",
 						s.remoteNodeID.Short(), sessionAge, warmupActive, effectiveThreshold)
+					s.dumpFlowDiagOnStall("false-positive")
 					continue
 				}
 				log.Printf("[STALL-DETECT] confirmed-stuck peer=%s age=%v warmup=%v effThresh=%s probesFailed=%d lastErr=%v — closing for fallback",
 					s.remoteNodeID.Short(), sessionAge, warmupActive, effectiveThreshold, probeAttempts, lastProbeErr)
+				s.dumpFlowDiagOnStall("confirmed-stuck")
 				s.CloseWithError(aether.ErrSessionStuck)
 				return
 			}
