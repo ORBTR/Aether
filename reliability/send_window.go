@@ -37,6 +37,15 @@ type SendEntry struct {
 	Retries int
 	Acked   bool
 
+	// XmitTime is the wall-clock time of the most recent transmission of
+	// this entry. Equal to SentAt at first send; updated to time.Now() by
+	// BumpXmitTime when the adapter retransmits. RACK loss detection
+	// (RFC 8985) consults XmitTime — not SentAt — to decide whether a
+	// frame is older than the receiver's most recent delivery and thus
+	// presumed lost. Without this distinction RACK would mark every
+	// retransmitted frame as lost again on the very first tick.
+	XmitTime time.Time
+
 	// BBRv2 per-packet delivery-rate sample. Stamped at send time by the
 	// adapter via congestion.BBRController.OnSend, read back by the
 	// adapter when the matching ACK arrives so it can call OnAckSampled
@@ -92,13 +101,55 @@ func (w *SendWindow) AddEntry(frame *aether.Frame) (uint32, *SendEntry) {
 
 	seq := w.next
 	frame.SeqNo = seq
+	now := time.Now()
 	entry := &SendEntry{
-		Frame:  frame,
-		SentAt: time.Now(),
+		Frame:    frame,
+		SentAt:   now,
+		XmitTime: now,
 	}
 	w.entries[seq] = entry
 	w.next++
 	return seq, entry
+}
+
+// BumpXmitTime updates XmitTime on the entry for seq to t. Called by the
+// adapter immediately before re-enqueuing a retransmit so RACK's loss
+// detector (RFC 8985 §6.2) sees the freshest transmission timestamp and
+// doesn't repeatedly mark a just-retransmitted frame as lost.
+//
+// No-op if seq is no longer in the window (already ACKed). Safe to call
+// from the reliability tick — single-mutex acquisition.
+func (w *SendWindow) BumpXmitTime(seq uint32, t time.Time) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if entry, ok := w.entries[seq]; ok {
+		entry.XmitTime = t
+		entry.Retries++
+	}
+}
+
+// SnapshotEntries returns a copy of all in-flight (seq, XmitTime) pairs
+// for RACK iteration. The caller iterates without holding any locks
+// (RACK only needs xmit times, not the underlying frames). Allocates a
+// fresh slice each call — RACK is invoked once per reliability tick on
+// streams with InFlight > 0, so allocation overhead is bounded.
+func (w *SendWindow) SnapshotEntries() []SnapshotEntry {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	out := make([]SnapshotEntry, 0, len(w.entries))
+	for seq, e := range w.entries {
+		out = append(out, SnapshotEntry{Seq: seq, XmitTime: e.XmitTime, Retries: e.Retries})
+	}
+	return out
+}
+
+// SnapshotEntry is a lock-free view of an in-flight frame's metadata
+// for RACK loss detection. Holds no live pointers into the SendWindow
+// so the caller can iterate without contending with handleACK or Add.
+type SnapshotEntry struct {
+	Seq      uint32
+	XmitTime time.Time
+	Retries  int
 }
 
 // Ack marks a single SeqNo as acknowledged and returns the entry (for RTT calculation).

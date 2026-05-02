@@ -68,6 +68,21 @@ type noiseStream struct {
 	// which the tick treats as "don't probe".
 	lastBaseACKSeen        atomic.Uint32
 	lastProgressAtUnixNano atomic.Int64
+
+	// rack runs RFC 8985 time-based loss detection on this stream.
+	// Updated by handleACK on every successful ACK (Ack call), consulted
+	// each reliability tick to enumerate freshly-lost seqs to retransmit.
+	// Replaces the previous "every RTO triggers OnLoss" cwnd-collapse
+	// pattern — RACK fires OnLoss once per actual loss, not once per
+	// retransmit attempt.
+	rack *congestion.RACK
+
+	// tlp implements RFC 8985 §7 Tail Loss Probe. Armed by the adapter
+	// when in-flight transitions from 0 → >0; fires when no ACK has
+	// arrived for a full PTO. Sends one packet OUTSIDE cwnd to elicit
+	// an ACK, breaking the deadlock where cwnd ≤ inFlight prevents any
+	// further sends.
+	tlp *congestion.TLP
 }
 
 // createStream creates a new stream with full reliability infrastructure via Engine.
@@ -122,6 +137,8 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 		retransmitQ: eng.RetransmitQ,
 		rtt:         eng.RTT,
 		replay:      eng.Replay,
+		rack:        congestion.NewRACK(eng.RTT.SRTT()),
+		tlp:         congestion.NewTLP(eng.RTT.SRTT()),
 	}
 	// Per-stream grant debouncer. Immediate-flush floor at 50% of the
 	// stream's initial credit so burst reads drain the pending total

@@ -257,6 +257,45 @@ func (b *BBRController) OnLoss() {
 	}
 }
 
+// OnLossWithPipe — BBR doesn't use PRR (its bandwidth-delay model
+// doesn't need a proportional drainer), so pipeBytes is ignored and
+// the call is forwarded to OnLoss. Adapter callers pass pipeBytes
+// unconditionally so the same call site works for both controllers.
+func (b *BBRController) OnLossWithPipe(pipeBytes int64) {
+	b.OnLoss()
+}
+
+// OnAckWithPipe — BBR uses its own delivery-rate sample machinery and
+// doesn't gain anything from PRR, so this forwards to OnAck. The
+// recommended path for BBR remains OnAckSampled (with a stamped
+// DeliveryRateSample); OnAckWithPipe exists purely to satisfy the
+// Controller interface for adapters that don't carry samples.
+func (b *BBRController) OnAckWithPipe(ackedBytes int64, rtt time.Duration, pipeBytes int64) {
+	b.OnAck(ackedBytes, rtt)
+}
+
+// ResetCWND restores BBR to a fresh-startup state — cwnd back to the
+// initial value, model state cleared (rtProp/btlBw/inflightHi). Called
+// by the adapter when probe-before-close confirms the path is alive
+// after a stretch of cumulative loss-driven cwnd shrinkage.
+//
+// Functionally equivalent to constructing a fresh BBRController, but
+// preserves the controller pointer so atomic.Pointer holders
+// (NoiseSession.cong) don't need a swap.
+func (b *BBRController) ResetCWND() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.cwnd = int64(initialCWND)
+	b.inflight = 0
+	b.inflightHi = 0
+	b.rtProp = 0
+	b.rtPropStamp = time.Time{}
+	b.btlBw = 0
+	b.appLimited = false
+	b.state = bbrStartup
+	b.recomputeOutputs()
+}
+
 // OnCE handles ECN CE marks (#15). One RTT-bounded reduction.
 func (b *BBRController) OnCE(bytesMarked int64) {
 	if bytesMarked <= 0 {
