@@ -558,8 +558,14 @@ func (s *NoiseSession) CloseWithError(err error) error {
 		if !s.lastAnyProgressAt.IsZero() {
 			stallSince = fmt.Sprintf("%v", time.Since(s.lastAnyProgressAt))
 		}
-		log.Printf("[SESSION-CLOSE] noise peer=%s err=%v stalled=%s callers=%s",
-			remoteShort, err, stallSince, callerChain)
+		lifetime := time.Since(s.createdAt)
+		warmupGrace := s.opts.SessionWarmupGrace
+		if warmupGrace == 0 {
+			warmupGrace = aether.DefaultSessionWarmupGrace
+		}
+		warmupActive := warmupGrace > 0 && lifetime < warmupGrace
+		log.Printf("[SESSION-CLOSE] noise peer=%s lifetime=%v warmup=%v err=%v stalled=%s callers=%s",
+			remoteShort, lifetime, warmupActive, err, stallSince, callerChain)
 		if err != nil {
 			s.closeErr = err
 		}
