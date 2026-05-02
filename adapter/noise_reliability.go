@@ -201,27 +201,61 @@ func (s *NoiseSession) reliabilityTick() {
 				time.Since(lastProgressAt) > stallThreshold
 			if sessionStuck {
 				// Probe-before-close: a stalled session might be a
-				// transient-ACK-loss false positive (e.g., a brief CPU
-				// pause delayed our processing of inbound ACKs). Send
-				// a Ping with a short deadline; if it round-trips, the
-				// path is alive and we reset the stall clock instead
-				// of declaring the session stuck. This dramatically
-				// reduces session-close cascades caused by local
-				// transient stalls (GC, lock contention) that affect
-				// many sessions simultaneously.
-				probeCtx, probeCancel := context.WithTimeout(context.Background(), 2*time.Second)
-				_, probeErr := s.Ping(probeCtx)
-				probeCancel()
-				if probeErr == nil {
-					// Path is alive — reset the stall clock and continue.
+				// transient false positive (CPU pause delayed our
+				// processing of inbound ACKs, OR a short packet-loss
+				// burst on a UDP path that recovers within seconds).
+				// We send up to 3 Pings spaced 1 s apart; if any one
+				// of them returns success the path is alive and we
+				// reset the stall clock. Only if ALL three fail do we
+				// declare the session stuck.
+				//
+				// Pre-v0.0.23 used a single Ping with a 2-second
+				// timeout. On UDP paths with bursty loss (notably fly
+				// cross-region anycast where a 200-ms blackout is
+				// common) that single probe could land entirely in
+				// the bad window and condemn an otherwise-healthy
+				// session. The connection manager would then mark
+				// noise-udp failed for 30 s-2 min, fall back to WS,
+				// and the upgrade churn loop would dominate the
+				// fleet's transport mix until the underlying loss
+				// passed. Three 1-second probes cover ~3 s of wall
+				// time which is long enough for typical fly loss
+				// bursts to clear without being long enough to delay
+				// genuine close-of-dead-session noticeably.
+				const probeAttempts = 3
+				const probeTimeout = 1 * time.Second
+				const probeSpacing = 1 * time.Second
+				probeOK := false
+				var lastProbeErr error
+				for attempt := 0; attempt < probeAttempts; attempt++ {
+					probeCtx, probeCancel := context.WithTimeout(context.Background(), probeTimeout)
+					_, lastProbeErr = s.Ping(probeCtx)
+					probeCancel()
+					if lastProbeErr == nil {
+						probeOK = true
+						break
+					}
+					if attempt < probeAttempts-1 {
+						// Brief gap between probes so back-to-back
+						// retries don't all hit the same loss burst.
+						select {
+						case <-time.After(probeSpacing):
+						case <-s.closed:
+							// Session was closed by another path
+							// (e.g. external Close); stop probing.
+							return
+						}
+					}
+				}
+				if probeOK {
 					s.mu.Lock()
 					s.lastAnyProgressAt = time.Now()
 					s.mu.Unlock()
 					dbgNoise.Printf("session stall threshold exceeded but Ping succeeded — false positive, reset stall clock")
 					continue
 				}
-				dbgNoise.Printf("session stuck: no ACK progress for %s with data in-flight, Ping also failed (%v) — closing for transport fallback",
-					stallThreshold, probeErr)
+				dbgNoise.Printf("session stuck: no ACK progress for %s with data in-flight, %d Pings also failed (last err: %v) — closing for transport fallback",
+					stallThreshold, probeAttempts, lastProbeErr)
 				s.CloseWithError(aether.ErrSessionStuck)
 				return
 			}
