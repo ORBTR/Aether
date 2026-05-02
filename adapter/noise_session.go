@@ -188,6 +188,13 @@ type NoiseSession struct {
 	// a lower-grade transport (e.g. Noise-UDP → WS) rather than thrash
 	// on a black-holed path. Updated under s.mu during reliabilityTick.
 	lastAnyProgressAt time.Time
+
+	// createdAt is the wall-clock time the session was constructed.
+	// Used by the stall detector together with opts.SessionWarmupGrace
+	// to compute an effective stall threshold that's larger during
+	// the session's initial lifetime — see reliabilityTick. Set once
+	// in NewNoiseSession and read lock-free thereafter.
+	createdAt time.Time
 }
 
 // NewNoiseSession creates an Aether session over a Noise-encrypted
@@ -226,6 +233,7 @@ func NewNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 		compressor:         aether.NewCompressor(),
 		tickStop:           make(chan struct{}),
 		closed:             make(chan struct{}),
+		createdAt:          time.Now(),
 	}
 	// Reed-Solomon encoder/decoder — instantiated even when no stream is
 	// using FECReedSolomon, because the cost is just a small Galois-field

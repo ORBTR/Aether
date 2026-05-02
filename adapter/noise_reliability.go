@@ -191,14 +191,31 @@ func (s *NoiseSession) reliabilityTick() {
 			if stallThreshold == 0 {
 				stallThreshold = aether.DefaultSessionStallThreshold
 			}
+			// Warmup grace: while the session is in its initial
+			// lifetime window the effective threshold is doubled so a
+			// freshly-installed session has time to demonstrate
+			// stability before transient packet-loss bursts can
+			// declare it stuck. Specifically targets the gossip-
+			// migration race after a transport upgrade — see
+			// SessionOptions.SessionWarmupGrace for the full
+			// rationale. Negative warmup grace = caller explicitly
+			// disabled the warmup (use the base threshold from t=0).
+			warmupGrace := s.opts.SessionWarmupGrace
+			if warmupGrace == 0 {
+				warmupGrace = aether.DefaultSessionWarmupGrace
+			}
+			effectiveThreshold := stallThreshold
+			if warmupGrace > 0 && time.Since(s.createdAt) < warmupGrace {
+				effectiveThreshold = stallThreshold * 2
+			}
 			s.mu.Lock()
 			if s.lastAnyProgressAt.IsZero() {
 				s.lastAnyProgressAt = time.Now()
 			}
 			lastProgressAt := s.lastAnyProgressAt
 			s.mu.Unlock()
-			sessionStuck := stallThreshold > 0 && anyInFlight &&
-				time.Since(lastProgressAt) > stallThreshold
+			sessionStuck := effectiveThreshold > 0 && anyInFlight &&
+				time.Since(lastProgressAt) > effectiveThreshold
 			if sessionStuck {
 				// Probe-before-close: a stalled session might be a
 				// transient false positive (CPU pause delayed our
