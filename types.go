@@ -195,6 +195,28 @@ type SessionOptions struct {
 	// 0 = use DefaultSessionStallThreshold. Set to a negative value to
 	// disable stall detection entirely.
 	SessionStallThreshold time.Duration
+
+	// SessionWarmupGrace extends SessionStallThreshold for a session's
+	// initial lifetime window. While time.Since(session.createdAt) is
+	// less than SessionWarmupGrace, the effective stall threshold is
+	// 2 × SessionStallThreshold. Designed to give freshly-installed
+	// sessions a chance to demonstrate stability under traffic before
+	// the stall detector can declare them stuck.
+	//
+	// Specifically targets the gossip-migration race: when a higher-
+	// grade session (e.g. noise-udp upgraded from a WS bootstrap)
+	// becomes the dispatch primary, dispatch traffic shifts onto it
+	// while gossip-initiator dedup may still be migrating. During
+	// that brief window the session has dispatch in-flight but the
+	// gossip side hasn't started pumping ACK-bearing traffic yet, so
+	// a single packet-loss burst that would normally be transient
+	// can trip the stall detector and reap the session before it
+	// proves itself. The 60 s default covers the gossip-migration
+	// window plus the proving-window grace the upper layer enforces.
+	//
+	// 0 = use DefaultSessionWarmupGrace. Set to a negative value to
+	// disable warmup grace (immediate stall threshold from t=0).
+	SessionWarmupGrace time.Duration
 }
 
 // DefaultMaxConcurrentStreams is the default per-session stream cap for
@@ -218,6 +240,13 @@ const DefaultSessionIdleTimeout = 5 * time.Minute
 // stuck session has missed roughly 15 re-emissions and is not going to
 // recover on its own.
 const DefaultSessionStallThreshold = 30 * time.Second
+
+// DefaultSessionWarmupGrace is the initial-lifetime window during
+// which the stall detector uses 2× SessionStallThreshold. Covers the
+// gossip-initiator-dedup migration race that follows a transport
+// upgrade — see SessionOptions.SessionWarmupGrace for the full
+// rationale.
+const DefaultSessionWarmupGrace = 60 * time.Second
 
 // DefaultSessionOptions returns production-safe defaults. Call this
 // and then override individual fields to customise — e.g.
@@ -276,6 +305,12 @@ func NormalizeSessionOptions(opts SessionOptions) SessionOptions {
 	// can opt out of stall detection entirely.
 	if opts.SessionStallThreshold == 0 {
 		opts.SessionStallThreshold = DefaultSessionStallThreshold
+	}
+	// SessionWarmupGrace: same zero-vs-negative semantics — zero means
+	// "use default", negative means "no warmup grace, full threshold
+	// from t=0".
+	if opts.SessionWarmupGrace == 0 {
+		opts.SessionWarmupGrace = DefaultSessionWarmupGrace
 	}
 	if opts.CongestionAlgo == "" {
 		opts.CongestionAlgo = "cubic"
