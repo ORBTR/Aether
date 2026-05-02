@@ -593,6 +593,97 @@ func (s *NoiseSession) IsClosed() bool {
 	}
 }
 
+// dumpFlowDiagOnStall emits a single high-detail [FLOW-DIAG] line capturing
+// the full flow-control + reliability + congestion state at the moment a
+// stall event fires. Called from the stall detector for both false-positive
+// (rescued by probe) and confirmed-stuck (closing for fallback) branches —
+// the diff between rescued and killed dumps is the diagnostic gold here.
+//
+// Per-stream: inFlight frames, sendBase/next, recvExpected/buffered/drops,
+// flow stream-window stats (currentWindow, outstanding, recvCredit,
+// consumed, grant-trigger breakdown), srtt, progressAge.
+// Session: congestion CWND + pacing rate, conn-window stats, lastAutoTune
+// age, lastGrantRefresh age, sessionAge.
+//
+// Designed to fit on one line per stream + one summary line so a single
+// stall event produces a small bounded log burst even on a 50-stream
+// session. No lock acquisition beyond the briefest snapshot pass.
+func (s *NoiseSession) dumpFlowDiagOnStall(reason string) {
+	remoteShort := s.remoteNodeID.Short()
+	now := time.Now()
+
+	type streamRow struct {
+		id          uint64
+		inFlight    int
+		sendBase    uint32
+		sendNext    uint32
+		recvExp     uint32
+		recvBuffered int
+		recvDrops   uint64
+		flowStats   flow.Stats
+		srtt        time.Duration
+		progressAge time.Duration
+	}
+
+	s.mu.Lock()
+	rows := make([]streamRow, 0, len(s.streams))
+	for streamID, st := range s.streams {
+		row := streamRow{id: streamID}
+		if st.sendWindow != nil {
+			row.inFlight = st.sendWindow.InFlight()
+			row.sendBase = st.sendWindow.Base()
+			row.sendNext = st.sendWindow.Next()
+		}
+		if st.recvWindow != nil {
+			row.recvExp = st.recvWindow.ExpectedSeqNo()
+			row.recvBuffered = st.recvWindow.BufferedCount()
+			row.recvDrops = st.recvWindow.DropsCount()
+		}
+		if st.window != nil {
+			row.flowStats = st.window.Stats()
+		}
+		if st.rtt != nil {
+			row.srtt = st.rtt.SRTT()
+		}
+		if pn := st.lastProgressAtUnixNano.Load(); pn != 0 {
+			row.progressAge = now.Sub(time.Unix(0, pn))
+		}
+		rows = append(rows, row)
+	}
+	autoTuneAge := now.Sub(s.lastAutoTune)
+	grantRefreshAge := now.Sub(s.lastGrantRefresh)
+	s.mu.Unlock()
+
+	cong := s.congestion()
+	var cwnd int64
+	var pacing float64
+	if cong != nil {
+		cwnd = cong.CWND()
+		pacing = cong.PacingRate()
+	}
+	connStats := s.connWindow.Stats()
+	sessionAge := now.Sub(s.createdAt)
+
+	log.Printf("[FLOW-DIAG] %s reason=%s sessionAge=%v cwnd=%d pacing=%.0fbps autoTuneAge=%v grantRefreshAge=%v conn{out=%d credit=%d cons=%d gE=%d gR=%d thr=%d eag=%d wm=%d tim=%d} streams=%d",
+		remoteShort, reason, sessionAge, cwnd, pacing, autoTuneAge, grantRefreshAge,
+		connStats.Outstanding, connStats.RecvCredit, connStats.Consumed,
+		connStats.GrantsEmitted, connStats.GrantsReceived,
+		connStats.ThresholdGrants, connStats.EagerGrants,
+		connStats.WatermarkGrants, connStats.TimedGrants,
+		len(rows))
+	for _, r := range rows {
+		log.Printf("[FLOW-DIAG] %s stream=%d inFlight=%d send{base=%d next=%d} recv{exp=%d buf=%d drops=%d} flow{cur=%d out=%d credit=%d cons=%d thr=%d eag=%d wm=%d tim=%d} srtt=%v progressAge=%v",
+			remoteShort, r.id, r.inFlight,
+			r.sendBase, r.sendNext,
+			r.recvExp, r.recvBuffered, r.recvDrops,
+			r.flowStats.CurrentWindow, r.flowStats.Outstanding,
+			r.flowStats.RecvCredit, r.flowStats.Consumed,
+			r.flowStats.ThresholdGrants, r.flowStats.EagerGrants,
+			r.flowStats.WatermarkGrants, r.flowStats.TimedGrants,
+			r.srtt, r.progressAge)
+	}
+}
+
 func (s *NoiseSession) MSS() int { return s.pmtuProber.MSS() }
 
 // SetSessionKey sets the per-frame encryption key and enables AEAD encryption.
