@@ -150,6 +150,50 @@ func (s *PathScorer) AllPaths(peerID PeerID) []*PathScore {
 	return paths
 }
 
+// ProtoIsDead returns true if every known path for (peerID, proto) is
+// either dead (in PathDeadCooldown) or has a success rate below 30%
+// over at least 5 attempts. Returns false when no history exists, when
+// any path is alive with workable history, or when there's not enough
+// history to make a confident judgement.
+//
+// Used by the dialer/upgrader to hard-skip a protocol that's been
+// demonstrably broken across all known addresses for a peer — without
+// this, cooldown alone permits indefinite retry on a permanently-broken
+// proto, producing the observed flap-and-fall-back churn.
+//
+// const thresholds match shouldSkipUpgradeByPathScore in HSTLES so the
+// signal is consistent between aether-level and library-level guards.
+func (s *PathScorer) ProtoIsDead(peerID PeerID, proto Protocol) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	const minAttemptsForSignal = 5
+	const failingSuccessRate = 0.30
+	hasAny := false
+	for _, p := range s.paths {
+		if p.PeerID != peerID || p.Protocol != proto {
+			continue
+		}
+		hasAny = true
+		// Any alive path with insufficient history → not enough data
+		// to call dead. Better to probe than over-suppress.
+		if p.IsAlive() && p.Attempts < minAttemptsForSignal {
+			return false
+		}
+		// Any alive path with workable history → not dead.
+		if p.IsAlive() && p.SuccessRate >= failingSuccessRate {
+			return false
+		}
+	}
+	// No paths recorded yet → can't be dead.
+	if !hasAny {
+		return false
+	}
+	// Every recorded path was either dead-cooldowned or had a low
+	// success rate over a meaningful sample size.
+	return true
+}
+
 // Prune removes paths that haven't been used in the given duration.
 func (s *PathScorer) Prune(maxAge time.Duration) {
 	s.mu.Lock()
