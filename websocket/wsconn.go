@@ -177,7 +177,26 @@ func (c *WSConn) Close() error {
 // pingLoop sends WebSocket ping frames at the configured interval.
 // Keeps the connection alive through HTTP proxies (Fly.io, Cloudflare, etc.)
 // that enforce idle timeouts on WebSocket connections.
+//
+// The first ping fires after a short 1-second delay rather than waiting
+// the full `interval` so a freshly-handshaken WS conn never goes more
+// than ~1s without traffic. Without this, a session whose application
+// layer (gossip dedup) has nothing to send for the first 10s would let
+// the underlying TCP idle for the full interval — long enough for fly's
+// edge proxy or a NAT mapping to terminate the upgrade. The cycle then
+// surfaced as connections dying at exactly `lifetime ≈ keepalive
+// interval` (10s on Grade C) because the keepalive ticker was the
+// first observer to notice the silently-closed conn.
 func (c *WSConn) pingLoop(interval time.Duration) {
+	// Initial fast ping — closes the post-handshake silence window.
+	select {
+	case <-c.pingStop:
+		return
+	case <-time.After(1 * time.Second):
+	}
+	if !c.sendPing() {
+		return
+	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -185,24 +204,33 @@ func (c *WSConn) pingLoop(interval time.Duration) {
 		case <-c.pingStop:
 			return
 		case <-ticker.C:
-			c.mu.Lock()
-			if c.closed {
-				c.mu.Unlock()
-				return
-			}
-			header := ws.Header{Fin: true, OpCode: ws.OpPing, Length: 0}
-			if !c.isServer {
-				header.Masked = true
-				header.Mask = ws.NewMask()
-			}
-			err := ws.WriteHeader(c.raw, header)
-			c.mu.Unlock()
-			if err != nil {
-				log.Printf("[WS] Ping write failed for %s: %v", truncWSID(c.peerID), err)
+			if !c.sendPing() {
 				return
 			}
 		}
 	}
+}
+
+// sendPing writes a single ping frame. Returns false on error so the
+// pingLoop can exit; callers don't need to log because sendPing logs.
+func (c *WSConn) sendPing() bool {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return false
+	}
+	header := ws.Header{Fin: true, OpCode: ws.OpPing, Length: 0}
+	if !c.isServer {
+		header.Masked = true
+		header.Mask = ws.NewMask()
+	}
+	err := ws.WriteHeader(c.raw, header)
+	c.mu.Unlock()
+	if err != nil {
+		log.Printf("[WS] Ping write failed for %s: %v", truncWSID(c.peerID), err)
+		return false
+	}
+	return true
 }
 
 // net.Conn interface delegation

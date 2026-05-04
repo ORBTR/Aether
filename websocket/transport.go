@@ -37,8 +37,14 @@ const (
 	// NonceHeader contains the challenge nonce for signature verification
 	NonceHeader = "X-HSTLES-Nonce"
 
-	// pingInterval is how often to send WebSocket ping frames for proxy keepalive
-	pingInterval = 10 * time.Second
+	// pingInterval is how often to send WebSocket ping frames for proxy keepalive.
+	// Sized at 5s rather than the obvious 10s because some HTTP edge proxies
+	// (fly.io's WebSocket upgrade path being the observed case) idle-close
+	// upgraded connections inside ~10s when no frames flow. WSConn.pingLoop
+	// also fires its FIRST ping at T+1s — together they ensure the
+	// underlying TCP never goes more than ~1s idle initially, then ~5s
+	// thereafter, well under any observed proxy idle threshold.
+	pingInterval = 5 * time.Second
 )
 
 type WebsocketTransportConfig struct {
