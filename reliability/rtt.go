@@ -9,90 +9,44 @@
 package reliability
 
 import (
-	"sync"
 	"time"
+
+	"github.com/ORBTR/aether/rtt"
 )
 
-// RTTEstimator implements the Jacobson/Karels algorithm (RFC 6298) for
-// smoothed RTT estimation and retransmission timeout (RTO) computation.
+// RTTEstimator implements RFC 6298 SRTT/RTTVar/RTO computation for a
+// single per-stream sample stream (data ACKs).
 //
-// The estimator tracks:
+// Thin wrapper over rtt.Estimator — the canonical implementation lives
+// in github.com/ORBTR/aether/rtt and is shared with health.Monitor
+// (control-plane keepalive RTT). This wrapper is preserved at the same
+// API surface so existing reliability callers (RetransmitQueue, RACK,
+// per-stream state machine) keep compiling unchanged.
+//
+// Tracks:
 //   - SRTT: smoothed round-trip time (exponentially weighted average)
-//   - RTTVAR: RTT variance (for jitter detection)
+//   - RTTVAR: RTT variance (mean deviation, for jitter detection)
 //   - RTO: retransmission timeout (SRTT + 4*RTTVAR, clamped to [minRTO, maxRTO])
 type RTTEstimator struct {
-	mu          sync.Mutex
-	srtt        time.Duration // smoothed RTT
-	rttvar      time.Duration // RTT variance
-	rto         time.Duration // retransmission timeout
-	alpha       float64       // SRTT smoothing factor (default: 0.125)
-	beta        float64       // RTTVAR smoothing factor (default: 0.25)
-	minRTO      time.Duration // minimum RTO (default: 200ms)
-	maxRTO      time.Duration // maximum RTO (default: 60s)
-	granularity time.Duration // clock granularity (default: 1ms)
-	initialized bool          // false until first sample
+	e *rtt.Estimator
 }
 
-// NewRTTEstimator creates an estimator with RFC 6298 default parameters.
+// NewRTTEstimator creates an estimator with RFC 6298 default parameters
+// suitable for per-stream data ACK RTT measurement.
 func NewRTTEstimator() *RTTEstimator {
-	return &RTTEstimator{
-		alpha:       0.125,
-		beta:        0.25,
-		minRTO:      200 * time.Millisecond,
-		maxRTO:      60 * time.Second,
-		granularity: time.Millisecond,
-		rto:         time.Second, // initial RTO before first sample
-	}
+	return &RTTEstimator{e: rtt.NewDefault()}
 }
 
-// newRTTEstimatorWithParams creates an estimator with custom parameters.
+// newRTTEstimatorWithParams creates an estimator with custom MinRTO/
+// MaxRTO bounds. Other parameters default. Used by tests.
 func newRTTEstimatorWithParams(minRTO, maxRTO time.Duration) *RTTEstimator {
-	e := NewRTTEstimator()
-	e.minRTO = minRTO
-	e.maxRTO = maxRTO
-	return e
+	return &RTTEstimator{e: rtt.New(rtt.Options{MinRTO: minRTO, MaxRTO: maxRTO})}
 }
 
 // Update records a new RTT sample and recalculates SRTT, RTTVAR, and RTO.
 // The sample should be the measured round-trip time for a single frame's ACK.
 // Retransmitted frames should NOT generate RTT samples (Karn's algorithm).
-func (e *RTTEstimator) Update(sample time.Duration) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	if !e.initialized {
-		// First sample: RFC 6298 Section 2.2
-		e.srtt = sample
-		e.rttvar = sample / 2
-		e.initialized = true
-	} else {
-		// Subsequent samples: RFC 6298 Section 2.3
-		// RTTVAR = (1 - beta) * RTTVAR + beta * |SRTT - R|
-		diff := e.srtt - sample
-		if diff < 0 {
-			diff = -diff
-		}
-		e.rttvar = time.Duration(float64(e.rttvar)*(1-e.beta) + float64(diff)*e.beta)
-
-		// SRTT = (1 - alpha) * SRTT + alpha * R
-		e.srtt = time.Duration(float64(e.srtt)*(1-e.alpha) + float64(sample)*e.alpha)
-	}
-
-	// RTO = SRTT + max(G, 4 * RTTVAR)
-	k := 4 * e.rttvar
-	if k < e.granularity {
-		k = e.granularity
-	}
-	e.rto = e.srtt + k
-
-	// Clamp RTO
-	if e.rto < e.minRTO {
-		e.rto = e.minRTO
-	}
-	if e.rto > e.maxRTO {
-		e.rto = e.maxRTO
-	}
-}
+func (e *RTTEstimator) Update(sample time.Duration) { e.e.Update(sample) }
 
 // UpdateWithDelay records an RTT sample with ACK processing delay subtracted.
 // rawRTT is the measured wall-clock round-trip. ackDelay is the time the
@@ -100,50 +54,33 @@ func (e *RTTEstimator) Update(sample time.Duration) {
 // The adjusted sample is max(rawRTT - ackDelay, 1µs) to prevent negative RTT.
 // Follows QUIC RFC 9002 Section 5.3 approach.
 func (e *RTTEstimator) UpdateWithDelay(rawRTT time.Duration, ackDelay time.Duration) {
-	adjusted := rawRTT - ackDelay
-	if adjusted < time.Microsecond {
-		adjusted = time.Microsecond
-	}
-	e.Update(adjusted)
+	e.e.UpdateWithDelay(rawRTT, ackDelay)
 }
 
 // RTO returns the current retransmission timeout.
-func (e *RTTEstimator) RTO() time.Duration {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.rto
-}
+func (e *RTTEstimator) RTO() time.Duration { return e.e.RTO() }
 
 // SRTT returns the smoothed round-trip time.
-func (e *RTTEstimator) SRTT() time.Duration {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.srtt
-}
+func (e *RTTEstimator) SRTT() time.Duration { return e.e.SRTT() }
 
-// rttVar returns the RTT variance.
-func (e *RTTEstimator) rttVar() time.Duration {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.rttvar
-}
+// rttVar returns the RTT variance. Package-private — exposed via
+// RTTVar() in the new API; kept lowercase for backwards compatibility
+// with existing reliability tests that consult this value.
+func (e *RTTEstimator) rttVar() time.Duration { return e.e.RTTVar() }
+
+// RTTVar returns the smoothed RTT mean deviation (RFC 6298). Public
+// counterpart to rttVar() — preferred for new callers.
+func (e *RTTEstimator) RTTVar() time.Duration { return e.e.RTTVar() }
 
 // BackoffRTO doubles the current RTO (exponential backoff on retransmit timeout).
 // Called when a retransmission timer fires without an ACK.
 // RFC 6298 Section 5.5: "double the RTO value".
-func (e *RTTEstimator) BackoffRTO() time.Duration {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.rto *= 2
-	if e.rto > e.maxRTO {
-		e.rto = e.maxRTO
-	}
-	return e.rto
-}
+func (e *RTTEstimator) BackoffRTO() time.Duration { return e.e.BackoffRTO() }
 
-// isInitialized returns true if at least one RTT sample has been recorded.
-func (e *RTTEstimator) isInitialized() bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.initialized
-}
+// isInitialized returns true if at least one RTT sample has been
+// recorded. Package-private; used by reliability internals.
+func (e *RTTEstimator) isInitialized() bool { return e.e.IsInitialized() }
+
+// IsInitialized is the public counterpart to isInitialized() — added
+// for parity with the new API.
+func (e *RTTEstimator) IsInitialized() bool { return e.e.IsInitialized() }
