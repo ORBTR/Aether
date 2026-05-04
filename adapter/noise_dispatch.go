@@ -134,14 +134,31 @@ func (s *NoiseSession) processIncomingFrame(frame *aether.Frame, indicator byte)
 		frame.Flags = frame.Flags.Clear(aether.FlagCOMPRESSED)
 	}
 
-	// Packet-level anti-replay check — DATA frames only.
-	// Control frames (WINDOW, ACK, PING, PONG, GOAWAY, CLOSE, RESET, PRIORITY)
-	// have SeqNo=0 and are not subject to replay attacks. Checking them against
-	// the replay window causes all but the first to be silently dropped as
-	// "duplicate", breaking flow control (WINDOW_UPDATE never reaches sender).
-	if frame.Type == aether.TypeDATA && !s.packetReplay.Check(uint64(frame.SeqNo)) {
-		return // replayed DATA frame — drop
-	}
+	// NOTE: connection-level packetReplay check removed. It was using
+	// frame.SeqNo (per-stream sequence assigned by st.sendWindow.Add) as
+	// if it were a connection-level packet counter. With multiple streams
+	// open (5+ on HSTLES mesh sessions), each stream independently starts
+	// at SeqNo=0; the second stream's first DATA frame collided with the
+	// first stream's bit-0 in the connection-level bitmap and was silently
+	// dropped as a "replay". As stream 0 (gossip) advanced past the
+	// 128-packet window, EVERY frame from streams 1+ (rpc, keepalive,
+	// control, reconcile) fell outside the window and was dropped. The
+	// observable effect was UDP sessions where streams 1-4 had inFlight
+	// frames that never received an ACK (peer never saw them), while
+	// stream 0 gossip kept working.
+	//
+	// Replay protection is preserved by two correct mechanisms:
+	//
+	//   1. noise/nonce_window.go — connection-level: each encrypted UDP
+	//      packet carries an 8-byte explicit nonce; the sliding 64-bit
+	//      bitmap rejects duplicates BEFORE decryption. This is the right
+	//      layer for transport-level replay protection.
+	//
+	//   2. noiseStream.replay (per-stream) at line 237 — application-level:
+	//      catches reordering within an open stream. The per-stream SeqNo
+	//      space is correctly used here because frame.SeqNo IS per-stream.
+	//
+	// The deleted check was a third, redundant, AND incorrect layer.
 	s.healthMon.RecordActivity()
 	s.dispatchFrame(frame)
 }
@@ -230,9 +247,9 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 
 	// Anti-replay check — unconditional for DATA (S7: feeds abuse score).
 	// Previously gated on FlagANTIREPLAY, which a peer could suppress to
-	// bypass per-stream replay protection. The connection-level
-	// packetReplay above catches identical duplicates, but the per-stream
-	// window defends against adversarial reordering within an open stream
+	// bypass per-stream replay protection. The noise/nonce_window layer
+	// catches connection-level encrypted-packet replays; this per-stream
+	// check defends against adversarial reordering within an open stream
 	// and must not be opt-out.
 	if !st.replay.Check(frame.SeqNo) {
 		s.reportAbuse(abuse.ReasonReplayDetected)
