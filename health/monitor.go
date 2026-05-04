@@ -12,11 +12,21 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/ORBTR/aether/rtt"
 )
 
 // Monitor tracks the health state of a single transport session.
-// Thread-safe: all fields protected by mu.
+// Thread-safe: all fields protected by mu (and an embedded RTT
+// estimator that has its own internal mutex).
 // Composable: embed in any session struct to get health tracking.
+//
+// RTT tracking is delegated to rtt.Estimator (RFC 6298 SRTT/RTTVar/RTO,
+// shared with the per-stream reliability layer). Monitor feeds it samples
+// from ping/pong cycles via RecordPongRecv. The estimator surfaces
+// SRTT, RTTVar, and RTO — the latter is the canonical "how long should
+// we wait before declaring a missing reply lost?" value used by the
+// keepalive subsystem to size its per-ping deadline.
 type Monitor struct {
 	mu             sync.RWMutex
 	lastActivity   time.Time
@@ -25,22 +35,24 @@ type Monitor struct {
 	missedPings    int
 	pendingPingSeq uint32
 	lastRTT        time.Duration
-	avgRTT         time.Duration
-	emaAlpha       float64 // smoothing factor for RTT EMA (default 0.2)
-	closed         int32   // atomic: 1 = closed
+	rttEst         *rtt.Estimator // SRTT/RTTVar/RTO over ping-RTT samples
+	closed         int32          // atomic: 1 = closed
 }
 
-// NewMonitor creates a health monitor with the given EMA smoothing factor.
-// emaAlpha controls how much weight new RTT samples get (0.2 = 20% new, 80% old).
+// NewMonitor creates a health monitor with the given EMA smoothing
+// factor. emaAlpha controls how much weight new RTT samples get
+// (0.2 = 20% new, 80% old). Pass 0 to use the RFC 6298 default
+// (α = 0.125). Outside (0, 1] also falls back to the RFC default.
 func NewMonitor(emaAlpha float64) *Monitor {
-	if emaAlpha <= 0 || emaAlpha > 1 {
-		emaAlpha = 0.2
+	estOpts := rtt.Options{}
+	if emaAlpha > 0 && emaAlpha <= 1 {
+		estOpts.Alpha = emaAlpha
 	}
 	now := time.Now()
 	return &Monitor{
 		lastActivity: now,
 		lastPongRecv: now,
-		emaAlpha:     emaAlpha,
+		rttEst:       rtt.New(estOpts),
 	}
 }
 
@@ -59,24 +71,24 @@ func (m *Monitor) RecordPingSent(seq uint32) {
 	m.mu.Unlock()
 }
 
-// RecordPongRecv records that a pong was received, computes RTT, updates EMA.
-// The seq parameter is the sequence number echoed back in the pong payload.
-// sentAt is the time the corresponding ping was sent (use PingSentAt() if the
-// caller doesn't track it separately). RTT is only updated when seq matches
-// the pending ping sequence.
+// RecordPongRecv records that a pong was received and feeds the RTT
+// sample to the underlying rtt.Estimator (RFC 6298 SRTT/RTTVar/RTO).
+// The seq parameter is the sequence number echoed back in the pong
+// payload. sentAt is the time the corresponding ping was sent (use
+// PingSentAt() if the caller doesn't track it separately). RTT
+// samples are only consumed when seq matches the pending ping
+// sequence.
 func (m *Monitor) RecordPongRecv(seq uint32, sentAt time.Time) {
 	m.mu.Lock()
 	now := time.Now()
 	// Only update RTT if this pong matches the pending ping
 	if seq != 0 && seq == m.pendingPingSeq {
-		rtt := now.Sub(sentAt)
-		m.lastRTT = rtt
-		if m.avgRTT == 0 {
-			m.avgRTT = rtt
-		} else {
-			alpha := m.emaAlpha
-			m.avgRTT = time.Duration(float64(m.avgRTT)*(1-alpha) + float64(rtt)*alpha)
-		}
+		sample := now.Sub(sentAt)
+		m.lastRTT = sample
+		// Delegate the RFC 6298 math to the shared estimator. Its
+		// Update is internally locked, so calling under m.mu is
+		// safe.
+		m.rttEst.Update(sample)
 	}
 	m.lastPongRecv = now
 	m.missedPings = 0
@@ -110,11 +122,14 @@ func (m *Monitor) LastActivity() time.Time {
 	return m.lastActivity
 }
 
-// RTT returns the last measured and EMA-smoothed round-trip times.
+// RTT returns the last measured RTT sample and the SRTT (smoothed
+// EMA-style mean per RFC 6298). Backwards-compatible signature; "avg"
+// is sourced from the underlying rtt.Estimator's SRTT.
 func (m *Monitor) RTT() (last, avg time.Duration) {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.lastRTT, m.avgRTT
+	last = m.lastRTT
+	m.mu.RUnlock()
+	return last, m.rttEst.SRTT()
 }
 
 // IsAlive returns true if the session has received data within the timeout.
@@ -138,12 +153,24 @@ func (m *Monitor) LastPongReceived() time.Time {
 	return m.lastPongRecv
 }
 
-// AvgRTT returns the EMA-smoothed RTT.
-func (m *Monitor) AvgRTT() time.Duration {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.avgRTT
-}
+// AvgRTT returns the SRTT (RFC 6298 smoothed mean of ping RTT samples).
+// Backwards-compatible name; identical to SRTT().
+func (m *Monitor) AvgRTT() time.Duration { return m.rttEst.SRTT() }
+
+// SRTT returns the smoothed round-trip time (RFC 6298). Equivalent to
+// AvgRTT — provided for naming parity with rtt.Estimator and the
+// reliability layer.
+func (m *Monitor) SRTT() time.Duration { return m.rttEst.SRTT() }
+
+// RTTVar returns the smoothed RTT mean deviation (RFC 6298) over the
+// ping/pong sample stream. Zero before the first pong.
+func (m *Monitor) RTTVar() time.Duration { return m.rttEst.RTTVar() }
+
+// RTO returns the canonical Probe Timeout for this session
+// (SRTT + max(G, 4*RTTVar), clamped to the estimator's [MinRTO, MaxRTO]).
+// Used by the keepalive subsystem to size its per-ping deadline:
+// short on stable low-latency paths, long on bursty or high-RTT paths.
+func (m *Monitor) RTO() time.Duration { return m.rttEst.RTO() }
 
 // MarkClosed marks the monitor as closed. Called by the owning session on Close().
 func (m *Monitor) MarkClosed() {
