@@ -81,6 +81,12 @@ type Manager struct {
 	// Redundancy level
 	redundantRealtime bool // Level 2: send REALTIME on both paths
 	weightedLB        bool // Level 3: weighted load balance across paths
+
+	// qstate carries the quality-driven control plane state. nil for
+	// legacy callers that haven't migrated to AddPathQA / EnsureK yet.
+	// Populated lazily by either of those methods so existing callers
+	// using AddPath + PrimarySession continue to work unchanged.
+	qstate *qualityState
 }
 
 // NewManager creates a multipath manager.
