@@ -311,6 +311,69 @@ func TestTracker_Forget_DropsSingleEntry(t *testing.T) {
 	}
 }
 
+func TestTracker_DialFailures_CountAndCooldown(t *testing.T) {
+	tr := NewTracker()
+	key := Key("peer1", "noise-udp")
+
+	// Initially no suppression.
+	if suppressed, _ := tr.IsDialSuppressed(key); suppressed {
+		t.Error("fresh key should not be suppressed")
+	}
+	if n := tr.DialFailureCount(key); n != 0 {
+		t.Errorf("fresh key should have 0 failures, got %d", n)
+	}
+
+	tr.RecordDialFailure(key)
+	if n := tr.DialFailureCount(key); n != 1 {
+		t.Errorf("after 1 failure: count = %d, want 1", n)
+	}
+	if suppressed, dur := tr.IsDialSuppressed(key); !suppressed || dur <= 0 {
+		t.Errorf("after 1 failure: suppressed=%v dur=%v, want true with positive dur", suppressed, dur)
+	}
+}
+
+func TestTracker_DialSuccess_ClearsState(t *testing.T) {
+	tr := NewTracker()
+	key := Key("peer1", "noise-udp")
+
+	tr.RecordDialFailure(key)
+	tr.RecordDialFailure(key)
+	tr.RecordDialFailure(key)
+	if n := tr.DialFailureCount(key); n != 3 {
+		t.Fatalf("setup: expected 3 failures, got %d", n)
+	}
+
+	tr.RecordDialSuccess(key)
+	if n := tr.DialFailureCount(key); n != 0 {
+		t.Errorf("after success: count = %d, want 0", n)
+	}
+	if suppressed, _ := tr.IsDialSuppressed(key); suppressed {
+		t.Error("after success: should not be suppressed")
+	}
+}
+
+func TestDialCooldownDuration_GrowsThenCaps(t *testing.T) {
+	tests := []struct {
+		failures int
+		min, max time.Duration
+	}{
+		{0, 0, 0},
+		{1, 30 * time.Second, 30 * time.Second},
+		{2, 1 * time.Minute, 1 * time.Minute},
+		{3, 2 * time.Minute, 2 * time.Minute},
+		{4, 4 * time.Minute, 4 * time.Minute},
+		{5, 8 * time.Minute, 8 * time.Minute},
+		{6, 10 * time.Minute, 10 * time.Minute}, // capped
+		{20, 10 * time.Minute, 10 * time.Minute}, // still capped
+	}
+	for _, tc := range tests {
+		got := dialCooldownDuration(tc.failures)
+		if got < tc.min || got > tc.max {
+			t.Errorf("dialCooldownDuration(%d) = %v, want [%v, %v]", tc.failures, got, tc.min, tc.max)
+		}
+	}
+}
+
 func TestTracker_StabilityTracksScoreVariance(t *testing.T) {
 	tr := NewTracker()
 	key := Key("peer1", "ws")
