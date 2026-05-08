@@ -1,30 +1,32 @@
-// Package quality computes a continuous, multi-dimensional health score
-// for an aether session. The score is the single source of truth read by
-// the multipath routing layer, the adaptive liveness loop, and any other
-// subsystem that needs to ask "is this connection any good right now?".
-//
-// Design summary (see Library/docs/plans/2026-05-05-quality-driven-control-plane.md):
+// Package quality computes a continuous, multi-dimensional health
+// score for an aether session. The score is the single source of
+// truth read by the multipath routing layer, the adaptive liveness
+// loop, and any other subsystem that needs to ask "is this connection
+// any good right now?".
 //
 //   - Score range [0, 1] — continuous, smooth, no cliffs that cause
-//     state-machine churn.
-//   - Eight independent components combined via weighted geometric mean:
-//     RTT health, loss, jitter, reorder, throughput, reliability, stability,
-//     and recent-failure penalty. Any one bad signal pulls the score down
-//     but no single signal zeros it (except the recent-failure multiplier
-//     for severe ProtoIsDead-style cases).
-//   - Route-class aware: each path is normalized against the expected RTT
-//     band for its class (same-region / cross-region / inter-continental).
-//     A 250 ms cross-region path scores like a 5 ms same-region path
-//     when both are healthy for their kind. Replaces the fleet-wide static
-//     ExpectedRTT/MaxAcceptableRTT thresholds in mesh/grade/grade.go that
-//     made cross-region paths unscoreable.
-//   - Region-affinity bonus is applied at *dispatch time* (DispatchRank),
-//     not at score-computation time. So a slow-but-healthy cross-region
-//     path keeps a high quality score; the dispatch layer picks
-//     same-region first when both exist.
-//   - Trend-aware: the RTT component factors in the rate of change of
-//     SRTT, so a path with rising RTT scores lower than one with stable
-//     RTT at the same instantaneous value (early-warning signal).
+//     state-machine churn in consumers.
+//   - Eight independent components combined via weighted geometric
+//     mean: RTT health, RTT trend, loss, jitter, reorder, throughput,
+//     reliability, stability. Any one bad signal pulls the aggregate
+//     down. Multiplicative AgeGrace and FailurePenalty gates can
+//     drive the result to zero independent of the components — a
+//     brand-new session reads as 0 until grace lifts; a path with
+//     several consecutive close-with-error events reads near zero
+//     until the failures decay out.
+//   - Route-class aware: each path is normalised against the expected
+//     RTT band for its class (same-region / cross-region / inter-
+//     continental). A 250 ms cross-region path scores like a 5 ms
+//     same-region path when both are healthy for their kind, instead
+//     of being permanently demoted by a fleet-wide static threshold.
+//   - Region-affinity bonus is applied at dispatch time
+//     (DispatchRank), not at score-computation time. A slow-but-
+//     healthy cross-region path keeps a high quality score; the
+//     dispatch layer picks same-region first when both exist.
+//   - Trend-aware: the RTT component factors in the rate of change
+//     of SRTT, so a path with rising RTT scores lower than one with
+//     stable RTT at the same instantaneous value — an early-warning
+//     signal that lets dispatch shift before things break.
 package quality
 
 import (

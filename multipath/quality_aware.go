@@ -132,11 +132,11 @@ func (m *Manager) Stop() {
 	q.mu.Unlock()
 }
 
-// AddPathQA registers a path with quality-aware metadata. Equivalent to
-// AddPath but also records the remote region so the path can be
-// classified for score normalization. Use this from callers that have
-// migrated to the quality-driven control plane; legacy callers can
-// continue to use AddPath.
+// AddPathQA registers a path with quality-aware metadata. Equivalent
+// to AddPath but also records the remote region so the path can be
+// classified by RouteClass for score normalisation. Callers that
+// don't pass a region or quality config can keep using AddPath; the
+// two coexist so the legacy WDRR scheduler keeps working alongside.
 func (m *Manager) AddPathQA(session aether.Session, proto aether.Protocol, remoteRegion string) {
 	m.AddPath(session, proto, 0) // legacy quality int unused on this path
 
@@ -276,9 +276,10 @@ func (m *Manager) computeScoreLocked(p *Path) quality.Score {
 	return score
 }
 
-// PathScores returns a snapshot of the most recent score per path. Used
-// by diagnostics endpoints and for the Stage 1 logging that compares
-// current decisions against quality-driven decisions.
+// PathScores returns a snapshot of the most recent quality score per
+// path, keyed by transport protocol. Used by diagnostics endpoints and
+// observability that needs to surface why dispatch picked the path it
+// did.
 func (m *Manager) PathScores() map[aether.Protocol]quality.Score {
 	m.mu.Lock()
 	defer m.mu.Unlock()

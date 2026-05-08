@@ -212,10 +212,19 @@ type trackerEntry struct {
 	lastBytesRecv       uint64
 	lastBytesAt         time.Time
 	bytesPerSec         float64
-	consecutiveFailures atomic.Int64
-	reliabilityEMA      float64 // EMA of (1 if clean close, 0 if error)
-	stabilityEMA        float64 // EMA of |Δscore|
+	consecutiveFailures atomic.Int64 // session-level close-with-error count
+	reliabilityEMA      float64      // EMA of (1 if clean close, 0 if error)
+	stabilityEMA        float64      // EMA of |Δscore|
 	lastScore           float64
+
+	// Dial-level state. Tracked separately from session-level
+	// consecutiveFailures because a dial failure means the handshake
+	// never completed — there was no session to score. The dispatcher
+	// suppresses dials of paths that have hit a threshold of consecutive
+	// dial failures, mirroring the legacy peer.failedProtos cooldown
+	// behaviour.
+	dialFailureCount    atomic.Int64
+	dialCooldownUntilNs atomic.Int64 // unix nanos; 0 = no cooldown
 }
 
 // NewTracker creates an empty tracker. Pass to NewInputs to fill in
@@ -396,6 +405,110 @@ func (t *Tracker) Stability(key string) float64 {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.stabilityEMA
+}
+
+// RecordDialFailure increments the dial-failure counter for a key and
+// sets a cooldown that callers consult before re-dialing the same
+// (peer, transport) pair. The cooldown grows with consecutive failures:
+//
+//	1 failure  → baseDialCooldown (30 s)
+//	2 failures → 1 min
+//	3 failures → 2 min
+//	N failures → min(2 min × 2^(N-3), suppressDialCooldown=10 min)
+//
+// Replaces peer.failedProtos[proto] + peer.dialFailCount[proto] +
+// m.cooldownFor(peer, proto) — all that bookkeeping moves into the
+// tracker so a single source of truth covers both session-level and
+// dial-level failure suppression.
+func (t *Tracker) RecordDialFailure(key string) {
+	e := t.entry(key)
+	n := e.dialFailureCount.Add(1)
+	cooldown := dialCooldownDuration(int(n))
+	expiry := time.Now().Add(cooldown).UnixNano()
+	e.dialCooldownUntilNs.Store(expiry)
+}
+
+// RecordDialSuccess clears the dial-failure counter and cooldown for
+// a key. Called after a successful dial completes the handshake so a
+// path that was failing intermittently can be re-evaluated.
+func (t *Tracker) RecordDialSuccess(key string) {
+	v, ok := t.entries.Load(key)
+	if !ok {
+		return
+	}
+	e := v.(*trackerEntry)
+	e.dialFailureCount.Store(0)
+	e.dialCooldownUntilNs.Store(0)
+}
+
+// IsDialSuppressed returns whether the path is in cooldown right now.
+// Lazy-clears the cooldown when its expiry has passed so the first
+// poll after the cooldown window naturally returns false. The second
+// return value is the cooldown's remaining duration, useful for
+// observability and for the EnsureK reconnect loop's backoff.
+func (t *Tracker) IsDialSuppressed(key string) (bool, time.Duration) {
+	v, ok := t.entries.Load(key)
+	if !ok {
+		return false, 0
+	}
+	e := v.(*trackerEntry)
+	expiry := e.dialCooldownUntilNs.Load()
+	if expiry == 0 {
+		return false, 0
+	}
+	remaining := time.Until(time.Unix(0, expiry))
+	if remaining <= 0 {
+		// Lazily clear so subsequent reads are fast.
+		e.dialCooldownUntilNs.CompareAndSwap(expiry, 0)
+		return false, 0
+	}
+	return true, remaining
+}
+
+// DialFailureCount returns the consecutive dial-failure count for a
+// key. Used by callers that want to surface "this path has been
+// flapping" in observability or to apply additional logic (e.g.
+// preferring transports with fewer recent failures during EnsureK
+// reconnect ordering).
+func (t *Tracker) DialFailureCount(key string) int {
+	v, ok := t.entries.Load(key)
+	if !ok {
+		return 0
+	}
+	return int(v.(*trackerEntry).dialFailureCount.Load())
+}
+
+// dialCooldownDuration is the cooldown growth schedule. Pulled out so
+// callers (and tests) can reason about timing without re-implementing
+// the formula.
+func dialCooldownDuration(failureCount int) time.Duration {
+	const (
+		baseCooldown     = 30 * time.Second
+		maxCooldown      = 10 * time.Minute
+		suppressThresh   = 3 // failures
+	)
+	if failureCount <= 0 {
+		return 0
+	}
+	if failureCount == 1 {
+		return baseCooldown
+	}
+	if failureCount == 2 {
+		return 1 * time.Minute
+	}
+	// At suppressThresh, we go to long suppression
+	exp := failureCount - suppressThresh // 0,1,2,...
+	if exp < 0 {
+		exp = 0
+	}
+	d := 2 * time.Minute
+	for i := 0; i < exp; i++ {
+		d *= 2
+		if d > maxCooldown {
+			return maxCooldown
+		}
+	}
+	return d
 }
 
 // Forget drops a single (peer, transport) entry from the tracker.

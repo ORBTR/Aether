@@ -838,16 +838,10 @@ func (s *TCPSession) CloseWithError(err error) error {
 		if err != nil {
 			s.closeErr = err
 		}
-		// Diagnostic log for the quality-driven control plane work
-		// (Library/docs/plans/2026-05-05-quality-driven-control-plane.md).
-		// The previous code captured closeErr but never printed it,
-		// which made root-causing the chronic 10s WS flap impossible —
-		// every observer saw "session closed at T=10s" but nobody saw
-		// the actual reason the underlying conn went away. Logging at
-		// the close site rather than at observers gives one canonical
-		// truth per session death. Mirrors the noise-session
-		// [SESSION-CLOSE] log so post-mortem grepping is uniform across
-		// transports. nil close = clean GoAway, no log noise added.
+		// Log the actual close reason at the close site so observers
+		// upstream don't have to guess. Mirrors the noise-session
+		// [SESSION-CLOSE] format so post-mortem grepping is uniform
+		// across transports. nil close = clean GoAway, no log noise.
 		if err != nil {
 			log.Printf("[SESSION-CLOSE] %s peer=%s reason=%q",
 				s.proto, truncNodeID(s.remoteNodeID), err.Error())
