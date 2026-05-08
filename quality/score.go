@@ -375,6 +375,34 @@ func (t *Tracker) Reliability(key string) float64 {
 	return e.reliabilityEMA
 }
 
+// PeerReliability returns the minimum reliability EMA across every
+// transport tracked for a peer, or 1.0 if no entries exist for the
+// peer. The pessimistic aggregate is correct for the connection
+// scaler's purposes: if any one transport keeps failing, the peer
+// relationship is unstable enough to warrant extra capacity even when
+// the other transports look fine.
+func (t *Tracker) PeerReliability(peerID string) float64 {
+	prefix := peerID + "|"
+	worst := 1.0
+	found := false
+	t.entries.Range(func(k, v any) bool {
+		s, ok := k.(string)
+		if !ok || len(s) <= len(prefix) || s[:len(prefix)] != prefix {
+			return true
+		}
+		e := v.(*trackerEntry)
+		e.mu.Lock()
+		r := e.reliabilityEMA
+		e.mu.Unlock()
+		if !found || r < worst {
+			worst = r
+			found = true
+		}
+		return true
+	})
+	return worst
+}
+
 // RecordScore feeds the latest aggregate score into the stability EMA.
 // Stability is 1 − EMA of |Δscore| so a path whose score bounces around
 // scores lower in the next compute.
