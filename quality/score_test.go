@@ -401,3 +401,38 @@ func TestTracker_StabilityTracksScoreVariance(t *testing.T) {
 			stable, bouncy)
 	}
 }
+
+func TestTracker_PeerReliability_AggregatesWorstTransport(t *testing.T) {
+	tr := NewTracker()
+
+	if got := tr.PeerReliability("missing"); got != 1.0 {
+		t.Errorf("PeerReliability of an unknown peer = %.3f, want 1.0", got)
+	}
+
+	healthy := Key("peerA", "noise-udp")
+	for i := 0; i < 10; i++ {
+		tr.RecordClose(healthy, true)
+	}
+	if got := tr.PeerReliability("peerA"); got < 0.99 {
+		t.Errorf("clean closes only: PeerReliability = %.3f, want ≥ 0.99", got)
+	}
+
+	flapping := Key("peerA", "websocket")
+	for i := 0; i < 8; i++ {
+		tr.RecordClose(flapping, false)
+	}
+
+	worst := tr.PeerReliability("peerA")
+	if worst >= tr.Reliability(healthy) {
+		t.Errorf("worst-transport reliability (%.3f) must drag the peer aggregate below the healthy transport's reliability (%.3f)",
+			worst, tr.Reliability(healthy))
+	}
+	if worst > 0.5 {
+		t.Errorf("8 consecutive error closes should drop the worst-transport reliability below 0.5, got %.3f", worst)
+	}
+
+	tr.ForgetPeer("peerA")
+	if got := tr.PeerReliability("peerA"); got != 1.0 {
+		t.Errorf("after ForgetPeer: PeerReliability = %.3f, want 1.0", got)
+	}
+}
