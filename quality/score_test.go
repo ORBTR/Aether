@@ -264,6 +264,53 @@ func TestTracker_FailuresAccumulate(t *testing.T) {
 	}
 }
 
+func TestTracker_ForgetPeer_DropsAllTransports(t *testing.T) {
+	tr := NewTracker()
+	keep := Key("peer-keep", "noise-udp")
+	dropUDP := Key("peer-drop", "noise-udp")
+	dropWS := Key("peer-drop", "ws")
+
+	tr.RecordClose(keep, false)
+	tr.RecordClose(dropUDP, false)
+	tr.RecordClose(dropUDP, false)
+	tr.RecordClose(dropWS, false)
+
+	if tr.ConsecutiveFailures(keep) != 1 {
+		t.Fatalf("keep entry: expected 1 failure, got %d", tr.ConsecutiveFailures(keep))
+	}
+
+	tr.ForgetPeer("peer-drop")
+
+	if tr.ConsecutiveFailures(dropUDP) != 0 {
+		t.Errorf("ForgetPeer didn't drop UDP entry: %d failures", tr.ConsecutiveFailures(dropUDP))
+	}
+	if tr.ConsecutiveFailures(dropWS) != 0 {
+		t.Errorf("ForgetPeer didn't drop WS entry: %d failures", tr.ConsecutiveFailures(dropWS))
+	}
+	if tr.ConsecutiveFailures(keep) != 1 {
+		t.Errorf("ForgetPeer accidentally dropped keep peer: %d failures", tr.ConsecutiveFailures(keep))
+	}
+}
+
+func TestTracker_Forget_DropsSingleEntry(t *testing.T) {
+	tr := NewTracker()
+	udp := Key("peer-1", "noise-udp")
+	ws := Key("peer-1", "ws")
+
+	tr.RecordClose(udp, false)
+	tr.RecordClose(udp, false)
+	tr.RecordClose(ws, false)
+
+	tr.Forget(udp)
+
+	if tr.ConsecutiveFailures(udp) != 0 {
+		t.Errorf("Forget didn't drop UDP: %d failures", tr.ConsecutiveFailures(udp))
+	}
+	if tr.ConsecutiveFailures(ws) != 1 {
+		t.Errorf("Forget shouldn't drop WS sibling: %d failures", tr.ConsecutiveFailures(ws))
+	}
+}
+
 func TestTracker_StabilityTracksScoreVariance(t *testing.T) {
 	tr := NewTracker()
 	key := Key("peer1", "ws")

@@ -397,3 +397,26 @@ func (t *Tracker) Stability(key string) float64 {
 	defer e.mu.Unlock()
 	return e.stabilityEMA
 }
+
+// Forget drops a single (peer, transport) entry from the tracker.
+// Called when a peer is permanently removed from the topology
+// (pruneStalePeers / unregister) so the tracker doesn't accumulate
+// state for nodes that are gone. Cheap — sync.Map.Delete is a no-op
+// if the key isn't present.
+func (t *Tracker) Forget(key string) {
+	t.entries.Delete(key)
+}
+
+// ForgetPeer drops every entry whose key matches "<peerID>|...". Used
+// when a peer is removed from the topology — every transport tracked
+// for that peer becomes stale at once. Walks the sync.Map once;
+// O(entries) but only invoked on peer eviction so the cost is bounded.
+func (t *Tracker) ForgetPeer(peerID string) {
+	prefix := peerID + "|"
+	t.entries.Range(func(k, _ any) bool {
+		if s, ok := k.(string); ok && len(s) > len(prefix) && s[:len(prefix)] == prefix {
+			t.entries.Delete(k)
+		}
+		return true
+	})
+}
