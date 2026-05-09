@@ -332,6 +332,49 @@ func TestTracker_DialFailures_CountAndCooldown(t *testing.T) {
 	}
 }
 
+func TestTracker_RecordCooldown_DoesNotBumpCounter(t *testing.T) {
+	tr := NewTracker()
+	key := Key("peer1", "noise-udp")
+
+	tr.RecordCooldown(key, 100*time.Millisecond)
+	if suppressed, _ := tr.IsDialSuppressed(key); !suppressed {
+		t.Error("after RecordCooldown: should be suppressed")
+	}
+	if n := tr.DialFailureCount(key); n != 0 {
+		t.Errorf("RecordCooldown must NOT bump failure counter, got %d", n)
+	}
+}
+
+func TestTracker_RecordCooldown_PreservesLongerExpiry(t *testing.T) {
+	tr := NewTracker()
+	key := Key("peer1", "noise-udp")
+
+	// A real dial failure sets the long exponential cooldown (30 s for 1
+	// failure). A short stall cooldown that arrives shortly after MUST
+	// NOT shorten the longer one.
+	tr.RecordDialFailure(key)
+	_, longDur := tr.IsDialSuppressed(key)
+	if longDur < 25*time.Second {
+		t.Fatalf("first dial failure should produce a >25 s cooldown, got %v", longDur)
+	}
+
+	tr.RecordCooldown(key, 50*time.Millisecond)
+	_, afterDur := tr.IsDialSuppressed(key)
+	if afterDur < 25*time.Second {
+		t.Errorf("RecordCooldown(50 ms) must NOT shorten an active 30 s cooldown, got %v", afterDur)
+	}
+}
+
+func TestTracker_RecordCooldown_ZeroIsNoOp(t *testing.T) {
+	tr := NewTracker()
+	key := Key("peer1", "noise-udp")
+
+	tr.RecordCooldown(key, 0)
+	if suppressed, _ := tr.IsDialSuppressed(key); suppressed {
+		t.Error("RecordCooldown(0) should be a no-op, not set suppression")
+	}
+}
+
 func TestTracker_DialSuccess_ClearsState(t *testing.T) {
 	tr := NewTracker()
 	key := Key("peer1", "noise-udp")
