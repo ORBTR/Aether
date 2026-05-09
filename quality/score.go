@@ -469,6 +469,34 @@ func (t *Tracker) RecordDialSuccess(key string) {
 	e.dialCooldownUntilNs.Store(0)
 }
 
+// RecordCooldown sets a fixed dial cooldown without bumping the failure
+// counter. Complementary to RecordDialFailure: the latter is for
+// authentic dial failures where "more failures = longer cooldown" makes
+// sense (the underlying problem is presumed durable), this is for
+// transient events like session stalls where the appropriate response
+// is "don't redial for N seconds, then try again from scratch". Setting
+// d=0 is a no-op so callers don't need to special-case it.
+//
+// If a longer cooldown is already in flight (e.g., from a previous
+// RecordDialFailure), this preserves whichever expiry is later — a
+// short stall cooldown can't shorten a real failure cooldown.
+func (t *Tracker) RecordCooldown(key string, d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	e := t.entry(key)
+	newExpiry := time.Now().Add(d).UnixNano()
+	for {
+		cur := e.dialCooldownUntilNs.Load()
+		if cur >= newExpiry {
+			return
+		}
+		if e.dialCooldownUntilNs.CompareAndSwap(cur, newExpiry) {
+			return
+		}
+	}
+}
+
 // IsDialSuppressed returns whether the path is in cooldown right now.
 // Lazy-clears the cooldown when its expiry has passed so the first
 // poll after the cooldown window naturally returns false. The second
