@@ -92,14 +92,26 @@ func (t *WebsocketTransport) Dial(ctx context.Context, target aether.Target) (ae
 	signature := ed25519.Sign(t.privateKey, message)
 	headers.Set(SignatureHeader, base64.StdEncoding.EncodeToString(signature))
 
+	// TLS config — by default the SNI is derived from the URL host in
+	// target.Address. Callers that need to dial a host that doesn't have
+	// a public cert (e.g. fly's `<app>.flycast` private anycast address
+	// when the public DNS resolver is broken) can pass the original
+	// public hostname via Metadata["sni_host"]; the cert presented by
+	// the same backend machine validates against that name even when
+	// reached via the private address.
+	tlsConfig := &tls.Config{InsecureSkipVerify: false}
+	if target.Metadata != nil {
+		if sniHost := target.Metadata["sni_host"]; sniHost != "" {
+			tlsConfig.ServerName = sniHost
+		}
+	}
+
 	// Dial using gobwas/ws — returns the raw net.Conn post-handshake
 	// Measure dial RTT (TCP handshake + TLS + WS upgrade) for cross-region latency
 	dialStart := time.Now()
 	dialer := ws.Dialer{
-		Header: ws.HandshakeHeaderHTTP(headers),
-		TLSConfig: &tls.Config{
-			InsecureSkipVerify: false,
-		},
+		Header:    ws.HandshakeHeaderHTTP(headers),
+		TLSConfig: tlsConfig,
 	}
 	rawConn, _, _, err := dialer.Dial(ctx, target.Address)
 	if err != nil {
@@ -278,10 +290,19 @@ func (t *WebsocketTransport) DialHijack(ctx context.Context, target aether.Targe
 
 	dialStart := time.Now()
 
-	// Dial TLS
+	// Dial TLS — derive default SNI from the URL host, but allow the
+	// caller to override via Metadata["sni_host"]. Override is needed
+	// when dialing a private host (e.g. fly `.flycast` anycast) whose
+	// cert is issued for the public name; cert validation still works
+	// because the same backend machine serves both addresses.
 	tlsHost := host
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		tlsHost = h
+	}
+	if target.Metadata != nil {
+		if sniHost := target.Metadata["sni_host"]; sniHost != "" {
+			tlsHost = sniHost
+		}
 	}
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	rawConn, err := dialer.DialContext(ctx, "tcp", host)
