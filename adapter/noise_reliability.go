@@ -461,6 +461,43 @@ func (s *NoiseSession) reliabilityTick() {
 	}
 }
 
+// writeFrameDeadline bounds how long a single conn.Write inside
+// writeFrame may block. conn.Write on a stream socket only blocks when
+// the kernel send buffer is full — which only happens when the peer
+// has stopped draining its receive side (an asymmetric path failure).
+// A healthy socket's Write returns in microseconds, so a 10s ceiling
+// never trips on a working link, but it caps the damage when a peer
+// goes silent: keepalive Ping writes a PING frame before polling for
+// the pong, and without this bound that write would hang for the full
+// OS TCP retransmit window (~15-30s observed), dragging keepalive
+// death detection out to 60-90s. With the bound, a stuck write fails
+// fast and the session is torn down deterministically.
+const writeFrameDeadline = 10 * time.Second
+
+// writeDeadlineConn is the subset of net.Conn writeFrame needs to bound
+// its writes. Real sockets (WebSocket, TLS, UDP) satisfy it with an
+// effective implementation; the StreamConn sub-stream adapter satisfies
+// it with a no-op (its writes enqueue to the scheduler and never block)
+// and grpc wrappers likewise — so the type assertion is always safe and
+// the bound simply has no effect where blocking can't occur.
+type writeDeadlineConn interface {
+	SetWriteDeadline(time.Time) error
+}
+
+// connWrite writes b to the transport conn. On any write error — most
+// importantly a write-deadline timeout from a stuck send buffer — it
+// tears the session down: a partial frame left on the wire desyncs the
+// peer's framing, so the session is unusable and must not be written to
+// again. CloseWithError is closeOnce-guarded and idempotent, so calling
+// it here is safe even if another path is closing concurrently.
+func (s *NoiseSession) connWrite(b []byte) error {
+	if _, err := s.conn.Write(b); err != nil {
+		s.CloseWithError(fmt.Errorf("aether: frame write failed: %w", err))
+		return err
+	}
+	return nil
+}
+
 // writeFrame serializes and writes a single frame to the Noise connection.
 // Applies compression (if enabled and payload > 64 bytes) and encryption (if key set).
 func (s *NoiseSession) writeFrame(frame *aether.Frame) error {
@@ -492,25 +529,30 @@ func (s *NoiseSession) writeFrame(frame *aether.Frame) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
+	// Bound every socket write for this frame. See writeFrameDeadline.
+	// No-op on non-blocking conns (StreamConn / grpc); cleared on exit
+	// so the deadline never leaks into the next writer's window.
+	if dl, ok := s.conn.(writeDeadlineConn); ok {
+		_ = dl.SetWriteDeadline(time.Now().Add(writeFrameDeadline))
+		defer dl.SetWriteDeadline(time.Time{})
+	}
+
 	var buf bytes.Buffer
 	if s.opts.HeaderComp {
 		// Control frames (not encrypted, no payload) → 4 bytes
 		if s.compressor.ShouldCompressControl(frame) {
 			s.compressor.EncodeControlShort(&buf, frame)
-			_, err := s.conn.Write(buf.Bytes())
-			return err
+			return s.connWrite(buf.Bytes())
 		}
 		// ACK frames → 11 bytes (lite) or 3+N (full)
 		if s.compressor.ShouldCompressACK(frame) {
 			s.compressor.EncodeACKShort(&buf, frame)
-			_, err := s.conn.Write(buf.Bytes())
-			return err
+			return s.connWrite(buf.Bytes())
 		}
 		// Encrypted DATA → 9 bytes + Nonce-in-payload
 		if frame.Flags.Has(aether.FlagENCRYPTED) && s.compressor.ShouldCompressData(frame) {
 			s.compressor.EncodeEncryptedDataShort(&buf, frame)
-			_, err := s.conn.Write(buf.Bytes())
-			return err
+			return s.connWrite(buf.Bytes())
 		}
 		// Unencrypted DATA → 6-9 bytes
 		if s.compressor.ShouldCompressData(frame) {
@@ -519,8 +561,7 @@ func (s *NoiseSession) writeFrame(frame *aether.Frame) error {
 			} else {
 				s.compressor.EncodeDataShort(&buf, frame)
 			}
-			_, err := s.conn.Write(buf.Bytes())
-			return err
+			return s.connWrite(buf.Bytes())
 		}
 	}
 
@@ -529,8 +570,7 @@ func (s *NoiseSession) writeFrame(frame *aether.Frame) error {
 		return err
 	}
 	s.compressor.RecordFullHeader(frame)
-	_, err := s.conn.Write(buf.Bytes())
-	return err
+	return s.connWrite(buf.Bytes())
 }
 
 // flateWriterPool reuses flate.Writer (~32KB each) to avoid per-frame allocation.
