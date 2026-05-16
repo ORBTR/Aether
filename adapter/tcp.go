@@ -12,6 +12,8 @@ import (
 	"io"
 	"log"
 	"net"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -838,14 +840,42 @@ func (s *TCPSession) CloseWithError(err error) error {
 		if err != nil {
 			s.closeErr = err
 		}
-		// Log the actual close reason at the close site so observers
-		// upstream don't have to guess. Mirrors the noise-session
-		// [SESSION-CLOSE] format so post-mortem grepping is uniform
-		// across transports. nil close = clean GoAway, no log noise.
-		if err != nil {
-			log.Printf("[SESSION-CLOSE] %s peer=%s reason=%q",
-				s.proto, truncNodeID(s.remoteNodeID), err.Error())
+		// Capture the caller chain so the FIRST closer in a close
+		// cascade is identifiable. Frame 0 is this closure, 1 is
+		// sync.Once, 2 is CloseWithError; frames 3-6 are the actual
+		// callers — readLoop defer, stall detector, idle watchdog,
+		// the HSTLES dedup/multipath layer, or transport accept-full.
+		callerChain := ""
+		var pcs [6]uintptr
+		if n := runtime.Callers(3, pcs[:]); n > 0 {
+			frames := runtime.CallersFrames(pcs[:n])
+			for i := 0; i < 4; i++ {
+				frame, more := frames.Next()
+				file := frame.File
+				if idx := strings.LastIndex(file, "/"); idx >= 0 {
+					file = file[idx+1:]
+				}
+				if callerChain != "" {
+					callerChain += "<-"
+				}
+				callerChain += fmt.Sprintf("%s:%d", file, frame.Line)
+				if !more {
+					break
+				}
+			}
 		}
+		// Log EVERY close, including clean nil closes. Previously a
+		// nil-error Close() — exactly what the HSTLES dedup/multipath
+		// layer calls on a losing session — was silent, so the real
+		// churn initiator never appeared in [SESSION-CLOSE] and a
+		// downstream readLoop-exit close masked it on the peer. The
+		// callers= chain names whoever actually triggered the close.
+		reason := "clean(nil)"
+		if err != nil {
+			reason = err.Error()
+		}
+		log.Printf("[SESSION-CLOSE] %s peer=%s reason=%q callers=%s",
+			s.proto, truncNodeID(s.remoteNodeID), reason, callerChain)
 		close(s.closed)
 		if s.tickStop != nil {
 			// Non-blocking close: housekeepingTick watches both this
