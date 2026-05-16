@@ -25,6 +25,13 @@ import (
 var ackEmitCount atomic.Uint64
 var lastAckLogAt atomic.Int64 // unix nanos of last log emission
 
+// dbgACK is the debug logger for the ACK engine. Enable with
+// DEBUG=aether.reliability.ack (or any ancestor: aether.reliability,
+// aether). Used to confirm whether real mesh traffic actually reaches
+// OnDataReceived and whether the flush path fires — diagnosing the
+// observed fleet-wide "zero ACKs emitted" condition.
+var dbgACK = aether.NewDebugLogger("aether.reliability.ack")
+
 // ACKPolicy controls when ACKs are sent.
 type ACKPolicy struct {
 	MaxPackets int           // ACK every N packets (default: 2)
@@ -116,6 +123,12 @@ func (e *ACKEngine) OnDataReceived(seqNo uint32, isControlStream bool) {
 	defer e.mu.Unlock()
 
 	e.pending++
+
+	// Diagnostic: confirms real inbound traffic reaches the ACK engine.
+	// If this never logs under load, data frames bypass this layer
+	// (handleData not reached, or wrong frame type) — see dbgACK.
+	dbgACK.Printf("OnDataReceived seq=%d control=%v pending=%d buffered=%d maxPackets=%d",
+		seqNo, isControlStream, e.pending, e.recvWindow.BufferedCount(), e.policy.MaxPackets)
 
 	// Track loss in ring buffer
 	e.lossRing[e.ringHead] = true
@@ -215,8 +228,15 @@ func (e *ACKEngine) LossRate() uint16 {
 
 func (e *ACKEngine) flushLocked() {
 	if e.pending == 0 && e.recvWindow.BufferedCount() == 0 {
+		dbgACK.Printf("flushLocked skipped — pending=0 buffered=0")
 		return
 	}
+	// Diagnostic: confirms the flush path fires and sendACK is wired.
+	// If OnDataReceived logs but this never does, no flush rule (or the
+	// 25ms timer) is triggering; if this logs but sendACK_set=false the
+	// callback was never registered.
+	dbgACK.Printf("flushLocked firing — pending=%d buffered=%d sendACK_set=%v",
+		e.pending, e.recvWindow.BufferedCount(), e.sendACK != nil)
 	ack := e.buildLocked()
 	e.pending = 0
 	e.lastACK = time.Now()
