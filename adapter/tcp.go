@@ -197,6 +197,24 @@ func NewTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 		s.sched.Unregister(streamID)
 	})
 	go s.streamGC.Start()
+
+	// Clear any deadline the transport left armed on the conn during its
+	// dial/handshake phase. Two known leak sources, both landing here:
+	//   - WebSocket dial: gobwas/ws applies the dial context's deadline
+	//     to the socket for the handshake and never clears it; the mesh
+	//     wraps every dial in a 5 s context, so the socket carries a hard
+	//     dialStart+5s read deadline into the session.
+	//   - WebSocket/TLS accept: a hijacked HTTP connection keeps whatever
+	//     Read/Idle timeout the serving http.Server armed on it.
+	// A TCPSession is long-lived and owns its liveness via the keepalive
+	// stream + housekeepingTick idle eviction — readLoop blocks
+	// indefinitely by design. A leftover deadline fires mid-session and
+	// kills it at exactly the dial-timeout mark (observed: grade-C WS
+	// sessions dying fleet-wide at lived≈5.00s). Cleared once here, at the
+	// single chokepoint every stream transport (WebSocket, TLS) funnels
+	// through, so no transport can leak a deadline into a live session.
+	_ = conn.SetDeadline(time.Time{})
+
 	go s.readLoop()
 	go s.writeLoop()
 	go s.housekeepingTick()
