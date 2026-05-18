@@ -302,8 +302,13 @@ func (t *NoiseTransport) performInitiatorHandshakeSharedAttempt(ctx context.Cont
 	noncePacket = append(noncePacket, nonce...)
 	noncePacket = append(noncePacket, packet...)
 
+	// currentMsg1 is the exact packet retransmitted while we wait for
+	// msg2 — initially the plain msg1 envelope, swapped for the
+	// cookie-wrapped form once we've answered a source-validation retry.
+	currentMsg1 := noncePacket
+
 	// Send msg1 via correct socket (IPv4 or IPv6 based on target)
-	if _, err = listener.connFor(addr).WriteToUDP(noncePacket, addr); err != nil {
+	if _, err = listener.connFor(addr).WriteToUDP(currentMsg1, addr); err != nil {
 		return nil, fmt.Errorf("handshake msg1: %w", err)
 	}
 
@@ -311,9 +316,17 @@ func (t *NoiseTransport) performInitiatorHandshakeSharedAttempt(ctx context.Cont
 	// reply with a RETRY packet (S3 — _SECURITY.md §3.1) to validate our
 	// source address. Detect that, then re-send msg1 with the cookie
 	// prepended. We accept at most one retry round-trip per handshake.
+	//
+	// Retransmit msg1 on a ticker until msg2 arrives or the dial deadline
+	// elapses: raw UDP drops packets, and on a cross-org / public path
+	// there is no 6PN reliability underneath. The responder re-sends its
+	// cached msg2 when it sees a duplicate msg1, so this single ticker
+	// recovers a lost msg1 OR a lost msg2.
 	deadline := t.handshakeDeadline(ctx)
 	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()
+	rxmit := time.NewTicker(handshakeRetransmitInterval)
+	defer rxmit.Stop()
 	var msg2 []byte
 	retried := false
 recvLoop:
@@ -337,11 +350,19 @@ recvLoop:
 				if _, err = listener.connFor(addr).WriteToUDP(wrapped, addr); err != nil {
 					return nil, fmt.Errorf("handshake msg1 retry: %w", err)
 				}
+				currentMsg1 = wrapped // retransmits now carry the cookie
 				retried = true
 				continue
 			}
 			msg2 = resp
 			break recvLoop
+		case <-rxmit.C:
+			// Re-send msg1. The responder treats a duplicate msg1 as a
+			// request to re-send msg2 (see handleHandshake), so this is
+			// safe and idempotent.
+			if _, werr := listener.connFor(addr).WriteToUDP(currentMsg1, addr); werr != nil {
+				return nil, fmt.Errorf("handshake msg1 retransmit: %w", werr)
+			}
 		case <-timer.C:
 			return nil, fmt.Errorf("%w: msg2 timeout", aether.ErrHandshakeFailed)
 		case <-ctx.Done():
@@ -400,6 +421,17 @@ recvLoop:
 	return s, nil
 }
 
+// handshakeRetransmitInterval is how often the initiator re-sends msg1
+// while still waiting for msg2. The Noise handshake runs over raw UDP,
+// which drops packets — and on cross-org / public-internet paths there
+// is no 6PN reliability underneath. Without retransmission a single lost
+// msg1 or msg2 fails the whole handshake. Sized at a few × a typical
+// cross-region RTT: long enough not to duplicate-storm a slow path,
+// short enough for several attempts inside the dial deadline (~5s in
+// mesh use). This is the same loss-recovery scheme WireGuard, QUIC and
+// DTLS use for their handshakes.
+const handshakeRetransmitInterval = 700 * time.Millisecond
+
 func (t *NoiseTransport) handshakeDeadline(ctx context.Context) time.Time {
 	deadline := time.Now().Add(t.handshake)
 	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
@@ -436,6 +468,7 @@ type listenerHandshake struct {
 	state     *noise.HandshakeState
 	created   time.Time
 	responded bool
+	response  []byte // exact msg2 bytes sent; re-sent verbatim on a retransmitted msg1
 	scopeID  string // Extracted from preamble (empty for dedicated transports)
 	dialNonce []byte // If non-nil, echo this nonce prefix in msg2/msg3 responses
 }
@@ -533,17 +566,22 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 			l.mu.Unlock()
 			return
 		}
-		// Echo dial nonce prefix so initiator can route the response
+		// Echo dial nonce prefix so initiator can route the response.
+		// Cache the exact bytes sent so a retransmitted msg1 (initiator
+		// hasn't seen this msg2) can be answered by re-sending verbatim.
+		var sent []byte
 		if dialNonce != nil {
 			nonceResp := make([]byte, 0, 1+dialNonceLen+len(response))
 			nonceResp = append(nonceResp, dialNoncePrefix)
 			nonceResp = append(nonceResp, dialNonce...)
 			nonceResp = append(nonceResp, response...)
-			_, _ = l.connFor(addr).WriteToUDP(nonceResp, addr)
+			sent = nonceResp
 		} else {
-			_, _ = l.connFor(addr).WriteToUDP(response, addr)
+			sent = response
 		}
+		_, _ = l.connFor(addr).WriteToUDP(sent, addr)
 		hs.responded = true
+		hs.response = sent
 		l.mu.Unlock()
 		return
 	}
@@ -556,6 +594,17 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 	// This message completes the handshake and establishes the session.
 	payload, cs1, cs2, err := state.ReadMessage(nil, msg)
 	if err != nil {
+		// Not a valid msg3. If we have already sent msg2, this is almost
+		// certainly a retransmitted msg1 — the initiator re-sending
+		// because our msg2 was lost. Re-send the cached msg2 and KEEP
+		// the handshake state; the old behaviour (delete) turned a
+		// single dropped msg2 into a failed handshake.
+		if hs.responded && hs.response != nil {
+			resp := hs.response
+			l.mu.Unlock()
+			_, _ = l.connFor(addr).WriteToUDP(resp, addr)
+			return
+		}
 		delete(l.handshakes, key)
 		l.mu.Unlock()
 		return
