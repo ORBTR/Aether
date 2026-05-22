@@ -516,6 +516,84 @@ func (t *NoiseTransport) QUICPacketConn() net.PacketConn {
 	return l.quicDemux
 }
 
+// punchProbePayload is the body of a hole-punch probe datagram. It is
+// deliberately not a valid STUN message, Noise handshake, or QUIC packet
+// — a peer's listener classifies an unrecognised datagram as scan
+// traffic and drops it, exactly as intended. The bytes only need to
+// traverse the path so the sender's NAT/firewall installs an outbound
+// mapping for the destination.
+var punchProbePayload = []byte("AETHER-PUNCH")
+
+const (
+	// punchProbeCount is how many probe datagrams a single PunchProbe
+	// sends to one address — a small burst absorbs UDP loss without
+	// flooding the path.
+	punchProbeCount = 5
+	// punchProbeSpacing is the gap between probe datagrams.
+	punchProbeSpacing = 50 * time.Millisecond
+)
+
+// PunchProbe pre-warms this node's NAT/firewall mapping toward addr by
+// sending a short burst of small datagrams from the live listening UDP
+// socket — the same socket a peer dialing this node lands on. It is the
+// responder half of a coordinated hole-punch: at the agreed T0 the
+// initiator dials this node while this node probes the initiator, so
+// both NATs install an outbound mapping for the other side at once and
+// the initiator's inbound handshake is no longer filtered.
+//
+// PunchProbe never reads — it only opens the mapping. The actual Noise
+// handshake arrives on the initiator's dial and is accepted by the
+// normal listener path. The probe socket is chosen by address family so
+// the mapping opened matches the family the peer will dial.
+//
+// Returns an error if the transport is not listening or every probe
+// write fails; a partial burst (some writes succeeded) is treated as
+// success — one datagram through is enough to open the mapping.
+func (t *NoiseTransport) PunchProbe(ctx context.Context, addr *net.UDPAddr) error {
+	if addr == nil {
+		return errors.New("noise: PunchProbe nil address")
+	}
+	t.listenerMu.Lock()
+	l := t.listener
+	t.listenerMu.Unlock()
+	if l == nil {
+		return errors.New("noise: PunchProbe before Listen")
+	}
+
+	conn := l.conn
+	if addr.IP != nil && addr.IP.To4() == nil && l.ipv6Conn != nil {
+		conn = l.ipv6Conn // IPv6 destination — probe from the IPv6 socket
+	}
+	if conn == nil {
+		return errors.New("noise: PunchProbe no listening socket")
+	}
+
+	var sent int
+	var lastErr error
+	for i := 0; i < punchProbeCount; i++ {
+		if _, err := conn.WriteToUDP(punchProbePayload, addr); err != nil {
+			lastErr = err
+		} else {
+			sent++
+		}
+		if i == punchProbeCount-1 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			if sent > 0 {
+				return nil
+			}
+			return ctx.Err()
+		case <-time.After(punchProbeSpacing):
+		}
+	}
+	if sent == 0 {
+		return fmt.Errorf("noise: PunchProbe to %s: all writes failed: %w", addr, lastErr)
+	}
+	return nil
+}
+
 // PeerRTT holds the measured round-trip time for a specific peer.
 type PeerRTT struct {
 	NodeID aether.NodeID
