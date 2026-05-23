@@ -70,7 +70,7 @@ type noiseConn struct {
 	errMu      sync.RWMutex
 	err        error
 	transport  *NoiseTransport // Added for Relay
-	scopeID   string         // Set during handshake (from preamble or config)
+	scopeID    string          // Set during handshake (from preamble or config)
 
 	// Explicit nonce mode (if both sides support capExplicitNonce)
 	explicitNonce bool
@@ -82,6 +82,14 @@ type noiseConn struct {
 
 	// Rekey tracking
 	rekey *RekeyTracker
+
+	// crossOrgPreambleTarget — when non-empty, the listener-side
+	// writeFunc prepends a routing preamble for this NodeID on every
+	// outbound write. Set by the initiator dial path when
+	// Target.Metadata[MetadataKeyCrossOrgPreamble]="1" so post-handshake
+	// data also hairpins through the anycast-receiving machine and
+	// reaches the right same-org machine in the destination app.
+	crossOrgPreambleTarget aether.NodeID
 
 	// Observability counters (Concerns #5, #6)
 	decryptErrors uint64 // atomic: failed decrypt attempts
@@ -145,12 +153,18 @@ func newNoiseConnListener(ptr *noiseListener, send, recv *noise.CipherState, rem
 		inbox:      make(chan []byte, inboxSize),
 		closed:     make(chan struct{}),
 		maxPacket:  ptr.transport.maxPacket,
-		writeFunc:  func(msg []byte) (int, error) { return udpConn.WriteToUDP(msg, remote) },
 		localAddr:  udpConn.LocalAddr(),
 		transport:  ptr.transport,
 		health:     transportHealth.NewMonitor(0.2), // EMA alpha default, overridden by aether.healthAlpha
 		rekey:      NewRekeyTracker(cfg.RekeyAfterBytes, cfg.RekeyAfterDuration),
 	}
+	// writeFunc closes over nc so it can read crossOrgPreambleTarget on
+	// every send — letting the dial path set it post-construction
+	// without rebuilding the func. Closure also captures the listener
+	// so socket selection (connFor) can pick the right address-family
+	// socket per-write, including for relayed OpReply paths that target
+	// an IPv6 6PN address while remote is an IPv4 5-tuple.
+	nc.writeFunc = buildNoiseConnWriteFunc(nc, ptr, remote)
 	nc.parentStop = func() {
 		ptr.removeSession(remote)
 	}
@@ -763,11 +777,58 @@ func (l *noiseListener) runReader(ctx context.Context, conn *net.UDPConn) {
 
 		// Per-source rate limit FIRST (S6) — drop silently before
 		// touching the global budget so an attacker IP can't starve
-		// legitimate peers. Drop without response = no amplification.
+		// legitimate peers, AND before the cross-org forwarder branch
+		// so a flood of preambled msg1 with random target NodeIDs
+		// can't amplify into intra-org bandwidth. Drop without
+		// response = no amplification.
+		//
+		// On the M_t side (OpForward ingress over 6PN) addr is a
+		// same-org 6PN peer that already passed the rate limit on
+		// M_r's public socket — the per-source bucket on a 6PN ULA is
+		// effectively a no-op because same-org senders are trusted
+		// and only have one shared source IP per machine anyway.
 		if l.transport.sourceLimit != nil && !l.transport.sourceLimit.Allow(addr) {
 			continue
 		}
-		// Global rate limiting check
+
+		// Cross-org forwarder: routing preamble (M_r side) + inner
+		// relay frames (both sides). When handleForwarderPacket returns
+		// (substBuf != nil), it consumed a forwarder frame and the
+		// payload should be processed as if it had arrived from
+		// substAddr (the originator's 5-tuple from an op=1 inject, or
+		// the routing-preamble-stripped msg1 from the same source).
+		// When (consumed=true, substBuf=nil) the forwarder handled the
+		// packet fully (forwarded to another machine, or replied
+		// upstream) and the listener should move on. When
+		// (consumed=false) the packet wasn't a forwarder frame; fall
+		// through to normal classification.
+		if l.transport.forwarder != nil {
+			substBuf, substAddr, consumed := l.handleForwarderPacket(buf[:n], addr, conn)
+			if consumed {
+				continue
+			}
+			if substBuf != nil {
+				// Replace the in-flight buffer + source with the
+				// forwarder-unwrapped form. copy() with overlapping
+				// ranges where substBuf aliases buf[hdr:] is safe —
+				// Go's spec mandates memmove semantics so a
+				// dst-at-lower-address forward overlap is well-defined.
+				// Do NOT swap to `buf = substBuf`; the buffer is
+				// reused next iteration and a fresh slice header
+				// would lose the underlying capacity.
+				copy(buf[:len(substBuf)], substBuf)
+				n = len(substBuf)
+				if substAddr != nil {
+					addr = substAddr
+				}
+			}
+		}
+
+		// Per-source rate limit is applied above (before the forwarder
+		// branch). Global rate-limit + ECN classification continue here
+		// on the post-forwarder path; the dispatch chain that follows
+		// keys by addr.String() which the forwarder substitution has
+		// already mutated to the originator's 5-tuple when relevant.
 		if !l.transport.rateLimiter.Allow(1) {
 			continue
 		}

@@ -208,15 +208,17 @@ func (t *NoiseTransport) performInitiatorHandshakeAttempt(ctx context.Context, u
 // shared UDP socket. Handshake responses are received via the listener's
 // pendingDials channel dispatch. After completion, the session is registered
 // in the listener's session map for ongoing packet dispatch.
-func (t *NoiseTransport) performInitiatorHandshakeShared(ctx context.Context, listener *noiseListener, addr *net.UDPAddr, path aether.Path) (aether.Connection, error) {
-	return t.performInitiatorHandshakeSharedAttempt(ctx, listener, addr, path, false)
+func (t *NoiseTransport) performInitiatorHandshakeShared(ctx context.Context, listener *noiseListener, addr *net.UDPAddr, path aether.Path, crossOrgPreamble bool) (aether.Connection, error) {
+	return t.performInitiatorHandshakeSharedAttempt(ctx, listener, addr, path, false, crossOrgPreamble)
 }
 
 // performInitiatorHandshakeSharedAttempt runs one shared-socket handshake
 // attempt. `xxOnly` forces XX even if a peer key is cached — used by the
 // XK-failure retry to bound recursion depth to 1 (preventing a stale-key
 // loop if another goroutine re-caches the peer key during eviction).
-func (t *NoiseTransport) performInitiatorHandshakeSharedAttempt(ctx context.Context, listener *noiseListener, addr *net.UDPAddr, path aether.Path, xxOnly bool) (aether.Connection, error) {
+// `crossOrgPreamble` prepends a routing preamble to msg1/retransmits/msg3
+// so the cross-org anycast-receiving machine can hairpin to the target.
+func (t *NoiseTransport) performInitiatorHandshakeSharedAttempt(ctx context.Context, listener *noiseListener, addr *net.UDPAddr, path aether.Path, xxOnly bool, crossOrgPreamble bool) (aether.Connection, error) {
 	dbgHandshake.Printf("Starting shared-socket handshake to %s (xxOnly=%v)", path.NodeID.Short(), xxOnly)
 
 	// Register pending dial with a unique nonce so the responder can echo it back
@@ -302,6 +304,18 @@ func (t *NoiseTransport) performInitiatorHandshakeSharedAttempt(ctx context.Cont
 	noncePacket = append(noncePacket, nonce...)
 	noncePacket = append(noncePacket, packet...)
 
+	// Cross-org dials prepend a routing preamble OUTSIDE the dial-nonce
+	// envelope. The anycast-receiving machine (M_r) strips the preamble
+	// before forwarding; the target machine (M_t) then sees the
+	// dial-nonce envelope exactly as a direct dial would have produced.
+	if crossOrgPreamble {
+		preamble := EncodeRoutingPreamble(path.NodeID)
+		framed := make([]byte, 0, len(preamble)+len(noncePacket))
+		framed = append(framed, preamble...)
+		framed = append(framed, noncePacket...)
+		noncePacket = framed
+	}
+
 	// currentMsg1 is the exact packet retransmitted while we wait for
 	// msg2 — initially the plain msg1 envelope, swapped for the
 	// cookie-wrapped form once we've answered a source-validation retry.
@@ -347,6 +361,20 @@ recvLoop:
 				wrapped = append(wrapped, nonce...)
 				wrapped = append(wrapped, cookie...)
 				wrapped = append(wrapped, packet...)
+				// Cross-org: the cookie was minted by M_t and signed with
+				// M_t's per-process retry secret. The retransmit MUST land
+				// back on M_t for validation — the routing preamble is the
+				// only way to ensure that. Without this, the initiator's
+				// retransmit lands on whichever same-org machine wins the
+				// 5-tuple hash; if it's not M_t, validation fails and the
+				// dial stalls until timeout.
+				if crossOrgPreamble {
+					preamble := EncodeRoutingPreamble(path.NodeID)
+					framed := make([]byte, 0, len(preamble)+len(wrapped))
+					framed = append(framed, preamble...)
+					framed = append(framed, wrapped...)
+					wrapped = framed
+				}
 				if _, err = listener.connFor(addr).WriteToUDP(wrapped, addr); err != nil {
 					return nil, fmt.Errorf("handshake msg1 retry: %w", err)
 				}
@@ -378,7 +406,7 @@ recvLoop:
 			dbgHandshake.Printf("XK shared-socket msg2 failed with %s, evicting and retrying XX: %v", path.NodeID.Short(), err)
 			t.evictPeerKey(path.NodeID)
 			listener.unregisterPendingDial(nonce)
-			return t.performInitiatorHandshakeSharedAttempt(ctx, listener, addr, path, true /* xxOnly */)
+			return t.performInitiatorHandshakeSharedAttempt(ctx, listener, addr, path, true /* xxOnly */, crossOrgPreamble)
 		}
 		return nil, fmt.Errorf("%w: msg2 read: %v", aether.ErrHandshakeFailed, err)
 	}
@@ -398,7 +426,21 @@ recvLoop:
 	if err != nil {
 		return nil, err
 	}
-	if _, err = listener.connFor(addr).WriteToUDP(msg3, addr); err != nil {
+	// Cross-org: msg3 also carries the routing preamble so any same-org
+	// machine receiving it (Fly's 5-tuple hash could land us on a
+	// different machine than msg1 in edge cases) can hairpin to M_t. The
+	// preamble is OUTSIDE the noise frame; M_r strips before forwarding.
+	// Post-handshake data packets rely on Fly's edge flow stickiness —
+	// if that proves insufficient in production we revisit and add a
+	// persistent preamble-on-every-write path.
+	msg3Wire := msg3
+	if crossOrgPreamble {
+		preamble := EncodeRoutingPreamble(path.NodeID)
+		msg3Wire = make([]byte, 0, len(preamble)+len(msg3))
+		msg3Wire = append(msg3Wire, preamble...)
+		msg3Wire = append(msg3Wire, msg3...)
+	}
+	if _, err = listener.connFor(addr).WriteToUDP(msg3Wire, addr); err != nil {
 		return nil, fmt.Errorf("handshake msg3: %w", err)
 	}
 
@@ -407,6 +449,14 @@ recvLoop:
 	// Create session using the listener's shared socket (like listener-accepted sessions)
 	nc := newNoiseConnListener(listener, sendCS, recvCS, addr, remoteNode)
 	nc.scopeID = preambleTenantID
+	// Cross-org: persist the preamble target on the noiseConn so the
+	// writeFunc continues to prepend it on every post-handshake send.
+	// Without this, data packets from initiator → cross-org peer land
+	// on whichever same-org machine wins Fly's 5-tuple hash and there's
+	// no session there — they get dropped silently.
+	if crossOrgPreamble {
+		nc.crossOrgPreambleTarget = path.NodeID
+	}
 
 	if remoteCaps&capExplicitNonce != 0 {
 		nc.enableExplicitNonce()
@@ -513,7 +563,7 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 				out = append(out, token...)
 			}
 			l.mu.Unlock()
-			_, _ = l.connFor(addr).WriteToUDP(out, addr)
+			_, _ = l.writeRelayAware(addr, out)
 			return
 		}
 
@@ -579,7 +629,7 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 		} else {
 			sent = response
 		}
-		_, _ = l.connFor(addr).WriteToUDP(sent, addr)
+		_, _ = l.writeRelayAware(addr, sent)
 		hs.responded = true
 		hs.response = sent
 		l.mu.Unlock()
@@ -602,7 +652,7 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 		if hs.responded && hs.response != nil {
 			resp := hs.response
 			l.mu.Unlock()
-			_, _ = l.connFor(addr).WriteToUDP(resp, addr)
+			_, _ = l.writeRelayAware(addr, resp)
 			return
 		}
 		delete(l.handshakes, key)

@@ -55,6 +55,14 @@ import (
 // 0x54 → tenant preamble; anything else → raw msg1.
 
 const (
+	// MetadataKeyCrossOrgPreamble is the well-known aether.Target.Metadata
+	// key that signals the Noise dialer should prepend a routing preamble
+	// (target = the dial Target.NodeID) to msg1 + retransmits + msg3.
+	// The value must be "1" (any other value is treated as unset). Library
+	// sets this when dialing to a cross-org anycast IPv4 so the receiving
+	// machine M_r can forward to the target machine M_t over 6PN.
+	MetadataKeyCrossOrgPreamble = "aether.cross_org_preamble"
+
 	// RoutingPreambleMagic identifies a routing-preamble-bearing packet
 	// ("AE" = AEther routing).
 	RoutingPreambleMagic uint16 = 0x4145
@@ -76,6 +84,7 @@ var (
 	ErrRoutingPreambleTooShort       = errors.New("route-preamble: data too short")
 	ErrRoutingPreambleMagicMismatch  = errors.New("route-preamble: not a routing preamble")
 	ErrRoutingPreambleVersion        = errors.New("route-preamble: unsupported version")
+	ErrRoutingPreambleFlags          = errors.New("route-preamble: unknown flag bits set")
 )
 
 // EncodeRoutingPreamble builds the 34-byte routing preamble for a given
@@ -83,9 +92,21 @@ var (
 //
 // The NodeID is the canonical textual form ("vl1_<26 chars>" = 30 bytes).
 // Encoders MUST pass a normalized NodeID (use aether.NormalizeNodeID or
-// NodeID.Canonical() if unsure); we copy what we're given. Flags is
-// reserved for future use (e.g. 0x80 = reply marker).
+// NodeID.Canonical() if unsure). Flags is reserved for future use
+// (e.g. 0x80 = reply marker).
+//
+// PANICS on a NodeID longer than RoutingPreambleNodeIDSize — silently
+// truncating would emit a packet with the wrong target and the receiver
+// would forward to the wrong machine with no way to detect the
+// corruption. A panic surfaces the programmer error loudly; canonical
+// NodeIDs are exactly 30 bytes so a violator is a caller passing
+// non-canonical data.
 func EncodeRoutingPreamble(target aether.NodeID) []byte {
+	if len(target) > RoutingPreambleNodeIDSize {
+		panic("noise.EncodeRoutingPreamble: NodeID exceeds " +
+			"RoutingPreambleNodeIDSize — caller must pass a canonical " +
+			"30-byte aether.NodeID, not a longer string")
+	}
 	out := make([]byte, RoutingPreambleSize)
 	binary.BigEndian.PutUint16(out[0:2], RoutingPreambleMagic)
 	out[2] = RoutingPreambleVersion
@@ -111,6 +132,11 @@ func IsRoutingPreamble(data []byte) bool {
 // remaining bytes, error). The remaining bytes are what the noise state
 // machine should see — i.e. the raw msg1 (possibly preceded by a tenant
 // preamble) with the routing preamble stripped.
+//
+// Forward-compat: unknown flag bits return ErrRoutingPreambleFlags. A
+// future version that defines a new flag must bump RoutingPreambleVersion
+// so old decoders reject the packet on the version check first (rather
+// than mishandling a flag they don't understand).
 func DecodeRoutingPreamble(data []byte) (aether.NodeID, []byte, error) {
 	if len(data) < RoutingPreambleSize {
 		return "", nil, ErrRoutingPreambleTooShort
@@ -121,7 +147,12 @@ func DecodeRoutingPreamble(data []byte) (aether.NodeID, []byte, error) {
 	if data[2] != RoutingPreambleVersion {
 		return "", nil, ErrRoutingPreambleVersion
 	}
-	// flags = data[3]; reserved, not consumed yet.
+	// flags = data[3]; every bit is reserved at v0x01, so any non-zero
+	// flag byte is an unknown extension that we MUST reject so a future
+	// flag-defining version doesn't get silently mishandled by us.
+	if data[3] != 0 {
+		return "", nil, ErrRoutingPreambleFlags
+	}
 	// Trim any trailing NUL padding (encoder right-pads if the NodeID is
 	// shorter than the fixed width — rare, but defensive).
 	raw := data[4 : 4+RoutingPreambleNodeIDSize]
