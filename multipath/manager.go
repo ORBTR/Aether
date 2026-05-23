@@ -15,6 +15,7 @@
 package multipath
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -58,6 +59,14 @@ type Path struct {
 	LastSuccess time.Time
 	ConsecutiveFailures int
 
+	// LastFailure timestamp drives the dead→standby resurrection path.
+	// OnPrimaryFailure stamps this when marking PathDead; the probe loop
+	// (and PickByQuality / PickPath opportunistically) check that
+	// `time.Now().Sub(LastFailure) >= deadResurrectCooldown` before
+	// re-considering the path as a standby candidate. Cascade A.3 fix
+	// (L4 #2+#7) — previously PathDead was terminal with no recovery.
+	LastFailure time.Time
+
 	// Level 3 weighted scheduling counters. weight is derived from
 	// Quality + RTT + loss; bytesScheduled is what we've sent on this
 	// path in the current round. The scheduler picks the path with
@@ -66,6 +75,14 @@ type Path struct {
 	weightCache   float64
 	bytesScheduled int64
 }
+
+// deadResurrectCooldown is the minimum time a path stays in PathDead
+// before becoming a probe/promotion candidate again. Without this,
+// either every probe attempt would slam a dead path immediately after
+// failure (wasteful churn) or PathDead would be permanent (the bug
+// Cascade A.3 fixed). 30s matches the probeInterval default so the
+// next probe tick is the first chance for resurrection.
+const deadResurrectCooldown = 30 * time.Second
 
 // Manager manages multiple paths to a single peer.
 type Manager struct {
@@ -147,6 +164,10 @@ func (m *Manager) PickPath(n int) aether.Session {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// Opportunistic dead-path resurrection: even without RunProbeLoop
+	// running, paths whose cooldown has elapsed get re-considered here.
+	m.resurrectExpiredDeadPathsLocked()
+
 	if !m.weightedLB || len(m.paths) <= 1 {
 		if m.primary < len(m.paths) {
 			return m.paths[m.primary].Session
@@ -223,12 +244,30 @@ func (m *Manager) AddPath(session aether.Session, proto aether.Protocol, quality
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// L4 #5: seed bytesScheduled at half the current live minimum so a
+	// new path doesn't pin the WDRR scheduler at deficit=0 for the
+	// first many sends. Without this, a freshly-added path WINS every
+	// PickPath comparison (cost = 0/weight = 0) until it accumulates
+	// enough bytes to match existing paths — turning every fresh
+	// AddPath into a momentary "newcomer takes all" window.
+	var seed int64
+	if len(m.paths) > 0 {
+		seed = m.paths[0].bytesScheduled
+		for _, p := range m.paths {
+			if p.bytesScheduled < seed {
+				seed = p.bytesScheduled
+			}
+		}
+		seed /= 2
+	}
+
 	path := &Path{
-		Session:  session,
-		Protocol: proto,
-		State:    PathStandby,
-		Quality:  quality,
-		LastSuccess: time.Now(),
+		Session:        session,
+		Protocol:       proto,
+		State:          PathStandby,
+		Quality:        quality,
+		LastSuccess:    time.Now(),
+		bytesScheduled: seed,
 	}
 
 	m.paths = append(m.paths, path)
@@ -247,17 +286,30 @@ func (m *Manager) RemovePath(session aether.Session) {
 	defer m.mu.Unlock()
 
 	for i, p := range m.paths {
-		if p.Session == session {
-			m.paths = append(m.paths[:i], m.paths[i+1:]...)
-			if m.primary >= len(m.paths) {
+		if p.Session != session {
+			continue
+		}
+		wasPrimary := i == m.primary
+		m.paths = append(m.paths[:i], m.paths[i+1:]...)
+		// L4 #6 fix: correctly adjust m.primary on removal. Previously
+		// the code only handled "primary index ran off the end"
+		// (m.primary >= len after splice → reset to 0, which silently
+		// picked paths[0] not the best). Three cases now:
+		//   - removed path was primary → promote best standby
+		//   - removed path was BEFORE primary → decrement index so it
+		//     still points at the same Path pointer post-shift
+		//   - removed path was AFTER primary → no change
+		switch {
+		case wasPrimary:
+			if len(m.paths) > 0 {
+				m.promotebestStandby()
+			} else {
 				m.primary = 0
 			}
-			// If removed path was primary, promote best standby
-			if i == m.primary && len(m.paths) > 0 {
-				m.promotebestStandby()
-			}
-			break
+		case i < m.primary:
+			m.primary--
 		}
+		return
 	}
 }
 
@@ -286,6 +338,34 @@ func (m *Manager) AllSessions() []aether.Session {
 	return sessions
 }
 
+// AllProtocolsRepresented returns the set of transport protocols
+// represented in the manager — across active, standby, AND PathDead
+// states (but excluding closed sessions). Used by EnsureK to decide
+// which protocols still need a fresh dial.
+//
+// L4 #12 fix: previously EnsureK consulted AllSessions which excludes
+// PathDead. A transiently dead path's protocol was missing from the
+// "already represented" set, so EnsureK kept re-dialing the same
+// broken transport — racing the still-extant Dead-state Path on the
+// other side and producing fresh dedup races. Including Dead lets
+// EnsureK pick a different protocol instead.
+func (m *Manager) AllProtocolsRepresented() []aether.Protocol {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	seen := make(map[aether.Protocol]struct{}, len(m.paths))
+	for _, p := range m.paths {
+		if p.Session == nil || p.Session.IsClosed() {
+			continue
+		}
+		seen[p.Protocol] = struct{}{}
+	}
+	out := make([]aether.Protocol, 0, len(seen))
+	for proto := range seen {
+		out = append(out, proto)
+	}
+	return out
+}
+
 // ShouldSendRedundant returns true if this frame should be sent on all paths
 // (Level 2: REALTIME class redundancy).
 func (m *Manager) ShouldSendRedundant(latencyClass aether.LatencyClass) bool {
@@ -295,6 +375,8 @@ func (m *Manager) ShouldSendRedundant(latencyClass aether.LatencyClass) bool {
 }
 
 // OnPrimaryFailure handles primary path failure — instant failover to standby.
+// Marks the failed path PathDead and stamps LastFailure so the probe loop
+// (or opportunistic resurrection) can revive it after deadResurrectCooldown.
 func (m *Manager) OnPrimaryFailure() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -305,10 +387,110 @@ func (m *Manager) OnPrimaryFailure() {
 
 	old := m.paths[m.primary]
 	old.State = PathDead
+	old.LastFailure = time.Now()
 	old.ConsecutiveFailures++
 
 	dbgMultipath.Printf("Primary path %s failed, failing over", old.Protocol)
 	m.promotebestStandby()
+}
+
+// resurrectExpiredDeadPathsLocked transitions PathDead paths back to
+// PathStandby once they've cooled down past deadResurrectCooldown. Called
+// from PickByQuality + PickPath (opportunistic, no extra goroutine) and
+// from the probe loop. Caller must hold m.mu.
+func (m *Manager) resurrectExpiredDeadPathsLocked() {
+	now := time.Now()
+	for _, p := range m.paths {
+		if p.State != PathDead {
+			continue
+		}
+		// Skip paths whose underlying session has actually closed —
+		// resurrection only makes sense for transient failures.
+		if p.Session == nil || p.Session.IsClosed() {
+			continue
+		}
+		if !p.LastFailure.IsZero() && now.Sub(p.LastFailure) < deadResurrectCooldown {
+			continue
+		}
+		p.State = PathStandby
+		dbgMultipath.Printf("Path %s resurrected from Dead → Standby (cooldown elapsed)", p.Protocol)
+	}
+}
+
+// RunProbeLoop runs a goroutine that periodically pings non-primary
+// paths to detect liveness recovery. Successful probes call
+// OnProbeSuccess which transitions PathDead/PathProbing back to
+// PathStandby and updates RTT. Failed probes leave the path's State
+// alone (so a Dead path stays Dead, a Standby path stays Standby) but
+// stamp LastFailure to defer the next probe.
+//
+// Exits when ctx is cancelled. Safe to call once per manager; calling
+// multiple times spawns multiple loops (caller's responsibility).
+//
+// Cascade A.3 (L4 #2): before this, the manager had probeInterval +
+// stabilityPeriod + maxFailures fields and OnProbeSuccess hook, but no
+// code ever drove them. Standby paths could not be promoted; dead
+// paths could not be resurrected. RunProbeLoop closes that gap.
+func (m *Manager) RunProbeLoop(ctx context.Context) {
+	interval := m.probeInterval
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			m.probeNonPrimary(ctx)
+		}
+	}
+}
+
+// probeNonPrimary pings every non-primary path. Holds m.mu only to
+// snapshot the path list — actual Ping calls happen outside the lock so
+// a slow ping doesn't block dispatch.
+func (m *Manager) probeNonPrimary(ctx context.Context) {
+	m.mu.Lock()
+	m.resurrectExpiredDeadPathsLocked()
+	type probeTarget struct {
+		idx     int
+		session aether.Session
+		proto   aether.Protocol
+	}
+	targets := make([]probeTarget, 0, len(m.paths))
+	for i, p := range m.paths {
+		if i == m.primary || p.Session == nil || p.Session.IsClosed() {
+			continue
+		}
+		if p.State == PathDead {
+			// Still cooling down — skip.
+			continue
+		}
+		targets = append(targets, probeTarget{idx: i, session: p.Session, proto: p.Protocol})
+	}
+	m.mu.Unlock()
+
+	for _, t := range targets {
+		pingCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		rtt, err := t.session.Ping(pingCtx)
+		cancel()
+		if err == nil {
+			m.OnProbeSuccess(t.session, rtt)
+			continue
+		}
+		// Failed probe — stamp LastFailure but don't change state
+		// (a standby path that's flaky stays standby; it'll be
+		// re-probed next tick).
+		m.mu.Lock()
+		if t.idx < len(m.paths) && m.paths[t.idx].Session == t.session {
+			m.paths[t.idx].LastProbe = time.Now()
+			m.paths[t.idx].LastFailure = time.Now()
+		}
+		m.mu.Unlock()
+	}
 }
 
 // OnProbeSuccess records a successful probe on a standby path.
@@ -347,6 +529,20 @@ func (m *Manager) setPrimary(i int) {
 	}
 	m.primary = i
 	m.paths[i].State = PathActive
+	// L4 #9: reset the new primary's bytesScheduled to the cohort minimum
+	// so it gets fair WDRR scheduling from the moment of promotion
+	// rather than ranking below its true quality due to the long quiet
+	// standby window. Tracker-level throughput EMA recovers naturally
+	// once UpdateThroughput starts firing again.
+	if len(m.paths) > 1 {
+		minSched := m.paths[0].bytesScheduled
+		for _, p := range m.paths {
+			if p.bytesScheduled < minSched {
+				minSched = p.bytesScheduled
+			}
+		}
+		m.paths[i].bytesScheduled = minSched
+	}
 	dbgMultipath.Printf("Primary path: %s (quality=%d)", m.paths[i].Protocol, m.paths[i].Quality)
 }
 
