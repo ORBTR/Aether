@@ -57,7 +57,23 @@ type PathMeta struct {
 	TrackerKey   string
 	LastScore    quality.Score
 	LastScoreAt  time.Time
+
+	// LastTrackerUpdate throttles the side-effect that PickByQuality
+	// (via computeScoreLocked) used to do on every dispatch call:
+	// UpdateRTT + UpdateThroughput on the Tracker. At dispatch rates
+	// of hundreds per second, that collapsed the baselineRTT EMA to
+	// instantaneous SRTT in ~60 calls (α=0.05 × 60 samples) instead
+	// of the intended ~60 seconds — killing the RTT-spike signal the
+	// quality.Inputs.BaselineRTT field is supposed to provide.
+	// L4 #3 fix: only refresh the tracker EMAs once per
+	// trackerUpdateMinInterval per path.
+	LastTrackerUpdate time.Time
 }
+
+// trackerUpdateMinInterval is the minimum gap between Tracker EMA
+// updates per path. Picked so the EMA converges over its intended
+// time horizon regardless of dispatch frequency.
+const trackerUpdateMinInterval = 1 * time.Second
 
 // addQualityState extends Manager with quality-aware bookkeeping.
 // Held in a separate struct so legacy callers don't need to know about
@@ -132,13 +148,38 @@ func (m *Manager) Stop() {
 	q.mu.Unlock()
 }
 
+// gradeQualityForProto maps an aether.Protocol to the legacy integer
+// `Quality` used by setPrimary / promotebestStandby / computePathWeight.
+// Higher = better. Mirrors the Grade A/B/C hierarchy in
+// HSTLES/Library/mesh/grade so the legacy WDRR scheduler picks the
+// SAME path the grade-aware scaler would.
+//
+// Cascade A.2 fix (L4 #1): AddPathQA previously passed Quality=0 for
+// every path, leaving setPrimary/promotebestStandby blind to grade —
+// whichever path was registered first became permanent primary even
+// when a higher-grade path arrived later. With this mapping, a noise
+// path arriving after a WS path actually displaces it.
+func gradeQualityForProto(proto aether.Protocol) int {
+	switch proto {
+	case aether.ProtoNoise:
+		return 100 // Grade A
+	case aether.ProtoQUIC, aether.ProtoGRPC:
+		return 60 // Grade B
+	case aether.ProtoWebSocket, aether.ProtoTCP:
+		return 30 // Grade C
+	default:
+		return 10 // Unknown / fallback — never zero, so it can still
+		// be promoted over a path with truly no signal.
+	}
+}
+
 // AddPathQA registers a path with quality-aware metadata. Equivalent
 // to AddPath but also records the remote region so the path can be
 // classified by RouteClass for score normalisation. Callers that
 // don't pass a region or quality config can keep using AddPath; the
 // two coexist so the legacy WDRR scheduler keeps working alongside.
 func (m *Manager) AddPathQA(session aether.Session, proto aether.Protocol, remoteRegion string) {
-	m.AddPath(session, proto, 0) // legacy quality int unused on this path
+	m.AddPath(session, proto, gradeQualityForProto(proto))
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -181,6 +222,10 @@ func (m *Manager) AddPathQA(session aether.Session, proto aether.Protocol, remot
 func (m *Manager) PickByQuality(op quality.DispatchOp) (aether.Session, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Opportunistic dead-path resurrection — see Manager.PickPath for
+	// the same call. Even without RunProbeLoop running, a path whose
+	// cooldown elapsed is back in the candidate pool here.
+	m.resurrectExpiredDeadPathsLocked()
 	if m.qstate == nil || m.qstate.cfg.Tracker == nil {
 		// No quality config; fall back to legacy primary selection.
 		if len(m.paths) == 0 || m.primary >= len(m.paths) {
@@ -244,8 +289,17 @@ func (m *Manager) computeScoreLocked(p *Path) quality.Score {
 	// Translate session metrics into Inputs for the quality package.
 	// Most fields read directly; baseline RTT and throughput come from
 	// the Tracker's longer-window EMAs.
-	cfg.Tracker.UpdateRTT(meta.TrackerKey, health.SRTT())
-	cfg.Tracker.UpdateThroughput(meta.TrackerKey, metrics.BytesRecv)
+	//
+	// L4 #3 throttle: only push fresh samples into the Tracker EMAs
+	// once per trackerUpdateMinInterval. PickByQuality fires on every
+	// dispatch decision; without throttling, hundreds of calls per
+	// second collapsed the baseline RTT EMA to instantaneous SRTT.
+	now := time.Now()
+	if now.Sub(meta.LastTrackerUpdate) >= trackerUpdateMinInterval {
+		cfg.Tracker.UpdateRTT(meta.TrackerKey, health.SRTT())
+		cfg.Tracker.UpdateThroughput(meta.TrackerKey, metrics.BytesRecv)
+		meta.LastTrackerUpdate = now
+	}
 
 	in := quality.Inputs{
 		Class:               meta.Class,

@@ -225,6 +225,19 @@ type trackerEntry struct {
 	// behaviour.
 	dialFailureCount    atomic.Int64
 	dialCooldownUntilNs atomic.Int64 // unix nanos; 0 = no cooldown
+
+	// dialProbeLastNs is the timestamp of the last "opportunistic
+	// probe" attempt — IsDialSuppressed allows one dial through every
+	// dialProbeInterval(failureCount) of cooldown so a transient issue
+	// that's actually resolved doesn't burn the full 10-minute cap
+	// before any retry happens. L1 #6 fix from the routing review.
+	dialProbeLastNs atomic.Int64 // unix nanos; 0 = never probed
+
+	// lastFailureDecayAt is the most recent time
+	// decayConsecutiveFailuresLocked halved the failure counter.
+	// Cascade E / L4 #10 — prevents a long-stale failure penalty
+	// from suppressing a path that's actually recovered.
+	lastFailureDecayAt time.Time
 }
 
 // NewTracker creates an empty tracker. Pass to NewInputs to fill in
@@ -284,14 +297,60 @@ func (t *Tracker) BaselineRTT(key string) time.Duration {
 	return e.baselineRTT
 }
 
+// decayConsecutiveFailuresLocked applies time-based decay to the
+// per-key consecutiveFailures counter. Called from UpdateThroughput
+// (which fires on every per-tick stats update) so a path that's
+// actually been carrying traffic gets its old failure penalty halved
+// every consecutiveFailuresDecayInterval. Without this, a path that
+// racked up 8 failures during a week of intermittent issues stays
+// penalised hours after recovery — Cascade E / L4 #10 fix.
+//
+// Caller holds e.mu.
+func decayConsecutiveFailuresLocked(e *trackerEntry, now time.Time) {
+	cur := e.consecutiveFailures.Load()
+	if cur == 0 {
+		return
+	}
+	if e.lastFailureDecayAt.IsZero() {
+		e.lastFailureDecayAt = now
+		return
+	}
+	if now.Sub(e.lastFailureDecayAt) < consecutiveFailuresDecayInterval {
+		return
+	}
+	// Halve. CompareAndSwap so concurrent RecordCloseReason can race
+	// and still get a consistent result (its Add(1) will simply land
+	// on the post-halved value).
+	for {
+		cur = e.consecutiveFailures.Load()
+		if cur == 0 {
+			break
+		}
+		newVal := cur / 2
+		if e.consecutiveFailures.CompareAndSwap(cur, newVal) {
+			break
+		}
+	}
+	e.lastFailureDecayAt = now
+}
+
+// consecutiveFailuresDecayInterval is how often the failure counter
+// halves while a path is being actively used (UpdateThroughput fires).
+// 60s matches the timescale of the reliability EMA — a path that's
+// stable for one minute deserves to be re-considered as a candidate.
+const consecutiveFailuresDecayInterval = 60 * time.Second
+
 // UpdateThroughput feeds a cumulative byte count + timestamp into the
 // per-key throughput EMA. Computes bytes/sec from the delta against
-// the previous sample.
+// the previous sample. Also opportunistically decays the
+// consecutiveFailures counter — a path that's actually carrying
+// traffic deserves to lose its old failure penalty over time.
 func (t *Tracker) UpdateThroughput(key string, bytesRecv uint64) {
 	now := time.Now()
 	e := t.entry(key)
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	decayConsecutiveFailuresLocked(e, now)
 	if e.lastBytesAt.IsZero() {
 		e.lastBytesRecv = bytesRecv
 		e.lastBytesAt = now
@@ -334,24 +393,70 @@ func (t *Tracker) BytesPerSec(key string) float64 {
 	return e.bytesPerSec
 }
 
-// RecordClose feeds a session-close event. cleanClose=true means a
-// clean GoAway; cleanClose=false means CloseWithError. Drives both
-// the consecutive-failures count and the reliability EMA.
-func (t *Tracker) RecordClose(key string, cleanClose bool) {
+// CloseReason categorises a session-close event so the reliability
+// scorer can distinguish a peer-rejected dedup-race close (carries no
+// signal about path health) from a clean GoAway (positive signal) from
+// an actual transport error (negative signal).
+//
+// L4 #4 fix: the previous (cleanClose bool) signature lumped dedup-race
+// closes and transport errors together based on lifetime — a transport
+// that died in the first 6s of every attempt LOOKED LIKE a perfect
+// clean-close path to the EMA, so chronically-broken paths stayed at
+// reliability=1.0 forever.
+type CloseReason int
+
+const (
+	// CloseClean is a normal GoAway-initiated close. Positive signal.
+	CloseClean CloseReason = iota
+
+	// CloseRaceLoser is a dedup-race loss — the peer had a more
+	// recent session and rejected ours. No signal about path health.
+	// Skip the EMA but DON'T bump consecutiveFailures.
+	CloseRaceLoser
+
+	// CloseTransportError is an actual error close — handshake
+	// failed, frame parse error, AEAD authentication failure, etc.
+	// Negative signal: feeds reliability EMA toward 0 and bumps
+	// consecutiveFailures.
+	CloseTransportError
+)
+
+// RecordCloseReason feeds a session-close event classified by reason.
+// Preferred over the legacy RecordClose for new call sites; the
+// legacy bool maps to either CloseClean or CloseTransportError so
+// existing callers keep working.
+func (t *Tracker) RecordCloseReason(key string, reason CloseReason) {
 	e := t.entry(key)
-	if cleanClose {
+	switch reason {
+	case CloseClean:
 		e.consecutiveFailures.Store(0)
-	} else {
+		e.mu.Lock()
+		e.reliabilityEMA = 0.1*1.0 + 0.9*e.reliabilityEMA
+		e.mu.Unlock()
+	case CloseRaceLoser:
+		// Neither signal — race-loser closes are routing churn,
+		// not path health. Per memory project_dedup_feedback_loop:
+		// feeding these to EMA causes scaler→K→dial→reject→close
+		// self-amplifying churn loops.
+	case CloseTransportError:
 		e.consecutiveFailures.Add(1)
+		e.mu.Lock()
+		e.reliabilityEMA = 0.1*0.0 + 0.9*e.reliabilityEMA
+		e.mu.Unlock()
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	signal := 1.0
-	if !cleanClose {
-		signal = 0.0
+}
+
+// RecordClose is the legacy two-state API. Maintained for existing
+// callers. New code should use RecordCloseReason with an explicit
+// reason — particularly CloseRaceLoser, which this legacy signature
+// cannot express (the cleanClose=true mapping doesn't capture that
+// race-loser closes carry no health signal at all).
+func (t *Tracker) RecordClose(key string, cleanClose bool) {
+	if cleanClose {
+		t.RecordCloseReason(key, CloseClean)
+	} else {
+		t.RecordCloseReason(key, CloseTransportError)
 	}
-	// EMA with α = 0.1 — about 10 closes' worth of memory.
-	e.reliabilityEMA = 0.1*signal + 0.9*e.reliabilityEMA
 }
 
 // ConsecutiveFailures returns the current count for a key.
@@ -502,6 +607,15 @@ func (t *Tracker) RecordCooldown(key string, d time.Duration) {
 // poll after the cooldown window naturally returns false. The second
 // return value is the cooldown's remaining duration, useful for
 // observability and for the EnsureK reconnect loop's backoff.
+//
+// Opportunistic probe (L1 #6): even during cooldown, we permit one
+// dial attempt every dialProbeInterval. Without this, after 6+
+// consecutive failures the path is suppressed for the full 10-minute
+// cap — and if the underlying network issue resolves halfway through,
+// we still wait the full 10 minutes before retrying. With the probe
+// allowance, the dialer gets to try once every ~2.5 minutes to detect
+// recovery, while a still-broken path is rejected again and the
+// growing-cooldown ladder continues unchanged.
 func (t *Tracker) IsDialSuppressed(key string) (bool, time.Duration) {
 	v, ok := t.entries.Load(key)
 	if !ok {
@@ -518,7 +632,38 @@ func (t *Tracker) IsDialSuppressed(key string) (bool, time.Duration) {
 		e.dialCooldownUntilNs.CompareAndSwap(expiry, 0)
 		return false, 0
 	}
+	// Opportunistic probe gate: if we've never probed since cooldown
+	// started, OR enough time has passed since the last probe, allow
+	// ONE dial through. Caller will either succeed (recordDialSuccess
+	// clears cooldown) or fail (recordDialFailure extends it).
+	now := time.Now().UnixNano()
+	failures := e.dialFailureCount.Load()
+	probeInterval := dialProbeInterval(failures)
+	if probeInterval > 0 {
+		last := e.dialProbeLastNs.Load()
+		if last == 0 || time.Duration(now-last) >= probeInterval {
+			if e.dialProbeLastNs.CompareAndSwap(last, now) {
+				return false, remaining
+			}
+		}
+	}
 	return true, remaining
+}
+
+// dialProbeInterval returns how often an opportunistic dial probe is
+// allowed during cooldown. Scales with failure count so a rapidly
+// flapping path doesn't get probed every few seconds — but a
+// long-suppressed path (10-min cap) gets a chance every ~2.5 minutes
+// to detect recovery. Returns 0 for low failure counts (the cooldown
+// is short enough that probing during it adds little value).
+func dialProbeInterval(failures int64) time.Duration {
+	if failures < 3 {
+		return 0 // base cooldowns ≤ 1 min; just wait them out
+	}
+	cooldown := dialCooldownDuration(int(failures))
+	// One probe per quarter of the cooldown window. Caps at 2.5 min
+	// (10-min cap / 4).
+	return cooldown / 4
 }
 
 // DialFailureCount returns the consecutive dial-failure count for a
