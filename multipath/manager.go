@@ -243,7 +243,16 @@ func computePathWeight(p *Path) float64 {
 func (m *Manager) AddPath(session aether.Session, proto aether.Protocol, quality int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.addPathLocked(session, proto, quality)
+}
 
+// addPathLocked is the lock-already-held variant of AddPath. Used by
+// AddPathQA so the quality-aware bookkeeping can happen under the same
+// lock as the legacy path insertion — eliminates the race window
+// where a concurrent AddPath could insert a path between AddPathQA's
+// unlock and relock, leaving its meta attached to the wrong Path.
+// Audit M11.
+func (m *Manager) addPathLocked(session aether.Session, proto aether.Protocol, quality int) *Path {
 	// L4 #5: seed bytesScheduled at half the current live minimum so a
 	// new path doesn't pin the WDRR scheduler at deficit=0 for the
 	// first many sends. Without this, a freshly-added path WINS every
@@ -278,6 +287,7 @@ func (m *Manager) AddPath(session aether.Session, proto aether.Protocol, quality
 	}
 
 	dbgMultipath.Printf("Added path %s (quality=%d, state=%s)", proto, quality, path.State)
+	return path
 }
 
 // RemovePath removes a transport path (session closed).
@@ -439,9 +449,22 @@ func (m *Manager) RunProbeLoop(ctx context.Context) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	// Also exit when the manager's Stop() is called — the qstate.stop
+	// channel is closed by Stop(), so we listen on both. Without this
+	// the probe loop would outlive the manager's qstate teardown and
+	// could touch state that's already been GC'd.
+	var stopCh <-chan struct{}
+	m.mu.Lock()
+	if m.qstate != nil {
+		stopCh = m.qstate.stop
+	}
+	m.mu.Unlock()
+
 	for {
 		select {
 		case <-ctx.Done():
+			return
+		case <-stopCh:
 			return
 		case <-ticker.C:
 			m.probeNonPrimary(ctx)

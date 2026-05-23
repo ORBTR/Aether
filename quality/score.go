@@ -204,6 +204,16 @@ func DispatchRank(s Score, op DispatchOp) float64 {
 // shard later.
 type Tracker struct {
 	entries sync.Map // key string → *trackerEntry
+
+	// decayLoopOnce guards lazy startup of the periodic decay
+	// goroutine. Started on the first call to UpdateRTT /
+	// UpdateThroughput / RecordCloseReason / IsDialSuppressed —
+	// whichever fires first. Audit H8: previously decay only ran
+	// from UpdateThroughput, so a dormant standby path (no traffic)
+	// kept its accumulated failure count forever, suppressing
+	// promotion even after the underlying issue cleared.
+	decayLoopOnce sync.Once
+	decayStop     chan struct{}
 }
 
 type trackerEntry struct {
@@ -241,8 +251,69 @@ type trackerEntry struct {
 }
 
 // NewTracker creates an empty tracker. Pass to NewInputs to fill in
-// the historical fields each Compute call needs.
-func NewTracker() *Tracker { return &Tracker{} }
+// the historical fields each Compute call needs. The periodic decay
+// goroutine starts lazily on first touch (see ensureDecayLoop) so
+// short-lived tests that never use the tracker don't spawn a
+// goroutine.
+func NewTracker() *Tracker {
+	return &Tracker{decayStop: make(chan struct{})}
+}
+
+// ensureDecayLoop starts the periodic ConsecutiveFailures-decay
+// goroutine on first call. Idempotent via sync.Once. Audit H8 fix —
+// a path that's dormant (no UpdateThroughput firing) needs its
+// failure count to age out anyway, otherwise it stays penalised long
+// after the underlying network blip cleared.
+func (t *Tracker) ensureDecayLoop() {
+	t.decayLoopOnce.Do(func() {
+		go t.runDecayLoop()
+	})
+}
+
+// runDecayLoop ticks every consecutiveFailuresDecayInterval and walks
+// every entry, halving the failure counter on paths whose
+// lastFailureDecayAt is older than the interval. The walk is O(N
+// entries) per tick but each entry's work is just an atomic Load +
+// time compare + (rarely) one CAS — cheap.
+//
+// Stops on `Close()`.
+func (t *Tracker) runDecayLoop() {
+	ticker := time.NewTicker(consecutiveFailuresDecayInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-t.decayStop:
+			return
+		case now := <-ticker.C:
+			t.entries.Range(func(_, v interface{}) bool {
+				e, ok := v.(*trackerEntry)
+				if !ok || e == nil {
+					return true
+				}
+				e.mu.Lock()
+				decayConsecutiveFailuresLocked(e, now)
+				e.mu.Unlock()
+				return true
+			})
+		}
+	}
+}
+
+// Close stops the periodic decay goroutine. Safe to call multiple
+// times. Trackers created via NewTracker without Close leak the
+// goroutine until process exit — fine for the global tracker the
+// runtime owns, but tests should defer Close().
+func (t *Tracker) Close() {
+	if t == nil {
+		return
+	}
+	select {
+	case <-t.decayStop:
+		// already closed
+	default:
+		close(t.decayStop)
+	}
+}
 
 // Key identifies a (peer, transport) pair within the tracker. Sessions
 // for the same peer over different transports track independently —
@@ -253,6 +324,10 @@ func Key(peerID, transport string) string {
 
 // entry returns the trackerEntry for key, creating it if necessary.
 func (t *Tracker) entry(key string) *trackerEntry {
+	// Lazy-start the periodic decay loop on first entry creation —
+	// any tracker that has at least one entry needs the decay loop
+	// running. Idempotent via sync.Once. Audit H8.
+	t.ensureDecayLoop()
 	if v, ok := t.entries.Load(key); ok {
 		return v.(*trackerEntry)
 	}
@@ -603,19 +678,18 @@ func (t *Tracker) RecordCooldown(key string, d time.Duration) {
 }
 
 // IsDialSuppressed returns whether the path is in cooldown right now.
-// Lazy-clears the cooldown when its expiry has passed so the first
+// PURE PREDICATE — does not mutate state; safe to call multiple times
+// for observability, dashboards, and dual-checks. Lazy-clears the
+// cooldown when its expiry has passed (idempotent), so the first
 // poll after the cooldown window naturally returns false. The second
 // return value is the cooldown's remaining duration, useful for
 // observability and for the EnsureK reconnect loop's backoff.
 //
-// Opportunistic probe (L1 #6): even during cooldown, we permit one
-// dial attempt every dialProbeInterval. Without this, after 6+
-// consecutive failures the path is suppressed for the full 10-minute
-// cap — and if the underlying network issue resolves halfway through,
-// we still wait the full 10 minutes before retrying. With the probe
-// allowance, the dialer gets to try once every ~2.5 minutes to detect
-// recovery, while a still-broken path is rejected again and the
-// growing-cooldown ladder continues unchanged.
+// Audit M12: this used to mutate dialProbeLastNs as a side effect of
+// the predicate query, violating command-query separation — a caller
+// that read the result twice would have stamped two probes. The
+// probe-allowance side effect now lives in TryDialThrough, called
+// only by the dialer when it's about to actually attempt a dial.
 func (t *Tracker) IsDialSuppressed(key string) (bool, time.Duration) {
 	v, ok := t.entries.Load(key)
 	if !ok {
@@ -628,26 +702,70 @@ func (t *Tracker) IsDialSuppressed(key string) (bool, time.Duration) {
 	}
 	remaining := time.Until(time.Unix(0, expiry))
 	if remaining <= 0 {
-		// Lazily clear so subsequent reads are fast.
+		// Lazily clear so subsequent reads are fast. CAS so two
+		// concurrent observers don't race; whichever wins clears
+		// the field, the other reads 0 next time.
 		e.dialCooldownUntilNs.CompareAndSwap(expiry, 0)
 		return false, 0
 	}
-	// Opportunistic probe gate: if we've never probed since cooldown
-	// started, OR enough time has passed since the last probe, allow
-	// ONE dial through. Caller will either succeed (recordDialSuccess
-	// clears cooldown) or fail (recordDialFailure extends it).
+	return true, remaining
+}
+
+// TryDialThrough returns true if the dialer should be allowed to
+// attempt a dial RIGHT NOW for this key, false if the cooldown still
+// applies. Distinct from IsDialSuppressed in that this is the
+// COMMAND form — calling it stamps an opportunistic-probe timestamp
+// when it returns true during a cooldown, so the next call within the
+// probe interval will return false.
+//
+// Use this exactly once at the start of a dial attempt, NOT for
+// observability or repeated checks. The intended pattern:
+//
+//	if !tracker.TryDialThrough(key) {
+//	    return ErrDialSuppressed
+//	}
+//	// actually dial
+//
+// Audit M12 fix — splits the predicate (IsDialSuppressed, pure)
+// from the command (TryDialThrough, allowed to mutate).
+//
+// L1 #6 opportunistic probe semantics: even during cooldown, this
+// returns true once every dialProbeInterval(failureCount) so a
+// transient issue that's actually resolved doesn't burn the full
+// 10-minute cap before any retry.
+func (t *Tracker) TryDialThrough(key string) bool {
+	v, ok := t.entries.Load(key)
+	if !ok {
+		return true // no record → no suppression
+	}
+	e := v.(*trackerEntry)
+	expiry := e.dialCooldownUntilNs.Load()
+	if expiry == 0 {
+		return true
+	}
+	remaining := time.Until(time.Unix(0, expiry))
+	if remaining <= 0 {
+		e.dialCooldownUntilNs.CompareAndSwap(expiry, 0)
+		return true
+	}
+	// In cooldown — check probe allowance.
 	now := time.Now().UnixNano()
 	failures := e.dialFailureCount.Load()
 	probeInterval := dialProbeInterval(failures)
-	if probeInterval > 0 {
-		last := e.dialProbeLastNs.Load()
-		if last == 0 || time.Duration(now-last) >= probeInterval {
-			if e.dialProbeLastNs.CompareAndSwap(last, now) {
-				return false, remaining
-			}
-		}
+	if probeInterval <= 0 {
+		return false
 	}
-	return true, remaining
+	last := e.dialProbeLastNs.Load()
+	if last != 0 && time.Duration(now-last) < probeInterval {
+		return false
+	}
+	// Stamp probe attempt — CAS so concurrent callers can't both
+	// be allowed through on the same probe slot.
+	if e.dialProbeLastNs.CompareAndSwap(last, now) {
+		return true
+	}
+	// Lost the CAS — another goroutine grabbed the probe slot.
+	return false
 }
 
 // dialProbeInterval returns how often an opportunistic dial probe is

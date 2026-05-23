@@ -85,6 +85,14 @@ type qualityState struct {
 	stop    chan struct{} // closed by Stop()
 	target  int           // K — current EnsureK target
 	stopped bool
+
+	// probeOnce gates RunProbeLoop start so EnsureK can launch it
+	// idempotently on first call. The probe loop pings non-primary
+	// paths every probeInterval so dead/standby paths can resurrect
+	// based on real liveness signal — without this, dead-path recovery
+	// only happens opportunistically when something calls PickPath /
+	// PickByQuality (audit critical finding #1).
+	probeOnce sync.Once
 }
 
 // EnsureK starts (or updates) a goroutine that maintains at least k
@@ -112,8 +120,17 @@ func (m *Manager) EnsureK(ctx context.Context, cfg QualityConfig, k int) error {
 			stop:   make(chan struct{}),
 			target: k,
 		}
+		q := m.qstate
 		m.mu.Unlock()
-		go m.qstate.runEnsure(ctx, m)
+		go q.runEnsure(ctx, m)
+		// Critical fix: start the probe loop ONCE per manager. Without
+		// this RunProbeLoop is dead code (it was defined but never
+		// invoked, so dead-path resurrection only happened on
+		// opportunistic PickPath / PickByQuality calls). Now every
+		// manager that runs EnsureK gets active liveness probes.
+		q.probeOnce.Do(func() {
+			go m.RunProbeLoop(ctx)
+		})
 		return nil
 	}
 	m.qstate.mu.Lock()
@@ -124,8 +141,14 @@ func (m *Manager) EnsureK(ctx context.Context, cfg QualityConfig, k int) error {
 	}
 	m.qstate.cfg = cfg
 	m.qstate.target = k
+	q := m.qstate
 	m.qstate.mu.Unlock()
 	m.mu.Unlock()
+	// Late-arriving EnsureK call (e.g., manager existed from a prior
+	// AddPathQA without EnsureK) — also start the probe loop once.
+	q.probeOnce.Do(func() {
+		go m.RunProbeLoop(ctx)
+	})
 	return nil
 }
 
@@ -178,11 +201,22 @@ func gradeQualityForProto(proto aether.Protocol) int {
 // classified by RouteClass for score normalisation. Callers that
 // don't pass a region or quality config can keep using AddPath; the
 // two coexist so the legacy WDRR scheduler keeps working alongside.
+//
+// Audit M11: AddPath is invoked through the lock-already-held
+// addPathLocked variant so the qstate.meta entry is attached to the
+// path returned in the SAME critical section — closes the race where
+// a concurrent AddPath could insert between AddPathQA's
+// AddPath-unlock and AddPathQA-relock and leave meta pointing at the
+// wrong Path pointer.
 func (m *Manager) AddPathQA(session aether.Session, proto aether.Protocol, remoteRegion string) {
-	m.AddPath(session, proto, gradeQualityForProto(proto))
-
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	path := m.addPathLocked(session, proto, gradeQualityForProto(proto))
+	if path == nil {
+		return
+	}
+
 	if m.qstate == nil {
 		// Quality state not initialised — caller hasn't called
 		// EnsureK yet. Allocate so subsequent AddPathQA calls find
@@ -192,12 +226,6 @@ func (m *Manager) AddPathQA(session aether.Session, proto aether.Protocol, remot
 			stop: make(chan struct{}),
 		}
 	}
-
-	// Find the path we just added (it's the last one).
-	if len(m.paths) == 0 {
-		return
-	}
-	path := m.paths[len(m.paths)-1]
 
 	cfg := m.qstate.cfg
 	class := quality.ClassifyRegions(cfg.LocalRegion, remoteRegion)
