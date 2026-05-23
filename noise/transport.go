@@ -190,6 +190,28 @@ type NoiseTransport struct {
 	ticketStore      *TicketStore
 	initiatorTickets *initiatorTicketCache // initiator-side resume cache
 	seenTickets      *seenTicketCache      // responder-side replay guard
+
+	// Cross-org anycast forwarder — intra-org noise-UDP hairpin per
+	// inner_relay.go + the design doc at
+	// HSTLES/Library/docs/superpowers/plans/2026-05-23-cross-org-anycast-forwarder.md.
+	// Nil = transport runs in non-forwarder mode (legacy behaviour:
+	// preambled msg1 for non-local targets is dropped, op=1 / op=2
+	// frames are ignored). Set via SetForwarder before the listener
+	// starts processing traffic.
+	forwarder *IntraOrgForwarder
+}
+
+// SetForwarder installs the intra-org anycast forwarder. Pass nil to
+// disable (default). Safe to call once at startup before Listen; not
+// safe to swap a live forwarder out from under a running listener
+// without coordinating with in-flight relay flows.
+func (t *NoiseTransport) SetForwarder(f *IntraOrgForwarder) {
+	t.forwarder = f
+}
+
+// Forwarder returns the installed forwarder, or nil. Tests use this.
+func (t *NoiseTransport) Forwarder() *IntraOrgForwarder {
+	return t.forwarder
 }
 
 // NewNoiseTransport builds a Noise transport using the provided config.
@@ -373,6 +395,13 @@ func (t *NoiseTransport) Dial(ctx context.Context, target aether.Target) (aether
 		NodeID:  target.NodeID,
 	}
 
+	// Cross-org dials prepend a routing preamble so the anycast-receiving
+	// machine (M_r) can forward to the target machine (M_t) over 6PN.
+	// Caller opts in via target.Metadata[MetadataKeyCrossOrgPreamble]="1";
+	// without it, this is a no-op and the dial behaves identically to a
+	// direct same-org or public dial.
+	crossOrgPreamble := target.Metadata != nil && target.Metadata[MetadataKeyCrossOrgPreamble] == "1"
+
 	// Attempt 0.5-RTT resume before full handshake. Skips the XK/XX
 	// round-trip entirely when a valid ticket is cached for this peer.
 	// If the responder rejects (expired, key rotated, replay) or the
@@ -395,7 +424,7 @@ func (t *NoiseTransport) Dial(ctx context.Context, target aether.Target) (aether
 		// don't loop attempting a dead ticket.
 	}
 
-	session, err := t.performInitiatorHandshakeShared(ctx, listener, addr, path)
+	session, err := t.performInitiatorHandshakeShared(ctx, listener, addr, path, crossOrgPreamble)
 	if err != nil {
 		return nil, aether.WrapOp("dial", aether.ProtoNoise, target.NodeID, err)
 	}
@@ -641,8 +670,15 @@ func (t *NoiseTransport) Receive(ctx context.Context, session aether.Connection)
 	return nc.receive(ctx)
 }
 
-// Close is a no-op for the shared Noise transport instance.
-func (t *NoiseTransport) Close() error { return nil }
+// Close releases transport-owned resources. The listener socket lifetime is
+// owned by the listener (not the transport), so this only tears down the
+// cross-org forwarder if one was attached — stopping its sweeper goroutine.
+func (t *NoiseTransport) Close() error {
+	if t.forwarder != nil {
+		t.forwarder.Close()
+	}
+	return nil
+}
 
 // Protocol implements aether.ProtocolAdapter.
 func (t *NoiseTransport) Protocol() aether.Protocol { return aether.ProtoNoise }

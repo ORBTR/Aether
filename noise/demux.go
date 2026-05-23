@@ -23,16 +23,25 @@ const (
 )
 
 // ClassifyPacket determines the protocol of a UDP packet.
-// Preamble detection (2-byte magic 0x5450) is checked BEFORE the QUIC byte range
-// because the preamble's first byte 0x54 falls within the QUIC range (0x40-0xBF).
+// Preamble detection (2-byte magic) is checked BEFORE the QUIC byte range —
+// every preamble magic this stack uses has a first byte that falls inside
+// the QUIC range (0x40-0xBF) and would otherwise be misrouted.
 func ClassifyPacket(data []byte) PacketType {
 	if len(data) == 0 {
 		return PacketNoise
 	}
-	// Check for preamble magic FIRST — 0x5450 ("TP") would be misidentified as QUIC
-	// because 0x54 falls in the QUIC range (0x40-0xBF).
-	if len(data) >= 2 && data[0] == 0x54 && data[1] == 0x50 {
-		return PacketNoise // preamble-bearing Noise handshake
+	// Recognised 2-byte preamble magics — return PacketNoise so the
+	// listener's runReader sees them and the forwarder/tenant branches
+	// can claim ownership before generic noise dispatch:
+	//
+	//   0x5450 "TP" — tenant-scope preamble
+	//   0x4145 "AE" — cross-org anycast routing preamble
+	//   0x524C "RL" — intra-org inner relay frame
+	if len(data) >= 2 {
+		switch (uint16(data[0]) << 8) | uint16(data[1]) {
+		case 0x5450, 0x4145, 0x524C:
+			return PacketNoise
+		}
 	}
 	b := data[0]
 	switch {
