@@ -115,6 +115,21 @@ func NewManager() *Manager {
 	}
 }
 
+// SetProbeInterval overrides the cadence at which RunProbeLoop pings
+// non-primary paths. Default 30s; callers that need to beat a faster
+// underlying-conn idle close (Fly 6PN UDP / cross-region NAT) should
+// drop this to 5-8s so the keepalive PING reaches the peer before the
+// kernel conntrack / NAT mapping reaps the socket. Call before
+// RunProbeLoop — the running ticker captures the value at start.
+func (m *Manager) SetProbeInterval(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	m.mu.Lock()
+	m.probeInterval = d
+	m.mu.Unlock()
+}
+
 // EnableRedundantRealtime activates Level 2 — REALTIME frames on both paths.
 func (m *Manager) EnableRedundantRealtime() {
 	m.mu.Lock()
