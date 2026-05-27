@@ -513,10 +513,10 @@ func (s *NoiseSession) handleOpen(frame *aether.Frame) {
 	}
 	st.state.Transition(aether.EventRecvOpen)
 
-	select {
-	case s.acceptCh <- st:
-	default:
-	}
+	// Route via the ByID dispatcher first so a pinned consumer
+	// (AcceptStreamByID) claims its stream regardless of wire order;
+	// fallbacks to per-ID backlog then FIFO acceptCh.
+	s.notifyStreamAccepted(st)
 }
 
 func (s *NoiseSession) handleImplicitOpen(frame *aether.Frame) {
@@ -526,10 +526,7 @@ func (s *NoiseSession) handleImplicitOpen(frame *aether.Frame) {
 	}
 	st.state.Transition(aether.EventRecvData)
 
-	select {
-	case s.acceptCh <- st:
-	default:
-	}
+	s.notifyStreamAccepted(st)
 
 	// Deliver the data
 	delivered := st.recvWindow.Insert(frame.SeqNo, frame.Payload)

@@ -54,6 +54,23 @@ type NoiseSession struct {
 	streams  map[uint64]*noiseStream
 	acceptCh chan *noiseStream
 
+	// byIDWaiters holds active AcceptStreamByID callers, keyed by the
+	// stream ID they are waiting for. handleOpen / handleImplicitOpen
+	// route the freshly-created stream through notifyStreamAccepted,
+	// which prefers a registered ByID waiter over the FIFO acceptCh —
+	// the architectural fix for OPEN-frame ordering races where, say,
+	// the swarm transport's stream 100 OPEN arrives ahead of the mesh
+	// gossip stream 0 OPEN and AcceptStream(ctx) for stream 0 would
+	// otherwise pick up the wrong stream.
+	//
+	// byIDBacklog parks streams that arrived before their consumer
+	// registered a waiter so the next AcceptStreamByID(id) call can
+	// claim one. Bounded per ID by maxByIDBacklogPerStream — past
+	// that, OPENs spill onto acceptCh so dynamic-stream consumers
+	// calling the FIFO AcceptStream still see them.
+	byIDWaiters map[uint64]chan *noiseStream
+	byIDBacklog map[uint64][]*noiseStream
+
 	// Stream layout — consumer-defined stream ID assignments
 	layout aether.StreamLayout
 	opts   aether.SessionOptions
@@ -220,6 +237,8 @@ func NewNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 		opts:               opts,
 		streams:            make(map[uint64]*noiseStream),
 		acceptCh:           make(chan *noiseStream, 16),
+		byIDWaiters:        make(map[uint64]chan *noiseStream),
+		byIDBacklog:        make(map[uint64][]*noiseStream),
 		healthMon:          health.NewMonitor(0.2),
 		sched:              scheduler.NewScheduler(),
 		connWindow:         flow.NewConnWindow(0),
@@ -407,6 +426,133 @@ func (s *NoiseSession) AcceptStream(ctx context.Context) (aether.Stream, error) 
 	}
 }
 
+// AcceptStreamByID blocks until a stream with exactly streamID arrives.
+// See the Session interface comment for the architectural rationale —
+// this is the wire-ordering-safe counterpart to AcceptStream and the
+// right entry point for any consumer pinned to a well-known stream ID
+// (gossip=0, rpc=1, keepalive=2, control=3, reconcile=4, swarm=100,
+// etc.). Streams already parked on the per-ID backlog are returned
+// immediately; otherwise the caller blocks on a waiter channel installed
+// in byIDWaiters until the OPEN arrives, ctx fires, or the session
+// closes. A second concurrent AcceptStreamByID for the same ID closes
+// the previous waiter — last caller wins.
+func (s *NoiseSession) AcceptStreamByID(ctx context.Context, streamID uint64) (aether.Stream, error) {
+	s.mu.Lock()
+	if backlog := s.byIDBacklog[streamID]; len(backlog) > 0 {
+		st := backlog[0]
+		if len(backlog) == 1 {
+			delete(s.byIDBacklog, streamID)
+		} else {
+			s.byIDBacklog[streamID] = backlog[1:]
+		}
+		s.mu.Unlock()
+		dbgNoise.Printf("AcceptStreamByID: stream=%d served from backlog", streamID)
+		return st, nil
+	}
+	if old, ok := s.byIDWaiters[streamID]; ok {
+		close(old)
+	}
+	ch := make(chan *noiseStream, 1)
+	s.byIDWaiters[streamID] = ch
+	s.mu.Unlock()
+	dbgNoise.Printf("AcceptStreamByID: stream=%d waiting", streamID)
+
+	select {
+	case st, ok := <-ch:
+		if !ok {
+			return nil, aether.ErrSessionClosed
+		}
+		return st, nil
+	case <-ctx.Done():
+		s.mu.Lock()
+		// Only deregister if we're still the registered waiter — a
+		// concurrent notifyStreamAccepted may have already pushed the
+		// stream onto ch while we were waiting for s.mu; consume it so
+		// the stream isn't orphaned.
+		if cur, ok := s.byIDWaiters[streamID]; ok && cur == ch {
+			delete(s.byIDWaiters, streamID)
+			s.mu.Unlock()
+			return nil, ctx.Err()
+		}
+		s.mu.Unlock()
+		select {
+		case st, ok := <-ch:
+			if !ok {
+				return nil, aether.ErrSessionClosed
+			}
+			return st, nil
+		default:
+			return nil, ctx.Err()
+		}
+	case <-s.closed:
+		return nil, aether.ErrSessionClosed
+	}
+}
+
+// notifyStreamAccepted delivers a freshly-accepted stream to either a
+// pinned AcceptStreamByID waiter, a per-ID backlog slot, or the FIFO
+// acceptCh (in priority order). Called by handleOpen / handleImplicitOpen.
+// ByID delivery takes precedence over FIFO so out-of-order OPEN frames
+// (e.g. swarm=100 arriving ahead of gossip=0) can't be mis-routed.
+//
+// When no waiter is registered the stream parks on byIDBacklog with a
+// grace timer (byIDBacklogGrace) that falls through to FIFO acceptCh
+// for legacy AcceptStream consumers. The timer is a no-op if an
+// AcceptStreamByID claims the entry first.
+func (s *NoiseSession) notifyStreamAccepted(st *noiseStream) {
+	s.mu.Lock()
+	if ch, ok := s.byIDWaiters[st.streamID]; ok {
+		delete(s.byIDWaiters, st.streamID)
+		s.mu.Unlock()
+		ch <- st
+		return
+	}
+	backlog := s.byIDBacklog[st.streamID]
+	if len(backlog) < maxByIDBacklogPerStream {
+		s.byIDBacklog[st.streamID] = append(backlog, st)
+		s.mu.Unlock()
+		time.AfterFunc(byIDBacklogGrace, func() { s.flushBacklogEntry(st) })
+		return
+	}
+	s.mu.Unlock()
+	s.pushToAcceptCh(st)
+}
+
+// flushBacklogEntry expires a backlog entry to FIFO acceptCh when the
+// grace timer fires. No-op if AcceptStreamByID already claimed it or
+// the session closed.
+func (s *NoiseSession) flushBacklogEntry(st *noiseStream) {
+	s.mu.Lock()
+	backlog := s.byIDBacklog[st.streamID]
+	idx := -1
+	for i, q := range backlog {
+		if q == st {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		s.mu.Unlock()
+		return
+	}
+	s.byIDBacklog[st.streamID] = append(backlog[:idx], backlog[idx+1:]...)
+	if len(s.byIDBacklog[st.streamID]) == 0 {
+		delete(s.byIDBacklog, st.streamID)
+	}
+	s.mu.Unlock()
+	s.pushToAcceptCh(st)
+}
+
+// pushToAcceptCh delivers to FIFO acceptCh without blocking the read
+// loop. Preserves pre-existing semantics — if the consumer isn't
+// draining fast enough the stream signal is dropped.
+func (s *NoiseSession) pushToAcceptCh(st *noiseStream) {
+	select {
+	case s.acceptCh <- st:
+	default:
+	}
+}
+
 func (s *NoiseSession) LocalNodeID() aether.NodeID  { return s.localNodeID }
 func (s *NoiseSession) RemoteNodeID() aether.NodeID { return s.remoteNodeID }
 func (s *NoiseSession) LocalPeerID() aether.PeerID  { return s.localPeerID }
@@ -579,6 +725,22 @@ func (s *NoiseSession) CloseWithError(err error) error {
 		if s.connGrantDebouncer != nil {
 			s.connGrantDebouncer.Close()
 		}
+		// Release any AcceptStreamByID waiters and drain the per-ID
+		// backlog so blocked callers return ErrSessionClosed instead of
+		// hanging. Backlog streams are reset because their recvCh /
+		// reliability engine is otherwise orphaned.
+		s.mu.Lock()
+		for id, ch := range s.byIDWaiters {
+			close(ch)
+			delete(s.byIDWaiters, id)
+		}
+		for id, queue := range s.byIDBacklog {
+			for _, st := range queue {
+				_ = st.Reset(aether.ResetCancel)
+			}
+			delete(s.byIDBacklog, id)
+		}
+		s.mu.Unlock()
 		s.conn.Close()
 	})
 	return nil
