@@ -12,8 +12,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,13 +40,16 @@ import (
 //   - Priority scheduling (WFQ)
 //   - Anti-replay (sliding window per stream)
 type NoiseSession struct {
+	// BaseSession owns the identity + lifecycle + accessor surface
+	// (LocalNodeID/RemoteNodeID/LocalPeerID/RemotePeerID/ConnectionID/
+	// Capabilities/Protocol/Health/IsClosed/LastActivity/IdleTimeout)
+	// shared with the TCP + QUIC adapters. Embedded as a pointer so
+	// the close-signal channel + sync.Once are safe across the read /
+	// write / reliability / ticker goroutines.
+	*aether.BaseSession
+
 	mu   sync.Mutex
 	conn net.Conn // the Noise-encrypted connection (reads/writes encrypted UDP datagrams)
-
-	localNodeID  aether.NodeID
-	remoteNodeID aether.NodeID
-	localPeerID  aether.PeerID
-	remotePeerID aether.PeerID
 
 	// Stream management
 	streams  map[uint64]*noiseStream
@@ -129,16 +130,15 @@ type NoiseSession struct {
 	// high load.
 	compressionEnabled atomic.Bool
 
-	// Peer abuse scoring (_SECURITY.md §3.6/§3.9/§3.12). Session tracks
-	// the remote peer's misbehaviour across subsystems (decrypt errors,
-	// crafted ACKs, replay attempts, stream-cap violations, etc.) and
-	// trips a circuit breaker when the score exceeds the threshold.
-	// `reportAbuse` is the adapter-level hook wired into the counter
-	// increment sites. Defaults to a per-session registry (1 entry); call
-	// SetAbuseScoreRegistry to share one registry across many sessions so
-	// operator dashboards can see a peer's cross-session behaviour in one
-	// place.
-	abuseScore *abuse.Score[aether.NodeID]
+	// Peer abuse scoring (_SECURITY.md §3.6/§3.9/§3.12). The shared
+	// AbuseTracker owns the registry, the threshold-breaker GoAway,
+	// and the threshold-breaker session close. Defaults to a
+	// per-session registry (1 entry); SetAbuseScoreRegistry replaces
+	// it with a shared one so cross-session dashboards can see a
+	// peer's behaviour across every connection in one place.
+	// `reportAbuse` forwards every misbehaviour-counter site into
+	// this tracker.
+	abuseTracker *aether.AbuseTracker
 
 	// Stream GC — resets idle streams after timeout (exempts well-known 0-3)
 	streamGC *aether.StreamGC
@@ -219,17 +219,16 @@ type NoiseSession struct {
 // want to override specific fields.
 func NewNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opts aether.SessionOptions) *NoiseSession {
 	opts = aether.NormalizeSessionOptions(opts)
+	base := aether.NewBaseSession(localNodeID, remoteNodeID, aether.ProtoNoise)
+	base.SetHealthMonitor(health.NewMonitor(0.2))
+	base.SetIdleTimeouts(opts.SessionIdleTimeout, aether.DefaultSessionIdleTimeout)
 	s := &NoiseSession{
+		BaseSession:        base,
 		conn:               conn,
-		localNodeID:        localNodeID,
-		remoteNodeID:       remoteNodeID,
-		localPeerID:        truncateID(localNodeID),
-		remotePeerID:       truncateID(remoteNodeID),
 		layout:             aether.DefaultStreamLayout(),
 		opts:               opts,
 		streams:            make(map[uint64]*noiseStream),
 		acceptCh:           make(chan *noiseStream, 16),
-		healthMon:          health.NewMonitor(0.2),
 		sched:              scheduler.NewScheduler(),
 		connWindow:         flow.NewConnWindow(0),
 		pacer:              selectPacer(opts),
@@ -241,7 +240,6 @@ func NewNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 		interleavedDecoder: reliability.NewInterleavedFECDecoder(),
 		compressor:         aether.NewCompressor(),
 		tickStop:           make(chan struct{}),
-		closed:             make(chan struct{}),
 		createdAt:          time.Now(),
 	}
 	// Reed-Solomon encoder/decoder — instantiated even when no stream is
@@ -266,7 +264,7 @@ func NewNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 	// preserve that here too.
 	s.acceptor = aether.NewStreamAcceptor(
 		func(st aether.Stream) { s.pushToAcceptCh(st.(*noiseStream)) },
-		s.closed,
+		base.CloseSignal(),
 		aether.ErrSessionClosed,
 	)
 
@@ -284,11 +282,21 @@ func NewNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 	// remote peer is the only key that matters, so a 1-entry registry is
 	// fine. Consumers that want cross-session scoring (e.g. a mesh-level
 	// operator dashboard) can replace this via SetAbuseScoreRegistry.
-	s.abuseScore = abuse.New[aether.NodeID](abuse.DefaultConfig())
+	// The tracker wraps the registry plus the threshold-breaker GoAway +
+	// close hooks so reportAbuse stays a one-liner.
+	s.abuseTracker = aether.NewAbuseTracker(
+		abuse.New[aether.NodeID](abuse.DefaultConfig()),
+		remoteNodeID,
+		func(reason aether.GoAwayReason, msg string) error {
+			return s.GoAway(context.Background(), reason, msg)
+		},
+		s.CloseWithError,
+		dbgNoise.Printf,
+	)
 
 	s.migrator = migration.NewMigrator()
 	s.packetReplay = reliability.NewPacketReplayWindow()
-	s.connID, _ = aether.GenerateConnectionID()
+	// connID is owned by *BaseSession (initialised by NewBaseSession).
 	s.classDefaults = aether.DefaultsForClass(aether.ClassRAW)
 	s.streamGC = aether.NewStreamGC(aether.DefaultStreamIdleTimeout, func(streamID uint64) {
 		dbgNoise.Printf("StreamGC: resetting idle stream %d", streamID)
@@ -314,8 +322,8 @@ func NewNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 	s.pmtuProber = pmtu.NewProber(func(probeID uint32, paddingSize uint16) error {
 		payload := aether.EncodePathProbe(probeID, paddingSize)
 		frame := &aether.Frame{
-			SenderID:   s.localPeerID,
-			ReceiverID: s.remotePeerID,
+			SenderID:   s.LocalPeerID(),
+			ReceiverID: s.RemotePeerID(),
 			StreamID:   s.layout.Control,
 			Type:       aether.TypePATH_PROBE,
 			Length:     uint32(len(payload)),
@@ -376,7 +384,7 @@ func selectPacer(opts aether.SessionOptions) congestion.PacingPolicy {
 
 func (s *NoiseSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (aether.Stream, error) {
 	select {
-	case <-s.closed:
+	case <-s.CloseSignal():
 		return nil, fmt.Errorf("session closed")
 	default:
 	}
@@ -402,8 +410,8 @@ func (s *NoiseSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) 
 		Dependency:  cfg.Dependency,
 	})
 	frame := &aether.Frame{
-		SenderID:   s.localPeerID,
-		ReceiverID: s.remotePeerID,
+		SenderID:   s.LocalPeerID(),
+		ReceiverID: s.RemotePeerID(),
 		StreamID:   cfg.StreamID,
 		Type:       aether.TypeOPEN,
 		Length:     uint32(len(openPayload)),
@@ -421,7 +429,7 @@ func (s *NoiseSession) AcceptStream(ctx context.Context) (aether.Stream, error) 
 		return st, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case <-s.closed:
+	case <-s.CloseSignal():
 		return nil, fmt.Errorf("session closed")
 	}
 }
@@ -457,14 +465,8 @@ func (s *NoiseSession) pushToAcceptCh(st *noiseStream) {
 	}
 }
 
-func (s *NoiseSession) LocalNodeID() aether.NodeID  { return s.localNodeID }
-func (s *NoiseSession) RemoteNodeID() aether.NodeID { return s.remoteNodeID }
-func (s *NoiseSession) LocalPeerID() aether.PeerID  { return s.localPeerID }
-func (s *NoiseSession) RemotePeerID() aether.PeerID { return s.remotePeerID }
-
-func (s *NoiseSession) Capabilities() aether.Capabilities {
-	return aether.CapabilitiesForProtocol(aether.ProtoNoise)
-}
+// Identity / Capabilities / Protocol accessors are promoted from the
+// embedded *BaseSession.
 
 // Ping sends a PING frame and waits briefly for any inbound activity
 // (PONG response or any other frame) before reporting the cached RTT.
@@ -490,56 +492,19 @@ func (s *NoiseSession) Capabilities() aether.Capabilities {
 //      (peer happens to send something else within 2 s) are fine for
 //      the keepalive use case; the goal is detecting silence.
 func (s *NoiseSession) Ping(ctx context.Context) (time.Duration, error) {
-	if s.IsClosed() {
-		return 0, aether.ErrSessionClosed
-	}
-	before := s.healthMon.LastActivity()
-	frame := &aether.Frame{
-		SenderID:   s.localPeerID,
-		ReceiverID: s.remotePeerID,
-		StreamID:   s.layout.Keepalive,
-		Type:       aether.TypePING,
-		SeqNo:      uint32(time.Now().UnixNano() & 0xFFFFFFFF),
-	}
-	if err := s.writeFrame(frame); err != nil {
-		return 0, err
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
-		deadline = dl
-	}
-	pollTicker := time.NewTicker(50 * time.Millisecond)
-	defer pollTicker.Stop()
-	for {
-		if s.IsClosed() {
-			return 0, aether.ErrSessionClosed
-		}
-		if s.healthMon.LastActivity().After(before) {
-			_, avg := s.healthMon.RTT()
-			return avg, nil
-		}
-		if !time.Now().Before(deadline) {
-			return 0, fmt.Errorf("aether: ping timeout (no inbound activity)")
-		}
-		select {
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		case <-pollTicker.C:
-		}
-	}
+	return aether.WaitForActivityPing(ctx, s.Health(), s.closed, func(seqNo uint32) error {
+		return s.writeFrame(&aether.Frame{
+			SenderID:   s.LocalPeerID(),
+			ReceiverID: s.RemotePeerID(),
+			StreamID:   s.layout.Keepalive,
+			Type:       aether.TypePING,
+			SeqNo:      seqNo,
+		})
+	})
 }
 
 func (s *NoiseSession) GoAway(ctx context.Context, reason aether.GoAwayReason, message string) error {
-	payload := aether.EncodeGoAway(reason, message)
-	frame := &aether.Frame{
-		SenderID:   s.localPeerID,
-		ReceiverID: s.remotePeerID,
-		StreamID:   s.layout.Control,
-		Type:       aether.TypeGOAWAY,
-		Length:     uint32(len(payload)),
-		Payload:    payload,
-	}
-	return s.writeFrame(frame)
+	return aether.SendGoAway(s.writeFrame, s.LocalPeerID(), s.RemotePeerID(), s.layout.Control, reason, message)
 }
 
 // releaseStream performs the session-side cleanup that every stream
@@ -571,87 +536,57 @@ func (s *NoiseSession) Close() error {
 }
 
 func (s *NoiseSession) CloseWithError(err error) error {
-	s.closeOnce.Do(func() {
-		// Capture caller stack (3 frames) to find the actual close
-		// trigger. Frame 0 is this anonymous fn, frame 1 is sync.Once,
-		// frame 2+ are the actual callers — show 3 levels so we can
-		// distinguish keepalive timeout vs stream-stuck vs reliability
-		// watchdog vs application Close(). Without this we got
-		// "once.go:69" which tells us nothing.
-		callerChain := ""
-		var pcs [4]uintptr
-		n := runtime.Callers(3, pcs[:])
-		if n > 0 {
-			frames := runtime.CallersFrames(pcs[:n])
-			for i := 0; i < 3; i++ {
-				frame, more := frames.Next()
-				file := frame.File
-				if idx := strings.LastIndex(file, "/"); idx >= 0 {
-					file = file[idx+1:]
-				}
-				if callerChain != "" {
-					callerChain += "<-"
-				}
-				callerChain += fmt.Sprintf("%s:%d", file, frame.Line)
-				if !more {
-					break
-				}
-			}
-		}
-		remoteShort := string(s.remoteNodeID)
-		if len(remoteShort) > 14 {
-			remoteShort = remoteShort[:14] + "..."
-		}
-		// Snapshot watchdog-relevant state at close time so we can see
-		// why the watchdog thought the session was stuck.
-		stallSince := "n/a"
-		if !s.lastAnyProgressAt.IsZero() {
-			stallSince = fmt.Sprintf("%v", time.Since(s.lastAnyProgressAt))
-		}
-		lifetime := time.Since(s.createdAt)
-		warmupGrace := s.opts.SessionWarmupGrace
-		if warmupGrace == 0 {
-			warmupGrace = aether.DefaultSessionWarmupGrace
-		}
-		warmupActive := warmupGrace > 0 && lifetime < warmupGrace
-		log.Printf("[SESSION-CLOSE] noise peer=%s lifetime=%v warmup=%v err=%v stalled=%s callers=%s",
-			remoteShort, lifetime, warmupActive, err, stallSince, callerChain)
-		if err != nil {
-			s.closeErr = err
-		}
-		close(s.closed)
-		if s.streamGC != nil {
-			s.streamGC.Stop()
-		}
-		// Flush any pending conn-level grant so the peer gets credit for
-		// bytes the application did consume, even if the session is
-		// tearing down. Idempotent; safe even if never initialized.
-		if s.connGrantDebouncer != nil {
-			s.connGrantDebouncer.Close()
-		}
-		// Release any AcceptStreamByID waiters and drain the per-ID
-		// backlog so blocked callers return ErrSessionClosed instead of
-		// hanging. Backlog streams are reset because their recvCh /
-		// reliability engine is otherwise orphaned — the acceptor
-		// surfaces them and the adapter calls Reset because the
-		// transport-specific teardown lives here.
-		if s.acceptor != nil {
-			for _, st := range s.acceptor.Close() {
-				_ = st.Reset(aether.ResetCancel)
-			}
-		}
-		s.conn.Close()
-	})
-	return nil
-}
-
-func (s *NoiseSession) IsClosed() bool {
-	select {
-	case <-s.closed:
-		return true
-	default:
-		return false
+	if !s.SignalClose() {
+		return nil
 	}
+	// Capture caller chain to find the actual close trigger. Frame 0
+	// is this method, frames 1+ are the callers — show 3 levels so we
+	// can distinguish keepalive timeout vs stream-stuck vs reliability
+	// watchdog vs application Close().
+	callerChain := aether.CaptureCallerChain(1, 3)
+	remoteShort := string(s.RemoteNodeID())
+	if len(remoteShort) > 14 {
+		remoteShort = remoteShort[:14] + "..."
+	}
+	// Snapshot watchdog-relevant state at close time so we can see
+	// why the watchdog thought the session was stuck.
+	stallSince := "n/a"
+	if !s.lastAnyProgressAt.IsZero() {
+		stallSince = fmt.Sprintf("%v", time.Since(s.lastAnyProgressAt))
+	}
+	lifetime := time.Since(s.createdAt)
+	warmupGrace := s.opts.SessionWarmupGrace
+	if warmupGrace == 0 {
+		warmupGrace = aether.DefaultSessionWarmupGrace
+	}
+	warmupActive := warmupGrace > 0 && lifetime < warmupGrace
+	log.Printf("[SESSION-CLOSE] noise peer=%s lifetime=%v warmup=%v err=%v stalled=%s callers=%s",
+		remoteShort, lifetime, warmupActive, err, stallSince, callerChain)
+	if err != nil {
+		s.closeErr = err
+	}
+	if s.streamGC != nil {
+		s.streamGC.Stop()
+	}
+	// Flush any pending conn-level grant so the peer gets credit for
+	// bytes the application did consume, even if the session is
+	// tearing down. Idempotent; safe even if never initialized.
+	if s.connGrantDebouncer != nil {
+		s.connGrantDebouncer.Close()
+	}
+	// Release any AcceptStreamByID waiters and drain the per-ID
+	// backlog so blocked callers return ErrSessionClosed instead of
+	// hanging. Backlog streams are reset because their recvCh /
+	// reliability engine is otherwise orphaned — the acceptor
+	// surfaces them and the adapter calls Reset because the
+	// transport-specific teardown lives here.
+	if s.acceptor != nil {
+		for _, st := range s.acceptor.Close() {
+			_ = st.Reset(aether.ResetCancel)
+		}
+	}
+	s.conn.Close()
+	return nil
 }
 
 // dumpFlowDiagOnStall emits a single high-detail [FLOW-DIAG] line capturing
@@ -670,7 +605,7 @@ func (s *NoiseSession) IsClosed() bool {
 // stall event produces a small bounded log burst even on a 50-stream
 // session. No lock acquisition beyond the briefest snapshot pass.
 func (s *NoiseSession) dumpFlowDiagOnStall(reason string) {
-	remoteShort := s.remoteNodeID.Short()
+	remoteShort := s.RemoteNodeID().Short()
 	now := time.Now()
 
 	type streamRow struct {
@@ -786,11 +721,10 @@ func (s *NoiseSession) SetSessionKey(key [32]byte) error {
 func (s *NoiseSession) SetCongestionController(cc congestion.Controller) {
 	s.cong.Store(&cc)
 }
-func (s *NoiseSession) ConnectionID() aether.ConnectionID { return s.connID }
-func (s *NoiseSession) Health() *health.Monitor           { return s.healthMon }
-func (s *NoiseSession) SessionKey() []byte                { return s.sessionKey }
-func (s *NoiseSession) CongestionWindow() int64           { return s.congestion().CWND() }
-func (s *NoiseSession) Protocol() aether.Protocol         { return aether.ProtoNoise }
+// ConnectionID / Health / Protocol all come from the embedded *BaseSession.
+
+func (s *NoiseSession) SessionKey() []byte      { return s.sessionKey }
+func (s *NoiseSession) CongestionWindow() int64 { return s.congestion().CWND() }
 // noiseConnStats is the optional observability surface exposed by the
 // underlying *noiseConn. We probe via interface so `decryptErrors`,
 // `inboxDrops`, and ECN CE-byte observations can flow through to
@@ -814,7 +748,7 @@ type noiseConnCE interface {
 }
 
 func (s *NoiseSession) Metrics() aether.SessionMetrics {
-	_, avg := s.healthMon.RTT()
+	_, avg := s.Health().RTT()
 	s.mu.Lock()
 	streamCount := len(s.streams)
 	var suspiciousACKs, recvDrops, seqWraps uint64
@@ -865,31 +799,19 @@ func (s *NoiseSession) StreamRefusedCount() uint64 {
 	return atomic.LoadUint64(&s.streamRefused)
 }
 
-// reportAbuse records a misbehaviour event against the remote peer. When
-// the peer's running score crosses the threshold, the session is
-// GOAWAYed with reason=Error and closed. See abuse/score.go for the
-// decay/threshold model. Safe to call at high frequency — the registry
-// uses exponential decay so transient events don't trip the breaker.
+// reportAbuse records a misbehaviour event against the remote peer.
+// Delegates to the shared AbuseTracker, which handles the registry
+// Record + threshold-breaker GoAway + close. See aether/abuse_tracker.go
+// for the shape.
 func (s *NoiseSession) reportAbuse(r abuse.Reason) {
-	if s.abuseScore == nil {
-		return
-	}
-	if _, exceeded := s.abuseScore.Record(s.remoteNodeID, r); exceeded {
-		dbgNoise.Printf("peer %s blacklisted (abuse score exceeded): reason=%s", s.remoteNodeID.Short(), r)
-		// GoAway + Close on the circuit-breaker edge. Best effort —
-		// errors ignored because we're tearing down anyway.
-		_ = s.GoAway(context.Background(), aether.GoAwayError, "abuse threshold")
-		s.CloseWithError(fmt.Errorf("peer %s exceeded abuse threshold (reason: %s)", s.remoteNodeID.Short(), r))
-	}
+	s.abuseTracker.Report(r)
 }
 
 // PeerAbuseScore returns the remote peer's current score (exponentially
 // decayed since last update). Useful for observability dashboards.
 func (s *NoiseSession) PeerAbuseScore() float64 {
-	if s.abuseScore == nil {
-		return 0
-	}
-	return s.abuseScore.Current(s.remoteNodeID)
+	score, _ := s.abuseTracker.PeerScore()
+	return score
 }
 
 // SetAbuseScoreRegistry replaces the per-session abuse registry with a
@@ -904,30 +826,13 @@ func (s *NoiseSession) PeerAbuseScore() float64 {
 // Signature takes `interface{}` to satisfy `aether.AbuseScoreCapable`
 // (which can't import abuse/ to avoid a cycle). Returns false when the
 // argument is not `*abuse.Score[aether.NodeID]` — the concrete type the
-// adapter expects.
+// tracker expects.
 func (s *NoiseSession) SetAbuseScoreRegistry(r interface{}) bool {
-	registry, ok := r.(*abuse.Score[aether.NodeID])
-	if !ok {
-		return false
-	}
-	s.abuseScore = registry
-	return true
+	return s.abuseTracker.SetRegistry(r)
 }
 
-// LastActivity satisfies aether.IdleEvictable — returns when the
-// session's healthMon last recorded inbound activity.
-func (s *NoiseSession) LastActivity() time.Time {
-	return s.healthMon.LastActivity()
-}
-
-// IdleTimeout satisfies aether.IdleEvictable — returns the effective
-// idle eviction threshold (opts override, else package default).
-func (s *NoiseSession) IdleTimeout() time.Duration {
-	if s.opts.SessionIdleTimeout > 0 {
-		return s.opts.SessionIdleTimeout
-	}
-	return aether.DefaultSessionIdleTimeout
-}
+// LastActivity / IdleTimeout / IsClosed are all promoted from the
+// embedded *BaseSession (BaseSession holds the override + default).
 
 // CompressionEnabled returns the current runtime compression toggle.
 // Starts from opts.Compression at construction; can be flipped at
@@ -1003,7 +908,7 @@ func (s *NoiseSession) autoTuneWindows() {
 	if aether.AutoTuneDisabled() {
 		return
 	}
-	_, sessionAvgRTT := s.healthMon.RTT()
+	_, sessionAvgRTT := s.Health().RTT()
 
 	s.mu.Lock()
 	streams := make([]*noiseStream, 0, len(s.streams))
@@ -1019,35 +924,19 @@ func (s *NoiseSession) autoTuneWindows() {
 		if rtt <= 0 {
 			rtt = sessionAvgRTT
 		}
-		if rtt <= 0 {
-			continue
-		}
-		st.window.SetRTT(rtt)
-
-		current := st.window.CurrentWindow()
-		suggested := st.window.SuggestedWindow()
-		if suggested == current {
-			continue
-		}
-		delta := suggested - current
-		maxStep := current / 4 // ±25 % per tick
-		if delta > maxStep {
-			delta = maxStep
-		} else if delta < -maxStep {
-			delta = -maxStep
-		}
-		if delta > 0 {
-			if grown := st.window.GrowWindow(delta); grown > 0 {
+		res := aether.AutoTuneWindow(st.window, rtt)
+		switch res.Action {
+		case "grow":
+			if res.Applied > 0 {
 				dbgNoise.Printf("autoTune stream=%d grow=%d current=%d rtt=%s",
-					st.streamID, grown, current+grown, rtt)
+					st.streamID, res.Applied, res.Current, rtt)
 			}
-		} else if delta < 0 {
-			if shrunk := st.window.ShrinkWindow(-delta); shrunk > 0 {
+		case "shrink":
+			if res.Applied > 0 {
 				dbgNoise.Printf("autoTune stream=%d shrink=%d current=%d rtt=%s",
-					st.streamID, shrunk, current-shrunk, rtt)
+					st.streamID, res.Applied, res.Current, rtt)
 			}
 		}
-		st.window.ResetPeak()
 	}
 }
 

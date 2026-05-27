@@ -101,6 +101,19 @@ func (id NodeID) Short() string {
 	return value[:10] + "…" + value[len(value)-6:]
 }
 
+// ToPeerID returns the 8-byte PeerID derived from the textual NodeID.
+// The first eight bytes of the canonical string form are copied into the
+// fixed-size array — this is what every transport adapter stamps into
+// outbound Frame.SenderID / Frame.ReceiverID so the wire identity matches
+// what the peer sees on its end of the connection. Lives on NodeID (rather
+// than each adapter) so the Noise, TCP and QUIC sessions all derive the
+// same value from the same input.
+func (id NodeID) ToPeerID() PeerID {
+	var pid PeerID
+	copy(pid[:], []byte(string(id)))
+	return pid
+}
+
 // Validate ensures the NodeID is well-formed.
 func (id NodeID) Validate() error {
 	_, err := id.Fingerprint()

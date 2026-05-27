@@ -12,8 +12,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,16 +40,17 @@ const DefaultTCPMaxConcurrentStreams = 256
 // Provides Aether multiplexing (all streams share one conn), flow control,
 // and the priority scheduler. Reliability comes from TCP natively.
 type TCPSession struct {
+	// BaseSession owns the identity + lifecycle + accessor surface
+	// (LocalNodeID/RemoteNodeID/LocalPeerID/RemotePeerID/ConnectionID/
+	// Capabilities/Protocol/Health/IsClosed/LastActivity/IdleTimeout)
+	// shared with the Noise + QUIC adapters. Embedded as a pointer so
+	// the close-signal channel + sync.Once are safe across the read /
+	// write / housekeeping goroutines.
+	*aether.BaseSession
+
 	mu   sync.Mutex
 	conn net.Conn
 
-	localNodeID  aether.NodeID
-	remoteNodeID aether.NodeID
-	localPeerID  aether.PeerID
-	remotePeerID aether.PeerID
-
-	proto         aether.Protocol // ProtoTCP (default) or set by wrappers (e.g. WebSocket, gRPC)
-	connID        aether.ConnectionID
 	layout        aether.StreamLayout
 	opts          aether.SessionOptions
 	classDefaults aether.TransportClassDefaults
@@ -67,15 +66,12 @@ type TCPSession struct {
 	// acceptor.AcceptByID.
 	acceptor *aether.StreamAcceptor
 
-	writeMu       sync.Mutex
-	healthMon     *health.Monitor
-	sched         *scheduler.Scheduler
-	connWindow    *flow.ConnWindow
-	compressor    *aether.Compressor
+	writeMu    sync.Mutex
+	sched      *scheduler.Scheduler
+	connWindow *flow.ConnWindow
+	compressor *aether.Compressor
 
-	closed    chan struct{}
-	closeOnce sync.Once
-	closeErr  error
+	closeErr error
 
 	// streamRefused counts peer-initiated OPEN requests rejected because
 	// MaxConcurrentStreams was reached. See _SECURITY.md §3.12.
@@ -83,9 +79,9 @@ type TCPSession struct {
 
 	// Protocol-agnostic capabilities (cross-adapter parity with Noise —
 	// these aren't Noise-specific concerns, they're session-level).
-	streamGC   *aether.StreamGC                // idle stream auto-RESET
-	abuseScore *abuse.Score[aether.NodeID]     // per-peer misbehaviour scoring
-	tickStop   chan struct{}                   // shuts down the housekeeping ticker
+	streamGC     *aether.StreamGC     // idle stream auto-RESET
+	abuseTracker *aether.AbuseTracker // per-peer misbehaviour scoring + threshold-breaker
+	tickStop     chan struct{}        // shuts down the housekeeping ticker
 
 	// throttle holds the explicit-CONGESTION signal state received from the
 	// peer. Zero value is "no throttle"; handleCongestion updates it when a
@@ -174,38 +170,43 @@ func (st *tcpStream) teardown() {
 // goroutine per concern.
 func NewTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto aether.Protocol, opts aether.SessionOptions) *TCPSession {
 	opts = aether.NormalizeSessionOptions(opts)
-	connID, _ := aether.GenerateConnectionID()
 	tc := aether.TransportClassForProtocol(proto)
+	base := aether.NewBaseSession(localNodeID, remoteNodeID, proto)
+	base.SetHealthMonitor(health.NewMonitor(0.2))
+	base.SetIdleTimeouts(opts.SessionIdleTimeout, aether.DefaultSessionIdleTimeout)
 	s := &TCPSession{
+		BaseSession:   base,
 		conn:          conn,
-		localNodeID:   localNodeID,
-		remoteNodeID:  remoteNodeID,
-		localPeerID:   truncateID(localNodeID),
-		remotePeerID:  truncateID(remoteNodeID),
-		proto:         proto,
-		connID:        connID,
 		layout:        aether.DefaultStreamLayout(),
 		opts:          opts,
 		classDefaults: aether.DefaultsForClass(tc),
 		streams:       make(map[uint64]*tcpStream),
 		acceptCh:      make(chan *tcpStream, 16),
-		healthMon:     health.NewMonitor(0.2),
 		sched:         scheduler.NewScheduler(),
 		connWindow:    flow.NewConnWindow(0),
 		compressor:    aether.NewCompressor(),
-		closed:        make(chan struct{}),
 		tickStop:      make(chan struct{}),
 	}
-	// Per-peer abuse registry — per-session by default, overridable via
-	// SetAbuseScoreRegistry for cross-session scoring.
-	s.abuseScore = abuse.New[aether.NodeID](abuse.DefaultConfig())
+	// Per-peer abuse tracker — per-session registry by default,
+	// overridable via SetAbuseScoreRegistry for cross-session scoring.
+	// The tracker wraps the registry plus the threshold-breaker
+	// GoAway + close hooks so reportAbuse stays a one-liner.
+	s.abuseTracker = aether.NewAbuseTracker(
+		abuse.New[aether.NodeID](abuse.DefaultConfig()),
+		remoteNodeID,
+		func(reason aether.GoAwayReason, msg string) error {
+			return s.GoAway(context.Background(), reason, msg)
+		},
+		s.CloseWithError,
+		dbgTCP.Printf,
+	)
 	// Per-StreamID accept dispatch — shared implementation living in
 	// the root aether package. Fallback pushes to FIFO acceptCh
 	// non-blocking; pre-refactor semantics drop on full acceptCh so we
 	// preserve that here.
 	s.acceptor = aether.NewStreamAcceptor(
 		func(st aether.Stream) { s.pushToAcceptCh(st.(*tcpStream)) },
-		s.closed,
+		base.CloseSignal(),
 		aether.ErrSessionClosed,
 	)
 	// Stream GC — identical policy to Noise; exempts well-known stream
@@ -246,59 +247,27 @@ func NewTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 }
 
 // readLoop reads Aether frames from the TCP connection and dispatches to streams.
-// Handles both full and short (compressed) headers.
+// Delegates the per-byte decode + short/full/batch dispatch to
+// aether.ReadNextFrame so the Noise and TCP adapters share one decode
+// implementation. Adapter-specific responsibilities stay here:
+// structural validation gate + abuse-on-malformed + per-frame logging.
 func (s *TCPSession) readLoop() {
 	defer s.CloseWithError(fmt.Errorf("readLoop exited"))
-	buf := make([]byte, 1)
 	for {
-		// Peek first byte to detect short vs full header
-		if _, err := io.ReadFull(s.conn, buf); err != nil {
-			dbgTCP.Printf("readLoop: EXIT firstByte err=%v remote=%s", err, truncNodeID(s.remoteNodeID))
-			if err != io.EOF {
-				s.closeErr = err
-			}
-			return
-		}
-
-		var frame *aether.Frame
-		var err error
-		if aether.IsShortHeader(buf[0]) {
-			switch buf[0] {
-			case aether.ShortDataIndicator:
-				frame, err = s.compressor.DecodeDataShort(s.conn)
-			case aether.ShortControlIndicator:
-				frame, err = s.compressor.DecodeControlShort(s.conn)
-			case aether.ShortACKIndicator:
-				frame, err = s.compressor.DecodeACKShort(s.conn)
-			case aether.ShortDataVarIndicator:
-				frame, err = s.compressor.DecodeDataShortVar(s.conn)
-			case aether.ShortEncryptedIndicator:
-				frame, err = s.compressor.DecodeEncryptedDataShort(s.conn)
-			case aether.ShortBatchIndicator:
-				var frames []*aether.Frame
-				frames, err = s.compressor.DecodeBatch(s.conn)
-				if err == nil {
-					for _, f := range frames {
-						s.healthMon.RecordActivity()
-						s.dispatchFrame(f)
-					}
-					continue
-				}
-			default:
-				err = fmt.Errorf("aether: unknown short header indicator 0x%02x", buf[0])
-			}
-		} else {
-			frame, err = aether.DecodeFrameWithFirstByte(s.conn, buf[0])
-			if err == nil {
-				s.compressor.RecordFullHeader(frame)
-			}
-		}
+		frame, _, batch, err := aether.ReadNextFrame(s.conn, s.compressor)
 		if err != nil {
-			dbgTCP.Printf("readLoop: EXIT decode err=%v remote=%s", err, truncNodeID(s.remoteNodeID))
+			dbgTCP.Printf("readLoop: EXIT err=%v remote=%s", err, s.RemoteNodeID().Short())
 			if err != io.EOF {
 				s.closeErr = err
 			}
 			return
+		}
+		if batch != nil {
+			for _, f := range batch {
+				s.Health().RecordActivity()
+				s.dispatchFrame(f)
+			}
+			continue
 		}
 
 		// Structural validation gate — short-header decoders skip
@@ -312,7 +281,7 @@ func (s *TCPSession) readLoop() {
 			continue
 		}
 
-		s.healthMon.RecordActivity()
+		s.Health().RecordActivity()
 		dbgTCP.Printf("readLoop: RX type=%d stream=%d len=%d flags=0x%02x", frame.Type, frame.StreamID, frame.Length, frame.Flags)
 		s.dispatchFrame(frame)
 	}
@@ -393,16 +362,7 @@ func (s *TCPSession) sendWindowUpdateAgnostic(streamID uint64, credit uint64) {
 // sendWindowUpdate sends a WINDOW_UPDATE frame granting additional credit to the sender.
 func (s *TCPSession) sendWindowUpdate(streamID uint64, credit uint64) {
 	dbgTCP.Printf("WINDOW_UPDATE send stream=%d credit=%d", streamID, credit)
-	payload := aether.EncodeWindowUpdate(credit)
-	frame := &aether.Frame{
-		SenderID:   s.localPeerID,
-		ReceiverID: s.remotePeerID,
-		StreamID:   streamID,
-		Type:       aether.TypeWINDOW,
-		Length:     uint32(len(payload)),
-		Payload:    payload,
-	}
-	if err := s.writeFrame(frame); err != nil {
+	if err := s.writeFrame(aether.BuildWindowUpdateFrame(s.LocalPeerID(), s.RemotePeerID(), streamID, credit)); err != nil {
 		dbgTCP.Printf("WINDOW_UPDATE send FAILED stream=%d credit=%d err=%v", streamID, credit, err)
 	}
 }
@@ -430,8 +390,8 @@ func (s *TCPSession) registerStream(st *tcpStream, enforceRemoteCap bool) *tcpSt
 			s.reportAbuse(abuse.ReasonStreamRefused)
 			payload := aether.EncodeReset(aether.ResetRefused)
 			reset := &aether.Frame{
-				SenderID:   s.localPeerID,
-				ReceiverID: s.remotePeerID,
+				SenderID:   s.LocalPeerID(),
+				ReceiverID: s.RemotePeerID(),
 				StreamID:   st.streamID,
 				Type:       aether.TypeRESET,
 				Length:     uint32(len(payload)),
@@ -586,60 +546,58 @@ func (s *TCPSession) handleReset(frame *aether.Frame) {
 	}
 }
 
-func (s *TCPSession) handleWindowUpdate(frame *aether.Frame) {
-	credit := aether.DecodeWindowUpdate(frame.Payload)
-	if frame.StreamID == aether.StreamConnectionLevel {
-		dbgTCP.Printf("WINDOW_UPDATE recv stream=conn credit=%d", credit)
-		s.connWindow.ApplyUpdate(int64(credit))
-	} else {
-		s.mu.Lock()
-		st, ok := s.streams[frame.StreamID]
-		s.mu.Unlock()
-		if ok {
-			dbgTCP.Printf("WINDOW_UPDATE recv stream=%d credit=%d", frame.StreamID, credit)
-			st.window.ApplyUpdate(int64(credit))
-		} else {
-			dbgTCP.Printf("WINDOW_UPDATE recv for unknown stream=%d credit=%d (DROPPED)", frame.StreamID, credit)
-		}
+// controlHandler returns a ControlFrameHandler bound to this session's
+// scheduler, health monitor, conn-window and frame writer. The
+// stream-window lookup acquires s.mu around the streams-map read.
+// WakeScheduler is false because the TCP writeLoop runs on a 2 ms
+// ticker rather than blocking on Consume — pre-refactor parity.
+func (s *TCPSession) controlHandler() *aether.ControlFrameHandler {
+	return &aether.ControlFrameHandler{
+		HealthMon:         s.Health(),
+		Sched:             s.sched,
+		ConnWindow:        s.connWindow,
+		Writer:            s.writeFrame,
+		Sender:            s.LocalPeerID(),
+		Receiver:          s.RemotePeerID(),
+		KeepaliveStreamID: s.layout.Keepalive,
+		WakeScheduler:     false,
+		StreamWindowLookup: func(streamID uint64) *flow.StreamWindow {
+			s.mu.Lock()
+			st, ok := s.streams[streamID]
+			s.mu.Unlock()
+			if !ok {
+				return nil
+			}
+			return st.window
+		},
 	}
+}
+
+func (s *TCPSession) handleWindowUpdate(frame *aether.Frame) {
+	s.controlHandler().HandleWindowUpdate(frame)
 }
 
 func (s *TCPSession) handlePing(frame *aether.Frame) {
-	// Respond with PONG
-	pong := &aether.Frame{
-		SenderID:   s.localPeerID,
-		ReceiverID: s.remotePeerID,
-		StreamID:   s.layout.Keepalive,
-		Type:       aether.TypePONG,
-		SeqNo:      frame.SeqNo, // echo the ping's SeqNo for RTT calculation
-	}
-	s.writeFrame(pong)
+	s.controlHandler().HandlePing(frame)
 }
 
 func (s *TCPSession) handlePong(frame *aether.Frame) {
-	s.healthMon.RecordActivity()
-	// SeqNo echoes the PING's SeqNo (low 32 bits of UnixNano at send time)
-	sentAt := time.Unix(0, int64(frame.SeqNo))
-	s.healthMon.RecordPongRecv(frame.SeqNo, sentAt)
+	s.controlHandler().HandlePong(frame)
 }
 
 func (s *TCPSession) handleGoAway(frame *aether.Frame) {
-	reason, message := aether.DecodeGoAway(frame.Payload)
-	log.Printf("[AETHER-TCP] GOAWAY from %s: reason=%d msg=%s", truncNodeID(s.remoteNodeID), reason, message)
-	s.CloseWithError(fmt.Errorf("peer sent GOAWAY (reason=%d): %s", reason, message))
+	aether.HandleGoAwayFrame(s.CloseWithError, s.RemoteNodeID().Short(), "TCP", frame)
 }
 
 func (s *TCPSession) handlePriority(frame *aether.Frame) {
-	p := aether.DecodePriority(frame.Payload)
-	s.sched.SetWeight(frame.StreamID, p.Weight)
+	s.controlHandler().HandlePriority(frame)
 }
 
 // handleCongestion processes an explicit CONGESTION frame — the peer
 // asking us to slow down. The session stores the hint in its throttle;
 // send-path consumers can check before committing large payloads.
 func (s *TCPSession) handleCongestion(frame *aether.Frame) {
-	p := aether.DecodeCongestion(frame.Payload)
-	s.throttle.Apply(p)
+	p := aether.HandleCongestionFrame(&s.throttle, frame)
 	dbgTCP.Printf("CONGESTION recv severity=%d reason=%d backoff=%dms",
 		p.Severity, p.Reason, p.BackoffMs)
 }
@@ -648,16 +606,7 @@ func (s *TCPSession) handleCongestion(frame *aether.Frame) {
 // side detects local pressure (memory high, recvCh backlog, etc.) and
 // wants the remote to back off before packets pile up.
 func (s *TCPSession) SendCongestion(p aether.CongestionPayload) error {
-	payload := aether.EncodeCongestion(p)
-	frame := &aether.Frame{
-		SenderID:   s.localPeerID,
-		ReceiverID: s.remotePeerID,
-		StreamID:   aether.StreamConnectionLevel,
-		Type:       aether.TypeCONGESTION,
-		Length:     uint32(len(payload)),
-		Payload:    payload,
-	}
-	return s.writeFrame(frame)
+	return s.writeFrame(aether.BuildCongestionFrame(s.LocalPeerID(), s.RemotePeerID(), p))
 }
 
 // Throttle exposes the session's congestion-throttle state. Callers
@@ -678,7 +627,7 @@ func (s *TCPSession) writeLoop() {
 	wake := s.sched.WakeCh()
 	for {
 		select {
-		case <-s.closed:
+		case <-s.CloseSignal():
 			return
 		case <-ticker.C:
 		case <-wake:
@@ -763,7 +712,7 @@ func (s *TCPSession) writeFrame(frame *aether.Frame) error {
 
 func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (aether.Stream, error) {
 	select {
-	case <-s.closed:
+	case <-s.CloseSignal():
 		return nil, fmt.Errorf("session closed")
 	default:
 	}
@@ -796,8 +745,8 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 		Dependency:  cfg.Dependency,
 	})
 	frame := &aether.Frame{
-		SenderID:   s.localPeerID,
-		ReceiverID: s.remotePeerID,
+		SenderID:   s.LocalPeerID(),
+		ReceiverID: s.RemotePeerID(),
 		StreamID:   cfg.StreamID,
 		Type:       aether.TypeDATA,
 		Flags:      aether.FlagSYN,
@@ -819,7 +768,7 @@ func (s *TCPSession) AcceptStream(ctx context.Context) (aether.Stream, error) {
 		return st, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case <-s.closed:
+	case <-s.CloseSignal():
 		return nil, fmt.Errorf("session closed")
 	}
 }
@@ -833,70 +782,27 @@ func (s *TCPSession) AcceptStreamByID(ctx context.Context, streamID uint64) (aet
 	return s.acceptor.AcceptByID(ctx, streamID)
 }
 
-func (s *TCPSession) LocalNodeID() aether.NodeID  { return s.localNodeID }
-func (s *TCPSession) RemoteNodeID() aether.NodeID { return s.remoteNodeID }
-func (s *TCPSession) LocalPeerID() aether.PeerID  { return s.localPeerID }
-func (s *TCPSession) RemotePeerID() aether.PeerID { return s.remotePeerID }
-
-func (s *TCPSession) Capabilities() aether.Capabilities {
-	return aether.CapabilitiesForProtocol(s.proto)
-}
+// Identity / Capabilities / Protocol accessors are promoted from the
+// embedded *BaseSession. Ping is below.
 
 // Ping sends a PING frame and waits for inbound activity (PONG or any
-// other frame) before reporting RTT. Mirrors NoiseSession.Ping — see
-// that comment for the zombie-session detection rationale.
+// other frame) before reporting RTT. Delegates to
+// aether.WaitForActivityPing for the polling loop — see that helper
+// for the zombie-session detection rationale.
 func (s *TCPSession) Ping(ctx context.Context) (time.Duration, error) {
-	if s.IsClosed() {
-		return 0, aether.ErrSessionClosed
-	}
-	before := s.healthMon.LastActivity()
-	start := time.Now()
-	frame := &aether.Frame{
-		SenderID:   s.localPeerID,
-		ReceiverID: s.remotePeerID,
-		StreamID:   s.layout.Keepalive,
-		Type:       aether.TypePING,
-		SeqNo:      uint32(start.UnixNano() & 0xFFFFFFFF),
-	}
-	if err := s.writeFrame(frame); err != nil {
-		return 0, err
-	}
-	deadline := time.Now().Add(2 * time.Second)
-	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
-		deadline = dl
-	}
-	pollTicker := time.NewTicker(50 * time.Millisecond)
-	defer pollTicker.Stop()
-	for {
-		if s.IsClosed() {
-			return 0, aether.ErrSessionClosed
-		}
-		if s.healthMon.LastActivity().After(before) {
-			_, avg := s.healthMon.RTT()
-			return avg, nil
-		}
-		if !time.Now().Before(deadline) {
-			return 0, fmt.Errorf("aether: ping timeout (no inbound activity)")
-		}
-		select {
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		case <-pollTicker.C:
-		}
-	}
+	return aether.WaitForActivityPing(ctx, s.Health(), s.CloseSignal(), func(seqNo uint32) error {
+		return s.writeFrame(&aether.Frame{
+			SenderID:   s.LocalPeerID(),
+			ReceiverID: s.RemotePeerID(),
+			StreamID:   s.layout.Keepalive,
+			Type:       aether.TypePING,
+			SeqNo:      seqNo,
+		})
+	})
 }
 
 func (s *TCPSession) GoAway(ctx context.Context, reason aether.GoAwayReason, message string) error {
-	payload := aether.EncodeGoAway(reason, message)
-	frame := &aether.Frame{
-		SenderID:   s.localPeerID,
-		ReceiverID: s.remotePeerID,
-		StreamID:   s.layout.Control,
-		Type:       aether.TypeGOAWAY,
-		Length:     uint32(len(payload)),
-		Payload:    payload,
-	}
-	return s.writeFrame(frame)
+	return aether.SendGoAway(s.writeFrame, s.LocalPeerID(), s.RemotePeerID(), s.layout.Control, reason, message)
 }
 
 func (s *TCPSession) Close() error {
@@ -904,73 +810,55 @@ func (s *TCPSession) Close() error {
 }
 
 func (s *TCPSession) CloseWithError(err error) error {
-	s.closeOnce.Do(func() {
-		if err != nil {
-			s.closeErr = err
+	if !s.SignalClose() {
+		return nil
+	}
+	if err != nil {
+		s.closeErr = err
+	}
+	// Capture the caller chain so the FIRST closer in a close
+	// cascade is identifiable. Frame 0 is this closure, 1 is
+	// CloseWithError; frames 2-5 are the actual callers — readLoop
+	// defer, stall detector, idle watchdog, the HSTLES dedup/multipath
+	// layer, or transport accept-full.
+	callerChain := aether.CaptureCallerChain(2, 4)
+	// Log EVERY close, including clean nil closes. Previously a
+	// nil-error Close() — exactly what the HSTLES dedup/multipath
+	// layer calls on a losing session — was silent, so the real
+	// churn initiator never appeared in [SESSION-CLOSE] and a
+	// downstream readLoop-exit close masked it on the peer. The
+	// callers= chain names whoever actually triggered the close.
+	reason := "clean(nil)"
+	if err != nil {
+		reason = err.Error()
+	}
+	log.Printf("[SESSION-CLOSE] %s peer=%s reason=%q callers=%s",
+		s.Protocol(), s.RemoteNodeID().Short(), reason, callerChain)
+	if s.tickStop != nil {
+		// Non-blocking close: housekeepingTick watches both this
+		// and the BaseSession close-signal so either signal stops it.
+		select {
+		case <-s.tickStop:
+		default:
+			close(s.tickStop)
 		}
-		// Capture the caller chain so the FIRST closer in a close
-		// cascade is identifiable. Frame 0 is this closure, 1 is
-		// sync.Once, 2 is CloseWithError; frames 3-6 are the actual
-		// callers — readLoop defer, stall detector, idle watchdog,
-		// the HSTLES dedup/multipath layer, or transport accept-full.
-		callerChain := ""
-		var pcs [6]uintptr
-		if n := runtime.Callers(3, pcs[:]); n > 0 {
-			frames := runtime.CallersFrames(pcs[:n])
-			for i := 0; i < 4; i++ {
-				frame, more := frames.Next()
-				file := frame.File
-				if idx := strings.LastIndex(file, "/"); idx >= 0 {
-					file = file[idx+1:]
-				}
-				if callerChain != "" {
-					callerChain += "<-"
-				}
-				callerChain += fmt.Sprintf("%s:%d", file, frame.Line)
-				if !more {
-					break
-				}
-			}
+	}
+	if s.streamGC != nil {
+		s.streamGC.Stop()
+	}
+	// Release any AcceptStreamByID waiters and unparked backlog
+	// streams so blocked callers return ErrSessionClosed instead of
+	// deadlocking. Backlog streams are reset because their config /
+	// recvCh is otherwise orphaned — nobody else will ever pick
+	// them up after close. The acceptor surfaces drained backlog
+	// streams; the adapter calls Reset because the transport-
+	// specific teardown lives here.
+	if s.acceptor != nil {
+		for _, st := range s.acceptor.Close() {
+			_ = st.Reset(aether.ResetCancel)
 		}
-		// Log EVERY close, including clean nil closes. Previously a
-		// nil-error Close() — exactly what the HSTLES dedup/multipath
-		// layer calls on a losing session — was silent, so the real
-		// churn initiator never appeared in [SESSION-CLOSE] and a
-		// downstream readLoop-exit close masked it on the peer. The
-		// callers= chain names whoever actually triggered the close.
-		reason := "clean(nil)"
-		if err != nil {
-			reason = err.Error()
-		}
-		log.Printf("[SESSION-CLOSE] %s peer=%s reason=%q callers=%s",
-			s.proto, truncNodeID(s.remoteNodeID), reason, callerChain)
-		close(s.closed)
-		if s.tickStop != nil {
-			// Non-blocking close: housekeepingTick watches both this
-			// and s.closed so either signal stops it.
-			select {
-			case <-s.tickStop:
-			default:
-				close(s.tickStop)
-			}
-		}
-		if s.streamGC != nil {
-			s.streamGC.Stop()
-		}
-		// Release any AcceptStreamByID waiters and unparked backlog
-		// streams so blocked callers return ErrSessionClosed instead of
-		// deadlocking. Backlog streams are reset because their config /
-		// recvCh is otherwise orphaned — nobody else will ever pick
-		// them up after close. The acceptor surfaces drained backlog
-		// streams; the adapter calls Reset because the transport-
-		// specific teardown lives here.
-		if s.acceptor != nil {
-			for _, st := range s.acceptor.Close() {
-				_ = st.Reset(aether.ResetCancel)
-			}
-		}
-		s.conn.Close()
-	})
+	}
+	s.conn.Close()
 	return nil
 }
 
@@ -1008,7 +896,7 @@ func (s *TCPSession) housekeepingTick() {
 	defer ticker.Stop()
 	for {
 		select {
-		case <-s.closed:
+		case <-s.CloseSignal():
 			return
 		case <-s.tickStop:
 			return
@@ -1017,7 +905,7 @@ func (s *TCPSession) housekeepingTick() {
 			if idle <= 0 {
 				idle = aether.DefaultSessionIdleTimeout
 			}
-			if time.Since(s.healthMon.LastActivity()) > idle {
+			if time.Since(s.Health().LastActivity()) > idle {
 				dbgTCP.Printf("session idle timeout (%s) — closing", idle)
 				s.CloseWithError(fmt.Errorf("session idle timeout (%s)", idle))
 				return
@@ -1035,7 +923,7 @@ func (s *TCPSession) autoTuneWindows() {
 	if aether.AutoTuneDisabled() {
 		return
 	}
-	_, avgRTT := s.healthMon.RTT()
+	_, avgRTT := s.Health().RTT()
 	if avgRTT <= 0 {
 		return
 	}
@@ -1046,57 +934,35 @@ func (s *TCPSession) autoTuneWindows() {
 	}
 	s.mu.Unlock()
 	for _, st := range streams {
-		st.window.SetRTT(avgRTT)
-		current := st.window.CurrentWindow()
-		suggested := st.window.SuggestedWindow()
-		if suggested == current {
-			continue
-		}
-		// Bound each adjustment to ±25 % of current to avoid oscillation.
-		delta := suggested - current
-		maxStep := current / 4
-		if delta > maxStep {
-			delta = maxStep
-		} else if delta < -maxStep {
-			delta = -maxStep
-		}
-		if delta > 0 {
-			if grown := st.window.GrowWindow(delta); grown > 0 {
+		res := aether.AutoTuneWindow(st.window, avgRTT)
+		switch res.Action {
+		case "grow":
+			if res.Applied > 0 {
 				dbgTCP.Printf("autoTune stream=%d grow=%d current=%d rtt=%s",
-					st.streamID, grown, current+grown, avgRTT)
+					st.streamID, res.Applied, res.Current, avgRTT)
 			}
-		} else if delta < 0 {
-			if shrunk := st.window.ShrinkWindow(-delta); shrunk > 0 {
+		case "shrink":
+			if res.Applied > 0 {
 				dbgTCP.Printf("autoTune stream=%d shrink=%d current=%d rtt=%s",
-					st.streamID, shrunk, current-shrunk, avgRTT)
+					st.streamID, res.Applied, res.Current, avgRTT)
 			}
 		}
-		st.window.ResetPeak()
 	}
 }
 
-// reportAbuse records a peer misbehaviour event. Mirrors the Noise
-// adapter's path: the registry's decay model means transient events
-// are forgiven while sustained misbehaviour trips the circuit breaker,
-// at which point we GoAway + Close. Safe to call at high frequency.
+// reportAbuse records a peer misbehaviour event. Delegates to the
+// shared AbuseTracker, which handles the registry Record +
+// threshold-breaker GoAway + close. Safe to call at high frequency —
+// the decay model means transient events are forgiven.
 func (s *TCPSession) reportAbuse(r abuse.Reason) {
-	if s.abuseScore == nil {
-		return
-	}
-	if _, exceeded := s.abuseScore.Record(s.remoteNodeID, r); exceeded {
-		dbgTCP.Printf("peer %s blacklisted (abuse score exceeded): reason=%s", s.remoteNodeID.Short(), r)
-		_ = s.GoAway(context.Background(), aether.GoAwayError, "abuse threshold")
-		s.CloseWithError(fmt.Errorf("peer %s exceeded abuse threshold (reason: %s)", s.remoteNodeID.Short(), r))
-	}
+	s.abuseTracker.Report(r)
 }
 
 // PeerAbuseScore returns the remote peer's current decayed score (0
-// when no events recorded or when the registry is nil).
+// when no events recorded or when the tracker has no registry).
 func (s *TCPSession) PeerAbuseScore() float64 {
-	if s.abuseScore == nil {
-		return 0
-	}
-	return s.abuseScore.Current(s.remoteNodeID)
+	score, _ := s.abuseTracker.PeerScore()
+	return score
 }
 
 // SetAbuseScoreRegistry swaps the per-session registry for a shared
@@ -1104,45 +970,16 @@ func (s *TCPSession) PeerAbuseScore() float64 {
 // `interface{}` to satisfy `aether.AbuseScoreCapable` without an
 // import cycle; returns false when the registry type doesn't match.
 func (s *TCPSession) SetAbuseScoreRegistry(r interface{}) bool {
-	registry, ok := r.(*abuse.Score[aether.NodeID])
-	if !ok {
-		return false
-	}
-	s.abuseScore = registry
-	return true
+	return s.abuseTracker.SetRegistry(r)
 }
 
-// LastActivity satisfies aether.IdleEvictable — when the session's
-// healthMon last observed inbound data.
-func (s *TCPSession) LastActivity() time.Time {
-	return s.healthMon.LastActivity()
-}
+// LastActivity / IdleTimeout / IsClosed / ConnectionID / Health /
+// Protocol / Capabilities all come from the embedded *BaseSession.
 
-// IdleTimeout satisfies aether.IdleEvictable — configured eviction
-// threshold (opts override, else package default).
-func (s *TCPSession) IdleTimeout() time.Duration {
-	if s.opts.SessionIdleTimeout > 0 {
-		return s.opts.SessionIdleTimeout
-	}
-	return aether.DefaultSessionIdleTimeout
-}
-
-func (s *TCPSession) IsClosed() bool {
-	select {
-	case <-s.closed:
-		return true
-	default:
-		return false
-	}
-}
-
-func (s *TCPSession) ConnectionID() aether.ConnectionID { return s.connID }
-func (s *TCPSession) Health() *health.Monitor           { return s.healthMon }
-func (s *TCPSession) SessionKey() []byte                { return nil } // TLS provides encryption
-func (s *TCPSession) CongestionWindow() int64           { return 0 }   // TCP handles congestion
-func (s *TCPSession) Protocol() aether.Protocol         { return s.proto }
+func (s *TCPSession) SessionKey() []byte      { return nil } // TLS provides encryption
+func (s *TCPSession) CongestionWindow() int64 { return 0 }   // TCP handles congestion
 func (s *TCPSession) Metrics() aether.SessionMetrics {
-	_, avg := s.healthMon.RTT()
+	_, avg := s.Health().RTT()
 	s.mu.Lock()
 	streamCount := len(s.streams)
 	observeData := make(map[uint64]aether.StreamObserveData, len(s.streams))
@@ -1216,8 +1053,8 @@ func (st *tcpStream) Send(ctx context.Context, data []byte) error {
 		data = data[len(chunk):]
 
 		frame := &aether.Frame{
-			SenderID:   st.session.localPeerID,
-			ReceiverID: st.session.remotePeerID,
+			SenderID:   st.session.LocalPeerID(),
+			ReceiverID: st.session.RemotePeerID(),
 			StreamID:   st.streamID,
 			Type:       aether.TypeDATA,
 			Length:     uint32(len(chunk)),
@@ -1247,7 +1084,7 @@ func (st *tcpStream) Receive(ctx context.Context) ([]byte, error) {
 		return data, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case <-st.session.closed:
+	case <-st.session.CloseSignal():
 		return nil, fmt.Errorf("session closed")
 	}
 }
@@ -1256,8 +1093,8 @@ func (st *tcpStream) Close() error {
 	st.state.Transition(aether.EventSendFIN)
 	st.teardown()
 	frame := &aether.Frame{
-		SenderID:   st.session.localPeerID,
-		ReceiverID: st.session.remotePeerID,
+		SenderID:   st.session.LocalPeerID(),
+		ReceiverID: st.session.RemotePeerID(),
 		StreamID:   st.streamID,
 		Type:       aether.TypeCLOSE,
 	}
@@ -1269,8 +1106,8 @@ func (st *tcpStream) Reset(reason aether.ResetReason) error {
 	st.teardown()
 	payload := aether.EncodeReset(reason)
 	frame := &aether.Frame{
-		SenderID:   st.session.localPeerID,
-		ReceiverID: st.session.remotePeerID,
+		SenderID:   st.session.LocalPeerID(),
+		ReceiverID: st.session.RemotePeerID(),
 		StreamID:   st.streamID,
 		Type:       aether.TypeRESET,
 		Length:     uint32(len(payload)),
@@ -1290,24 +1127,6 @@ func (st *tcpStream) SetPriority(weight uint8, dependency uint64) {
 // Send ignores timeouts — the value is accurate for scheduling decisions.
 func (st *tcpStream) AvailableCredit() int64 {
 	return st.window.Available()
-}
-
-// ────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ────────────────────────────────────────────────────────────────────────────
-
-func truncNodeID(nodeID aether.NodeID) string {
-	s := string(nodeID)
-	if len(s) > 12 {
-		return s[:12]
-	}
-	return s
-}
-
-func truncateID(nodeID aether.NodeID) aether.PeerID {
-	var pid aether.PeerID
-	copy(pid[:], []byte(string(nodeID)))
-	return pid
 }
 
 // Ensure interfaces are satisfied at compile time.

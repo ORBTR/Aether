@@ -16,61 +16,29 @@ import (
 	"github.com/ORBTR/aether"
 	"github.com/ORBTR/aether/abuse"
 	"github.com/ORBTR/aether/congestion"
+	"github.com/ORBTR/aether/flow"
 	"github.com/ORBTR/aether/reliability"
 )
 
 // readLoop reads Aether frames from the Noise connection and dispatches to streams.
-// Supports both full 50-byte headers and v2 short headers (0x82-0x87).
+// Delegates decode to aether.ReadNextFrame; the post-decode pipeline
+// (decrypt → decompress → anti-replay → dispatch) stays here in
+// processIncomingFrame because each step is Noise-specific.
 func (s *NoiseSession) readLoop() {
 	defer s.CloseWithError(fmt.Errorf("readLoop exited"))
-	buf := make([]byte, 1)
 	for {
-		if _, err := io.ReadFull(s.conn, buf); err != nil {
-			if err != io.EOF {
-				s.closeErr = err
-			}
-			return
-		}
-
-		var frame *aether.Frame
-		var err error
-		indicator := buf[0]
-
-		if aether.IsShortHeader(buf[0]) {
-			switch buf[0] {
-			case aether.ShortDataIndicator:
-				frame, err = s.compressor.DecodeDataShort(s.conn)
-			case aether.ShortControlIndicator:
-				frame, err = s.compressor.DecodeControlShort(s.conn)
-			case aether.ShortACKIndicator:
-				frame, err = s.compressor.DecodeACKShort(s.conn)
-			case aether.ShortDataVarIndicator:
-				frame, err = s.compressor.DecodeDataShortVar(s.conn)
-			case aether.ShortEncryptedIndicator:
-				frame, err = s.compressor.DecodeEncryptedDataShort(s.conn)
-			case aether.ShortBatchIndicator:
-				var frames []*aether.Frame
-				frames, err = s.compressor.DecodeBatch(s.conn)
-				if err == nil {
-					for _, f := range frames {
-						s.processIncomingFrame(f, indicator)
-					}
-					continue
-				}
-			default:
-				err = fmt.Errorf("aether: unknown short header 0x%02x", buf[0])
-			}
-		} else {
-			frame, err = aether.DecodeFrameWithFirstByte(s.conn, buf[0])
-			if err == nil {
-				s.compressor.RecordFullHeader(frame)
-			}
-		}
+		frame, indicator, batch, err := aether.ReadNextFrame(s.conn, s.compressor)
 		if err != nil {
 			if err != io.EOF {
 				s.closeErr = err
 			}
 			return
+		}
+		if batch != nil {
+			for _, f := range batch {
+				s.processIncomingFrame(f, indicator)
+			}
+			continue
 		}
 		s.processIncomingFrame(frame, indicator)
 	}
@@ -159,7 +127,7 @@ func (s *NoiseSession) processIncomingFrame(frame *aether.Frame, indicator byte)
 	//      space is correctly used here because frame.SeqNo IS per-stream.
 	//
 	// The deleted check was a third, redundant, AND incorrect layer.
-	s.healthMon.RecordActivity()
+	s.Health().RecordActivity()
 	s.dispatchFrame(frame)
 }
 
@@ -204,24 +172,14 @@ func (s *NoiseSession) dispatchFrame(frame *aether.Frame) {
 // sender throttle hint. Session's throttle state is updated; send-path
 // consumers can check it before committing large sends.
 func (s *NoiseSession) handleCongestion(frame *aether.Frame) {
-	p := aether.DecodeCongestion(frame.Payload)
-	s.throttle.Apply(p)
+	p := aether.HandleCongestionFrame(&s.throttle, frame)
 	dbgNoise.Printf("CONGESTION recv severity=%d reason=%d backoff=%dms",
 		p.Severity, p.Reason, p.BackoffMs)
 }
 
 // SendCongestion emits a CONGESTION frame to the peer.
 func (s *NoiseSession) SendCongestion(p aether.CongestionPayload) error {
-	payload := aether.EncodeCongestion(p)
-	frame := &aether.Frame{
-		SenderID:   s.localPeerID,
-		ReceiverID: s.remotePeerID,
-		StreamID:   aether.StreamConnectionLevel,
-		Type:       aether.TypeCONGESTION,
-		Length:     uint32(len(payload)),
-		Payload:    payload,
-	}
-	return s.writeFrame(frame)
+	return s.writeFrame(aether.BuildCongestionFrame(s.LocalPeerID(), s.RemotePeerID(), p))
 }
 
 // Throttle exposes the session's congestion-throttle state.
@@ -593,57 +551,52 @@ func (s *NoiseSession) handleReset(frame *aether.Frame) {
 	}
 }
 
+// controlHandler returns a ControlFrameHandler bound to this session's
+// scheduler, health monitor, conn-window and frame writer. Constructed
+// per-call (cheap struct) so handler call sites stay independent of
+// session lifecycle ordering. The stream-window lookup acquires s.mu
+// around the streams-map read — the same locking the inlined handler
+// used pre-refactor.
+func (s *NoiseSession) controlHandler() *aether.ControlFrameHandler {
+	return &aether.ControlFrameHandler{
+		HealthMon:         s.Health(),
+		Sched:             s.sched,
+		ConnWindow:        s.connWindow,
+		Writer:            s.writeFrame,
+		Sender:            s.LocalPeerID(),
+		Receiver:          s.RemotePeerID(),
+		KeepaliveStreamID: s.layout.Keepalive,
+		WakeScheduler:     true, // noise writeLoop blocks on Consume → wake on credit
+		StreamWindowLookup: func(streamID uint64) *flow.StreamWindow {
+			s.mu.Lock()
+			st, ok := s.streams[streamID]
+			s.mu.Unlock()
+			if !ok {
+				return nil
+			}
+			return st.window
+		},
+	}
+}
+
 func (s *NoiseSession) handleWindowUpdate(frame *aether.Frame) {
-	credit := aether.DecodeWindowUpdate(frame.Payload)
-	if frame.StreamID == aether.StreamConnectionLevel {
-		s.connWindow.ApplyUpdate(int64(credit))
-	} else {
-		s.mu.Lock()
-		st, ok := s.streams[frame.StreamID]
-		s.mu.Unlock()
-		if ok {
-			st.window.ApplyUpdate(int64(credit))
-		}
-	}
-	// A stalled writeLoop (blocked on Consume because cwnd=0 / stream
-	// credit exhausted) won't unblock on its own — Enqueue is the only
-	// other thing that signals wake. Kick the scheduler so it re-evaluates
-	// Consume the moment credit arrives. Without this the session
-	// deadlocks on slow-receiver flows.
-	if credit > 0 {
-		s.sched.Wake()
-	}
+	s.controlHandler().HandleWindowUpdate(frame)
 }
 
 func (s *NoiseSession) handlePing(frame *aether.Frame) {
-	pong := &aether.Frame{
-		SenderID:   s.localPeerID,
-		ReceiverID: s.remotePeerID,
-		StreamID:   s.layout.Keepalive,
-		Type:       aether.TypePONG,
-		SeqNo:      frame.SeqNo,
-	}
-	s.writeFrame(pong)
+	s.controlHandler().HandlePing(frame)
 }
 
 func (s *NoiseSession) handlePong(frame *aether.Frame) {
-	s.healthMon.RecordActivity()
-	sentAt := time.Unix(0, int64(frame.SeqNo))
-	s.healthMon.RecordPongRecv(frame.SeqNo, sentAt)
+	s.controlHandler().HandlePong(frame)
 }
 
 func (s *NoiseSession) handleGoAway(frame *aether.Frame) {
-	reason, message := aether.DecodeGoAway(frame.Payload)
-	// %q Go-quotes the peer-supplied message, neutralising log-injection
-	// via embedded newlines / ANSI escapes that would otherwise forge
-	// fake log lines in aggregators.
-	log.Printf("[AETHER-NOISE] GOAWAY from %s: reason=%d msg=%q", string(s.remoteNodeID)[:12], reason, message)
-	s.CloseWithError(fmt.Errorf("peer sent GOAWAY (reason=%d): %s", reason, message))
+	aether.HandleGoAwayFrame(s.CloseWithError, s.RemoteNodeID().Short(), "NOISE", frame)
 }
 
 func (s *NoiseSession) handlePriority(frame *aether.Frame) {
-	p := aether.DecodePriority(frame.Payload)
-	s.sched.SetWeight(frame.StreamID, p.Weight)
+	s.controlHandler().HandlePriority(frame)
 }
 
 // resumeMaterialRecorder is the optional surface a *noiseConn exposes
@@ -664,13 +617,13 @@ func (s *NoiseSession) handleHandshake(frame *aether.Frame) {
 			return
 		}
 		if err := s.migrator.ValidateMigration(
-			s.connID,
+			s.ConnectionID(),
 			nil, 0, sessionKey, hs.Payload,
 		); err != nil {
 			log.Printf("[AETHER-NOISE] Migration validation failed: %v", err)
 			return
 		}
-		log.Printf("[AETHER-NOISE] Address migration accepted from %s", string(s.remoteNodeID))
+		log.Printf("[AETHER-NOISE] Address migration accepted from %s", string(s.RemoteNodeID()))
 	case aether.HandshakeResumeMaterial:
 		// Responder delivered ticket + plaintext-perspective keys for
 		// future 0.5-RTT resume. Forward to the transport layer's
@@ -697,8 +650,8 @@ func (s *NoiseSession) handlePathProbe(frame *aether.Frame) {
 	} else {
 		// Echo back with ACK flag
 		resp := &aether.Frame{
-			SenderID:   s.localPeerID,
-			ReceiverID: s.remotePeerID,
+			SenderID:   s.LocalPeerID(),
+			ReceiverID: s.RemotePeerID(),
 			StreamID:   s.layout.Control,
 			Type:       aether.TypePATH_PROBE,
 			Flags:      aether.FlagACK,
@@ -736,8 +689,8 @@ func (s *NoiseSession) sendCompositeACK(st *noiseStream, cack *aether.CompositeA
 	}
 	payload := aether.EncodeCompositeACK(cack)
 	frame := &aether.Frame{
-		SenderID:   s.localPeerID,
-		ReceiverID: s.remotePeerID,
+		SenderID:   s.LocalPeerID(),
+		ReceiverID: s.RemotePeerID(),
 		StreamID:   st.streamID,
 		Type:       aether.TypeACK,
 		Flags:      aether.FlagCOMPOSITE_ACK, // marks as Composite ACK format
@@ -761,16 +714,7 @@ func (s *NoiseSession) RecordCEBytes(n int) {
 
 // sendWindowUpdate sends a WINDOW_UPDATE frame granting additional credit to the sender.
 func (s *NoiseSession) sendWindowUpdate(streamID uint64, credit uint64) {
-	payload := aether.EncodeWindowUpdate(credit)
-	frame := &aether.Frame{
-		SenderID:   s.localPeerID,
-		ReceiverID: s.remotePeerID,
-		StreamID:   streamID,
-		Type:       aether.TypeWINDOW,
-		Length:     uint32(len(payload)),
-		Payload:    payload,
-	}
-	s.writeFrame(frame)
+	s.writeFrame(aether.BuildWindowUpdateFrame(s.LocalPeerID(), s.RemotePeerID(), streamID, credit))
 }
 
 // sendWindowUpdateAgnostic adapts sendWindowUpdate to the WindowUpdater signature.

@@ -5,10 +5,54 @@
 package aether
 
 import (
+	"fmt"
 	"log"
 	"os"
+	"runtime"
 	"strings"
 )
+
+// CaptureCallerChain returns a `file:line<-file:line<-…` string covering
+// `depth` frames starting `skip` frames up from the call site.
+//
+// Pre-refactor the Noise and TCP adapters' CloseWithError each carried a
+// 20-line copy of this runtime.Callers + frames loop because identifying
+// the first closer in a close cascade ("which goroutine started the
+// teardown?") was load-bearing for diagnosing churn. One definition keeps
+// the log format identical across transports — operators grep one shape.
+//
+// skip is the number of frames above this helper to elide before
+// recording — typically 1 (i.e. start at the function that called
+// CaptureCallerChain). depth caps the number of frames included; the
+// loop exits early on frames.Next reporting !more.
+func CaptureCallerChain(skip, depth int) string {
+	if depth <= 0 {
+		return ""
+	}
+	// +1 to step past this helper itself.
+	pcs := make([]uintptr, depth)
+	n := runtime.Callers(skip+1, pcs)
+	if n == 0 {
+		return ""
+	}
+	frames := runtime.CallersFrames(pcs[:n])
+	out := ""
+	for i := 0; i < depth; i++ {
+		fr, more := frames.Next()
+		file := fr.File
+		if idx := strings.LastIndex(file, "/"); idx >= 0 {
+			file = file[idx+1:]
+		}
+		if out != "" {
+			out += "<-"
+		}
+		out += fmt.Sprintf("%s:%d", file, fr.Line)
+		if !more {
+			break
+		}
+	}
+	return out
+}
 
 // DebugLogger provides conditional debug logging, enabled by the DEBUG
 // environment variable. All Aether namespaces are prefixed "aether.*"
