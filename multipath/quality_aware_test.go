@@ -44,6 +44,9 @@ func (f *fakeSession) OpenStream(context.Context, aether.StreamConfig) (aether.S
 func (f *fakeSession) AcceptStream(context.Context) (aether.Stream, error) {
 	return nil, errors.New("not implemented")
 }
+func (f *fakeSession) AcceptStreamByID(context.Context, uint64) (aether.Stream, error) {
+	return nil, errors.New("not implemented")
+}
 func (f *fakeSession) LocalNodeID() aether.NodeID                  { return aether.NodeID("local") }
 func (f *fakeSession) RemoteNodeID() aether.NodeID                 { return f.remoteID }
 func (f *fakeSession) LocalPeerID() aether.PeerID                  { return aether.PeerID{} }

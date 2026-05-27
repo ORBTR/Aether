@@ -21,7 +21,30 @@ type Session interface {
 
 	// AcceptStream waits for a remotely-opened stream (OPEN frame from peer).
 	// Returns the stream with the configuration the peer requested.
+	// FIFO: returns whatever stream arrives next on the wire — appropriate
+	// for dynamic-stream consumers (e.g. RPC server accepting unpredictable
+	// stream IDs ≥ 10). Consumers that need a specific well-known stream
+	// (gossip=0, rpc=1, keepalive=2, control=3, reconcile=4, swarm=100,
+	// etc.) should use AcceptStreamByID to avoid mis-routing when streams
+	// arrive out-of-order on the wire.
 	AcceptStream(ctx context.Context) (Stream, error)
+
+	// AcceptStreamByID blocks until a stream with exactly the requested
+	// StreamID arrives, regardless of the order streams hit the wire. The
+	// well-known mesh streams (gossip=0, rpc=1, keepalive=2, control=3,
+	// reconcile=4) and any other ID-pinned consumers (e.g. swarm=100)
+	// should use this rather than AcceptStream so an out-of-order OPEN
+	// for a different ID doesn't get mis-claimed by the wrong consumer.
+	//
+	// Streams whose IDs are not currently awaited by a ByID waiter are
+	// either parked on a small per-ID backlog (drained by the next
+	// matching AcceptStreamByID call) or, when no backlog slot is
+	// available, fall through to the FIFO acceptCh so dynamic-stream
+	// consumers calling AcceptStream still see them.
+	//
+	// On session close, all blocked AcceptStreamByID callers return
+	// ErrSessionClosed.
+	AcceptStreamByID(ctx context.Context, streamID uint64) (Stream, error)
 
 	// LocalNodeID returns this node's full identity.
 	LocalNodeID() NodeID

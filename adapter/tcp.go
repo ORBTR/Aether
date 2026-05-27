@@ -33,6 +33,24 @@ import (
 // See _SECURITY.md §3.12.
 const DefaultTCPMaxConcurrentStreams = 256
 
+// maxByIDBacklogPerStream bounds the number of unclaimed streams parked
+// on a per-ID backlog before incoming OPENs for that ID fall through to
+// the FIFO acceptCh. The mesh layer normally pre-arms AcceptStreamByID
+// for every well-known stream before the peer can open them, so the
+// backlog should rarely exceed 1 in practice; the cap exists to bound
+// worst-case memory on a misbehaving peer that floods OPENs for a
+// single ID with no claimant waiting.
+const maxByIDBacklogPerStream = 4
+
+// byIDBacklogGrace is how long an arrived stream parks on byIDBacklog
+// waiting for an AcceptStreamByID claim before falling through to the
+// FIFO acceptCh. Short enough that legacy AcceptStream consumers (e.g.
+// dynamic RPC streams 10+) don't observe a perceptible delay, long
+// enough to absorb the typical scheduling skew between an OPEN arriving
+// on the wire and the consuming goroutine calling AcceptStreamByID.
+// Bypassed entirely when a waiter is already armed at OPEN time.
+const byIDBacklogGrace = 100 * time.Millisecond
+
 // TCPSession implements Session over a TCP/TLS connection.
 // Provides Aether multiplexing (all streams share one conn), flow control,
 // and the priority scheduler. Reliability comes from TCP natively.
@@ -52,6 +70,21 @@ type TCPSession struct {
 	classDefaults aether.TransportClassDefaults
 	streams       map[uint64]*tcpStream
 	acceptCh      chan *tcpStream
+
+	// byIDWaiters holds active AcceptStreamByID callers, keyed by the
+	// stream ID they are waiting for. handleOpen / handleImplicitOpen
+	// check this map under s.mu before pushing to the FIFO acceptCh —
+	// if a waiter is registered the stream is delivered directly to it
+	// instead. Cleared when the waiter is satisfied or the session
+	// closes (close(ch) makes the receive return zero-value + ok=false).
+	//
+	// byIDBacklog parks streams whose IDs are not currently awaited so
+	// a later AcceptStreamByID(id) call can claim one without having
+	// raced the OPEN frame. Bounded per ID by maxByIDBacklogPerStream
+	// — beyond that, OPENs fall through to acceptCh so dynamic-stream
+	// consumers calling AcceptStream still see them.
+	byIDWaiters map[uint64]chan *tcpStream
+	byIDBacklog map[uint64][]*tcpStream
 	writeMu       sync.Mutex
 	healthMon     *health.Monitor
 	sched         *scheduler.Scheduler
@@ -174,6 +207,8 @@ func NewTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 		classDefaults: aether.DefaultsForClass(tc),
 		streams:       make(map[uint64]*tcpStream),
 		acceptCh:      make(chan *tcpStream, 16),
+		byIDWaiters:   make(map[uint64]chan *tcpStream),
+		byIDBacklog:   make(map[uint64][]*tcpStream),
 		healthMon:     health.NewMonitor(0.2),
 		sched:         scheduler.NewScheduler(),
 		connWindow:    flow.NewConnWindow(0),
@@ -457,6 +492,8 @@ func (s *TCPSession) handleOpen(frame *aether.Frame) {
 	}
 	// registerStream returns the pre-existing stream on duplicate OPEN;
 	// only advance state + notify acceptor when we actually inserted.
+	// Duplicate OPENs short-circuit here so the same stream is never
+	// delivered twice to a waiter / acceptCh.
 	if st != candidate {
 		return
 	}
@@ -465,6 +502,77 @@ func (s *TCPSession) handleOpen(frame *aether.Frame) {
 
 	s.sched.Register(frame.StreamID, payload.Priority, payload.Dependency)
 
+	s.notifyStreamAccepted(st)
+}
+
+// notifyStreamAccepted delivers a freshly-accepted stream to either a
+// pinned AcceptStreamByID waiter, a per-ID backlog slot, or the FIFO
+// acceptCh (in that priority order). Called by handleOpen and
+// handleImplicitOpen — the two paths that produce a remotely-initiated
+// stream. The ByID dispatch happens BEFORE the FIFO push so an
+// out-of-order OPEN for a pinned stream (e.g. swarm=100 arriving before
+// gossip=0) can't be drained by a generic AcceptStream caller that's
+// waiting for stream 0.
+//
+// When no waiter is registered, the stream parks on byIDBacklog and a
+// grace timer (byIDBacklogGrace) schedules a fall-through to FIFO
+// acceptCh so legacy AcceptStream consumers still see it. If the
+// backlog for this ID is already at maxByIDBacklogPerStream the stream
+// goes straight to FIFO. The timer fires only if the backlog entry is
+// still parked when it expires — an intervening AcceptStreamByID call
+// removes the entry first, and the timer becomes a no-op.
+func (s *TCPSession) notifyStreamAccepted(st *tcpStream) {
+	s.mu.Lock()
+	if ch, ok := s.byIDWaiters[st.streamID]; ok {
+		delete(s.byIDWaiters, st.streamID)
+		s.mu.Unlock()
+		// Buffered channel (cap 1) — never blocks.
+		ch <- st
+		return
+	}
+	backlog := s.byIDBacklog[st.streamID]
+	if len(backlog) < maxByIDBacklogPerStream {
+		s.byIDBacklog[st.streamID] = append(backlog, st)
+		s.mu.Unlock()
+		time.AfterFunc(byIDBacklogGrace, func() { s.flushBacklogEntry(st) })
+		return
+	}
+	s.mu.Unlock()
+	s.pushToAcceptCh(st)
+}
+
+// flushBacklogEntry runs when the grace window for a parked stream
+// expires. If the stream is still in byIDBacklog (no AcceptStreamByID
+// claimed it) it falls through to the FIFO acceptCh so any legacy
+// AcceptStream consumer can pick it up. A no-op when the stream was
+// already drained by AcceptStreamByID or by session close.
+func (s *TCPSession) flushBacklogEntry(st *tcpStream) {
+	s.mu.Lock()
+	backlog := s.byIDBacklog[st.streamID]
+	idx := -1
+	for i, q := range backlog {
+		if q == st {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		s.mu.Unlock()
+		return
+	}
+	s.byIDBacklog[st.streamID] = append(backlog[:idx], backlog[idx+1:]...)
+	if len(s.byIDBacklog[st.streamID]) == 0 {
+		delete(s.byIDBacklog, st.streamID)
+	}
+	s.mu.Unlock()
+	s.pushToAcceptCh(st)
+}
+
+// pushToAcceptCh delivers a stream to the FIFO acceptCh without
+// blocking the read loop. Mirrors the pre-existing non-blocking push
+// semantics — if the consumer isn't draining acceptCh fast enough the
+// stream is silently dropped, same as before this rework.
+func (s *TCPSession) pushToAcceptCh(st *tcpStream) {
 	select {
 	case s.acceptCh <- st:
 	default:
@@ -509,10 +617,7 @@ func (s *TCPSession) handleImplicitOpen(frame *aether.Frame) {
 
 	s.sched.Register(frame.StreamID, cfg.Priority, cfg.Dependency)
 
-	select {
-	case s.acceptCh <- st:
-	default:
-	}
+	s.notifyStreamAccepted(st)
 }
 
 func (s *TCPSession) handleClose(frame *aether.Frame) {
@@ -783,6 +888,78 @@ func (s *TCPSession) AcceptStream(ctx context.Context) (aether.Stream, error) {
 	}
 }
 
+// AcceptStreamByID blocks until a stream with exactly streamID arrives.
+// See the Session interface comment for the architectural rationale —
+// this is the wire-ordering-safe counterpart to AcceptStream and is the
+// right entry point for any consumer pinned to a well-known stream ID.
+//
+// Drain order: backlog first (a stream may already have arrived and been
+// parked there), then register a waiter and block until either the OPEN
+// frame arrives, the context fires, or the session closes. Only one
+// waiter per streamID is supported — a second concurrent
+// AcceptStreamByID(id) call while another is still blocked closes the
+// previous waiter's channel so it errors out rather than hanging
+// forever.
+func (s *TCPSession) AcceptStreamByID(ctx context.Context, streamID uint64) (aether.Stream, error) {
+	s.mu.Lock()
+	if backlog := s.byIDBacklog[streamID]; len(backlog) > 0 {
+		st := backlog[0]
+		if len(backlog) == 1 {
+			delete(s.byIDBacklog, streamID)
+		} else {
+			s.byIDBacklog[streamID] = backlog[1:]
+		}
+		s.mu.Unlock()
+		dbgTCP.Printf("AcceptStreamByID: stream=%d served from backlog", streamID)
+		return st, nil
+	}
+	// Replace any pre-existing waiter for the same ID — last caller wins.
+	if old, ok := s.byIDWaiters[streamID]; ok {
+		close(old)
+	}
+	ch := make(chan *tcpStream, 1)
+	s.byIDWaiters[streamID] = ch
+	s.mu.Unlock()
+	dbgTCP.Printf("AcceptStreamByID: stream=%d waiting", streamID)
+
+	select {
+	case st, ok := <-ch:
+		if !ok {
+			// Channel closed without a value — superseded by another
+			// waiter for the same ID, or session-close cleanup drained
+			// us. Treat both as session-closed for the caller; the
+			// supersede case is a programming error the caller should
+			// see surface.
+			return nil, aether.ErrSessionClosed
+		}
+		return st, nil
+	case <-ctx.Done():
+		s.mu.Lock()
+		// Only remove ourselves if we're still the registered waiter —
+		// notifyStreamAccepted may have grabbed the slot in the gap
+		// between ctx firing and us reacquiring s.mu, in which case the
+		// stream is already on its way down `ch` and we must consume it
+		// so the caller (or a follow-up AcceptStreamByID) doesn't leak.
+		if cur, ok := s.byIDWaiters[streamID]; ok && cur == ch {
+			delete(s.byIDWaiters, streamID)
+			s.mu.Unlock()
+			return nil, ctx.Err()
+		}
+		s.mu.Unlock()
+		select {
+		case st, ok := <-ch:
+			if !ok {
+				return nil, aether.ErrSessionClosed
+			}
+			return st, nil
+		default:
+			return nil, ctx.Err()
+		}
+	case <-s.closed:
+		return nil, aether.ErrSessionClosed
+	}
+}
+
 func (s *TCPSession) LocalNodeID() aether.NodeID  { return s.localNodeID }
 func (s *TCPSession) RemoteNodeID() aether.NodeID { return s.remoteNodeID }
 func (s *TCPSession) LocalPeerID() aether.PeerID  { return s.localPeerID }
@@ -907,6 +1084,23 @@ func (s *TCPSession) CloseWithError(err error) error {
 		if s.streamGC != nil {
 			s.streamGC.Stop()
 		}
+		// Release any AcceptStreamByID waiters and unparked backlog
+		// streams so blocked callers return ErrSessionClosed instead of
+		// deadlocking. Backlog streams are reset because their config /
+		// recvCh is otherwise orphaned — nobody else will ever pick
+		// them up after close.
+		s.mu.Lock()
+		for id, ch := range s.byIDWaiters {
+			close(ch)
+			delete(s.byIDWaiters, id)
+		}
+		for id, queue := range s.byIDBacklog {
+			for _, st := range queue {
+				_ = st.Reset(aether.ResetCancel)
+			}
+			delete(s.byIDBacklog, id)
+		}
+		s.mu.Unlock()
 		s.conn.Close()
 	})
 	return nil
