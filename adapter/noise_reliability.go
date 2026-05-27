@@ -31,7 +31,7 @@ func (s *NoiseSession) writeLoop() {
 		// Drain everything currently scheduled before re-parking.
 		for {
 			select {
-			case <-s.closed:
+			case <-s.CloseSignal():
 				return
 			default:
 			}
@@ -56,7 +56,7 @@ func (s *NoiseSession) writeLoop() {
 				s.sched.Enqueue(frame.StreamID, frame)
 				select {
 				case <-time.After(wait):
-				case <-s.closed:
+				case <-s.CloseSignal():
 					return
 				}
 				continue
@@ -86,7 +86,7 @@ func (s *NoiseSession) writeLoop() {
 
 		// Park until either new work arrives or the session closes.
 		select {
-		case <-s.closed:
+		case <-s.CloseSignal():
 			return
 		case <-wake:
 		}
@@ -118,7 +118,7 @@ func (s *NoiseSession) reliabilityTick() {
 	}
 	for {
 		select {
-		case <-s.closed:
+		case <-s.CloseSignal():
 			return
 		case <-ticker.C:
 			anyInFlight := false
@@ -142,7 +142,7 @@ func (s *NoiseSession) reliabilityTick() {
 
 			if emitHealth {
 				if dropper, ok := s.conn.(interface{ InboxDrops() uint64 }); ok {
-					remoteShort := string(s.remoteNodeID)
+					remoteShort := string(s.RemoteNodeID())
 					if len(remoteShort) > 14 {
 						remoteShort = remoteShort[:14] + "..."
 					}
@@ -221,7 +221,7 @@ func (s *NoiseSession) reliabilityTick() {
 							st.sendWindow.BumpXmitTime(highSeq, tickNow)
 							st.tlp.MarkProbeSent(highSeq)
 							log.Printf("[TLP] peer=%s stream=%d probeSeq=%d inFlight=%d cwnd=%d",
-								s.remoteNodeID.Short(), streamID, highSeq, inFlight, s.congestion().CWND())
+								s.RemoteNodeID().Short(), streamID, highSeq, inFlight, s.congestion().CWND())
 						}
 					}
 
@@ -248,7 +248,7 @@ func (s *NoiseSession) reliabilityTick() {
 					if lastProgressNs != 0 {
 						progressAge = fmt.Sprintf("%v", time.Since(time.Unix(0, lastProgressNs)))
 					}
-					remoteShort := string(s.remoteNodeID)
+					remoteShort := string(s.RemoteNodeID())
 					if len(remoteShort) > 14 {
 						remoteShort = remoteShort[:14] + "..."
 					}
@@ -329,7 +329,7 @@ func (s *NoiseSession) reliabilityTick() {
 						// retries don't all hit the same loss burst.
 						select {
 						case <-time.After(probeSpacing):
-						case <-s.closed:
+						case <-s.CloseSignal():
 							// Session was closed by another path
 							// (e.g. external Close); stop probing.
 							return
@@ -359,7 +359,7 @@ func (s *NoiseSession) reliabilityTick() {
 					s.congestion().ResetCWND()
 					newCwnd := s.congestion().CWND()
 					log.Printf("[STALL-DETECT] false-positive peer=%s age=%v warmup=%v effThresh=%s cwnd=%d→%d (persistent-congestion exit)",
-						s.remoteNodeID.Short(), sessionAge, warmupActive, effectiveThreshold, prevCwnd, newCwnd)
+						s.RemoteNodeID().Short(), sessionAge, warmupActive, effectiveThreshold, prevCwnd, newCwnd)
 					s.dumpFlowDiagOnStall("false-positive")
 					// Wake the writeLoop so it re-evaluates CanSend with
 					// the freshly-reset cwnd. Without this, the deadlock
@@ -368,7 +368,7 @@ func (s *NoiseSession) reliabilityTick() {
 					continue
 				}
 				log.Printf("[STALL-DETECT] confirmed-stuck peer=%s age=%v warmup=%v effThresh=%s probesFailed=%d lastErr=%v — closing for fallback",
-					s.remoteNodeID.Short(), sessionAge, warmupActive, effectiveThreshold, probeAttempts, lastProbeErr)
+					s.RemoteNodeID().Short(), sessionAge, warmupActive, effectiveThreshold, probeAttempts, lastProbeErr)
 				s.dumpFlowDiagOnStall("confirmed-stuck")
 				s.CloseWithError(aether.ErrSessionStuck)
 				return
@@ -394,7 +394,7 @@ func (s *NoiseSession) reliabilityTick() {
 			if idleTimeout <= 0 {
 				idleTimeout = aether.DefaultSessionIdleTimeout
 			}
-			if time.Since(s.healthMon.LastActivity()) > idleTimeout {
+			if time.Since(s.Health().LastActivity()) > idleTimeout {
 				s.CloseWithError(fmt.Errorf("session idle timeout (%s)", idleTimeout))
 				return
 			}

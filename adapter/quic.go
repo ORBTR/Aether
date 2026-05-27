@@ -28,25 +28,25 @@ import (
 // Aether provides: stream lifecycle (OPEN/CLOSE/RESET semantics only).
 // QUIC provides: EVERYTHING ELSE (reliability, flow control, congestion, mux, encryption).
 type QUICSession struct {
-	conn         quic.Connection
-	connID       aether.ConnectionID
-	localNodeID  aether.NodeID
-	remoteNodeID aether.NodeID
-	localPeerID  aether.PeerID
-	remotePeerID aether.PeerID
-	streams      map[uint64]*quicStream
-	acceptCh     chan *quicStream
+	// BaseSession owns the identity + lifecycle + accessor surface
+	// (LocalNodeID/RemoteNodeID/LocalPeerID/RemotePeerID/ConnectionID/
+	// Capabilities/Protocol/Health/IsClosed/LastActivity/IdleTimeout)
+	// shared with the Noise + TCP adapters. Embedded as a pointer so
+	// the close-signal channel + sync.Once are safe across all three
+	// goroutines (read loop, accept loop, caller-driven Close).
+	*aether.BaseSession
+
+	conn    quic.Connection
+	streams map[uint64]*quicStream
 	// acceptor handles per-StreamID accept dispatch — pinned waiters,
 	// per-ID backlog, and the FIFO fallback to acceptCh. Shared
 	// transport-agnostic implementation in the root aether package, so
 	// the Noise, TCP, and QUIC adapters all delegate here rather than
 	// each carrying their own copy. acceptLoop calls acceptor.Notify;
 	// AcceptStreamByID delegates to acceptor.AcceptByID.
-	acceptor  *aether.StreamAcceptor
-	healthMon *health.Monitor
-	closed    chan struct{}
-	closeOnce sync.Once
-	mu        sync.Mutex
+	acceptor *aether.StreamAcceptor
+	acceptCh chan *quicStream
+	mu       sync.Mutex
 }
 
 // quicStream wraps a native QUIC bidirectional stream as an Aether Stream.
@@ -62,18 +62,13 @@ type quicStream struct {
 
 // NewQuicSession creates an Aether session over a QUIC connection.
 func NewQuicSession(conn quic.Connection, localNodeID, remoteNodeID aether.NodeID) *QUICSession {
-	connID, _ := aether.GenerateConnectionID()
+	base := aether.NewBaseSession(localNodeID, remoteNodeID, aether.ProtoQUIC)
+	base.SetHealthMonitor(health.NewMonitor(0.2))
 	s := &QUICSession{
-		conn:         conn,
-		connID:       connID,
-		localNodeID:  localNodeID,
-		remoteNodeID: remoteNodeID,
-		localPeerID:  truncateID(localNodeID),
-		remotePeerID: truncateID(remoteNodeID),
-		streams:      make(map[uint64]*quicStream),
-		acceptCh:     make(chan *quicStream, 16),
-		healthMon:    health.NewMonitor(0.2),
-		closed:       make(chan struct{}),
+		BaseSession: base,
+		conn:        conn,
+		streams:     make(map[uint64]*quicStream),
+		acceptCh:    make(chan *quicStream, 16),
 	}
 	// Per-StreamID accept dispatch — shared implementation in the root
 	// aether package. Fallback blocks on FIFO acceptCh OR session close,
@@ -81,7 +76,7 @@ func NewQuicSession(conn quic.Connection, localNodeID, remoteNodeID aether.NodeI
 	// acceptCh stalls the accept loop until a consumer drains.
 	s.acceptor = aether.NewStreamAcceptor(
 		s.pushToAcceptCh,
-		s.closed,
+		base.CloseSignal(),
 		aether.ErrSessionClosed,
 	)
 	go s.acceptLoop()
@@ -101,7 +96,7 @@ func (s *QUICSession) pushToAcceptCh(st aether.Stream) {
 	}
 	select {
 	case s.acceptCh <- qs:
-	case <-s.closed:
+	case <-s.CloseSignal():
 	}
 }
 
@@ -156,7 +151,7 @@ func (s *QUICSession) acceptLoop() {
 
 func (s *QUICSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (aether.Stream, error) {
 	select {
-	case <-s.closed:
+	case <-s.CloseSignal():
 		return nil, fmt.Errorf("session closed")
 	default:
 	}
@@ -200,7 +195,7 @@ func (s *QUICSession) AcceptStream(ctx context.Context) (aether.Stream, error) {
 		return st, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case <-s.closed:
+	case <-s.CloseSignal():
 		return nil, fmt.Errorf("session closed")
 	}
 }
@@ -212,15 +207,6 @@ func (s *QUICSession) AcceptStream(ctx context.Context) (aether.Stream, error) {
 // implementation.
 func (s *QUICSession) AcceptStreamByID(ctx context.Context, streamID uint64) (aether.Stream, error) {
 	return s.acceptor.AcceptByID(ctx, streamID)
-}
-
-func (s *QUICSession) LocalNodeID() aether.NodeID  { return s.localNodeID }
-func (s *QUICSession) RemoteNodeID() aether.NodeID { return s.remoteNodeID }
-func (s *QUICSession) LocalPeerID() aether.PeerID  { return s.localPeerID }
-func (s *QUICSession) RemotePeerID() aether.PeerID { return s.remotePeerID }
-
-func (s *QUICSession) Capabilities() aether.Capabilities {
-	return aether.CapabilitiesForProtocol(aether.ProtoQUIC)
 }
 
 // Ping reports session liveness for keepalive. QUIC has its own
@@ -238,7 +224,7 @@ func (s *QUICSession) Ping(ctx context.Context) (time.Duration, error) {
 	if err := s.conn.Context().Err(); err != nil {
 		return 0, aether.ErrSessionClosed
 	}
-	_, avg := s.healthMon.RTT()
+	_, avg := s.Health().RTT()
 	return avg, nil
 }
 
@@ -248,37 +234,25 @@ func (s *QUICSession) GoAway(ctx context.Context, reason aether.GoAwayReason, me
 }
 
 func (s *QUICSession) Close() error {
-	s.closeOnce.Do(func() {
-		close(s.closed)
-		// Release ByID waiters and drain the backlog; blocked
-		// AcceptStreamByID callers return ErrSessionClosed. Drained
-		// backlog streams are not Reset here because QUIC stream
-		// cancel is handled by quic-go on conn close — calling
-		// CancelRead/Write twice is harmless but redundant.
-		if s.acceptor != nil {
-			_ = s.acceptor.Close()
-		}
-		s.conn.CloseWithError(0, "session closed")
-	})
+	if !s.SignalClose() {
+		return nil
+	}
+	// Release ByID waiters and drain the backlog; blocked
+	// AcceptStreamByID callers return ErrSessionClosed. Drained
+	// backlog streams are not Reset here because QUIC stream
+	// cancel is handled by quic-go on conn close — calling
+	// CancelRead/Write twice is harmless but redundant.
+	if s.acceptor != nil {
+		_ = s.acceptor.Close()
+	}
+	s.conn.CloseWithError(0, "session closed")
 	return nil
 }
 
-func (s *QUICSession) IsClosed() bool {
-	select {
-	case <-s.closed:
-		return true
-	default:
-		return false
-	}
-}
-
-func (s *QUICSession) ConnectionID() aether.ConnectionID { return s.connID }
-func (s *QUICSession) Health() *health.Monitor           { return s.healthMon }
-func (s *QUICSession) SessionKey() []byte                { return nil } // QUIC handles encryption
-func (s *QUICSession) CongestionWindow() int64           { return 0 }   // QUIC handles congestion
-func (s *QUICSession) Protocol() aether.Protocol         { return aether.ProtoQUIC }
+func (s *QUICSession) SessionKey() []byte      { return nil } // QUIC handles encryption
+func (s *QUICSession) CongestionWindow() int64 { return 0 }   // QUIC handles congestion
 func (s *QUICSession) Metrics() aether.SessionMetrics {
-	_, avg := s.healthMon.RTT()
+	_, avg := s.Health().RTT()
 	s.mu.Lock()
 	streamCount := len(s.streams)
 	s.mu.Unlock()
@@ -327,7 +301,7 @@ func (st *quicStream) Receive(ctx context.Context) ([]byte, error) {
 	if _, err := io.ReadFull(st.quicStream, data); err != nil {
 		return nil, err
 	}
-	st.session.healthMon.RecordActivity()
+	st.session.Health().RecordActivity()
 	return data, nil
 }
 

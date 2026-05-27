@@ -194,8 +194,8 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 			// Reply with RESET so the peer gives up; no state created locally.
 			payload := aether.EncodeReset(aether.ResetRefused)
 			reset := &aether.Frame{
-				SenderID:   s.localPeerID,
-				ReceiverID: s.remotePeerID,
+				SenderID:   s.LocalPeerID(),
+				ReceiverID: s.RemotePeerID(),
 				StreamID:   streamID,
 				Type:       aether.TypeRESET,
 				Length:     uint32(len(payload)),
@@ -297,8 +297,8 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 // sendSingleFrame sends one frame (original small payload or one fragment).
 func (st *noiseStream) sendSingleFrame(ctx context.Context, data []byte) error {
 	frame := &aether.Frame{
-		SenderID:   st.session.localPeerID,
-		ReceiverID: st.session.remotePeerID,
+		SenderID:   st.session.LocalPeerID(),
+		ReceiverID: st.session.RemotePeerID(),
 		StreamID:   st.streamID,
 		Type:       aether.TypeDATA,
 		Flags:      aether.FlagANTIREPLAY, // enable anti-replay on all Noise-UDP frames
@@ -334,8 +334,8 @@ func (st *noiseStream) sendSingleFrame(ctx context.Context, data []byte) error {
 			repairs := st.session.interleavedEncoder.Add(data)
 			for _, repair := range repairs {
 				repair.StreamID = st.streamID
-				repair.SenderID = st.session.localPeerID
-				repair.ReceiverID = st.session.remotePeerID
+				repair.SenderID = st.session.LocalPeerID()
+				repair.ReceiverID = st.session.RemotePeerID()
 				st.session.sched.Enqueue(st.streamID, repair)
 			}
 		case reliability.FECReedSolomon:
@@ -345,15 +345,15 @@ func (st *noiseStream) sendSingleFrame(ctx context.Context, data []byte) error {
 			repairs := st.session.rsEncoder.Add(data)
 			for _, repair := range repairs {
 				repair.StreamID = st.streamID
-				repair.SenderID = st.session.localPeerID
-				repair.ReceiverID = st.session.remotePeerID
+				repair.SenderID = st.session.LocalPeerID()
+				repair.ReceiverID = st.session.RemotePeerID()
 				st.session.sched.Enqueue(st.streamID, repair)
 			}
 		default:
 			if repair := st.session.fecEncoder.Add(data); repair != nil {
 				repair.StreamID = st.streamID
-				repair.SenderID = st.session.localPeerID
-				repair.ReceiverID = st.session.remotePeerID
+				repair.SenderID = st.session.LocalPeerID()
+				repair.ReceiverID = st.session.RemotePeerID()
 				st.session.sched.Enqueue(st.streamID, repair)
 			}
 		}
@@ -405,7 +405,7 @@ func (st *noiseStream) Receive(ctx context.Context) ([]byte, error) {
 			return data, nil
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-st.session.closed:
+		case <-st.session.CloseSignal():
 			return nil, fmt.Errorf("session closed")
 		}
 	}
@@ -436,8 +436,8 @@ func (st *noiseStream) Close() error {
 	st.state.Transition(aether.EventSendFIN)
 	st.teardown()
 	frame := &aether.Frame{
-		SenderID:   st.session.localPeerID,
-		ReceiverID: st.session.remotePeerID,
+		SenderID:   st.session.LocalPeerID(),
+		ReceiverID: st.session.RemotePeerID(),
 		StreamID:   st.streamID,
 		Type:       aether.TypeCLOSE,
 	}
@@ -458,8 +458,8 @@ func (st *noiseStream) Reset(reason aether.ResetReason) error {
 	st.state.Transition(aether.EventSendReset)
 	payload := aether.EncodeReset(reason)
 	frame := &aether.Frame{
-		SenderID:   st.session.localPeerID,
-		ReceiverID: st.session.remotePeerID,
+		SenderID:   st.session.LocalPeerID(),
+		ReceiverID: st.session.RemotePeerID(),
 		StreamID:   st.streamID,
 		Type:       aether.TypeRESET,
 		Length:     uint32(len(payload)),
