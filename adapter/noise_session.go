@@ -52,16 +52,15 @@ type NoiseSession struct {
 	conn net.Conn // the Noise-encrypted connection (reads/writes encrypted UDP datagrams)
 
 	// Stream management
-	streams  map[uint64]*noiseStream
-	acceptCh chan *noiseStream
+	streams map[uint64]*noiseStream
 
-	// acceptor handles per-StreamID accept dispatch — pinned waiters,
-	// per-ID backlog, and the FIFO fallback to acceptCh. Lives in the
-	// root aether package so all three transport adapters (Noise, TCP,
-	// QUIC) share one implementation rather than each carrying its own
-	// copy. handleOpen / handleImplicitOpen call acceptor.Notify on
-	// every accepted stream; AcceptStreamByID delegates to
-	// acceptor.AcceptByID.
+	// acceptor owns per-StreamID accept dispatch — pinned waiters,
+	// per-ID backlog, and the FIFO that AcceptStream drains. Lives in
+	// the root aether package so all three transport adapters (Noise,
+	// TCP, QUIC) share one implementation rather than each carrying
+	// their own channel + push-mode shim. handleOpen /
+	// handleImplicitOpen call acceptor.Notify on every accepted
+	// stream; AcceptStream and AcceptStreamByID delegate to it.
 	acceptor *aether.StreamAcceptor
 
 	// Stream layout — consumer-defined stream ID assignments
@@ -228,7 +227,6 @@ func NewNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 		layout:             aether.DefaultStreamLayout(),
 		opts:               opts,
 		streams:            make(map[uint64]*noiseStream),
-		acceptCh:           make(chan *noiseStream, 16),
 		sched:              scheduler.NewScheduler(),
 		connWindow:         flow.NewConnWindow(0),
 		pacer:              selectPacer(opts),
@@ -258,15 +256,15 @@ func NewNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 		int64(float64(flow.DefaultConnCredit)*GrantImmediateFraction),
 	)
 
-	// Per-StreamID accept dispatch — shared implementation living in
-	// the root aether package. Fallback pushes to FIFO acceptCh
-	// non-blocking; pre-refactor semantics drop on full acceptCh so we
-	// preserve that here too.
-	s.acceptor = aether.NewStreamAcceptor(
-		func(st aether.Stream) { s.pushToAcceptCh(st.(*noiseStream)) },
-		base.CloseSignal(),
-		aether.ErrSessionClosed,
-	)
+	// Per-StreamID accept dispatch + AcceptStream FIFO — shared
+	// implementation in the root aether package. NonBlockingDrop
+	// matches pre-consolidation semantics: when the FIFO is full the
+	// OPEN-frame handler drops silently rather than stalling readLoop.
+	s.acceptor = aether.NewStreamAcceptor(aether.StreamAcceptorConfig{
+		Mode:      aether.NonBlockingDrop,
+		Closed:    base.CloseSignal(),
+		ErrClosed: aether.ErrSessionClosed,
+	})
 
 	// Initial congestion controller — stored atomically so the setter
 	// can swap without racing the ACK / write / tick paths.
@@ -423,15 +421,12 @@ func (s *NoiseSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) 
 	return st, nil
 }
 
+// AcceptStream delegates to the shared aether.StreamAcceptor — the
+// adapter no longer owns the FIFO channel + per-transport select. See
+// stream_acceptor.go for the underlying drain order (waiter → backlog
+// → FIFO).
 func (s *NoiseSession) AcceptStream(ctx context.Context) (aether.Stream, error) {
-	select {
-	case st := <-s.acceptCh:
-		return st, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-s.CloseSignal():
-		return nil, fmt.Errorf("session closed")
-	}
+	return s.acceptor.Accept(ctx)
 }
 
 // AcceptStreamByID delegates to the shared aether.StreamAcceptor. See
@@ -447,22 +442,11 @@ func (s *NoiseSession) AcceptStreamByID(ctx context.Context, streamID uint64) (a
 
 // notifyStreamAccepted hands a freshly-accepted stream to the shared
 // StreamAcceptor. The acceptor picks between a pinned ByID waiter, a
-// per-ID backlog slot, or the FIFO acceptCh (via the fallback wired in
-// NewNoiseSession). Called by handleOpen / handleImplicitOpen — the
-// two paths that produce a remotely-initiated stream.
+// per-ID backlog slot, or the internal FIFO that AcceptStream drains.
+// Called by handleOpen / handleImplicitOpen — the two paths that
+// produce a remotely-initiated stream.
 func (s *NoiseSession) notifyStreamAccepted(st *noiseStream) {
 	s.acceptor.Notify(st)
-}
-
-// pushToAcceptCh delivers to FIFO acceptCh without blocking the read
-// loop. Preserves pre-existing semantics — if the consumer isn't
-// draining fast enough the stream signal is dropped. Wired as the
-// StreamAcceptor fallback in NewNoiseSession.
-func (s *NoiseSession) pushToAcceptCh(st *noiseStream) {
-	select {
-	case s.acceptCh <- st:
-	default:
-	}
 }
 
 // Identity / Capabilities / Protocol accessors are promoted from the
