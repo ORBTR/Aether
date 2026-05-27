@@ -36,15 +36,17 @@ type QUICSession struct {
 	remotePeerID aether.PeerID
 	streams      map[uint64]*quicStream
 	acceptCh     chan *quicStream
-	// byIDWaiters / byIDBacklog provide AcceptStreamByID dispatch
-	// independent of FIFO arrival order. See the matching fields on
-	// TCPSession / NoiseSession for the architectural rationale.
-	byIDWaiters map[uint64]chan *quicStream
-	byIDBacklog map[uint64][]*quicStream
-	healthMon   *health.Monitor
-	closed      chan struct{}
-	closeOnce   sync.Once
-	mu          sync.Mutex
+	// acceptor handles per-StreamID accept dispatch — pinned waiters,
+	// per-ID backlog, and the FIFO fallback to acceptCh. Shared
+	// transport-agnostic implementation in the root aether package, so
+	// the Noise, TCP, and QUIC adapters all delegate here rather than
+	// each carrying their own copy. acceptLoop calls acceptor.Notify;
+	// AcceptStreamByID delegates to acceptor.AcceptByID.
+	acceptor  *aether.StreamAcceptor
+	healthMon *health.Monitor
+	closed    chan struct{}
+	closeOnce sync.Once
+	mu        sync.Mutex
 }
 
 // quicStream wraps a native QUIC bidirectional stream as an Aether Stream.
@@ -70,13 +72,37 @@ func NewQuicSession(conn quic.Connection, localNodeID, remoteNodeID aether.NodeI
 		remotePeerID: truncateID(remoteNodeID),
 		streams:      make(map[uint64]*quicStream),
 		acceptCh:     make(chan *quicStream, 16),
-		byIDWaiters:  make(map[uint64]chan *quicStream),
-		byIDBacklog:  make(map[uint64][]*quicStream),
 		healthMon:    health.NewMonitor(0.2),
 		closed:       make(chan struct{}),
 	}
+	// Per-StreamID accept dispatch — shared implementation in the root
+	// aether package. Fallback blocks on FIFO acceptCh OR session close,
+	// preserving the pre-refactor QUIC behaviour where a packed
+	// acceptCh stalls the accept loop until a consumer drains.
+	s.acceptor = aether.NewStreamAcceptor(
+		s.pushToAcceptCh,
+		s.closed,
+		aether.ErrSessionClosed,
+	)
 	go s.acceptLoop()
 	return s
+}
+
+// pushToAcceptCh forwards a stream to the FIFO acceptCh. Wired as the
+// StreamAcceptor fallback in NewQuicSession. Blocks until acceptCh
+// accepts or the session closes — matches pre-refactor QUIC semantics
+// (which used a select on acceptCh + closed). Returning early on
+// session close means the accept loop will see a subsequent Notify
+// short-circuit because the acceptor is closed.
+func (s *QUICSession) pushToAcceptCh(st aether.Stream) {
+	qs, ok := st.(*quicStream)
+	if !ok {
+		return
+	}
+	select {
+	case s.acceptCh <- qs:
+	case <-s.closed:
+	}
 }
 
 // acceptLoop accepts incoming QUIC streams and wraps them as Aether streams.
@@ -115,67 +141,12 @@ func (s *QUICSession) acceptLoop() {
 		s.streams[streamID] = st
 		s.mu.Unlock()
 
-		if !s.notifyStreamAccepted(st) {
-			return
-		}
-	}
-}
-
-// notifyStreamAccepted hands a freshly-accepted stream to either a
-// pinned AcceptStreamByID waiter, a per-ID backlog slot, or the FIFO
-// acceptCh (in priority order). Returns false only when the session is
-// closed mid-dispatch so the caller can bail out of its accept loop.
-// Backlog entries get a grace timer that flushes them to acceptCh if
-// no AcceptStreamByID claim arrives in byIDBacklogGrace.
-func (s *QUICSession) notifyStreamAccepted(st *quicStream) bool {
-	s.mu.Lock()
-	if ch, ok := s.byIDWaiters[st.streamID]; ok {
-		delete(s.byIDWaiters, st.streamID)
-		s.mu.Unlock()
-		ch <- st
-		return true
-	}
-	backlog := s.byIDBacklog[st.streamID]
-	if len(backlog) < maxByIDBacklogPerStream {
-		s.byIDBacklog[st.streamID] = append(backlog, st)
-		s.mu.Unlock()
-		time.AfterFunc(byIDBacklogGrace, func() { s.flushBacklogEntry(st) })
-		return true
-	}
-	s.mu.Unlock()
-	select {
-	case s.acceptCh <- st:
-		return true
-	case <-s.closed:
-		return false
-	}
-}
-
-// flushBacklogEntry expires a backlog entry to FIFO acceptCh when the
-// grace timer fires. No-op if AcceptStreamByID already claimed it or
-// the session closed.
-func (s *QUICSession) flushBacklogEntry(st *quicStream) {
-	s.mu.Lock()
-	backlog := s.byIDBacklog[st.streamID]
-	idx := -1
-	for i, q := range backlog {
-		if q == st {
-			idx = i
-			break
-		}
-	}
-	if idx < 0 {
-		s.mu.Unlock()
-		return
-	}
-	s.byIDBacklog[st.streamID] = append(backlog[:idx], backlog[idx+1:]...)
-	if len(s.byIDBacklog[st.streamID]) == 0 {
-		delete(s.byIDBacklog, st.streamID)
-	}
-	s.mu.Unlock()
-	select {
-	case s.acceptCh <- st:
-	case <-s.closed:
+		// Hand to the shared per-StreamID dispatcher. Notify always
+		// makes progress (waiter / backlog / fallback). If the
+		// session has closed mid-dispatch the acceptor's isClosed
+		// guard rejects the notify and the loop continues; we exit
+		// on the next conn.AcceptStream error instead.
+		s.acceptor.Notify(st)
 	}
 }
 
@@ -234,54 +205,13 @@ func (s *QUICSession) AcceptStream(ctx context.Context) (aether.Stream, error) {
 	}
 }
 
-// AcceptStreamByID blocks until a stream with exactly streamID arrives.
-// Mirrors the TCP/Noise implementation — see Session.AcceptStreamByID
-// for the architectural rationale.
+// AcceptStreamByID delegates to the shared aether.StreamAcceptor. See
+// the Session interface comment + stream_acceptor.go for the
+// architectural rationale — the per-StreamID dispatch lives in the
+// root aether package so all three transport adapters share one
+// implementation.
 func (s *QUICSession) AcceptStreamByID(ctx context.Context, streamID uint64) (aether.Stream, error) {
-	s.mu.Lock()
-	if backlog := s.byIDBacklog[streamID]; len(backlog) > 0 {
-		st := backlog[0]
-		if len(backlog) == 1 {
-			delete(s.byIDBacklog, streamID)
-		} else {
-			s.byIDBacklog[streamID] = backlog[1:]
-		}
-		s.mu.Unlock()
-		return st, nil
-	}
-	if old, ok := s.byIDWaiters[streamID]; ok {
-		close(old)
-	}
-	ch := make(chan *quicStream, 1)
-	s.byIDWaiters[streamID] = ch
-	s.mu.Unlock()
-
-	select {
-	case st, ok := <-ch:
-		if !ok {
-			return nil, aether.ErrSessionClosed
-		}
-		return st, nil
-	case <-ctx.Done():
-		s.mu.Lock()
-		if cur, ok := s.byIDWaiters[streamID]; ok && cur == ch {
-			delete(s.byIDWaiters, streamID)
-			s.mu.Unlock()
-			return nil, ctx.Err()
-		}
-		s.mu.Unlock()
-		select {
-		case st, ok := <-ch:
-			if !ok {
-				return nil, aether.ErrSessionClosed
-			}
-			return st, nil
-		default:
-			return nil, ctx.Err()
-		}
-	case <-s.closed:
-		return nil, aether.ErrSessionClosed
-	}
+	return s.acceptor.AcceptByID(ctx, streamID)
 }
 
 func (s *QUICSession) LocalNodeID() aether.NodeID  { return s.localNodeID }
@@ -321,16 +251,13 @@ func (s *QUICSession) Close() error {
 	s.closeOnce.Do(func() {
 		close(s.closed)
 		// Release ByID waiters and drain the backlog; blocked
-		// AcceptStreamByID callers return ErrSessionClosed.
-		s.mu.Lock()
-		for id, ch := range s.byIDWaiters {
-			close(ch)
-			delete(s.byIDWaiters, id)
+		// AcceptStreamByID callers return ErrSessionClosed. Drained
+		// backlog streams are not Reset here because QUIC stream
+		// cancel is handled by quic-go on conn close — calling
+		// CancelRead/Write twice is harmless but redundant.
+		if s.acceptor != nil {
+			_ = s.acceptor.Close()
 		}
-		for id := range s.byIDBacklog {
-			delete(s.byIDBacklog, id)
-		}
-		s.mu.Unlock()
 		s.conn.CloseWithError(0, "session closed")
 	})
 	return nil
