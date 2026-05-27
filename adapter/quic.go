@@ -38,14 +38,13 @@ type QUICSession struct {
 
 	conn    quic.Connection
 	streams map[uint64]*quicStream
-	// acceptor handles per-StreamID accept dispatch — pinned waiters,
-	// per-ID backlog, and the FIFO fallback to acceptCh. Shared
+	// acceptor owns per-StreamID accept dispatch — pinned waiters,
+	// per-ID backlog, and the FIFO that AcceptStream drains. Shared
 	// transport-agnostic implementation in the root aether package, so
-	// the Noise, TCP, and QUIC adapters all delegate here rather than
-	// each carrying their own copy. acceptLoop calls acceptor.Notify;
-	// AcceptStreamByID delegates to acceptor.AcceptByID.
+	// the Noise, TCP, and QUIC adapters do not each carry their own
+	// channel + push-mode shim. acceptLoop calls acceptor.Notify;
+	// AcceptStream and AcceptStreamByID delegate to it.
 	acceptor *aether.StreamAcceptor
-	acceptCh chan *quicStream
 	mu       sync.Mutex
 }
 
@@ -68,36 +67,21 @@ func NewQuicSession(conn quic.Connection, localNodeID, remoteNodeID aether.NodeI
 		BaseSession: base,
 		conn:        conn,
 		streams:     make(map[uint64]*quicStream),
-		acceptCh:    make(chan *quicStream, 16),
 	}
-	// Per-StreamID accept dispatch — shared implementation in the root
-	// aether package. Fallback blocks on FIFO acceptCh OR session close,
-	// preserving the pre-refactor QUIC behaviour where a packed
-	// acceptCh stalls the accept loop until a consumer drains.
-	s.acceptor = aether.NewStreamAcceptor(
-		s.pushToAcceptCh,
-		base.CloseSignal(),
-		aether.ErrSessionClosed,
-	)
+	// Per-StreamID accept dispatch + AcceptStream FIFO — shared
+	// implementation in the root aether package. BlockUntilClose
+	// preserves the pre-consolidation QUIC behaviour: when the FIFO
+	// fills up the accept loop stalls until a consumer drains or the
+	// session closes, rather than dropping streams. QUIC has no other
+	// backpressure surface to push on, so blocking is the right
+	// signal.
+	s.acceptor = aether.NewStreamAcceptor(aether.StreamAcceptorConfig{
+		Mode:      aether.BlockUntilClose,
+		Closed:    base.CloseSignal(),
+		ErrClosed: aether.ErrSessionClosed,
+	})
 	go s.acceptLoop()
 	return s
-}
-
-// pushToAcceptCh forwards a stream to the FIFO acceptCh. Wired as the
-// StreamAcceptor fallback in NewQuicSession. Blocks until acceptCh
-// accepts or the session closes — matches pre-refactor QUIC semantics
-// (which used a select on acceptCh + closed). Returning early on
-// session close means the accept loop will see a subsequent Notify
-// short-circuit because the acceptor is closed.
-func (s *QUICSession) pushToAcceptCh(st aether.Stream) {
-	qs, ok := st.(*quicStream)
-	if !ok {
-		return
-	}
-	select {
-	case s.acceptCh <- qs:
-	case <-s.CloseSignal():
-	}
 }
 
 // acceptLoop accepts incoming QUIC streams and wraps them as Aether streams.
@@ -189,15 +173,12 @@ func (s *QUICSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (
 	return st, nil
 }
 
+// AcceptStream delegates to the shared aether.StreamAcceptor — the
+// adapter no longer owns the FIFO channel + per-transport select. See
+// stream_acceptor.go for the underlying drain order (waiter → backlog
+// → FIFO).
 func (s *QUICSession) AcceptStream(ctx context.Context) (aether.Stream, error) {
-	select {
-	case st := <-s.acceptCh:
-		return st, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-s.CloseSignal():
-		return nil, fmt.Errorf("session closed")
-	}
+	return s.acceptor.Accept(ctx)
 }
 
 // AcceptStreamByID delegates to the shared aether.StreamAcceptor. See

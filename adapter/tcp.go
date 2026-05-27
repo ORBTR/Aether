@@ -55,15 +55,14 @@ type TCPSession struct {
 	opts          aether.SessionOptions
 	classDefaults aether.TransportClassDefaults
 	streams       map[uint64]*tcpStream
-	acceptCh      chan *tcpStream
 
-	// acceptor handles per-StreamID accept dispatch — pinned waiters,
-	// per-ID backlog, and the FIFO fallback to acceptCh. Shared
+	// acceptor owns per-StreamID accept dispatch — pinned waiters,
+	// per-ID backlog, and the FIFO that AcceptStream drains. Shared
 	// transport-agnostic implementation in the root aether package, so
 	// the Noise, TCP, and QUIC adapters do not each carry their own
-	// copy of the same bookkeeping. handleOpen / handleImplicitOpen
-	// call acceptor.Notify; AcceptStreamByID delegates to
-	// acceptor.AcceptByID.
+	// channel + push-mode shim. handleOpen / handleImplicitOpen call
+	// acceptor.Notify; AcceptStream and AcceptStreamByID delegate to
+	// it.
 	acceptor *aether.StreamAcceptor
 
 	writeMu    sync.Mutex
@@ -181,7 +180,6 @@ func NewTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 		opts:          opts,
 		classDefaults: aether.DefaultsForClass(tc),
 		streams:       make(map[uint64]*tcpStream),
-		acceptCh:      make(chan *tcpStream, 16),
 		sched:         scheduler.NewScheduler(),
 		connWindow:    flow.NewConnWindow(0),
 		compressor:    aether.NewCompressor(),
@@ -200,15 +198,15 @@ func NewTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 		s.CloseWithError,
 		dbgTCP.Printf,
 	)
-	// Per-StreamID accept dispatch — shared implementation living in
-	// the root aether package. Fallback pushes to FIFO acceptCh
-	// non-blocking; pre-refactor semantics drop on full acceptCh so we
-	// preserve that here.
-	s.acceptor = aether.NewStreamAcceptor(
-		func(st aether.Stream) { s.pushToAcceptCh(st.(*tcpStream)) },
-		base.CloseSignal(),
-		aether.ErrSessionClosed,
-	)
+	// Per-StreamID accept dispatch + AcceptStream FIFO — shared
+	// implementation in the root aether package. NonBlockingDrop
+	// matches pre-consolidation semantics: when the FIFO is full the
+	// OPEN-frame handler drops silently rather than stalling readLoop.
+	s.acceptor = aether.NewStreamAcceptor(aether.StreamAcceptorConfig{
+		Mode:      aether.NonBlockingDrop,
+		Closed:    base.CloseSignal(),
+		ErrClosed: aether.ErrSessionClosed,
+	})
 	// Stream GC — identical policy to Noise; exempts well-known stream
 	// IDs 0-3 (control / keepalive).
 	s.streamGC = aether.NewStreamGC(aether.DefaultStreamIdleTimeout, func(streamID uint64) {
@@ -456,23 +454,11 @@ func (s *TCPSession) handleOpen(frame *aether.Frame) {
 
 // notifyStreamAccepted hands a freshly-accepted stream to the shared
 // StreamAcceptor. The acceptor picks between a pinned ByID waiter, a
-// per-ID backlog slot, or the FIFO acceptCh (via the fallback wired
-// in NewTCPSession). Called by handleOpen and handleImplicitOpen —
-// the two paths that produce a remotely-initiated stream.
+// per-ID backlog slot, or the internal FIFO that AcceptStream drains.
+// Called by handleOpen and handleImplicitOpen — the two paths that
+// produce a remotely-initiated stream.
 func (s *TCPSession) notifyStreamAccepted(st *tcpStream) {
 	s.acceptor.Notify(st)
-}
-
-// pushToAcceptCh delivers a stream to the FIFO acceptCh without
-// blocking the read loop. Mirrors the pre-existing non-blocking push
-// semantics — if the consumer isn't draining acceptCh fast enough the
-// stream is silently dropped, same as before this rework. Wired as
-// the StreamAcceptor fallback in NewTCPSession.
-func (s *TCPSession) pushToAcceptCh(st *tcpStream) {
-	select {
-	case s.acceptCh <- st:
-	default:
-	}
 }
 
 func (s *TCPSession) handleImplicitOpen(frame *aether.Frame) {
@@ -760,17 +746,19 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 	return st, nil
 }
 
+// AcceptStream delegates to the shared aether.StreamAcceptor — the
+// adapter no longer owns the FIFO channel + per-transport select. See
+// stream_acceptor.go for the underlying drain order (waiter → backlog
+// → FIFO).
 func (s *TCPSession) AcceptStream(ctx context.Context) (aether.Stream, error) {
-	dbgTCP.Printf("AcceptStream: waiting... (acceptCh len=%d)", len(s.acceptCh))
-	select {
-	case st := <-s.acceptCh:
-		dbgTCP.Printf("AcceptStream: got stream=%d", st.streamID)
-		return st, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-s.CloseSignal():
-		return nil, fmt.Errorf("session closed")
+	dbgTCP.Printf("AcceptStream: waiting...")
+	st, err := s.acceptor.Accept(ctx)
+	if err == nil {
+		if ts, ok := st.(*tcpStream); ok {
+			dbgTCP.Printf("AcceptStream: got stream=%d", ts.streamID)
+		}
 	}
+	return st, err
 }
 
 // AcceptStreamByID delegates to the shared aether.StreamAcceptor. See
