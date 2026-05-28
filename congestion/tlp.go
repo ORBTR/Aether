@@ -155,15 +155,30 @@ func (t *TLP) Disarm() {
 }
 
 // ShouldProbe reports whether the adapter should send a TLP probe right
-// now. Returns true when scheduledAt has elapsed AND no probe is
-// currently in flight AND we haven't exhausted maxConsecutiveProbes.
+// now. Returns true when:
+//   - The TLP is armed (scheduledAt is set, i.e. there's data in flight),
+//   - The scheduled PTO has elapsed (now >= scheduledAt),
+//   - We haven't exhausted maxConsecutiveProbes (the session-level
+//     stall detector — noise_reliability.go [STALL-DETECT] — handles
+//     the fully black-holed case from there).
+//
+// NOTE: This deliberately does NOT gate on probePending. RFC 8985 §7.5
+// and RFC 9002 §6.2.4 allow back-to-back probes (up to N) without an
+// intervening ACK so that a single dropped probe doesn't permanently
+// wedge the connection. The earlier "probePending blocks ShouldProbe"
+// behaviour fired exactly one probe per stream and then, if that probe
+// was lost on the wire (the very case we built TLP to handle), the
+// stream stayed wedged forever because no subsequent probe could fire.
+// consecutiveProbes — incremented on every MarkProbeSent and capped at
+// maxConsecutiveProbes — provides the correct giving-up signal: after
+// N consecutive un-ACKed probes the session stall path takes over.
 //
 // On true, the adapter selects which seq to probe (typically the
 // largest in-flight seq, per RFC 8985 §7.4) and calls MarkProbeSent.
 func (t *TLP) ShouldProbe(now time.Time) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.scheduledAt.IsZero() || t.probePending {
+	if t.scheduledAt.IsZero() {
 		return false
 	}
 	if t.consecutiveProbes >= maxConsecutiveProbes {
@@ -173,29 +188,40 @@ func (t *TLP) ShouldProbe(now time.Time) bool {
 }
 
 // NextWakeup returns the wall-clock time at which ShouldProbe will next
-// transition to true. Zero if disarmed or already pending. Useful for
-// the adapter's outer scheduler to set a single timer rather than poll.
+// transition to true. Zero if disarmed or if we've exhausted
+// maxConsecutiveProbes (session-level stall detector takes over).
+// Like ShouldProbe, this does NOT gate on probePending — a re-arm with
+// a new XmitTime is what schedules the next probe, and consecutiveProbes
+// is the give-up signal.
 func (t *TLP) NextWakeup() time.Time {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.scheduledAt.IsZero() || t.probePending {
+	if t.scheduledAt.IsZero() {
+		return time.Time{}
+	}
+	if t.consecutiveProbes >= maxConsecutiveProbes {
 		return time.Time{}
 	}
 	return t.scheduledAt
 }
 
-// MarkProbeSent records that a probe was just sent for seq. This
-// suppresses duplicate probes on the next tick while the probe is in
-// flight, and increments the back-to-back probe counter.
+// MarkProbeSent records that a probe was just sent for seq. Stores the
+// probe seq so MarkProbeAcked can recognise the returning ACK, and
+// increments the consecutive-probe counter. After maxConsecutiveProbes
+// without an intervening ACK, ShouldProbe stops firing and the session-
+// level stall detector takes over (see noise_reliability.go
+// [STALL-DETECT]).
+//
+// Does NOT block subsequent probes by itself — that's deliberate (see
+// ShouldProbe's doc comment for the RFC rationale). The next probe is
+// gated by scheduledAt (re-Arm'd by the adapter from the freshest
+// in-flight XmitTime) and consecutiveProbes.
 func (t *TLP) MarkProbeSent(seq uint32) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.probePending = true
 	t.pendingProbeSeq = seq
 	t.consecutiveProbes++
-	// Don't clear scheduledAt — if the probe doesn't return, the next
-	// ShouldProbe call after the new PTO elapses (re-armed in Arm by
-	// the next Send cycle) is what fires the next probe.
 }
 
 // MarkProbeAcked records that an ACK arrived for the in-flight probe.
