@@ -514,29 +514,43 @@ func (s *NoiseSession) connWrite(b []byte) error {
 // writeFrame serializes and writes a single frame to the Noise connection.
 // Applies compression (if enabled and payload > 64 bytes) and encryption (if key set).
 func (s *NoiseSession) writeFrame(frame *aether.Frame) error {
-	// Compression: compress payload if enabled and worthwhile (>64 bytes)
-	// Read the atomic toggle (not opts.Compression) so runtime flips
-	// from SetCompressionEnabled / adaptive CPU controller / agent
-	// netmon link-change handlers take effect immediately without
-	// reconstructing the session.
-	if s.compressionEnabled.Load() && len(frame.Payload) > 64 {
+	// Compression + encryption are IDEMPOTENT on the frame object. The
+	// crypto/aead.go Encrypt path mutates frame.Payload in place
+	// (plaintext → ciphertext + 16B auth tag), and compressPayload does
+	// the same for the compression flag. We MUST skip those steps on
+	// retransmits — the frame in the send window is shared between the
+	// original send, RACK retransmits, RTO retransmits, and TLP probes,
+	// and re-encrypting an already-encrypted payload produces double-
+	// ciphertext that the receiver decrypts once into ciphertext_v1
+	// (not plaintext), failing pb.UnmarshalRequest with "invalid
+	// wire-format data". The receiver dedups duplicate SeqNos at
+	// recvWindow.Insert, so resending the cached ciphertext bytes
+	// (same nonce, same payload) is the correct retransmit behavior.
+	//
+	// The flag check keeps writeFrame safe to call on a frame any number
+	// of times; the first call transforms it, subsequent calls are no-ops
+	// that send the cached bytes.
+	if s.compressionEnabled.Load() && len(frame.Payload) > 64 && !frame.Flags.Has(aether.FlagCOMPRESSED) {
 		compressed := compressPayload(frame.Payload)
 		if len(compressed) < len(frame.Payload) { // only use if smaller
 			frame.Payload = compressed
 			frame.Length = uint32(len(compressed))
 			frame.Flags = frame.Flags.Set(aether.FlagCOMPRESSED)
 		}
-	} else {
-		frame.Flags = frame.Flags.Clear(aether.FlagCOMPRESSED)
 	}
 
-	// Encryption: encrypt payload if key set and enabled
-	if s.encryptor != nil && s.opts.Encryption {
+	// Encryption: encrypt payload if key set and enabled.
+	// MUST be idempotent — see comment above. Re-encrypting already-
+	// encrypted bytes was the root cause of fleet-wide "proto: cannot
+	// parse invalid wire-format data" Unmarshal errors on RPC paths
+	// where retransmits (TLP probes especially after aether v0.0.60's
+	// back-to-back probe fix) re-ran this code on a sendWindow frame
+	// whose Payload had already been swapped to ciphertext by the
+	// first send.
+	if s.encryptor != nil && s.opts.Encryption && !frame.Flags.Has(aether.FlagENCRYPTED) {
 		if err := s.encryptor.Encrypt(frame); err != nil {
 			return fmt.Errorf("aether encrypt: %w", err)
 		}
-	} else {
-		frame.Flags = frame.Flags.Clear(aether.FlagENCRYPTED)
 	}
 
 	s.writeMu.Lock()
