@@ -30,6 +30,8 @@ type ReplayWindow struct {
 	topSeq         uint32 // highest accepted SeqNo
 	inited         bool   // false until first frame
 	wrapsDetected  uint64 // atomic: jumps > SeqNoWrapThreshold rejected as wrap attack
+	duplicates     uint64 // atomic: total ResultDuplicate observations (legitimate retransmits)
+	ancientDrops   uint64 // atomic: total ResultAncient observations (out-of-window)
 }
 
 // NewReplayWindow creates an anti-replay window.
@@ -41,6 +43,30 @@ func NewReplayWindow() *ReplayWindow {
 // rejected as potential SeqNo-wraparound replay attacks.
 func (w *ReplayWindow) WrapsDetectedCount() uint64 {
 	return atomic.LoadUint64(&w.wrapsDetected)
+}
+
+// DuplicateCount returns the total number of ResultDuplicate observations
+// since this window was created. Duplicates are SeqNos already seen
+// within the recent sliding window — almost always legitimate
+// retransmits from the sender's reliability layer when an ACK was lost
+// or late. A high count signals a lossy reverse path (data → ACK
+// direction) and is the most useful per-stream signal for distinguishing
+// "path works but loses ACKs" from "path loses data". Operators reading
+// dashboards / quality scorers consuming path signals should treat this
+// as informational; it is NOT an abuse signal (see CheckResult).
+func (w *ReplayWindow) DuplicateCount() uint64 {
+	return atomic.LoadUint64(&w.duplicates)
+}
+
+// AncientDropCount returns the total number of ResultAncient observations
+// since this window was created. SeqNos below the window bottom that a
+// legitimate sender's reliability layer cannot produce. Distinguished
+// from DuplicateCount because Ancient COULD indicate an attack (or a
+// peer with broken send-window bookkeeping) while Duplicate does not.
+// Surfaced separately so dashboards / abuse reviews can isolate the
+// security-relevant signal.
+func (w *ReplayWindow) AncientDropCount() uint64 {
+	return atomic.LoadUint64(&w.ancientDrops)
 }
 
 // CheckResult classifies the outcome of a SeqNo replay check so the
@@ -167,12 +193,14 @@ func (w *ReplayWindow) CheckV2(seqNo uint32) CheckResult {
 	// seqNo <= top — check if within window
 	diff := w.topSeq - seqNo
 	if diff >= ReplayWindowSize {
+		atomic.AddUint64(&w.ancientDrops, 1)
 		return ResultAncient // too old — outside window, cannot be a legitimate retransmit
 	}
 
 	// Check if already seen
 	bit := uint64(1) << diff
 	if w.bitmap&bit != 0 {
+		atomic.AddUint64(&w.duplicates, 1)
 		return ResultDuplicate // already seen — almost always a legitimate retransmit
 	}
 

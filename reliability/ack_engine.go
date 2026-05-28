@@ -177,6 +177,30 @@ func (e *ACKEngine) Flush() {
 	e.flushLocked()
 }
 
+// OnDuplicateReceived is called when a duplicate frame arrives — a
+// SeqNo already marked as seen in the per-stream replay window. The
+// original was previously delivered + ACKed but the sender retransmitted
+// because its ACK was lost / late. We force an immediate ACK back so
+// the sender's retransmit timer clears its pending state and stops
+// retransmitting. Without this, the sender's RTO/TLP keeps firing and
+// the receiver sees duplicate after duplicate, burning bandwidth on
+// wasted retransmits and prolonging recovery from one lost ACK to
+// O(maxRetries × RTO) instead of one extra round-trip.
+//
+// Matches TCP's "immediate ACK on duplicate data" behaviour (RFC 5681
+// §4.2) and QUIC's equivalent (RFC 9002 §B.7). The pending counter is
+// bumped so flushLocked's pending-zero guard does not skip the send;
+// buildLocked emits the CURRENT cumulative ACK (which already includes
+// this SeqNo from the original receipt), giving the sender fresh
+// evidence of delivery.
+func (e *ACKEngine) OnDuplicateReceived(seqNo uint32) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.pending++
+	dbgACK.Printf("OnDuplicateReceived seq=%d — forcing immediate ACK to clear sender retransmit", seqNo)
+	e.flushLocked()
+}
+
 // MarkIdle records that the stream has been idle (for ACK-on-first-after-idle rule).
 func (e *ACKEngine) MarkIdle() {
 	e.mu.Lock()
