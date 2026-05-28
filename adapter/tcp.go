@@ -619,7 +619,12 @@ func (s *TCPSession) writeLoop() {
 		case <-wake:
 		}
 
-		frame := s.sched.Dequeue()
+		frame, _ := s.sched.Dequeue()
+		// isProbe is irrelevant for the TCP transport — TCP has its own
+		// kernel-level flow control and aether's cwnd is not enforced
+		// here. The signature is the scheduler's, kept consistent so a
+		// single call site doesn't have to special-case Dequeue per
+		// transport.
 		if frame == nil {
 			continue
 		}
@@ -628,7 +633,7 @@ func (s *TCPSession) writeLoop() {
 		if s.opts.HeaderComp && s.sched.Len() > 0 {
 			batch := []*aether.Frame{frame}
 			for s.sched.Len() > 0 && len(batch) < 16 {
-				next := s.sched.Dequeue()
+				next, _ := s.sched.Dequeue()
 				if next == nil {
 					break
 				}

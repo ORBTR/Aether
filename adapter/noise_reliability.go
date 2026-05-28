@@ -36,16 +36,22 @@ func (s *NoiseSession) writeLoop() {
 			default:
 			}
 
-			frame := s.sched.Dequeue()
+			frame, isProbe := s.sched.Dequeue()
 			if frame == nil {
 				break // empty — fall through to park on wake/closed
 			}
 
 			frameSize := int(aether.HeaderSize) + int(frame.Length)
 
-			// Congestion window check — re-enqueue and wait for next ACK
-			// (the ACK path will re-signal wake when it advances cwnd).
-			if !s.congestion().CanSend(int64(frameSize)) {
+			// RFC 8985 §7.5: TLP loss probes MUST be transmitted outside
+			// the congestion window so they can recover from cwnd-collapse
+			// deadlocks. Without this bypass, a stream that has driven its
+			// cwnd to zero through losses cannot send the very probe that
+			// would elicit an ACK and reopen the window — leading to the
+			// fleet-wide `tlp{scheduledIn=-29s probePending=true probes=1}`
+			// wedge we saw in production. Regular frames still respect
+			// CanSend (and re-enqueue + park until cwnd advances).
+			if !isProbe && !s.congestion().CanSend(int64(frameSize)) {
 				s.sched.Enqueue(frame.StreamID, frame)
 				break
 			}
@@ -213,11 +219,18 @@ func (s *NoiseSession) reliabilityTick() {
 					// without an ACK. The probe is the highest in-flight
 					// seq's frame (RFC 8985 §7.4: probe with the latest
 					// data so the receiver's ACK reveals the gap).
+					//
+					// Use EnqueueProbe (NOT Enqueue) so the writeLoop's
+					// CanSend gate is bypassed for this frame per §7.5 —
+					// otherwise a collapsed cwnd traps the probe behind
+					// the very condition it was meant to recover from.
+					// Probes go into the per-stream probe slot in the
+					// scheduler (at most one in flight, replaced on
+					// re-arm), separate from the regular WFQ queue.
 					if st.tlp.ShouldProbe(tickNow) {
 						highSeq := st.sendWindow.Next() - 1
 						if entry := st.sendWindow.GetEntry(highSeq); entry != nil {
-							s.sched.MarkRetransmit(streamID)
-							s.sched.Enqueue(streamID, entry.Frame)
+							s.sched.EnqueueProbe(streamID, entry.Frame)
 							st.sendWindow.BumpXmitTime(highSeq, tickNow)
 							st.tlp.MarkProbeSent(highSeq)
 							log.Printf("[TLP] peer=%s stream=%d probeSeq=%d inFlight=%d cwnd=%d",
