@@ -735,7 +735,7 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 	_, avg := s.Health().RTT()
 	s.mu.Lock()
 	streamCount := len(s.streams)
-	var suspiciousACKs, recvDrops, seqWraps uint64
+	var suspiciousACKs, recvDrops, seqWraps, replayDup, replayAncient uint64
 	for _, st := range s.streams {
 		if st.sendWindow != nil {
 			suspiciousACKs += st.sendWindow.SuspiciousACKsCount()
@@ -745,6 +745,8 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 		}
 		if st.replay != nil {
 			seqWraps += st.replay.WrapsDetectedCount()
+			replayDup += st.replay.DuplicateCount()
+			replayAncient += st.replay.AncientDropCount()
 		}
 	}
 	s.mu.Unlock()
@@ -774,6 +776,13 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 		RecvWindowDrops:  recvDrops,
 		DecryptErrors:    decryptErr,
 		InboxDrops:       inboxDrops,
+		// Anti-replay classification (post-CheckV2 split). ReplayRejects
+		// preserved as the sum so old consumers reading the aggregate
+		// see the same total — the split surfaces the operational
+		// meaning. See SessionMetrics docs for the distinction.
+		ReplayDuplicates: replayDup,
+		ReplayAncient:    replayAncient,
+		ReplayRejects:    replayDup + replayAncient + seqWraps,
 	}
 }
 
