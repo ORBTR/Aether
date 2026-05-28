@@ -124,7 +124,7 @@ type SessionMetrics struct {
 	ActiveStreams int           // number of open streams
 	DroppedFrames uint64        // frames dropped (buffer full, expired, replay)
 	FECRecoveries uint64        // frames recovered via FEC (without retransmit)
-	ReplayRejects uint64        // frames rejected by anti-replay window
+	ReplayRejects uint64        // frames rejected by anti-replay window (deprecated: now equals ReplayDuplicates + ReplayAncient — kept for back-compat)
 
 	// Security observability counters. See _SECURITY.md for the attack
 	// classes each addresses.
@@ -135,6 +135,29 @@ type SessionMetrics struct {
 	RecvWindowDrops  uint64 //       — reorder-buffer overflow drops (total across streams)
 	DecryptErrors    uint64 //       — decryption failures on incoming packets
 	InboxDrops       uint64 //       — packets dropped because the session inbox was full
+
+	// Anti-replay classification counters (post-CheckV2 split). Total
+	// ReplayRejects is the sum of these — surfaced separately because
+	// the operational meaning is different:
+	//
+	// ReplayDuplicates = legitimate retransmits the sender re-sent
+	//   because its ACK was lost / late. NOT abuse. A high value
+	//   signals a lossy ACK-direction path (reverse channel) and is
+	//   the most useful per-stream observable for diagnosing
+	//   asymmetric loss. Consumers should display this as a quality
+	//   signal (path stress), not a security event.
+	//
+	// ReplayAncient = SeqNos below the reliability window bottom. A
+	//   legitimate sender cannot produce these inside one rekey
+	//   window, so an elevated count is genuinely anomalous (buggy
+	//   peer, broken send-window bookkeeping, or active replay attack
+	//   with stale captured frames). DOES feed abuse score.
+	//
+	// SeqNoWraps (above) is the third class — forward jumps past
+	// half the uint32 space, kept separate because it has an even
+	// stricter "definitely-attack" interpretation.
+	ReplayDuplicates uint64 // legitimate retransmit count (informational, not abuse)
+	ReplayAncient    uint64 // out-of-window drops (abuse-eligible)
 
 	// Per-stream observe metrics (ACK-observe mode — pure observation, no enforcement).
 	// Available on all transport types. Keyed by stream ID.
