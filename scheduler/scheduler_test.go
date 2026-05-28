@@ -17,7 +17,7 @@ func TestScheduler_SingleStream(t *testing.T) {
 	f := &aether.Frame{Type: aether.TypeDATA, StreamID: 1, Length: 10, Payload: make([]byte, 10)}
 	s.Enqueue(1, f)
 
-	got := s.Dequeue()
+	got, _ := s.Dequeue()
 	if got == nil {
 		t.Fatal("expected frame from single stream")
 	}
@@ -26,7 +26,7 @@ func TestScheduler_SingleStream(t *testing.T) {
 	}
 
 	// Queue empty now
-	if s.Dequeue() != nil {
+	if f, _ := s.Dequeue(); f != nil {
 		t.Error("should be nil after draining")
 	}
 }
@@ -48,7 +48,7 @@ func TestScheduler_WeightedFairness(t *testing.T) {
 	// from the high-weight stream.
 	first10High := 0
 	for i := 0; i < 10; i++ {
-		f := s.Dequeue()
+		f, _ := s.Dequeue()
 		if f == nil {
 			break
 		}
@@ -72,7 +72,7 @@ func TestScheduler_EmptyQueues(t *testing.T) {
 	if !s.IsEmpty() {
 		t.Error("should be empty with no frames")
 	}
-	if s.Dequeue() != nil {
+	if f, _ := s.Dequeue(); f != nil {
 		t.Error("dequeue on empty should return nil")
 	}
 }
@@ -86,7 +86,7 @@ func TestScheduler_Unregister(t *testing.T) {
 	if s.StreamCount() != 0 {
 		t.Errorf("StreamCount after unregister: got %d, want 0", s.StreamCount())
 	}
-	if s.Dequeue() != nil {
+	if f, _ := s.Dequeue(); f != nil {
 		t.Error("dequeue after unregister should return nil")
 	}
 }
@@ -98,7 +98,7 @@ func TestScheduler_SetWeight(t *testing.T) {
 
 	// Enqueue and verify it still works
 	s.Enqueue(1, &aether.Frame{Type: aether.TypeDATA, StreamID: 1, Length: 0})
-	if s.Dequeue() == nil {
+	if f, _ := s.Dequeue(); f == nil {
 		t.Error("should dequeue after weight change")
 	}
 }
@@ -140,7 +140,7 @@ func TestScheduler_KeepaliveNeverStarved(t *testing.T) {
 	// Keepalive should be dequeued within the first few frames (not after 100 gossip frames)
 	keepaliveSent := false
 	for i := 0; i < 10; i++ {
-		f := s.Dequeue()
+		f, _ := s.Dequeue()
 		if f == nil {
 			break
 		}

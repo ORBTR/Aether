@@ -48,6 +48,13 @@ type scheduledStream struct {
 	dependency   uint64 // parent stream ID (0 = root)
 	latencyClass aether.LatencyClass
 	queue        []*aether.Frame
+	// probe holds a pending TLP loss probe (RFC 8985 §7.5). At most one
+	// probe per stream — TLP semantics permits a single probe in flight
+	// at a time, and a re-arm replaces any pending one. Probes are
+	// dequeued ahead of `queue` and are transmitted outside the
+	// congestion window (the writeLoop bypasses CanSend when Dequeue
+	// reports isProbe=true).
+	probe        *aether.Frame
 	deficit      float64 // WFQ virtual finish time
 	isRetransmit bool    // next frame is a retransmit (cost 2x)
 }
@@ -164,23 +171,70 @@ func (s *Scheduler) Enqueue(streamID uint64, frame *aether.Frame) {
 	}
 }
 
-// Dequeue returns the next frame to send based on latency class + weighted fair queuing.
-// Returns nil if all queues are empty.
+// EnqueueProbe queues a TLP loss probe for a stream. Per RFC 8985 §7.5
+// the probe MUST be transmitted outside the congestion window so it can
+// recover from cwnd-collapse deadlocks (where every retransmit is
+// blocked by CanSend because losses have driven cwnd to zero). The
+// scheduler holds at most one probe per stream (TLP allows one in
+// flight at a time); a subsequent EnqueueProbe replaces the prior
+// pending probe when TLP re-arms. Probes are dequeued ahead of every
+// other class — including REALTIME — because they are the only way to
+// break a stalled connection.
 //
-// Algorithm:
-//  1. Strict priority between latency classes: REALTIME > INTERACTIVE > BULK
-//  2. Within each class: WFQ via virtual finish time (weight-proportional)
+// Pairs with Dequeue's isProbe return: the writeLoop reads the flag
+// and bypasses the CanSend check, completing the §7.5 contract.
+func (s *Scheduler) EnqueueProbe(streamID uint64, frame *aether.Frame) {
+	s.mu.Lock()
+	queued := false
+	if ss, ok := s.streams[streamID]; ok {
+		ss.probe = frame
+		queued = true
+	}
+	s.mu.Unlock()
+	if queued {
+		s.signalWake()
+	}
+}
+
+// Dequeue returns the next frame to send and whether it is a TLP probe.
 //
-// This ensures control plane frames (REALTIME) never wait behind bulk data.
-func (s *Scheduler) Dequeue() *aether.Frame {
+// Ordering (strict, top-down):
+//  1. Pending TLP probes across any stream — absolute priority (RFC 8985
+//     §7.5: probes must be sent promptly to recover from cwnd collapse).
+//  2. REALTIME class (unless over RealtimeCapPercent bandwidth share).
+//  3. INTERACTIVE class.
+//  4. BULK class.
+//
+// Within steps 2–4, WFQ picks the best stream by virtual finish time.
+//
+// isProbe=true tells the writeLoop to bypass congestion-window checks
+// (CanSend) for this frame, per RFC 8985 §7.5. isProbe=false means the
+// frame goes through normal cwnd flow control.
+func (s *Scheduler) Dequeue() (*aether.Frame, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if len(s.order) == 0 {
-		return nil
+		return nil, false
 	}
 
-	// Determine if REALTIME is over its bandwidth cap
+	// 1. TLP probes have absolute priority. Walk s.order so probes are
+	// drained in a stable, registration-ordered sequence rather than
+	// map-iteration order (deterministic ordering helps tests + log
+	// readability without affecting correctness).
+	for _, streamID := range s.order {
+		ss, ok := s.streams[streamID]
+		if !ok || ss.probe == nil {
+			continue
+		}
+		frame := ss.probe
+		ss.probe = nil
+		// Probes do not consume the REALTIME cap counters — they are
+		// recovery traffic, not application traffic.
+		return frame, true
+	}
+
+	// 2. Determine if REALTIME is over its bandwidth cap
 	realtimeCapped := false
 	if s.totalBytes > 0 && s.realtimeBytes*100/s.totalBytes > int64(RealtimeCapPercent) {
 		realtimeCapped = true
@@ -191,7 +245,7 @@ func (s *Scheduler) Dequeue() *aether.Frame {
 		s.totalBytes /= 2
 	}
 
-	// Try each latency class in priority order: REALTIME → INTERACTIVE → BULK
+	// 3. Try each latency class in priority order: REALTIME → INTERACTIVE → BULK
 	// If REALTIME is capped, skip it and let INTERACTIVE/BULK catch up
 	for _, targetClass := range []aether.LatencyClass{aether.ClassREALTIME, aether.ClassINTERACTIVE, aether.ClassBULK} {
 		if targetClass == aether.ClassREALTIME && realtimeCapped {
@@ -205,11 +259,11 @@ func (s *Scheduler) Dequeue() *aether.Frame {
 			if targetClass == aether.ClassREALTIME {
 				s.realtimeBytes += bytesOut
 			}
-			return frame
+			return frame, false
 		}
 	}
 
-	return nil
+	return nil, false
 }
 
 // dequeueFromClass picks the best frame within a specific latency class using WFQ.
@@ -259,20 +313,22 @@ func (s *Scheduler) dequeueFromClass(targetClass aether.LatencyClass) *aether.Fr
 	return frame
 }
 
-// IsEmpty returns true if all stream queues are empty.
+// IsEmpty returns true if all stream queues — including pending TLP
+// probes — are empty.
 func (s *Scheduler) IsEmpty() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	for _, ss := range s.streams {
-		if len(ss.queue) > 0 {
+		if len(ss.queue) > 0 || ss.probe != nil {
 			return false
 		}
 	}
 	return true
 }
 
-// Len returns the total number of queued frames across all streams.
+// Len returns the total number of queued frames across all streams,
+// including any pending TLP probes.
 func (s *Scheduler) Len() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -280,6 +336,9 @@ func (s *Scheduler) Len() int {
 	total := 0
 	for _, ss := range s.streams {
 		total += len(ss.queue)
+		if ss.probe != nil {
+			total++
+		}
 	}
 	return total
 }
