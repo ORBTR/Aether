@@ -165,8 +165,13 @@ func newNoiseConnListener(ptr *noiseListener, send, recv *noise.CipherState, rem
 	// socket per-write, including for relayed OpReply paths that target
 	// an IPv6 6PN address while remote is an IPv4 5-tuple.
 	nc.writeFunc = buildNoiseConnWriteFunc(nc, ptr, remote)
+	// Identity-matched removal — see ConnectionMap.RemoveBy. A blind
+	// RemoveByAddr here would clobber the WINNING session's map slot if
+	// this conn had been displaced by a simultaneous-dial peer (same
+	// addr key, different conn). Compare by *noiseConn pointer so the
+	// close path only touches entries that still belong to us.
 	nc.parentStop = func() {
-		ptr.removeSession(remote)
+		ptr.removeSessionForConn(nc)
 	}
 	return nc
 }
@@ -945,6 +950,18 @@ func (l *noiseListener) registerDialSession(addr *net.UDPAddr, nc *noiseConn, no
 func (l *noiseListener) removeSession(addr *net.UDPAddr) {
 	key := addr.String()
 	l.sessions.RemoveByAddr(key)
+}
+
+// removeSessionForConn removes ONLY map entries whose stored connection
+// is still this exact noiseConn. Safe for the close path even when a
+// concurrent simultaneous-dial winner has overwritten our slot — the
+// matchFn returns false for the winner's entries and the close becomes
+// a no-op on those keys instead of clobbering the live session. See
+// ConnectionMap.RemoveBy for full rationale.
+func (l *noiseListener) removeSessionForConn(nc *noiseConn) {
+	l.sessions.RemoveBy(func(sess aether.Connection) bool {
+		return connFromSession(sess) == nc
+	})
 }
 
 // pruneStaleHandshakes removes incomplete handshakes and leaked pending dials

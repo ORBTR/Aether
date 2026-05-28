@@ -462,6 +462,39 @@ recvLoop:
 		nc.enableExplicitNonce()
 	}
 
+	// Simultaneous-dial deterministic tiebreak (initiator side). See the
+	// responder-side comment in handleHandshake for the full rationale —
+	// both peers concurrently dialing each other land at the same map
+	// key on each side, and without coordinated dedup at the noise
+	// layer the displaced session gets orphaned and produces a stalled
+	// conversation that the upper layer can't see.
+	//
+	// Rule mirrored from the responder: keep the session where the
+	// lower-NodeID peer is the initiator. As initiator here we keep
+	// this session only if our NodeID is LOWER than the peer's. If we
+	// are higher, the peer's outbound (their initiator) is the
+	// preferred conversation and our outbound is closed.
+	//
+	// Skipped when no existing session is registered for this NodeID —
+	// first-time dials install unconditionally.
+	if existing := listener.sessions.Get(remoteNode); existing != nil {
+		localLower := string(t.localNode) < string(remoteNode)
+		if !localLower {
+			// We should be the responder; the existing inbound is the
+			// preferred conversation. Close this outbound loser.
+			dbgHandshake.Printf("simultaneous-dial: closing outbound to %s (local %s >= remote)",
+				remoteNode.Short(), t.localNode.Short())
+			nc.Close()
+			return nil, aether.WrapOp("dial", aether.ProtoNoise, remoteNode,
+				fmt.Errorf("simultaneous-dial: local NodeID is the preferred responder; existing inbound wins"))
+		}
+		// We are lower; this outbound wins. Close the existing inbound
+		// loser asynchronously so it doesn't block our registration.
+		dbgHandshake.Printf("simultaneous-dial: displacing existing inbound for %s (local %s < remote)",
+			remoteNode.Short(), t.localNode.Short())
+		go existing.Close()
+	}
+
 	// Register in listener's session map so subsequent packets are dispatched correctly
 	listener.registerDialSession(addr, nc, remoteNode)
 
@@ -678,6 +711,44 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 	// Negotiate explicit nonce mode if both sides support it
 	if remoteCaps&capExplicitNonce != 0 {
 		nc.enableExplicitNonce()
+	}
+	// Simultaneous-dial deterministic tiebreak. When the peer has
+	// concurrently dialed us, both directions complete a handshake at
+	// nearly the same time and BOTH would Put into the session map at
+	// the same key (the peer's listener port). Without coordination, the
+	// second Put silently displaces the first, then any close on the
+	// displaced session clobbers the surviving session's map slot —
+	// orphaning a live conversation.
+	//
+	// Tiebreak rule (matches the upper-layer mesh dedup): keep the
+	// session where the lower-NodeID peer is the initiator. As responder
+	// here we keep this session only if our NodeID is HIGHER than the
+	// peer's — i.e., the peer is the lower-NodeID side and SHOULD be
+	// the initiator. If we are lower, our outbound dial is the
+	// preferred conversation and this inbound is closed.
+	//
+	// Applied only when an existing session is already registered for
+	// this NodeID — for first-time dials there is nothing to deduplicate.
+	// On a winning replacement we close the displaced outbound; the
+	// identity-matched parentStop ensures that close does not disturb
+	// the new entry we are about to install.
+	if existing := l.sessions.Get(remoteNode); existing != nil {
+		localLower := string(l.transport.localNode) < string(remoteNode)
+		if localLower {
+			// We should be the initiator; our outbound (the existing)
+			// is the preferred conversation. Close this inbound loser.
+			dbgHandshake.Printf("simultaneous-dial: closing inbound from %s (local %s < remote)",
+				remoteNode.Short(), l.transport.localNode.Short())
+			delete(l.handshakes, key)
+			l.mu.Unlock()
+			nc.Close()
+			return
+		}
+		// We are higher; this inbound wins. Close the existing outbound
+		// loser asynchronously so it doesn't block our Put.
+		dbgHandshake.Printf("simultaneous-dial: displacing existing outbound for %s (local %s > remote)",
+			remoteNode.Short(), l.transport.localNode.Short())
+		go existing.Close()
 	}
 	l.sessions.Put(remoteNode, key, scopeID, &noiseConnSession{conn: nc, nodeID: remoteNode})
 	delete(l.handshakes, key)

@@ -109,6 +109,12 @@ func (m *ConnectionMap) All() map[NodeID]Connection {
 
 // RemoveByAddr unregisters a session by its address string.
 // Returns the NodeID of the removed session, or "" if not found.
+//
+// Callers that hold a specific session reference and want to remove
+// ONLY entries that still point to that session (e.g., the close path
+// after a simultaneous-dial replacement) should use RemoveBy instead —
+// otherwise a stale-close on a displaced session would clobber the
+// winning session's entries by addr collision.
 func (m *ConnectionMap) RemoveByAddr(addr string) NodeID {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -138,6 +144,49 @@ func (m *ConnectionMap) RemoveByAddr(addr string) NodeID {
 		}
 	}
 	return nodeID
+}
+
+// RemoveBy unregisters all entries whose stored Connection matches the
+// caller's identity predicate. Used by close paths that hold a specific
+// session reference and want to remove ONLY entries that still belong
+// to that session — even if the addr/NodeID slot has since been
+// overwritten by a winning simultaneous-dial peer.
+//
+// Why this matters: when two peers concurrently dial each other on the
+// same transport (a same-region same-origin race), each peer's inbound
+// + outbound handshakes register under the SAME addr key (the peer's
+// listener port). Put silently overwrites the first. If the upper-layer
+// dedup then closes the displaced session, a plain RemoveByAddr would
+// clobber the WINNING session's map entries by addr collision —
+// orphaning a live session that no longer has any map presence, so
+// future inbound packets fall through to handleHandshake and get
+// silently dropped as malformed msg1. The peer eventually sees
+// "session stuck (no forward progress)" and tears the conversation
+// down even though the underlying UDP path was healthy.
+//
+// matchFn is called once per scanned entry with the entry's stored
+// session. Returning true removes that entry across all three indexes
+// (byAddr, byNodeID, byScope). matchFn MUST be cheap — it runs under
+// m.mu held for write.
+func (m *ConnectionMap) RemoveBy(matchFn func(Connection) bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for addr, sess := range m.byAddr {
+		if matchFn(sess) {
+			delete(m.byAddr, addr)
+		}
+	}
+	for id, sess := range m.byNodeID {
+		if matchFn(sess) {
+			delete(m.byNodeID, id)
+			for tid, nodeMap := range m.byScope {
+				delete(nodeMap, id)
+				if len(nodeMap) == 0 {
+					delete(m.byScope, tid)
+				}
+			}
+		}
+	}
 }
 
 // TenantCount returns the number of sessions for a specific scope.
