@@ -203,15 +203,36 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 	// Record stream activity for GC
 	s.streamGC.RecordActivity(frame.StreamID)
 
-	// Anti-replay check — unconditional for DATA (S7: feeds abuse score).
-	// Previously gated on FlagANTIREPLAY, which a peer could suppress to
-	// bypass per-stream replay protection. The noise/nonce_window layer
-	// catches connection-level encrypted-packet replays; this per-stream
-	// check defends against adversarial reordering within an open stream
-	// and must not be opt-out.
-	if !st.replay.Check(frame.SeqNo) {
+	// Anti-replay classification — distinguishes legitimate retransmits
+	// (drop silently, NO abuse) from genuine anomalies (drop AND feed
+	// abuse score). Conflating the two was the fleet-wide churn root
+	// cause: aether's own reliability layer retransmits frames when an
+	// ACK is lost or late, and on any path with non-zero loss those
+	// retransmits arrive after their originals — landing inside the
+	// replay window as ResultDuplicate. The old `Check()` returned
+	// false for all reject reasons, so every retransmit fed
+	// `abuse.ReasonReplayDetected` (weight 8). ~13 retransmits in
+	// ~28 s crossed the abuse threshold (100) and killed the session.
+	// On lossy paths this killed sessions faster than the connection
+	// manager could re-establish them, producing the rising-churn
+	// pattern.
+	//
+	// CheckV2 separates the cases: only Ancient (SeqNo below window
+	// bottom — a legitimate retransmit cannot land that far behind the
+	// reliability layer's send window) and WrapAttack (SeqNo jumped past
+	// half the uint32 space, impossible in a single rekey window) are
+	// reported as abuse. Duplicate is the protocol-correct behaviour of
+	// a working reliability layer under loss.
+	switch result := st.replay.CheckV2(frame.SeqNo); result {
+	case reliability.ResultNew:
+		// fall through to delivery below
+	case reliability.ResultDuplicate:
+		return // legitimate retransmit — drop silently, NO abuse
+	case reliability.ResultAncient, reliability.ResultWrapAttack:
 		s.reportAbuse(abuse.ReasonReplayDetected)
-		return // replayed frame — drop silently
+		return
+	default:
+		return
 	}
 
 	// Reliability: insert into receive window for reordering
