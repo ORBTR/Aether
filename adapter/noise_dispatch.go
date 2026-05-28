@@ -227,7 +227,29 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 	case reliability.ResultNew:
 		// fall through to delivery below
 	case reliability.ResultDuplicate:
-		return // legitimate retransmit — drop silently, NO abuse
+		// Legitimate retransmit — the sender's reliability layer
+		// re-sent a frame because its ACK was lost or arrived late.
+		// The original was already delivered + ACKed; this copy
+		// carries no new data.
+		//
+		// CRITICAL: force an immediate ACK so the sender's retransmit
+		// timer clears. The default ACK engine batches with a 25 ms
+		// delayed-ACK timer (Rule 5), but a duplicate is direct
+		// evidence that the previous ACK was lost — the receiver
+		// SHOULD be eager about replying to break the retransmit
+		// storm. Matches RFC 5681 §4.2 (TCP) / RFC 9002 §B.7 (QUIC).
+		// Without this, recovery from one lost ACK takes
+		// O(maxRetries × RTO) instead of one extra round-trip, and
+		// duplicate count climbs until the abuse-tracker fix
+		// (CheckResult split) is the only thing keeping the session
+		// alive — fix the symptom AND stop the storm.
+		//
+		// Skip recvWindow.Insert (already delivered) and
+		// congestion.OnAck (would double-count bytes).
+		if st.ackEngine != nil {
+			st.ackEngine.OnDuplicateReceived(frame.SeqNo)
+		}
+		return
 	case reliability.ResultAncient, reliability.ResultWrapAttack:
 		s.reportAbuse(abuse.ReasonReplayDetected)
 		return
