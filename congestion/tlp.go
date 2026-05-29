@@ -236,13 +236,26 @@ func (t *TLP) MarkProbeAcked() {
 }
 
 // AnyAckReceived is called by the adapter for every ACK (not just probe
-// ACKs). Resets the consecutiveProbes counter — if real data is being
-// ACKed normally we don't want a stale probe count to suppress future
-// TLPs.
+// ACKs) AND by STALL-DETECT's false-positive-recovery path (which has
+// just proven the path is alive via session-level Pings — equivalent to
+// an ACK from TLP's perspective). Resets every per-probe field so the
+// state matches the invariant "no probe is currently in flight":
+//
+//   - consecutiveProbes back to 0 (re-enables ShouldProbe after the
+//     adapter previously hit maxConsecutiveProbes)
+//   - probePending and pendingProbeSeq cleared so the diagnostic
+//     snapshot stops reporting a phantom in-flight probe
+//
+// Without clearing probePending here, FLOW-DIAG emits the contradictory
+// `probePending=true probes=0` after the false-positive recovery runs —
+// harmless on the data plane (ShouldProbe doesn't gate on probePending
+// per RFC 8985 §7.5) but breaks the operator-facing invariant.
 func (t *TLP) AnyAckReceived() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.consecutiveProbes = 0
+	t.probePending = false
+	t.pendingProbeSeq = 0
 }
 
 // PendingProbeSeq returns (seq, true) if a probe is currently in flight,
