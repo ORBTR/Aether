@@ -310,6 +310,15 @@ func (s *Scheduler) dequeueFromClass(targetClass aether.LatencyClass) *aether.Fr
 	frameSize := float64(aether.HeaderSize) + float64(frame.Length)
 	ss.deficit += frameSize / float64(ss.weight)
 
+	// Clear the retransmit flag after consuming it. The flag is documented
+	// as single-shot ("next enqueue for a stream as a retransmit") but was
+	// only ever set true and never cleared — so any stream that ever lost
+	// a packet kept the 2x WFQ cost penalty applied to every subsequent
+	// non-retransmit frame for the rest of the stream's lifetime,
+	// permanently de-prioritising it against healthy peers. Clear here,
+	// inside the same s.mu critical section that owns ss.isRetransmit.
+	ss.isRetransmit = false
+
 	return frame
 }
 
