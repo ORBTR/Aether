@@ -371,8 +371,30 @@ func (s *NoiseSession) reliabilityTick() {
 					prevCwnd := s.congestion().CWND()
 					s.congestion().ResetCWND()
 					newCwnd := s.congestion().CWND()
-					log.Printf("[STALL-DETECT] false-positive peer=%s age=%v warmup=%v effThresh=%s cwnd=%d→%d (persistent-congestion exit)",
-						s.RemoteNodeID().Short(), sessionAge, warmupActive, effectiveThreshold, prevCwnd, newCwnd)
+					// Reset per-stream TLP exhaustion counters. Without
+					// this, streams whose `tlp.consecutiveProbes` reached
+					// `maxConsecutiveProbes` during the loss burst that
+					// triggered the stall stay frozen — `ShouldProbe()`
+					// returns false forever, no further probes can fire,
+					// and the cwnd we just restored is unusable because
+					// reliability has no way to elicit an ACK.
+					//
+					// The session-level Pings that produced this
+					// false-positive verdict ARE proof the path is alive,
+					// which is exactly the signal `AnyAckReceived()` is
+					// designed to consume (per `tlp.go` doc: "if real
+					// data is being ACKed normally we don't want a stale
+					// probe count to suppress future TLPs").
+					var tlpResetCount int
+					for _, e := range snap {
+						state := e.st.tlp.Snapshot()
+						if state.ConsecutiveProbes > 0 {
+							e.st.tlp.AnyAckReceived()
+							tlpResetCount++
+						}
+					}
+					log.Printf("[STALL-DETECT] false-positive peer=%s age=%v warmup=%v effThresh=%s cwnd=%d→%d tlpReset=%d (persistent-congestion exit)",
+						s.RemoteNodeID().Short(), sessionAge, warmupActive, effectiveThreshold, prevCwnd, newCwnd, tlpResetCount)
 					s.dumpFlowDiagOnStall("false-positive")
 					// Wake the writeLoop so it re-evaluates CanSend with
 					// the freshly-reset cwnd. Without this, the deadlock
