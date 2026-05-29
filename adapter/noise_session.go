@@ -476,7 +476,14 @@ func (s *NoiseSession) notifyStreamAccepted(st *noiseStream) {
 //      (peer happens to send something else within 2 s) are fine for
 //      the keepalive use case; the goal is detecting silence.
 func (s *NoiseSession) Ping(ctx context.Context) (time.Duration, error) {
-	return aether.WaitForActivityPing(ctx, s.Health(), s.closed, func(seqNo uint32) error {
+	// CloseSignal() is owned by BaseSession and IS allocated; the local
+	// `s.closed` field (declared on NoiseSession but never make()d) was
+	// silently passing nil here, which kept the WaitForActivityPing
+	// closeSignal select-arm always-blocked and defeated the documented
+	// fast-fail-on-dead-session behaviour. Use the BaseSession signal
+	// so a session torn down mid-probe returns ErrSessionClosed
+	// immediately instead of polling LastActivity for the deadline.
+	return aether.WaitForActivityPing(ctx, s.Health(), s.CloseSignal(), func(seqNo uint32) error {
 		return s.writeFrame(&aether.Frame{
 			SenderID:   s.LocalPeerID(),
 			ReceiverID: s.RemotePeerID(),

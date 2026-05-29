@@ -427,8 +427,20 @@ func (q *qualityState) runEnsure(ctx context.Context, m *Manager) {
 		cancel()
 		if err != nil {
 			consecutiveFails++
-			backoff := baseBackoff << uint(consecutiveFails-1)
-			if backoff > maxBackoff {
+			// Cap the shift before applying. baseBackoff (5s) << 5 already
+			// equals 160s — well past maxBackoff (60s). Without this cap,
+			// consecutiveFails ~33+ overflows the int64 left-shift and
+			// flips backoff negative (observed in fleet logs as
+			// `backoff=-1759548h`). The `> maxBackoff` clamp below
+			// doesn't catch negative values, so timer.Reset(<0) fires
+			// immediately and a permanently-unreachable peer drives a
+			// dial-storm at full speed.
+			shift := consecutiveFails - 1
+			if shift > 5 {
+				shift = 5
+			}
+			backoff := baseBackoff << uint(shift)
+			if backoff > maxBackoff || backoff <= 0 {
 				backoff = maxBackoff
 			}
 			log.Printf("[multipath] EnsureK dial failed (peer=%s, attempt=%d, backoff=%v): %v",

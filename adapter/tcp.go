@@ -333,6 +333,18 @@ func (s *TCPSession) deliverToStream(frame *aether.Frame) {
 		dbgTCP.Printf("deliverToStream: no stream for ID=%d, dropping %d bytes", frame.StreamID, frame.Length)
 		return // unknown stream, drop
 	}
+	// Recover from a `send on closed channel` panic. handleClose deletes
+	// the stream from s.streams BEFORE closing recvCh under the same
+	// lock, so a fresh lookup after handleClose returns ok=false and we
+	// drop the frame cleanly. But a race remains: a goroutine that read
+	// `st` from s.streams BEFORE handleClose's lock window can reach the
+	// send below AFTER recvCh is closed. The recover() turns the panic
+	// into a logged drop — same semantics as a closed peer.
+	defer func() {
+		if r := recover(); r != nil {
+			dbgTCP.Printf("deliverToStream: send-on-closed for stream %d (race with handleClose): %v", frame.StreamID, r)
+		}
+	}()
 	delivered := DeliverToRecvChWithSignals(st.recvCh, frame.Payload, st.window, frame.StreamID, s.sendWindowUpdateAgnostic, s.SendCongestion)
 	if delivered {
 		// ACK-observe: track metrics (no wire ACK, no retransmit)
@@ -505,12 +517,32 @@ func (s *TCPSession) handleImplicitOpen(frame *aether.Frame) {
 func (s *TCPSession) handleClose(frame *aether.Frame) {
 	s.mu.Lock()
 	st, ok := s.streams[frame.StreamID]
+	if !ok {
+		s.mu.Unlock()
+		s.compressor.RemoveStream(frame.StreamID)
+		return
+	}
+	// Transition AND remove-from-map BEFORE releasing s.mu, so that any
+	// concurrent deliverToStream which has not yet acquired s.mu will
+	// see the deleted entry and drop the frame; the residual race (a
+	// reader that already cached `st` before this lock acquisition) is
+	// handled by deliverToStream's panic-recover.
+	st.state.Transition(aether.EventRecvFIN)
+	fullyClosed := !st.state.IsOpen()
+	if fullyClosed {
+		delete(s.streams, frame.StreamID)
+	}
 	s.mu.Unlock()
-	if ok {
-		st.state.Transition(aether.EventRecvFIN)
-		if !st.state.IsOpen() {
-			st.teardown()
-			close(st.recvCh)
+
+	if fullyClosed {
+		st.teardown()
+		close(st.recvCh)
+		// Mirror NoiseSession.handleClose: release scheduler and
+		// streamGC resources so a long-running session doesn't bloat
+		// internal maps with one entry per fully-closed dynamic stream.
+		s.sched.Unregister(frame.StreamID)
+		if s.streamGC != nil {
+			s.streamGC.Unregister(frame.StreamID)
 		}
 	}
 	s.compressor.RemoveStream(frame.StreamID)

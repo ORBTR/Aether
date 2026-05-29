@@ -614,7 +614,17 @@ func (w *StreamWindow) ShrinkWindow(n int64) int64 {
 	w.mu.Lock()
 	w.initialDeficit += n
 	w.currentWindow -= n
-	dbgFlow.Printf("ShrinkWindow by=%d currentWindow=%d deficit=%d", n, w.currentWindow, w.initialDeficit)
+	// Maintain the recvCredit <= currentWindow invariant. grantLocked
+	// suppresses WINDOW_UPDATE emission when recvCredit > currentWindow,
+	// and ReceiverConsume is the only path that decrements recvCredit —
+	// so a shrunk-while-idle stream can sit indefinitely with the sender
+	// stalled waiting for a grant that never emits. Clamp here so the
+	// post-shrink state always satisfies recvCredit <= currentWindow
+	// and grantLocked can resume emitting updates.
+	if w.recvCredit > w.currentWindow {
+		w.recvCredit = w.currentWindow
+	}
+	dbgFlow.Printf("ShrinkWindow by=%d currentWindow=%d deficit=%d recvCredit=%d", n, w.currentWindow, w.initialDeficit, w.recvCredit)
 	w.mu.Unlock()
 	return n
 }
