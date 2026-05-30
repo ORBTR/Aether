@@ -20,7 +20,16 @@ const (
 	// MaxACKCumulativeJump caps the distance between the current send-window
 	// base and ack.BaseACK. A normal peer's BaseACK advances by small numbers
 	// per ACK; jumps larger than this are rejected.
-	MaxACKCumulativeJump uint32 = 4096
+	//
+	// Raised from 4096 to 65536 (Finding L from aether deep-review
+	// 2026-05-31). At 4096, a peer that fell behind during a stall and
+	// then resumed (e.g. catching up after a 5s wedge) could send a
+	// cumulative ACK covering > 4096 seq numbers, causing this validator
+	// to reject EVERY recovery ACK as "suspicious" — leaving the sender's
+	// window stuck forever. The new ceiling is sendWindow.maxSize × 2,
+	// which is still well below the 2^31 attack threshold but big enough
+	// to absorb realistic backlogs from recovery-after-wedge.
+	MaxACKCumulativeJump uint32 = 65536
 
 	// MaxACKRangeSize caps the size of any ExtRange / DroppedRange block.
 	MaxACKRangeSize uint32 = 1024
@@ -67,12 +76,25 @@ type SendWindow struct {
 	// (out-of-range BaseACK jump, oversized range, invalid bitmap length).
 	// See _SECURITY.md §3.2.
 	suspiciousACKs uint64
+
+	// Atomic counter of ACKs silently no-op'd because BaseACK < base
+	// (stale / reordered ACK against an already-advanced send window).
+	// Surfaced via StaleBaseACKsCount() for observability — was Finding I
+	// from aether deep-review 2026-05-31: high counts of stale ACKs after
+	// reorder produced a silent ACK starvation window with no signal.
+	staleBaseACKs uint64
 }
 
 // SuspiciousACKsCount returns the number of Composite ACKs rejected
 // because they failed sanity checks (ACK CPU-exhaustion defence).
 func (w *SendWindow) SuspiciousACKsCount() uint64 {
 	return atomic.LoadUint64(&w.suspiciousACKs)
+}
+
+// StaleBaseACKsCount returns the number of Composite ACKs silently
+// no-op'd because BaseACK < base (stale / reordered).
+func (w *SendWindow) StaleBaseACKsCount() uint64 {
+	return atomic.LoadUint64(&w.staleBaseACKs)
 }
 
 // NewSendWindow creates a send window with the given maximum size.
@@ -268,7 +290,10 @@ func (w *SendWindow) ProcessCompositeACK(ack *aether.CompositeACK, reorderThresh
 		}
 	} else {
 		// BaseACK before our base — stale or bogus, ignore but don't flag
-		// (can legitimately happen with reordered ACKs).
+		// as suspicious (can legitimately happen with reordered ACKs).
+		// Count separately for observability — bursts of stale ACKs
+		// during a wedge are diagnostic.
+		atomic.AddUint64(&w.staleBaseACKs, 1)
 		return nil, nil
 	}
 
@@ -429,6 +454,33 @@ func (w *SendWindow) InFlight() int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return len(w.entries)
+}
+
+// InFlightBytes returns the on-wire size of all unacknowledged frames in
+// this window (sum of HeaderSize + Frame.Length per entry).
+//
+// Was Finding E from aether deep-review 2026-05-31: NoiseSession.writeLoop
+// previously called c.congestion().CanSend(frameSize) — passing the next
+// frame's size as if it were the cumulative in-flight byte count. CUBIC's
+// contract is `inFlight < cwnd`, so a per-frame call with frameSize ≪ cwnd
+// always returned true, bypassing congestion control entirely. Callers now
+// sum InFlightBytes() across the session's live streams and pass that plus
+// the prospective frameSize so CUBIC actually gates sends.
+//
+// O(entries) per call under the SendWindow lock. Acceptable: invoked once
+// per writeLoop send (a few times per ms at peak), with entries.count
+// bounded by maxSize (typically a few hundred).
+func (w *SendWindow) InFlightBytes() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var total int64
+	for _, e := range w.entries {
+		if e.Frame == nil {
+			continue
+		}
+		total += int64(aether.HeaderSize) + int64(e.Frame.Length)
+	}
+	return total
 }
 
 // Base returns the oldest unacked SeqNo.

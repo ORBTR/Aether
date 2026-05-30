@@ -70,6 +70,12 @@ type noiseStream struct {
 	lastBaseACKSeen        atomic.Uint32
 	lastProgressAtUnixNano atomic.Int64
 
+	// lastAckSilentLogUnixNano throttles the [ACK-SILENT] warning so
+	// reliabilityTick logs at most once per minute per stream. Otherwise
+	// a wedged stream would flood the log at 10 ms ticker resolution.
+	// Was Finding M from aether deep-review 2026-05-31.
+	lastAckSilentLogUnixNano atomic.Int64
+
 	// rack runs RFC 8985 time-based loss detection on this stream.
 	// Updated by handleACK on every successful ACK (Ack call), consulted
 	// each reliability tick to enumerate freshly-lost seqs to retransmit.
@@ -212,7 +218,22 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 	// Register with stream GC for idle timeout tracking
 	s.streamGC.Register(streamID)
 
-	s.sched.Register(streamID, cfg.Priority, cfg.Dependency)
+	// Propagate cfg.LatencyClass to the scheduler. The previous call to
+	// s.sched.Register(...) defaulted every stream to DefaultLatencyClass
+	// (ClassBULK), so callers like Library that explicitly requested
+	// ClassINTERACTIVE on stream 1 (BidiRPC) saw their setting silently
+	// dropped — RPC dispatch competed with gossip at the lowest priority.
+	// Was Finding D from aether deep-review 2026-05-31.
+	//
+	// ClassUnset (zero value) means the caller didn't specify a class —
+	// fall back to DefaultLatencyClass(streamID) rather than treating the
+	// omission as ClassREALTIME (which would funnel every default-config
+	// stream past the scheduler's 10% bandwidth cap).
+	class := cfg.LatencyClass
+	if class == aether.ClassUnset {
+		class = aether.DefaultLatencyClass(streamID)
+	}
+	s.sched.RegisterWithClass(streamID, cfg.Priority, cfg.Dependency, class)
 	return st
 }
 

@@ -522,7 +522,13 @@ func (s *TCPSession) handleImplicitOpen(frame *aether.Frame) {
 	st.attachGrantDebouncer()
 	st.state.Transition(aether.EventRecvData)
 
-	s.sched.Register(frame.StreamID, cfg.Priority, cfg.Dependency)
+	// Propagate cfg.LatencyClass (Finding D parity with noise adapter).
+	// ClassUnset (zero value) → DefaultLatencyClass(streamID).
+	classAccepted := cfg.LatencyClass
+	if classAccepted == aether.ClassUnset {
+		classAccepted = aether.DefaultLatencyClass(frame.StreamID)
+	}
+	s.sched.RegisterWithClass(frame.StreamID, cfg.Priority, cfg.Dependency, classAccepted)
 
 	s.notifyStreamAccepted(st)
 }
@@ -836,7 +842,13 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 	}
 	st.attachGrantDebouncer()
 
-	s.sched.Register(cfg.StreamID, cfg.Priority, cfg.Dependency)
+	// Propagate cfg.LatencyClass (Finding D parity with noise adapter).
+	// ClassUnset (zero value) → DefaultLatencyClass(streamID).
+	classOpen := cfg.LatencyClass
+	if classOpen == aether.ClassUnset {
+		classOpen = aether.DefaultLatencyClass(cfg.StreamID)
+	}
+	s.sched.RegisterWithClass(cfg.StreamID, cfg.Priority, cfg.Dependency, classOpen)
 
 	// Implicit OPEN via SYN flag — saves 50 bytes by combining OPEN with first DATA frame.
 	// The OPEN payload (reliability, priority, dependency) rides as the DATA frame's payload.

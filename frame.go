@@ -555,27 +555,47 @@ const (
 // LatencyClass defines the scheduling priority class for a stream.
 // Strict priority between classes: REALTIME > INTERACTIVE > BULK.
 // WFQ by weight within each class.
+//
+// Numeric reservation: 0 is reserved as ClassUnset so callers who leave
+// StreamConfig.LatencyClass at its zero value can be distinguished from
+// callers who explicitly chose REALTIME. Adapter call sites translate
+// ClassUnset → DefaultLatencyClass(streamID). Was Finding D follow-up
+// from aether deep-review 2026-05-31 — the previous numbering
+// (REALTIME=0) silently routed every config-omits-class stream into
+// REALTIME, then the scheduler's 10%-bandwidth cap demoted them past
+// every other class on the same session, stalling delivery.
+//
+// LatencyClass is NOT carried on the wire (OpenPayload encodes only
+// Reliability + Priority + Dependency). Each peer schedules its own
+// outbound frames per its local config, so renumbering is wire-safe.
 type LatencyClass uint8
 
 const (
+	// ClassUnset is the zero value reserved for "caller didn't specify".
+	// Callers must NEVER set this explicitly; adapter sites substitute
+	// DefaultLatencyClass(streamID).
+	ClassUnset LatencyClass = 0
+
 	// ClassREALTIME is strict-priority, never queued behind BULK.
 	// Bandwidth-capped at 10% of link to prevent abuse.
 	// Use for: PING/PONG, WHOIS, RENDEZVOUS, input events, emergency policy.
-	ClassREALTIME LatencyClass = 0
+	ClassREALTIME LatencyClass = 1
 
 	// ClassINTERACTIVE is medium priority, served after REALTIME, before BULK.
 	// Use for: RPC dispatch, screen key frames, tunnels, normal policy.
-	ClassINTERACTIVE LatencyClass = 1
+	ClassINTERACTIVE LatencyClass = 2
 
 	// ClassBULK is lowest priority, gets remaining bandwidth.
 	// WFQ by weight within this class.
 	// Use for: gossip, telemetry, file transfer, screen deltas.
-	ClassBULK LatencyClass = 2
+	ClassBULK LatencyClass = 3
 )
 
 // String returns a human-readable class name.
 func (c LatencyClass) String() string {
 	switch c {
+	case ClassUnset:
+		return "UNSET"
 	case ClassREALTIME:
 		return "REALTIME"
 	case ClassINTERACTIVE:
