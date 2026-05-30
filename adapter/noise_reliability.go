@@ -51,9 +51,19 @@ func (s *NoiseSession) writeLoop() {
 			// fleet-wide `tlp{scheduledIn=-29s probePending=true probes=1}`
 			// wedge we saw in production. Regular frames still respect
 			// CanSend (and re-enqueue + park until cwnd advances).
-			if !isProbe && !s.congestion().CanSend(int64(frameSize)) {
-				s.sched.Enqueue(frame.StreamID, frame)
-				break
+			//
+			// Finding E (aether deep-review 2026-05-31): CanSend's contract
+			// is `inFlight < cwnd`, but the previous call passed frameSize
+			// (the prospective send) instead of cumulative in-flight bytes.
+			// frameSize ≪ cwnd ⇒ CanSend ≡ true ⇒ CUBIC was disabled in
+			// production. Sum InFlightBytes across the session's streams,
+			// then test `inFlight + frameSize ≤ cwnd`.
+			if !isProbe {
+				inFlightBytes := s.totalInFlightBytes()
+				if !s.congestion().CanSend(inFlightBytes + int64(frameSize)) {
+					s.sched.Enqueue(frame.StreamID, frame)
+					break
+				}
 			}
 
 			// Pacing: park exactly as long as the pacer says.
@@ -97,6 +107,35 @@ func (s *NoiseSession) writeLoop() {
 		case <-wake:
 		}
 	}
+}
+
+// totalInFlightBytes sums InFlightBytes() across every live stream's send
+// window. Used by the CUBIC CanSend gate in writeLoop (Finding E).
+//
+// Snapshot-then-iterate to avoid holding s.mu while taking per-stream
+// SendWindow locks. Per-stream InFlightBytes already locks the stream's
+// own window briefly; combining both locks under s.mu would risk
+// contending with handleACK / handleData / OpenStream for no benefit.
+func (s *NoiseSession) totalInFlightBytes() int64 {
+	s.mu.Lock()
+	if len(s.streams) == 0 {
+		s.mu.Unlock()
+		return 0
+	}
+	streams := make([]*noiseStream, 0, len(s.streams))
+	for _, st := range s.streams {
+		streams = append(streams, st)
+	}
+	s.mu.Unlock()
+
+	var total int64
+	for _, st := range streams {
+		if st == nil || st.sendWindow == nil {
+			continue
+		}
+		total += st.sendWindow.InFlightBytes()
+	}
+	return total
 }
 
 // reliabilityTick checks for retransmission timeouts periodically.
@@ -407,6 +446,60 @@ func (s *NoiseSession) reliabilityTick() {
 				s.dumpFlowDiagOnStall("confirmed-stuck")
 				s.CloseWithError(aether.ErrSessionStuck)
 				return
+			}
+
+			// Per-stream stuck detector. STALL-DETECT above is session-
+			// level: lastAnyProgressAt resets when ANY stream makes
+			// progress. So a wedged stream-1 (BidiRPC) while stream-0
+			// (gossip) ticks happily never trips session-level STALL-
+			// DETECT, and the BidiRPC wedge can persist for minutes.
+			// Was Finding K from aether deep-review 2026-05-31.
+			//
+			// Per-stream rule: any stream with in-flight > 0 AND no
+			// progress for stuckStreamThreshold while the SESSION is
+			// healthy (we just saw progress on some other stream) is
+			// individually wedged. Reset that stream's TLP exhaustion
+			// so probes can resume. Don't close the session — we have
+			// evidence the path is alive via the other stream(s).
+			const stuckStreamThreshold = 30 * time.Second
+			nowNano := time.Now().UnixNano()
+			for _, e := range snap {
+				inFlight := e.st.sendWindow.InFlight()
+				if inFlight == 0 {
+					continue
+				}
+				lastProgressNs := e.st.lastProgressAtUnixNano.Load()
+				if lastProgressNs == 0 {
+					continue
+				}
+				if time.Duration(nowNano-lastProgressNs) < stuckStreamThreshold {
+					continue
+				}
+				// Stream individually wedged. Reset its TLP so probes can
+				// resume; the next ACK (or its absence) decides whether
+				// the path is genuinely stuck or just under temporary
+				// loss. Log once per stream per detection.
+				tlpState := e.st.tlp.Snapshot()
+				if tlpState.ConsecutiveProbes > 0 {
+					e.st.tlp.AnyAckReceived()
+					log.Printf("[STREAM-STUCK-DETECT] peer=%s stream=%d inFlight=%d progressAge=%v tlpReset",
+						s.RemoteNodeID().Short(), e.id, inFlight, time.Duration(nowNano-lastProgressNs))
+				}
+
+				// [ACK-SILENT]: explicit warning when this stream has been
+				// sending without ACK progress for >30s but TLP isn't
+				// telling us anything is wrong (e.g. no probes scheduled
+				// because we already disarmed). One per stream per minute.
+				// Was Finding M from aether deep-review 2026-05-31 — the
+				// silent-ACK starvation case lacked an obvious log signal.
+				lastWarn := e.st.lastAckSilentLogUnixNano.Load()
+				if nowNano-lastWarn > int64(time.Minute) &&
+					e.st.lastAckSilentLogUnixNano.CompareAndSwap(lastWarn, nowNano) {
+					log.Printf("[ACK-SILENT] peer=%s stream=%d inFlight=%d progressAge=%v sendBase=%d — no ACK progress",
+						s.RemoteNodeID().Short(), e.id, inFlight,
+						time.Duration(nowNano-lastProgressNs),
+						e.st.sendWindow.Base())
+				}
 			}
 
 			// PMTU probe timeout check + periodic re-probe (no s.mu needed)

@@ -272,8 +272,24 @@ func (e *ACKEngine) flushLocked() {
 	}
 	e.timerMu.Unlock()
 
-	if e.sendACK != nil {
-		e.sendACK(ack)
+	// CRITICAL: release e.mu BEFORE calling sendACK. sendACK ultimately
+	// invokes writeFrame → conn.Write which can block up to writeFrame-
+	// Deadline (10s). If e.mu were held across that, every subsequent
+	// OnDataReceived call would block on the lock — incoming frames pile
+	// up, recvCh fills, ACK generation grinds to a halt across the whole
+	// session. This was Finding B from the aether deep-review 2026-05-31:
+	// recurring multi-minute wedge symptom with ACK-engine-mu pinned by
+	// the AfterFunc callback at startTimerLocked() (line ~380).
+	//
+	// The lock-yield-then-call pattern requires the caller to hold e.mu
+	// at function entry — which all flushLocked() call sites do. We
+	// release before invoking the callback, then RE-ACQUIRE so the
+	// caller's deferred Unlock remains correct.
+	sendACK := e.sendACK
+	prevACK := e.lastACK
+	e.mu.Unlock()
+	if sendACK != nil {
+		sendACK(ack)
 		// Counter-bump per emission. Periodically logged so we can
 		// observe ACK production rate at the receiver side. If this
 		// counter is incrementing while peers' sendBase still stays
@@ -281,16 +297,30 @@ func (e *ACKEngine) flushLocked() {
 		// inbound on peer). If this counter never moves, ACKs aren't
 		// being generated at all (engine policy never fires).
 		count := ackEmitCount.Add(1)
-		nowNano := time.Now().UnixNano()
-		lastNano := lastAckLogAt.Load()
-		if nowNano-lastNano > int64(60*time.Second) && lastAckLogAt.CompareAndSwap(lastNano, nowNano) {
-			baseStr := uint32(0)
-			if ack != nil {
-				baseStr = ack.BaseACK
+		baseStr := uint32(0)
+		if ack != nil {
+			baseStr = ack.BaseACK
+		}
+		// First ACK after >1s of silence is suspicious — under healthy
+		// load this engine fires every 25ms or sooner. Always log it
+		// regardless of the 60s sampling window. Was Finding M from
+		// aether deep-review 2026-05-31: silent ACK starvation periods
+		// were diagnostically invisible because [ACK-EMIT] only sampled
+		// once per minute.
+		now := time.Now()
+		if !prevACK.IsZero() && now.Sub(prevACK) > time.Second {
+			log.Printf("[ACK-EMIT] resumed after %v silence baseACK=%d cumulative=%d",
+				now.Sub(prevACK).Round(time.Millisecond), baseStr, count)
+		} else {
+			nowNano := now.UnixNano()
+			lastNano := lastAckLogAt.Load()
+			if nowNano-lastNano > int64(60*time.Second) && lastAckLogAt.CompareAndSwap(lastNano, nowNano) {
+				log.Printf("[ACK-EMIT] cumulative=%d sample baseACK=%d", count, baseStr)
 			}
-			log.Printf("[ACK-EMIT] cumulative=%d sample baseACK=%d", count, baseStr)
 		}
 	}
+	// Re-acquire so the caller's deferred Unlock still pairs with one Lock.
+	e.mu.Lock()
 }
 
 func (e *ACKEngine) buildLocked() *aether.CompositeACK {

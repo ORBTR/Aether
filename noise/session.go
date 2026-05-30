@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -252,9 +253,17 @@ func (c *noiseConn) decryptAndDeliver(msg []byte) error {
 		case c.inbox <- append([]byte(nil), payload...):
 			return nil
 		default:
-			atomic.AddUint64(&c.inboxDrops, 1)
-			dbgSession.Printf("Inbox full for %s — dropping packet (%d bytes, total drops: %d)",
-				c.remoteNode, len(payload), atomic.LoadUint64(&c.inboxDrops))
+			drops := atomic.AddUint64(&c.inboxDrops, 1)
+			// Promote the FIRST drop of a burst to log.Printf so a wedge
+			// that causes silent ACK starvation surfaces immediately —
+			// the prior debug-gated dbgSession.Printf was invisible in
+			// production. Continue to log every 1000th drop unconditionally
+			// so a sustained drop storm still produces signal without
+			// log spam. Was Finding F from aether deep-review 2026-05-31.
+			if drops == 1 || drops%1000 == 0 {
+				log.Printf("[INBOX-DROP] peer=%s dropping packet (%d bytes, total drops: %d)",
+					c.remoteNode, len(payload), drops)
+			}
 			return nil
 		}
 	case relay.PacketTypePing:

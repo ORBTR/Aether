@@ -50,8 +50,14 @@ const (
 	minBackpressure = 10 * time.Millisecond
 
 	// maxBackpressure is the longest wait before dropping a frame.
-	// Used for occasional overflow (application momentarily slow).
-	maxBackpressure = 200 * time.Millisecond
+	// Lowered from 200ms to 25ms to match ACKEngine.MaxDelay. The prior
+	// 200ms cap allowed a single slow consumer to stall the readLoop for
+	// 8× the ACK-delay budget — during that stall the noise inbox
+	// (128 slots) could overflow, dropping inbound ACKs for OTHER
+	// streams silently. Was Finding C from aether deep-review 2026-05-31.
+	// At 25ms, even a fully-saturated burst is bounded to one ACK-delay
+	// cycle, so backpressure can't starve ACK production fleet-wide.
+	maxBackpressure = 25 * time.Millisecond
 
 	// dropRateThreshold: when the recent drop rate exceeds this,
 	// reduce backpressure to avoid stalling the readLoop.

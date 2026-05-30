@@ -188,16 +188,11 @@ func (s *NoiseSession) Throttle() *aether.CongestionThrottle {
 }
 
 func (s *NoiseSession) handleData(frame *aether.Frame) {
-	// Recover from a `send on closed channel` panic. handleReset / local
-	// Reset / streamGC sweep can run closeRecvOnce after this goroutine
-	// has cached `st` from the s.streams lookup. The recover() turns the
-	// panic into a logged drop with no other side effects — matches the
-	// TCP adapter's deliverToStream defense (tcp.go:354-360).
-	defer func() {
-		if r := recover(); r != nil {
-			dbgNoise.Printf("handleData: send-on-closed for stream %d (race with teardown): %v", frame.StreamID, r)
-		}
-	}()
+	// Recover from a `send on closed channel` panic is scoped to the
+	// delivery loop below — broad function-wide recover would silently
+	// swallow unrelated bugs (nil deref, internal state corruption) and
+	// turn correctness regressions into invisible drops. Was Finding G
+	// from aether deep-review 2026-05-31.
 	s.mu.Lock()
 	st, ok := s.streams[frame.StreamID]
 	s.mu.Unlock()
@@ -269,24 +264,48 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 
 	// Reliability: insert into receive window for reordering
 	delivered := st.recvWindow.Insert(frame.SeqNo, frame.Payload)
-	for _, payload := range delivered {
-		ok := DeliverToRecvChWithSignals(st.recvCh, payload, st.window, st.streamID, s.sendWindowUpdateAgnostic, s.SendCongestion)
-		// Conn-level flow control: successful delivery grants credit at
-		// application-read time via the session debouncer (Receive →
-		// connGrantDebouncer.Record). On drop, the debouncer will never
-		// see these bytes so we must grant directly here to prevent a
-		// permanent conn-level stall.
-		if !ok {
-			if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
-				s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
-			}
-		}
-	}
 
-	// Notify ACK engine — it decides when to send based on adaptive policy
+	// Notify ACK engine BEFORE the delivery loop. DeliverToRecvChWith-
+	// Signals can block up to maxBackpressure (now 25ms, was 200ms) on
+	// a slow consumer; deferring the ACK-engine notify behind that
+	// stall meant the readLoop pipeline held off ACK generation for
+	// EVERY frame on EVERY stream while one stream's recvCh was full.
+	// noise inbox (128 slots) overflows during that window, silently
+	// dropping inbound ACKs for OTHER streams. Was Finding C from
+	// aether deep-review 2026-05-31 — observed in production as
+	// rack.fackAge climbing across all streams concurrently.
+	//
+	// The ACK engine only does in-memory state updates + may emit a
+	// CompositeACK; it never blocks on a stream's recvCh. Safe to
+	// promote ahead of delivery.
 	if st.ackEngine != nil {
 		st.ackEngine.OnDataReceived(frame.SeqNo, frame.StreamID == s.layout.Control)
 	}
+
+	// Delivery loop: handleReset / local Reset / streamGC sweep can run
+	// closeRecvOnce after this goroutine cached `st`, racing with the
+	// channel-send inside DeliverToRecvChWithSignals. Recover narrowly
+	// scoped to that send (Finding G).
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				dbgNoise.Printf("handleData: send-on-closed for stream %d (race with teardown): %v", frame.StreamID, r)
+			}
+		}()
+		for _, payload := range delivered {
+			ok := DeliverToRecvChWithSignals(st.recvCh, payload, st.window, st.streamID, s.sendWindowUpdateAgnostic, s.SendCongestion)
+			// Conn-level flow control: successful delivery grants credit at
+			// application-read time via the session debouncer (Receive →
+			// connGrantDebouncer.Record). On drop, the debouncer will never
+			// see these bytes so we must grant directly here to prevent a
+			// permanent conn-level stall.
+			if !ok {
+				if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
+					s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
+				}
+			}
+		}
+	}()
 
 	// Congestion controller: record data received
 	s.congestion().OnAck(int64(frame.Length), st.rtt.SRTT())
@@ -531,13 +550,9 @@ func (s *NoiseSession) handleOpen(frame *aether.Frame) {
 }
 
 func (s *NoiseSession) handleImplicitOpen(frame *aether.Frame) {
-	// Same recover() pattern as handleData — implicit-open races with
-	// teardown if the peer reuses a freshly-closed StreamID.
-	defer func() {
-		if r := recover(); r != nil {
-			dbgNoise.Printf("handleImplicitOpen: send-on-closed for stream %d (race with teardown): %v", frame.StreamID, r)
-		}
-	}()
+	// Recover scoped to the delivery loop only (Finding G — same reasoning
+	// as handleData). Any panic outside the channel-send is a real bug and
+	// must not be silently swallowed.
 	st := s.createStream(frame.StreamID, aether.DefaultStreamConfig(frame.StreamID), true /* enforceRemoteCap */)
 	if st == nil {
 		return
@@ -546,17 +561,35 @@ func (s *NoiseSession) handleImplicitOpen(frame *aether.Frame) {
 
 	s.notifyStreamAccepted(st)
 
-	// Deliver the data
+	// Reliability: insert into recv window.
 	delivered := st.recvWindow.Insert(frame.SeqNo, frame.Payload)
-	for _, payload := range delivered {
-		ok := DeliverToRecvChWithSignals(st.recvCh, payload, st.window, st.streamID, s.sendWindowUpdateAgnostic, s.SendCongestion)
-		// Drop-only conn-level credit: see handleData.
-		if !ok {
-			if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
-				s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
+
+	// Prime the ACK engine for the implicit-open's first frame BEFORE
+	// the delivery loop. Without this, the first frame on a peer-initiated
+	// stream sat un-ACKed until a SECOND frame arrived (which would call
+	// handleData's notify) — wasting a round-trip on every stream open.
+	// Mirrors handleData's reorder (Finding C). Was Finding H from
+	// aether deep-review 2026-05-31.
+	if st.ackEngine != nil {
+		st.ackEngine.OnDataReceived(frame.SeqNo, frame.StreamID == s.layout.Control)
+	}
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				dbgNoise.Printf("handleImplicitOpen: send-on-closed for stream %d (race with teardown): %v", frame.StreamID, r)
+			}
+		}()
+		for _, payload := range delivered {
+			ok := DeliverToRecvChWithSignals(st.recvCh, payload, st.window, st.streamID, s.sendWindowUpdateAgnostic, s.SendCongestion)
+			// Drop-only conn-level credit: see handleData.
+			if !ok {
+				if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
+					s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
+				}
 			}
 		}
-	}
+	}()
 }
 
 func (s *NoiseSession) handleClose(frame *aether.Frame) {
@@ -792,24 +825,25 @@ func (s *NoiseSession) sendWindowUpdateAgnostic(streamID uint64, credit uint64) 
 
 // deliverToStream delivers raw payload to a stream's receive channel.
 func (s *NoiseSession) deliverToStream(streamID uint64, payload []byte) {
-	// Same recover() pattern as handleData / handleImplicitOpen — the
-	// stream lookup result `st` can be torn down by handleReset / local
-	// Reset / streamGC sweep between lookup and the send below.
+	s.mu.Lock()
+	st, ok := s.streams[streamID]
+	s.mu.Unlock()
+	if !ok {
+		return
+	}
+	// Recover narrowly scoped to the channel-send (Finding G — same
+	// reasoning as handleData). handleReset / local Reset / streamGC
+	// sweep can run closeRecvOnce after the lookup above.
 	defer func() {
 		if r := recover(); r != nil {
 			dbgNoise.Printf("deliverToStream: send-on-closed for stream %d (race with teardown): %v", streamID, r)
 		}
 	}()
-	s.mu.Lock()
-	st, ok := s.streams[streamID]
-	s.mu.Unlock()
-	if ok {
-		delivered := DeliverToRecvChWithSignals(st.recvCh, payload, st.window, streamID, s.sendWindowUpdateAgnostic, s.SendCongestion)
-		// Drop-only conn-level credit: see handleData.
-		if !delivered {
-			if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
-				s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
-			}
+	delivered := DeliverToRecvChWithSignals(st.recvCh, payload, st.window, streamID, s.sendWindowUpdateAgnostic, s.SendCongestion)
+	// Drop-only conn-level credit: see handleData.
+	if !delivered {
+		if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
+			s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
 		}
 	}
 }
