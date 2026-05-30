@@ -343,9 +343,28 @@ func (c *noiseConn) sendPacket(packetType byte, payload []byte) error {
 	return err
 }
 
+// rekeySignalRetries is the number of times maybeInitiateRekey transmits
+// the PacketTypeRekey datagram before ratcheting the send cipher. UDP can
+// drop a single datagram silently — the previous fire-once design left
+// the sender ratcheted while the receiver wasn't, then every subsequent
+// frame failed AEAD silently until the session timed out (was the
+// H-Rekey-1 / C2 finding). 3 retries match what BIND's similar
+// UDP-signal designs use; on a lossless network all 3 arrive harmlessly
+// (the receiver ratchets idempotently on first observation).
+const rekeySignalRetries = 3
+
 // maybeInitiateRekey checks byte and time thresholds and sends a rekey signal
 // if either is exceeded. The rekey signal tells the peer to ratchet its receive
 // cipher, then we ratchet our send cipher. Thread-safe via sendMu.
+//
+// Reliability against UDP drop: PacketTypeRekey is sent N times
+// (rekeySignalRetries) back-to-back before we ratchet our send cipher.
+// On the receive side the rekey is idempotent — the first signal
+// observed ratchets the recv cipher; subsequent signals are decrypted
+// successfully and dropped (the rekey marker is the entire payload).
+// Costs three extra datagrams every rekeyByteThreshold (~64 MiB by
+// default) — negligible amortized overhead in exchange for closing
+// the C2 silent-decryption-failure window.
 func (c *noiseConn) maybeInitiateRekey() {
 	if !c.rekey.ShouldRekey() {
 		return
@@ -355,19 +374,24 @@ func (c *noiseConn) maybeInitiateRekey() {
 		c.remoteNode, c.rekey.BytesSent(), c.rekey.ThreshBytes(),
 		c.rekey.TimeSinceRekey(), c.rekey.ThreshDur())
 
-	// Send rekey signal (empty payload) — this packet is encrypted with the OLD key
+	// Encrypt the rekey signal ONCE under the old key, then transmit the
+	// resulting ciphertext N times — encryption is the only nondeterministic
+	// step (nonce advance) so we can't re-Encrypt the same nonce twice.
 	data := []byte{relay.PacketTypeRekey}
+	var ct []byte
 	if c.explicitNonce {
-		ct := c.encryptor.Encrypt(nil, nil, data)
-		_, _ = c.writeFunc(ct)
+		ct = c.encryptor.Encrypt(nil, nil, data)
 	} else {
 		c.sendMu.Lock()
-		cipher, err := c.send.Encrypt(nil, nil, data)
+		var err error
+		ct, err = c.send.Encrypt(nil, nil, data)
 		c.sendMu.Unlock()
 		if err != nil {
 			return
 		}
-		_, _ = c.writeFunc(cipher)
+	}
+	for i := 0; i < rekeySignalRetries; i++ {
+		_, _ = c.writeFunc(ct)
 	}
 
 	// Ratchet our send cipher — all subsequent sends use the new key

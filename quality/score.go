@@ -224,7 +224,8 @@ type trackerEntry struct {
 	bytesPerSec         float64
 	consecutiveFailures atomic.Int64 // session-level close-with-error count
 	reliabilityEMA      float64      // EMA of (1 if clean close, 0 if error)
-	stabilityEMA        float64      // EMA of |Δscore|
+	stabilityEMA           float64 // 1 - stabilitySmoothedDelta — exposed via Stability()
+	stabilitySmoothedDelta float64 // EMA of |Δscore| (lower = more stable)
 	lastScore           float64
 
 	// Dial-level state. Tracked separately from session-level
@@ -586,6 +587,14 @@ func (t *Tracker) PeerReliability(peerID string) float64 {
 // RecordScore feeds the latest aggregate score into the stability EMA.
 // Stability is 1 − EMA of |Δscore| so a path whose score bounces around
 // scores lower in the next compute.
+//
+// Proper EMA: stability_new = α·current_stability_estimate + (1-α)·prev.
+// The previous formula computed `variance = 0.2*delta + 0.8*(1-stab)`
+// then `stab = 1 - variance`, whose fixed point at delta=0 sits at
+// stab=1.0 ONLY if reached from stab=1.0 — anything below 1.0 oscillated
+// around 0.5 (was H-Quality-EMA-Oscillation). The correct EMA-of-|delta|
+// formula tracks delta directly and derives stab as `1 - smoothed_delta`,
+// with a steady-state of 1.0 at delta=0 reachable from any prior value.
 func (t *Tracker) RecordScore(key string, score float64) {
 	e := t.entry(key)
 	e.mu.Lock()
@@ -595,9 +604,10 @@ func (t *Tracker) RecordScore(key string, score float64) {
 		if delta < 0 {
 			delta = -delta
 		}
-		// EMA of |delta| — lower is more stable.
-		variance := 0.2*delta + 0.8*(1-e.stabilityEMA)
-		e.stabilityEMA = clamp01(1 - variance)
+		// Smooth |delta| with α=0.2. stabilitySmoothedDelta starts at 0
+		// (max stability) so first samples bias toward "stable".
+		e.stabilitySmoothedDelta = 0.2*delta + 0.8*e.stabilitySmoothedDelta
+		e.stabilityEMA = clamp01(1 - e.stabilitySmoothedDelta)
 	}
 	e.lastScore = score
 }

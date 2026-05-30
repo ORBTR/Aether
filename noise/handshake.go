@@ -125,7 +125,15 @@ func (t *NoiseTransport) performInitiatorHandshakeAttempt(ctx context.Context, u
 		return nil, err
 	}
 	buf := make([]byte, t.maxPacket)
-	n, err := udpConn.Read(buf)
+
+	// msg1/msg2 retransmit loop: on raw UDP, a single dropped datagram
+	// fails the whole handshake (was H-Handshake-Retx). Retry msg1 every
+	// initiatorRetryInterval until either msg2 arrives, the per-attempt
+	// deadline fires, or the caller's ctx cancels. Each retry uses the
+	// same handshake packet — Noise XX/XK msg1 carries no nonce so
+	// receiver-side dedup is the responder's responsibility (it tolerates
+	// duplicates by ignoring msg1 after it's started building msg2).
+	n, err := readWithMsg1Retry(udpConn, packet, buf, deadline)
 	if err != nil {
 		// If XK failed (peer key rotated), evict cache and retry with XX
 		if cachedPeerKey != nil {
@@ -856,4 +864,58 @@ func (l *noiseListener) resolveHandshakeKey(msg []byte) (prologue []byte, scopeI
 		return nil, "", 0, nil, false
 	}
 	return prologue, "", msg[4], msg[5:], true
+}
+
+// initiatorRetryInterval is how often performInitiatorHandshakeAttempt
+// retransmits msg1 while waiting for msg2 on a raw UDP socket. 800ms is
+// short enough to recover from a single drop within a 5s handshake
+// budget (gives ~6 attempts) and long enough that a slow responder isn't
+// flooded with duplicates. The responder ignores msg1 once it's already
+// started building msg2 so duplicates are harmless.
+const initiatorRetryInterval = 800 * time.Millisecond
+
+// readWithMsg1Retry reads from udpConn while periodically resending the
+// msg1 packet. Returns the number of bytes read on success, or an error
+// if the deadline elapses before any msg2 arrives.
+//
+// The strategy: set a short per-read deadline (initiatorRetryInterval),
+// then loop: try read → on timeout re-send msg1 + set a fresh short
+// deadline → on any other error or success return. The cumulative budget
+// is the supplied 'deadline' (passed by the caller); we never poll past
+// it. Was H-Handshake-Retx — a single dropped msg1 OR msg2 datagram
+// caused the entire 5s handshake budget to spin idle waiting for a
+// reply that the responder never knew to send.
+func readWithMsg1Retry(udpConn *net.UDPConn, msg1 []byte, buf []byte, deadline time.Time) (int, error) {
+	for {
+		now := time.Now()
+		if !now.Before(deadline) {
+			return 0, fmt.Errorf("handshake deadline exceeded")
+		}
+		nextDeadline := now.Add(initiatorRetryInterval)
+		if nextDeadline.After(deadline) {
+			nextDeadline = deadline
+		}
+		if err := udpConn.SetReadDeadline(nextDeadline); err != nil {
+			return 0, err
+		}
+		n, err := udpConn.Read(buf)
+		if err == nil {
+			return n, nil
+		}
+		// time.Now() crossing the per-read deadline triggers net.Error
+		// with Timeout()=true. Any other error (closed conn, refused,
+		// etc.) is terminal.
+		if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+			return 0, err
+		}
+		if time.Now().Before(deadline) {
+			// Resend msg1 and loop.
+			if _, werr := udpConn.Write(msg1); werr != nil {
+				return 0, werr
+			}
+			dbgHandshake.Printf("Retransmitting msg1 (no msg2 within %v)", initiatorRetryInterval)
+			continue
+		}
+		return 0, err
+	}
 }
