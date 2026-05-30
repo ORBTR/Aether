@@ -552,6 +552,20 @@ func (s *NoiseSession) writeFrame(frame *aether.Frame) error {
 	// The flag check keeps writeFrame safe to call on a frame any number
 	// of times; the first call transforms it, subsequent calls are no-ops
 	// that send the cached bytes.
+	// Compress + encrypt INSIDE writeMu so the check-then-act FlagCOMPRESSED/
+	// FlagENCRYPTED guards execute atomically with the mutation. Was
+	// H-Noise-Frame-Race: two concurrent goroutines (e.g. RACK retx
+	// fighting the original send on the same Frame pointer) could each
+	// pass the !FlagXXX check before either mutated Payload, then both
+	// compressed/encrypted the same plaintext — second one corrupted
+	// the buffer the receiver dedup eventually expects to match. The
+	// re-order moves both check + mutation into the writeMu critical
+	// section. CPU cost: compressPayload + Encrypt run under a lock
+	// the writeLoop already holds for its conn.Write, so the wall-clock
+	// per-frame budget is unchanged.
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
 	if s.compressionEnabled.Load() && len(frame.Payload) > 64 && !frame.Flags.Has(aether.FlagCOMPRESSED) {
 		compressed := compressPayload(frame.Payload)
 		if len(compressed) < len(frame.Payload) { // only use if smaller
@@ -574,9 +588,6 @@ func (s *NoiseSession) writeFrame(frame *aether.Frame) error {
 			return fmt.Errorf("aether encrypt: %w", err)
 		}
 	}
-
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 
 	// Bound every socket write for this frame. See writeFrameDeadline.
 	// No-op on non-blocking conns (StreamConn / grpc); cleared on exit
