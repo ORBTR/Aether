@@ -60,6 +60,20 @@ const (
 	bbrStartupGrowthThreshold = 1.25 // BtlBw must grow ≥25% per round to stay in Startup
 	bbrStartupFullCntThreshold = 3   // 3 stalled rounds → exit Startup
 	bbrInflightHiHeadroom = 0.85     // CWND clamp = inflightHi * (1 - headroom)
+
+	// rtPropResetDefault is the rtProp seeded by ResetCWND when no
+	// previous measurement survives. 100 ms is the conventional "first
+	// RTT" assumption — close to LAN+1 hop, lets BBR converge on real
+	// path RTT within a few rounds. Was the H-BBR-ResetCWND-DivZero fix:
+	// seeding zero produced bdp=0 and an unhelpful pacing-floor stall.
+	rtPropResetDefault = 100 * time.Millisecond
+
+	// btlBwResetDefault is the bandwidth seeded by ResetCWND. 1 MB/s
+	// (~8 Mbps) is conservative enough that ProbeBW will quickly grow
+	// it to the real path bandwidth, and large enough that the post-
+	// reset pacingRate isn't pinned to bbrMinPacingRate (1400 B/s) for
+	// dozens of rounds. Same justification as rtPropResetDefault.
+	btlBwResetDefault = 1_048_576.0
 )
 
 // ProbeBW 8-phase gain cycle.
@@ -282,17 +296,28 @@ func (b *BBRController) OnAckWithPipe(ackedBytes int64, rtt time.Duration, pipeB
 // Functionally equivalent to constructing a fresh BBRController, but
 // preserves the controller pointer so atomic.Pointer holders
 // (NoiseSession.cong) don't need a swap.
+//
+// rtProp and btlBw are seeded with sensible defaults (rtPropResetDefault,
+// btlBwResetDefault) rather than zeroes — was the H-BBR-ResetCWND-DivZero
+// finding. With both at zero, recomputeOutputs produces bdp=0 (clamped
+// to minCWND) and pacingRate=0 (clamped to bbrMinPacingRate which is
+// 1400 B/s — far below useful), so post-reset the sender spends many
+// rounds at near-floor pacing before BBR's filters re-converge. Seeding
+// at modest defaults gives the controller a non-degenerate starting
+// state while preserving fast convergence to true path properties.
 func (b *BBRController) ResetCWND() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.cwnd = int64(initialCWND)
 	b.inflight = 0
 	b.inflightHi = 0
-	b.rtProp = 0
+	b.rtProp = rtPropResetDefault
 	b.rtPropStamp = time.Time{}
-	b.btlBw = 0
+	b.btlBw = btlBwResetDefault
 	b.appLimited = false
 	b.state = bbrStartup
+	b.fullBwCount = 0
+	b.fullBwLastVal = 0
 	b.recomputeOutputs()
 }
 
@@ -372,9 +397,20 @@ func (b *BBRController) runStateMachine(now time.Time) {
 		}
 
 	case bbrDrain:
-		// Exit Drain once inflight drops to ≈BDP.
+		// Exit Drain once inflight drops to ≈BDP. If btlBw is zero —
+		// because Startup exited without ever updating the filter
+		// (entirely-app-limited stream) — bdp would be 0 and Drain
+		// could only exit when inflight reaches 0. With any data in
+		// flight, the controller would be permanently stuck (was
+		// H-BBR-Drain-Deadlock). Apply a floor on the exit threshold
+		// so Drain can always reach ProbeBW within bounded time even
+		// when the bandwidth filter has nothing to anchor on.
 		bdp := int64(b.btlBw * b.rtProp.Seconds())
-		if b.inflight <= bdp {
+		exitThreshold := bdp
+		if exitThreshold < int64(b.mss)*4 {
+			exitThreshold = int64(b.mss) * 4
+		}
+		if b.inflight <= exitThreshold {
 			b.state = bbrProbeBW
 			b.cycleIndex = 0
 			b.cycleStamp = now
@@ -463,10 +499,18 @@ type maxFilter struct {
 }
 
 func (f *maxFilter) update(sample float64) {
-	f.samples = append(f.samples, sample)
-	if len(f.samples) > f.windowSize {
-		f.samples = f.samples[1:]
+	if len(f.samples) >= f.windowSize {
+		// Shift left and overwrite the tail so the backing array stays
+		// at windowSize entries — was L-BBR-MaxFilter-Backing: the
+		// previous `samples[1:]` slid the slice header but kept the
+		// original backing array growing unboundedly under repeated
+		// append+reslice. With copy-then-overwrite the backing array
+		// is bounded by windowSize forever.
+		copy(f.samples, f.samples[1:])
+		f.samples[len(f.samples)-1] = sample
+		return
 	}
+	f.samples = append(f.samples, sample)
 }
 
 func (f *maxFilter) max() float64 {

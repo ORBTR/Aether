@@ -167,9 +167,18 @@ func (c *CUBICController) OnAckWithPipe(ackedBytes int64, rtt time.Duration, pip
 			}
 			// Effective cwnd = current pipe + sndcnt budget.
 			c.cwnd = pipe + sndcnt
-			// Recovery exits when ssthresh has been reached and
-			// pipe falls below it — handed by transition test below.
-			if c.cwnd >= c.ssthresh && pipe < c.ssthresh {
+			// Exit recovery once the inflight pipe is back to the
+			// post-loss target (≥ ssthresh). The previous condition
+			// (cwnd >= ssthresh && pipe < ssthresh) tripped at the
+			// PRR boundary case cwnd == ssthresh + pipe slightly
+			// below ssthresh, which RFC 6937 considers the SAME state
+			// as "still in recovery, growing pipe". Exiting early
+			// jumped to congestion avoidance before all losses had
+			// been repaired (was M-CUBIC-PRR-Exit). Using pipe alone
+			// matches RFC 6937 §3.2 "recovery completes when ack
+			// reaches recovery_point" since pipe-recovery and ack-
+			// reaching-recovery-point are coincident.
+			if pipe >= c.ssthresh {
 				c.state = cubicCongestionAvoidance
 				c.tEpoch = time.Now()
 				c.recoverFS = 0

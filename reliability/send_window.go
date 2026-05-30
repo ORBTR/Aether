@@ -179,17 +179,32 @@ func (w *SendWindow) Ack(seqNo uint32) *SendEntry {
 
 // AckRange marks all SeqNos in [start, end] inclusive as acknowledged.
 // Returns the count of newly acknowledged entries.
+//
+// Wrap-attack defence: end may be ^uint32(0) (0xFFFFFFFF) from a
+// malicious or buggy peer; the naive `for seq := start; seq <= end; seq++`
+// then never terminates because seq wraps to 0 and continues to satisfy
+// `seq <= end` forever (was M-AckRange-Wrap-Loop). Cap the iteration
+// at maxAckRangeSpan entries — a real cumulative ACK never covers
+// that many seqs in one frame; anything larger is corruption or attack.
 func (w *SendWindow) AckRange(start, end uint32) int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	// Compute span using wrap-safe arithmetic. uint32 subtraction handles
+	// the wrap naturally; we then bound the result.
+	span := uint64(end - start)
+	if span > maxAckRangeSpan {
+		return 0
+	}
 	count := 0
-	for seq := start; seq <= end; seq++ {
+	seq := start
+	for i := uint64(0); i <= span; i++ {
 		if entry, ok := w.entries[seq]; ok {
 			entry.Acked = true
 			delete(w.entries, seq)
 			count++
 		}
+		seq++
 	}
 
 	// Advance base
@@ -203,6 +218,13 @@ func (w *SendWindow) AckRange(start, end uint32) int {
 
 	return count
 }
+
+// maxAckRangeSpan caps the number of seq numbers a single AckRange call
+// may iterate. A real cumulative ACK covers at most "all in-flight"
+// which is bounded by SendWindow.maxSize (typically 4096); 65536 gives
+// 16x headroom for adapter-specific oversizing while still rejecting
+// the 4-billion-entry wrap-attack input.
+const maxAckRangeSpan uint64 = 65536
 
 // GetEntry returns the entry for a specific SeqNo (for retransmission by Composite ACK implicit NACK).
 // Returns nil if the SeqNo is not in the window.
@@ -364,8 +386,16 @@ func (w *SendWindow) ProcessCompositeACK(ack *aether.CompositeACK, reorderThresh
 	return acked, nacks
 }
 
-// Expired returns all entries that have been in-flight longer than the given RTO.
-// These are candidates for retransmission.
+// Expired returns all entries that have been in-flight longer than the
+// given RTO. These are candidates for retransmission.
+//
+// Uses XmitTime (most-recent-send) not SentAt (original-send) so a
+// frame that's already been retransmitted doesn't re-trip Expired the
+// next tick before the new attempt has had a chance to ACK. SentAt
+// stays the original timestamp for diagnostics; XmitTime is the value
+// the dedicated BumpXmitTime path was added to maintain (was the
+// H-Reliability-Expired finding — Expired against SentAt produced a
+// retransmit storm under sustained loss).
 func (w *SendWindow) Expired(rto time.Duration) []*SendEntry {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -373,7 +403,14 @@ func (w *SendWindow) Expired(rto time.Duration) []*SendEntry {
 	now := time.Now()
 	var expired []*SendEntry
 	for _, entry := range w.entries {
-		if !entry.Acked && now.Sub(entry.SentAt) > rto {
+		if entry.Acked {
+			continue
+		}
+		ref := entry.XmitTime
+		if ref.IsZero() {
+			ref = entry.SentAt
+		}
+		if now.Sub(ref) > rto {
 			expired = append(expired, entry)
 		}
 	}

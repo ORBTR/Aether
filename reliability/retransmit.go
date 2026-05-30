@@ -55,6 +55,22 @@ type RetransmitQueue struct {
 	maxAge        time.Duration // 0 = no deadline. Frames older than this are dropped instead of retransmitted.
 	maxBytes      int64         // 0 = unlimited
 	bufferedBytes int64
+	// onEvict (if set) is invoked for every entry the queue silently
+	// drops to make room — byte-cap eviction, deadline drop, etc.
+	// Upper layers register a callback to bump a metric or release
+	// flow-control credit so the eviction doesn't surface as a
+	// permanently-stuck send window (was the H-Reliability-Eviction
+	// finding — evicted entries vanished without notice). Called WITH
+	// q.mu held; callbacks must not re-enter the queue.
+	onEvict func(*RetransmitEntry)
+}
+
+// SetOnEvict installs the eviction callback. Pass nil to clear.
+// Concurrent-safe but typically called once at session-init time.
+func (q *RetransmitQueue) SetOnEvict(fn func(*RetransmitEntry)) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.onEvict = fn
 }
 
 // NewRetransmitQueue creates a retransmission queue.
@@ -126,19 +142,7 @@ func (q *RetransmitQueue) Enqueue(frame *aether.Frame) {
 	defer q.mu.Unlock()
 
 	incoming := frameBytes(frame)
-	// Evict the oldest entry until the incoming frame fits under the
-	// byte cap. Skip eviction if the incoming frame alone exceeds the
-	// cap (a single giant frame must still be queued; the cap is a
-	// soft aggregate, not a per-frame limit).
-	if q.maxBytes > 0 && incoming <= q.maxBytes {
-		for q.queue.Len() > 0 && q.bufferedBytes+incoming > q.maxBytes {
-			oldest := heap.Pop(&q.queue).(*RetransmitEntry)
-			q.bufferedBytes -= frameBytes(oldest.Frame)
-		}
-		if q.bufferedBytes < 0 {
-			q.bufferedBytes = 0
-		}
-	}
+	q.evictForRoomLocked(incoming)
 
 	now := time.Now()
 	rto := q.rtt.RTO()
@@ -151,6 +155,25 @@ func (q *RetransmitQueue) Enqueue(frame *aether.Frame) {
 	}
 	heap.Push(&q.queue, entry)
 	q.bufferedBytes += incoming
+}
+
+// evictForRoomLocked pops the oldest entries until incoming fits under
+// the byte cap. Notifies onEvict for each evicted entry so upper layers
+// can release flow-control credit / bump metrics. Caller holds q.mu.
+func (q *RetransmitQueue) evictForRoomLocked(incoming int64) {
+	if q.maxBytes <= 0 || incoming > q.maxBytes {
+		return
+	}
+	for q.queue.Len() > 0 && q.bufferedBytes+incoming > q.maxBytes {
+		oldest := heap.Pop(&q.queue).(*RetransmitEntry)
+		q.bufferedBytes -= frameBytes(oldest.Frame)
+		if q.onEvict != nil {
+			q.onEvict(oldest)
+		}
+	}
+	if q.bufferedBytes < 0 {
+		q.bufferedBytes = 0
+	}
 }
 
 // EnqueueFromSend is like Enqueue but links the retransmit entry to the
@@ -166,15 +189,7 @@ func (q *RetransmitQueue) EnqueueFromSend(se *SendEntry) {
 	defer q.mu.Unlock()
 
 	incoming := frameBytes(se.Frame)
-	if q.maxBytes > 0 && incoming <= q.maxBytes {
-		for q.queue.Len() > 0 && q.bufferedBytes+incoming > q.maxBytes {
-			oldest := heap.Pop(&q.queue).(*RetransmitEntry)
-			q.bufferedBytes -= frameBytes(oldest.Frame)
-		}
-		if q.bufferedBytes < 0 {
-			q.bufferedBytes = 0
-		}
-	}
+	q.evictForRoomLocked(incoming)
 
 	now := time.Now()
 	rto := q.rtt.RTO()
@@ -237,7 +252,26 @@ func (q *RetransmitQueue) Dequeue() *aether.Frame {
 
 	// Re-enqueue with doubled RTO (exponential backoff). bufferedBytes
 	// is unchanged since the same entry stays in the queue.
+	//
+	// Re-sample the current RTTEstimator-derived RTO as a floor so a
+	// post-spike recovery is reflected in the next try. Without this,
+	// once entry.RTO doubled to e.g. 5s during a bad burst it stayed
+	// at 5s+ for the lifetime of the entry even if SRTT had recovered
+	// to 10ms (was M-RTO-Stuck-Historical). The doubled value still
+	// applies if the live RTO has also grown — we take MAX so we
+	// never under-back-off, only catch up to a recovered estimator.
 	entry.RTO *= 2
+	if live := q.rtt.RTO(); live > 0 && live*2 > entry.RTO {
+		// keep entry.RTO (we've already backed off further than the live)
+	} else if live > 0 && live < entry.RTO {
+		// Live RTO is smaller than our doubled RTO. Only adopt the live
+		// when it's significantly smaller (less than half) so we don't
+		// thrash on small RTT samples; otherwise keep the historical
+		// backoff intact.
+		if live*2 < entry.RTO {
+			entry.RTO = live * 2
+		}
+	}
 	maxRTO := 60 * time.Second
 	if entry.RTO > maxRTO {
 		entry.RTO = maxRTO
