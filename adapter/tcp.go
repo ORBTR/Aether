@@ -110,6 +110,18 @@ type tcpStream struct {
 	mu             sync.Mutex
 	connOnce       sync.Once
 	connView       net.Conn // cached net.Conn wrapper
+	recvOnce       sync.Once
+}
+
+// closeRecvOnce closes st.recvCh exactly once. Multiple teardown paths
+// (handleReset, local Reset, handleClose, streamGC callback) may race
+// to release the stream; recvOnce makes the channel-close idempotent so
+// none of them panic with `send on closed channel` or `close of closed
+// channel`. Any in-flight Receive() returns io.EOF.
+func (st *tcpStream) closeRecvOnce() {
+	st.recvOnce.Do(func() {
+		close(st.recvCh)
+	})
 }
 
 // attachGrantDebouncer initializes st.grantDebouncer bound to st.window
@@ -212,12 +224,13 @@ func NewTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 	s.streamGC = aether.NewStreamGC(aether.DefaultStreamIdleTimeout, func(streamID uint64) {
 		dbgTCP.Printf("StreamGC: resetting idle stream %d", streamID)
 		s.mu.Lock()
-		if st, ok := s.streams[streamID]; ok {
-			_ = st.Reset(aether.ResetTimeout)
-			delete(s.streams, streamID)
-		}
+		st, ok := s.streams[streamID]
 		s.mu.Unlock()
-		s.sched.Unregister(streamID)
+		if !ok {
+			return
+		}
+		// st.Reset deletes from s.streams, closes recvCh, releaseStream.
+		_ = st.Reset(aether.ResetTimeout)
 	})
 	go s.streamGC.Start()
 
@@ -536,14 +549,8 @@ func (s *TCPSession) handleClose(frame *aether.Frame) {
 
 	if fullyClosed {
 		st.teardown()
-		close(st.recvCh)
-		// Mirror NoiseSession.handleClose: release scheduler and
-		// streamGC resources so a long-running session doesn't bloat
-		// internal maps with one entry per fully-closed dynamic stream.
-		s.sched.Unregister(frame.StreamID)
-		if s.streamGC != nil {
-			s.streamGC.Unregister(frame.StreamID)
-		}
+		st.closeRecvOnce()
+		s.releaseStream(frame.StreamID)
 	}
 	s.compressor.RemoveStream(frame.StreamID)
 }
@@ -559,8 +566,18 @@ func (s *TCPSession) handleReset(frame *aether.Frame) {
 	if ok {
 		st.state.Transition(aether.EventRecvReset)
 		st.teardown()
-		close(st.recvCh)
-		s.sched.Unregister(frame.StreamID)
+		st.closeRecvOnce()
+		s.releaseStream(frame.StreamID)
+	}
+}
+
+// releaseStream idempotently unregisters streamID from the scheduler
+// and stream GC. Parity with NoiseSession.releaseStream — gives every
+// teardown path one helper to call instead of duplicating the pair.
+func (s *TCPSession) releaseStream(streamID uint64) {
+	s.sched.Unregister(streamID)
+	if s.streamGC != nil {
+		s.streamGC.Unregister(streamID)
 	}
 }
 
@@ -1138,8 +1155,15 @@ func (st *tcpStream) Reset(reason aether.ResetReason) error {
 		Length:     uint32(len(payload)),
 		Payload:    payload,
 	}
-	st.session.sched.Unregister(st.streamID)
-	return st.session.writeFrame(frame)
+	err := st.session.writeFrame(frame)
+	st.session.releaseStream(st.streamID)
+	st.session.mu.Lock()
+	if _, ok := st.session.streams[st.streamID]; ok {
+		delete(st.session.streams, st.streamID)
+	}
+	st.session.mu.Unlock()
+	st.closeRecvOnce()
+	return err
 }
 
 func (st *tcpStream) SetPriority(weight uint8, dependency uint64) {

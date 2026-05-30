@@ -29,6 +29,7 @@ type noiseStream struct {
 	session  *NoiseSession
 	state    *aether.StreamStateMachine
 	recvCh   chan []byte
+	recvOnce sync.Once
 	window   *flow.StreamWindow
 
 	// grantDebouncer coalesces stream-level WINDOW_UPDATE emissions driven
@@ -454,6 +455,17 @@ func (st *noiseStream) teardown() {
 	}
 }
 
+// closeRecvOnce closes st.recvCh exactly once. Multiple teardown
+// paths (handleReset, local Reset, handleClose, streamGC callback)
+// can race; recvOnce makes the close idempotent so none of them
+// panic with `close of closed channel`. Any in-flight Receive()
+// returns io.EOF.
+func (st *noiseStream) closeRecvOnce() {
+	st.recvOnce.Do(func() {
+		close(st.recvCh)
+	})
+}
+
 func (st *noiseStream) Reset(reason aether.ResetReason) error {
 	st.state.Transition(aether.EventSendReset)
 	payload := aether.EncodeReset(reason)
@@ -478,6 +490,7 @@ func (st *noiseStream) Reset(reason aether.ResetReason) error {
 	}
 	st.session.mu.Unlock()
 	st.session.releaseStream(st.streamID)
+	st.closeRecvOnce()
 	return err
 }
 

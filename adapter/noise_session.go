@@ -164,11 +164,10 @@ type NoiseSession struct {
 	encryptor  *aethercrypto.FrameEncryptor
 	sessionKey []byte
 
-	// Tick management
-	tickStop  chan struct{}
-	closed    chan struct{}
-	closeOnce sync.Once
-	closeErr  error
+	// closeErr captures the cause supplied to CloseWithError so callers
+	// can later inspect it via CloseErr(). BaseSession owns the lifecycle
+	// channel (CloseSignal / SignalClose) — Noise stores only the reason.
+	closeErr error
 
 	// throttle holds the explicit-CONGESTION signal state from the peer.
 	// Zero value is "no throttle"; handleCongestion updates it on incoming
@@ -237,7 +236,6 @@ func NewNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 		interleavedEncoder: reliability.NewInterleavedFECEncoder(reliability.DefaultFECGroupSize),
 		interleavedDecoder: reliability.NewInterleavedFECDecoder(),
 		compressor:         aether.NewCompressor(),
-		tickStop:           make(chan struct{}),
 		createdAt:          time.Now(),
 	}
 	// Reed-Solomon encoder/decoder — instantiated even when no stream is
