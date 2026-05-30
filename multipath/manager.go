@@ -90,6 +90,11 @@ type Manager struct {
 	paths []*Path
 	primary int // index of active path
 
+	// probeTick increments on every probeNonPrimary invocation. Used to
+	// decide whether to include the primary path in this tick's probe
+	// set (every primaryProbeEvery-th tick). Was H-Multipath-PrimaryProbe.
+	probeTick uint64
+
 	// Configuration
 	probeInterval    time.Duration
 	stabilityPeriod  time.Duration
@@ -402,6 +407,15 @@ func (m *Manager) ShouldSendRedundant(latencyClass aether.LatencyClass) bool {
 // OnPrimaryFailure handles primary path failure — instant failover to standby.
 // Marks the failed path PathDead and stamps LastFailure so the probe loop
 // (or opportunistic resurrection) can revive it after deadResurrectCooldown.
+//
+// Dead-on-arrival recovery: if every other path is also PathDead (a
+// network blip can kill all transports simultaneously) promotebestStandby
+// returns no winner and the primary index would remain pointing at the
+// just-killed path. Dispatch then returns it forever from PrimarySession
+// until something external triggers a re-probe. The recovery path here
+// resurrects all dead standbys (skipping cooldown) and re-runs the
+// promotion — at least one path can return to PathStandby and become
+// the new primary. Was the H-Multipath-DeadPrimary finding.
 func (m *Manager) OnPrimaryFailure() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -416,6 +430,17 @@ func (m *Manager) OnPrimaryFailure() {
 	old.ConsecutiveFailures++
 
 	dbgMultipath.Printf("Primary path %s failed, failing over", old.Protocol)
+	if m.promotebestStandby() {
+		return
+	}
+	// No live standby — force every Dead path with a non-closed session
+	// back to Standby (skip cooldown) so we can promote one of them.
+	dbgMultipath.Printf("All standbys also Dead — forcing dead-resurrect to break wedge")
+	for _, p := range m.paths {
+		if p.State == PathDead && p.Session != nil && !p.Session.IsClosed() {
+			p.State = PathStandby
+		}
+	}
 	m.promotebestStandby()
 }
 
@@ -487,12 +512,24 @@ func (m *Manager) RunProbeLoop(ctx context.Context) {
 	}
 }
 
-// probeNonPrimary pings every non-primary path. Holds m.mu only to
-// snapshot the path list — actual Ping calls happen outside the lock so
-// a slow ping doesn't block dispatch.
+// primaryProbeEvery is the modulus that determines how often probeNonPrimary
+// ALSO probes the primary path. Tied to the global probe counter — every Nth
+// probe tick includes the primary. 4 gives a primary-liveness check every
+// ~2 minutes at the default 30s tick. Without primary probing, a silently
+// wedged primary (cwnd-stuck, app reads block, no explicit error) was
+// undetectable until external OnPrimaryFailure was called from dispatch
+// (was H-Multipath-PrimaryProbe).
+const primaryProbeEvery uint64 = 4
+
+// probeNonPrimary pings every non-primary path (and the primary on every
+// primaryProbeEvery-th invocation). Holds m.mu only to snapshot the path
+// list — actual Ping calls happen outside the lock so a slow ping doesn't
+// block dispatch.
 func (m *Manager) probeNonPrimary(ctx context.Context) {
 	m.mu.Lock()
 	m.resurrectExpiredDeadPathsLocked()
+	m.probeTick++
+	probePrimary := m.probeTick%primaryProbeEvery == 0
 	type probeTarget struct {
 		idx     int
 		session aether.Session
@@ -500,7 +537,10 @@ func (m *Manager) probeNonPrimary(ctx context.Context) {
 	}
 	targets := make([]probeTarget, 0, len(m.paths))
 	for i, p := range m.paths {
-		if i == m.primary || p.Session == nil || p.Session.IsClosed() {
+		if p.Session == nil || p.Session.IsClosed() {
+			continue
+		}
+		if i == m.primary && !probePrimary {
 			continue
 		}
 		if p.State == PathDead {
@@ -585,7 +625,9 @@ func (m *Manager) setPrimary(i int) {
 }
 
 // promotebestStandby finds the best non-dead path and makes it primary.
-func (m *Manager) promotebestStandby() {
+// Returns true on success, false when no live standby exists (caller
+// can react by resurrecting Dead paths — see OnPrimaryFailure).
+func (m *Manager) promotebestStandby() bool {
 	bestIdx := -1
 	bestQuality := -1
 	for i, p := range m.paths {
@@ -596,5 +638,7 @@ func (m *Manager) promotebestStandby() {
 	}
 	if bestIdx >= 0 {
 		m.setPrimary(bestIdx)
+		return true
 	}
+	return false
 }
