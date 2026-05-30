@@ -570,7 +570,7 @@ func (s *NoiseSession) handleClose(frame *aether.Frame) {
 		default:
 		}
 	}
-	close(st.recvCh)
+	st.closeRecvOnce()
 	st.teardown()
 	s.mu.Lock()
 	delete(s.streams, frame.StreamID)
@@ -589,7 +589,7 @@ func (s *NoiseSession) handleReset(frame *aether.Frame) {
 	if ok {
 		st.state.Transition(aether.EventRecvReset)
 		st.teardown()
-		close(st.recvCh)
+		st.closeRecvOnce()
 		s.releaseStream(frame.StreamID)
 	}
 }
