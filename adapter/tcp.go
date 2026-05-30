@@ -656,10 +656,19 @@ func (s *TCPSession) Throttle() *aether.CongestionThrottle {
 // A short ticker (2ms) provides batching window — gives the scheduler a
 // chance to accumulate frames for coalescing — but the loop also consumes
 // the wake channel so it serves bursty traffic with minimal latency.
+//
+// Write-error tracking: consecutive non-temporary write failures past
+// writeFailTolerance trigger CloseWithError so a dying TCP/WS conn
+// can't burn CPU spinning forever. readLoop's natural EOF on the same
+// conn would eventually kill the session too, but that's
+// "eventually" — explicit fail-fast surfaces broken conns inside
+// milliseconds. Temporary errors (i/o timeout, EAGAIN) reset the
+// counter so a transient hiccup doesn't tear the session down.
 func (s *TCPSession) writeLoop() {
 	ticker := time.NewTicker(2 * time.Millisecond)
 	defer ticker.Stop()
 	wake := s.sched.WakeCh()
+	var consecutiveFails int
 	for {
 		select {
 		case <-s.CloseSignal():
@@ -690,10 +699,16 @@ func (s *TCPSession) writeLoop() {
 			}
 			if len(batch) > 1 {
 				s.writeMu.Lock()
-				if _, err := s.compressor.EncodeBatch(s.conn, batch); err != nil {
-					dbgTCP.Printf("writeLoop: batch err=%v count=%d", err, len(batch))
-				}
+				_, err := s.compressor.EncodeBatch(s.conn, batch)
 				s.writeMu.Unlock()
+				if err != nil {
+					dbgTCP.Printf("writeLoop: batch err=%v count=%d", err, len(batch))
+					if s.bumpWriteFailLocked(&consecutiveFails, err) {
+						return
+					}
+				} else {
+					consecutiveFails = 0
+				}
 				continue
 			}
 			// Only 1 frame — fall through to single write
@@ -706,8 +721,55 @@ func (s *TCPSession) writeLoop() {
 		}
 		if err := s.writeFrame(frame); err != nil {
 			dbgTCP.Printf("writeLoop: writeFrame err=%v stream=%d", err, frame.StreamID)
+			if s.bumpWriteFailLocked(&consecutiveFails, err) {
+				return
+			}
+		} else {
+			consecutiveFails = 0
 		}
 	}
+}
+
+// writeFailTolerance bounds how many consecutive non-temporary write
+// failures writeLoop tolerates before tearing down the session. Picked
+// to ride out a small burst of transient errors (rebind, ARP refresh)
+// without sacrificing fail-fast on a genuinely broken conn — 3 attempts
+// at ~2 ms tick interval is ~6 ms before close.
+const writeFailTolerance = 3
+
+// bumpWriteFailLocked increments the per-session consecutive failure
+// counter. Returns true when writeLoop should exit (session closed via
+// CloseWithError). Returns false for transient errors (caller resets
+// counter via the normal success path).
+//
+// "Locked" in the name refers to the writeLoop's exclusive ownership of
+// consecutiveFails — not a mutex; the counter is goroutine-local to
+// writeLoop.
+func (s *TCPSession) bumpWriteFailLocked(counter *int, err error) bool {
+	if isTemporaryNetError(err) {
+		return false
+	}
+	*counter++
+	if *counter < writeFailTolerance {
+		return false
+	}
+	s.CloseWithError(fmt.Errorf("write loop: %d consecutive failures (%w)", *counter, err))
+	return true
+}
+
+// isTemporaryNetError returns true when err is a net.Error whose
+// Temporary() reports true. Such errors should NOT count against the
+// write-fail tolerance budget (kernel-level transient like EAGAIN or
+// i/o timeout).
+func isTemporaryNetError(err error) bool {
+	if err == nil {
+		return false
+	}
+	type temp interface{ Temporary() bool }
+	if t, ok := err.(temp); ok && t.Temporary() {
+		return true
+	}
+	return false
 }
 
 // writeFrame serializes and writes a single frame to the TCP connection.
@@ -794,6 +856,18 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 		Payload:    openPayload,
 	}
 	if err := s.writeFrame(frame); err != nil {
+		// Rollback every registration that registerStream + Register +
+		// attachGrantDebouncer just performed. Without this, OpenStream
+		// returned (nil, err) but left s.streams + scheduler + streamGC +
+		// the grantDebouncer goroutine all pinned. Repeated probes
+		// against a dying peer grew s.streams unboundedly (was the
+		// H-TCP-OpenStream-Rollback finding).
+		st.teardown()
+		s.mu.Lock()
+		delete(s.streams, cfg.StreamID)
+		s.mu.Unlock()
+		s.releaseStream(cfg.StreamID)
+		st.closeRecvOnce()
 		return nil, fmt.Errorf("send SYN+DATA: %w", err)
 	}
 
