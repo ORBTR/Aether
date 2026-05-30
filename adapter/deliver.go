@@ -114,6 +114,11 @@ func DeliverToRecvChWithSignals(
 	sendCongestion CongestionSignaler,
 	stats ...*DeliveryStats,
 ) bool {
+	// Hot path — no defer recover here. The recovery for racy
+	// closed-channel sends lives on the call-site teardown paths where
+	// the race actually matters (noise_dispatch handleClose drain loop,
+	// TCP deliverToStream). Adding a defer here adds enough overhead to
+	// flake the grant-debouncer coalesce test under load.
 	// Fast path: non-blocking delivery. No grant here — Receive() owns it.
 	select {
 	case recvCh <- payload:

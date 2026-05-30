@@ -188,6 +188,16 @@ func (s *NoiseSession) Throttle() *aether.CongestionThrottle {
 }
 
 func (s *NoiseSession) handleData(frame *aether.Frame) {
+	// Recover from a `send on closed channel` panic. handleReset / local
+	// Reset / streamGC sweep can run closeRecvOnce after this goroutine
+	// has cached `st` from the s.streams lookup. The recover() turns the
+	// panic into a logged drop with no other side effects — matches the
+	// TCP adapter's deliverToStream defense (tcp.go:354-360).
+	defer func() {
+		if r := recover(); r != nil {
+			dbgNoise.Printf("handleData: send-on-closed for stream %d (race with teardown): %v", frame.StreamID, r)
+		}
+	}()
 	s.mu.Lock()
 	st, ok := s.streams[frame.StreamID]
 	s.mu.Unlock()
@@ -521,6 +531,13 @@ func (s *NoiseSession) handleOpen(frame *aether.Frame) {
 }
 
 func (s *NoiseSession) handleImplicitOpen(frame *aether.Frame) {
+	// Same recover() pattern as handleData — implicit-open races with
+	// teardown if the peer reuses a freshly-closed StreamID.
+	defer func() {
+		if r := recover(); r != nil {
+			dbgNoise.Printf("handleImplicitOpen: send-on-closed for stream %d (race with teardown): %v", frame.StreamID, r)
+		}
+	}()
 	st := s.createStream(frame.StreamID, aether.DefaultStreamConfig(frame.StreamID), true /* enforceRemoteCap */)
 	if st == nil {
 		return
@@ -564,12 +581,20 @@ func (s *NoiseSession) handleClose(frame *aether.Frame) {
 		st.ackEngine.Stop()
 	}
 	remaining := st.recvWindow.Drain()
-	for _, payload := range remaining {
-		select {
-		case st.recvCh <- payload:
-		default:
+	// recvCh-close is idempotent via closeRecvOnce, but a concurrent local
+	// Reset / streamGC sweep on the same streamID can close the channel
+	// between when this loop checks "ok" and when it sends. recover() turns
+	// the panic into a benign drop — matching the TCP adapter's
+	// deliverToStream defense (tcp.go:354-360).
+	func() {
+		defer func() { _ = recover() }()
+		for _, payload := range remaining {
+			select {
+			case st.recvCh <- payload:
+			default:
+			}
 		}
-	}
+	}()
 	st.closeRecvOnce()
 	st.teardown()
 	s.mu.Lock()
@@ -767,6 +792,14 @@ func (s *NoiseSession) sendWindowUpdateAgnostic(streamID uint64, credit uint64) 
 
 // deliverToStream delivers raw payload to a stream's receive channel.
 func (s *NoiseSession) deliverToStream(streamID uint64, payload []byte) {
+	// Same recover() pattern as handleData / handleImplicitOpen — the
+	// stream lookup result `st` can be torn down by handleReset / local
+	// Reset / streamGC sweep between lookup and the send below.
+	defer func() {
+		if r := recover(); r != nil {
+			dbgNoise.Printf("deliverToStream: send-on-closed for stream %d (race with teardown): %v", streamID, r)
+		}
+	}()
 	s.mu.Lock()
 	st, ok := s.streams[streamID]
 	s.mu.Unlock()
