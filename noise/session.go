@@ -804,33 +804,20 @@ func (l *noiseListener) runReader(ctx context.Context, conn *net.UDPConn) {
 			continue
 		}
 
-		// Per-source rate limit FIRST (S6) — drop silently before
-		// touching the global budget so an attacker IP can't starve
-		// legitimate peers, AND before the cross-org forwarder branch
-		// so a flood of preambled msg1 with random target NodeIDs
-		// can't amplify into intra-org bandwidth. Drop without
-		// response = no amplification.
-		//
-		// On the M_t side (OpForward ingress over 6PN) addr is a
-		// same-org 6PN peer that already passed the rate limit on
-		// M_r's public socket — the per-source bucket on a 6PN ULA is
-		// effectively a no-op because same-org senders are trusted
-		// and only have one shared source IP per machine anyway.
-		if l.transport.sourceLimit != nil && !l.transport.sourceLimit.Allow(addr) {
-			continue
-		}
-
 		// Cross-org forwarder: routing preamble (M_r side) + inner
-		// relay frames (both sides). When handleForwarderPacket returns
-		// (substBuf != nil), it consumed a forwarder frame and the
-		// payload should be processed as if it had arrived from
-		// substAddr (the originator's 5-tuple from an op=1 inject, or
-		// the routing-preamble-stripped msg1 from the same source).
-		// When (consumed=true, substBuf=nil) the forwarder handled the
-		// packet fully (forwarded to another machine, or replied
-		// upstream) and the listener should move on. When
-		// (consumed=false) the packet wasn't a forwarder frame; fall
-		// through to normal classification.
+		// relay frames (both sides). MUST run BEFORE dispatchToSession
+		// because forwarder may substitute addr to the originator's
+		// 5-tuple — and dispatchToSession's key derives from addr.
+		// When handleForwarderPacket returns (substBuf != nil), it
+		// consumed a forwarder frame and the payload should be
+		// processed as if it had arrived from substAddr. When
+		// (consumed=true, substBuf=nil) the forwarder handled the
+		// packet fully. When (consumed=false) fall through to normal
+		// classification.
+		//
+		// The forwarder branch has its own per-source defense against
+		// preamble-flood amplification (see handleForwarderPacket),
+		// so we don't need the per-source bucket here to guard it.
 		if l.transport.forwarder != nil {
 			substBuf, substAddr, consumed := l.handleForwarderPacket(buf[:n], addr, conn)
 			if consumed {
@@ -853,29 +840,45 @@ func (l *noiseListener) runReader(ctx context.Context, conn *net.UDPConn) {
 			}
 		}
 
-		// Per-source rate limit is applied above (before the forwarder
-		// branch). Global rate-limit + ECN classification continue here
-		// on the post-forwarder path; the dispatch chain that follows
-		// keys by addr.String() which the forwarder substitution has
-		// already mutated to the originator's 5-tuple when relevant.
-		if !l.transport.rateLimiter.Allow(1) {
+		// FAST PATH — established session dispatch BEFORE rate limits.
+		//
+		// Critical fix for the "rack.fackAge climbs to minutes / cwnd
+		// unchanged / TLP probes go out but no ACKs return" production
+		// fingerprint observed 2026-05-31. The per-source rate limiter
+		// is configured as a HANDSHAKE-flood defence (10 burst, 1/sec
+		// refill at ratelimit.go:68-76), but the previous flow applied
+		// it to EVERY inbound packet — including AEAD-authenticated
+		// data + ACK frames on long-lived sessions. Any active session
+		// emitting >1 packet/sec sustained exhausted its source bucket;
+		// subsequent ACKs were silently dropped; sender's send-window
+		// never advanced; STALL-DETECT fired repeatedly with no recovery.
+		//
+		// AEAD-authenticated traffic on established sessions is trusted
+		// — the cryptographic check is the gate. Skip the per-source +
+		// global rate limits when the packet matches a known session;
+		// only enforce them on packets that fall through to the
+		// handshake / unknown-source path.
+		//
+		// ECN handling moves here too so CE marks aren't dropped on
+		// rate-limited packets that would otherwise dispatch.
+		key := addr.String()
+		msg := append([]byte(nil), buf[:n]...)
+		if l.dispatchToSession(key, msg) {
+			if isCEMarked(tos) {
+				if nc := connFromSession(l.sessions.GetByAddr(key)); nc != nil {
+					nc.RecordCEBytes(n)
+				}
+			}
 			continue
 		}
 
-		// ECN: if the kernel delivered a CE-marked datagram, fold the
-		// byte count into the session's CE counter so it rides the next
-		// outbound CompositeACK (CACKHasECN flag + CEBytes field). The
-		// lookup mirrors dispatchToSession's key scheme so both paths
-		// share the same ConnectionMap indexing.
-		if isCEMarked(tos) {
-			if nc := connFromSession(l.sessions.GetByAddr(addr.String())); nc != nil {
-				nc.RecordCEBytes(n)
-			}
+		// SLOW PATH — packet did not match an established session.
+		// Treat as handshake-candidate from unknown / first-contact
+		// source and apply the rate limits intended for that path.
+		if l.transport.sourceLimit != nil && !l.transport.sourceLimit.Allow(addr) {
+			continue
 		}
-
-		msg := append([]byte(nil), buf[:n]...)
-		key := addr.String()
-		if l.dispatchToSession(key, msg) {
+		if !l.transport.rateLimiter.Allow(1) {
 			continue
 		}
 		// Check if this is a response to an outgoing dial handshake
