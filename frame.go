@@ -301,6 +301,13 @@ type Frame struct {
 
 // Validate checks the frame for structural correctness.
 // Returns nil if valid, or an error describing the issue.
+//
+// Type-specific minimum-size checks: each control type has a known wire
+// size declared above (OpenPayloadSize, ResetPayloadSize, etc.). A frame
+// arriving with a shorter payload would surface as a decode panic when
+// the type-specific decoder reads past the end (was the
+// H-Frame-Validate-PayloadSize finding). Validation here rejects them
+// before the type-handler is invoked.
 func (f *Frame) Validate() error {
 	if !f.Type.IsValid() {
 		return fmt.Errorf("aether: invalid frame type 0x%02X", byte(f.Type))
@@ -314,7 +321,22 @@ func (f *Frame) Validate() error {
 	if f.Flags.Has(FlagENCRYPTED) && f.Nonce.IsZero() {
 		return fmt.Errorf("aether: ENCRYPTED flag set but nonce is zero")
 	}
+	if minSize, ok := minPayloadSizes[f.Type]; ok && f.Length < minSize {
+		return fmt.Errorf("aether: %s payload too small (%d bytes, min %d)", f.Type, f.Length, minSize)
+	}
 	return nil
+}
+
+// minPayloadSizes is the per-type minimum wire size for control frames.
+// Sourced from the per-type Size constants declared in this file. DATA
+// frames have no minimum (zero-length DATA is a valid keepalive on some
+// streams). Type-specific decoders never need to bounds-check their
+// initial read because Validate has already rejected undersized frames.
+var minPayloadSizes = map[FrameType]uint32{
+	TypeOPEN:       OpenPayloadSize,
+	TypeRESET:      ResetPayloadSize,
+	TypeWINDOW:     WindowUpdateSize,
+	TypeCONGESTION: CongestionPayloadSize,
 }
 
 // IsControl returns true if this is a control frame (not DATA).

@@ -74,6 +74,14 @@ func (p *Pacer) Consume(n int) bool {
 
 // TimeUntilSend returns how long to wait before n bytes can be sent.
 // Returns 0 if tokens are already available.
+//
+// Overflow defence: when p.rate is very small (e.g. bbrMinPacingRate
+// 1400 B/s pre-converge) and n is large (~10 MB), the naive nanosecond
+// product overflows int64 (~292 years cap) and wraps to a negative
+// time.Duration, which the caller's timer.Reset interprets as "fire
+// immediately" — defeating pacing entirely (was M-Pacer-Overflow).
+// Compute in float, clamp to maxPacerWait when the deficit exceeds
+// what int64 nanoseconds can represent.
 func (p *Pacer) TimeUntilSend(n int) time.Duration {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -83,10 +91,21 @@ func (p *Pacer) TimeUntilSend(n int) time.Duration {
 	}
 	deficit := float64(n) - p.tokens
 	if p.rate <= 0 {
-		return time.Hour // no rate set
+		return maxPacerWait // no rate set
 	}
-	return time.Duration(deficit / p.rate * float64(time.Second))
+	waitNs := deficit / p.rate * float64(time.Second)
+	if waitNs >= float64(maxPacerWait) || waitNs < 0 {
+		return maxPacerWait
+	}
+	return time.Duration(waitNs)
 }
+
+// maxPacerWait caps how long TimeUntilSend may return. Picked at 1 hour
+// — far longer than any reasonable pacing decision should ever require
+// (a converged BBR controller paces at ≥ measured bandwidth so per-
+// frame waits stay sub-second). The cap is the overflow guard, not a
+// performance tuning.
+const maxPacerWait = time.Hour
 
 // refill adds tokens based on elapsed time. Must be called with mu held.
 func (p *Pacer) refill() {

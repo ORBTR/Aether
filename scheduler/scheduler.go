@@ -127,11 +127,27 @@ func (s *Scheduler) RegisterWithClass(streamID uint64, weight uint8, dependency 
 	s.order = append(s.order, streamID)
 }
 
-// Unregister removes a stream from the scheduler. Any queued frames are dropped.
-func (s *Scheduler) Unregister(streamID uint64) {
+// Unregister removes a stream from the scheduler. Any queued frames are
+// dropped — but they're returned to the caller (and the pending probe,
+// if any) so upper layers can release the flow-control credit they
+// reserved at Enqueue time. Without that return path, every
+// stream-teardown burnt the credit reserved for in-queue frames,
+// eventually draining the conn-level window (was the
+// H-Scheduler-Unregister-Leak finding).
+//
+// Returns (droppedFrames, droppedProbe). Callers (adapter teardown
+// paths) iterate the frames and call ReleaseUnsent on stream-window +
+// conn-window for each payload length.
+func (s *Scheduler) Unregister(streamID uint64) (droppedFrames []*aether.Frame, droppedProbe *aether.Frame) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if ss, ok := s.streams[streamID]; ok {
+		if len(ss.queue) > 0 {
+			droppedFrames = append([]*aether.Frame(nil), ss.queue...)
+		}
+		droppedProbe = ss.probe
+	}
 	delete(s.streams, streamID)
 
 	// Remove from order
@@ -141,6 +157,7 @@ func (s *Scheduler) Unregister(streamID uint64) {
 			break
 		}
 	}
+	return droppedFrames, droppedProbe
 }
 
 // SetWeight updates a stream's scheduling weight.

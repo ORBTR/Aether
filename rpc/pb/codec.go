@@ -55,7 +55,19 @@ func UnmarshalResponse(data []byte) (*RPCResponse, error) {
 
 // ReadMessage reads a length-prefixed binary message from the reader.
 // Wire format: [4-byte length (BigEndian)][protobuf message]
+//
+// maxSize MUST be > 0; ReadMessage substitutes MaxMessageSize when a
+// caller passes 0 to defend against accidental "no limit" (which would
+// permit a peer-supplied 4 GiB length to drive `make([]byte, length)`
+// and OOM the process). The length check runs BEFORE the make, so a
+// hostile peer's oversized prefix surfaces as ErrMessageTooLarge
+// without any allocation (was H-Codec-ReadMessage-4GB; reading the
+// audit confirmed the existing check is in the right order — this
+// patch tightens the maxSize=0 default).
 func ReadMessage(reader io.Reader, maxSize uint32) ([]byte, error) {
+	if maxSize == 0 {
+		maxSize = MaxMessageSize
+	}
 	var length uint32
 	if err := binary.Read(reader, binary.BigEndian, &length); err != nil {
 		return nil, err

@@ -104,13 +104,23 @@ func NewTLP(initialSRTT time.Duration) *TLP {
 
 // computePTO returns 2*SRTT + max_ack_delay, bounded by [floor, ceiling].
 // Caller must hold mu.
+//
+// Overflow defence: if srtt is pathologically large (e.g. corrupt RTT
+// measurement returning math.MaxInt64), 2*srtt overflows int64 and
+// becomes negative — then +maxAckDelay may bring it positive again,
+// surfacing as an undefined value relative to the bounds. Detect either
+// negative or beyond-ceiling and clamp at the ceiling (was
+// L-TLP-Overflow-MaxSRTT).
 func (t *TLP) computePTO() time.Duration {
+	if t.srtt > tlpPTOCeiling {
+		return tlpPTOCeiling
+	}
 	pto := tlpPTOMultiplier*t.srtt + t.maxAckDelay
+	if pto < 0 || pto > tlpPTOCeiling {
+		return tlpPTOCeiling
+	}
 	if pto < tlpPTOFloor {
 		return tlpPTOFloor
-	}
-	if pto > tlpPTOCeiling {
-		return tlpPTOCeiling
 	}
 	return pto
 }
