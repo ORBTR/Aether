@@ -25,6 +25,39 @@ import (
 var ackEmitCount atomic.Uint64
 var lastAckLogAt atomic.Int64 // unix nanos of last log emission
 
+// Batch 6 telemetry: distinguishes which OnDataReceived trigger
+// causes each flushLocked. The delay-timer path imposes a ~MaxDelay
+// (25ms default) RTT floor for small RPC responses that don't satisfy
+// any of the immediate triggers (gap / control / post-idle /
+// max-packets) — the candidate latency amplifier for noise-UDP RPC.
+//   ackEmitImmediate — emitted by one of the immediate triggers:
+//                      gap detected, control stream, first frame
+//                      after idle, or max-packets threshold.
+//   ackEmitDelayTimer — emitted because the adaptive delayed-ACK
+//                       timer fired (no immediate trigger applied).
+//   ackEmitDuplicate  — emitted by OnDuplicateReceived forcing an
+//                       immediate flush so the sender's retransmit
+//                       timer clears.
+//
+// Counted globally across all engines so they sum to ackEmitCount
+// minus the on-demand Flush() called by stream-close paths.
+var (
+	ackEmitImmediate atomic.Uint64
+	ackEmitDelayTimer    atomic.Uint64
+	ackEmitDuplicate     atomic.Uint64
+)
+
+// AckEmitStats returns global ACK-engine emit counters for surfacing
+// via Library MeshMetrics. Distinguishes delay-timer-driven emissions
+// (the adaptive ack-delay floor — candidate for RPC latency
+// amplification on fast paths) from immediate emissions and
+// duplicate-triggered emits.
+func AckEmitStats() (immediate, delayTimer, duplicate uint64) {
+	return ackEmitImmediate.Load(),
+		ackEmitDelayTimer.Load(),
+		ackEmitDuplicate.Load()
+}
+
 // dbgACK is the debug logger for the ACK engine. Enable with
 // DEBUG=aether.reliability.ack (or any ancestor: aether.reliability,
 // aether). Used to confirm whether real mesh traffic actually reaches
@@ -137,12 +170,14 @@ func (e *ACKEngine) OnDataReceived(seqNo uint32, isControlStream bool) {
 
 	// Rule 1: Gap detected → immediate ACK
 	if e.policy.ImmOnGap && e.recvWindow.BufferedCount() > 0 {
+		ackEmitImmediate.Add(1)
 		e.flushLocked()
 		return
 	}
 
 	// Rule 2: Control stream → immediate ACK
 	if isControlStream && e.policy.ImmOnCtrl {
+		ackEmitImmediate.Add(1)
 		e.flushLocked()
 		return
 	}
@@ -155,6 +190,7 @@ func (e *ACKEngine) OnDataReceived(seqNo uint32, isControlStream bool) {
 		}
 	}
 	if !e.lastIdle.IsZero() && time.Since(e.lastIdle) > idleThreshold {
+		ackEmitImmediate.Add(1)
 		e.flushLocked()
 		e.lastIdle = time.Time{} // clear idle
 		return
@@ -162,11 +198,14 @@ func (e *ACKEngine) OnDataReceived(seqNo uint32, isControlStream bool) {
 
 	// Rule 4: MaxPackets reached
 	if e.pending >= e.policy.MaxPackets {
+		ackEmitImmediate.Add(1)
 		e.flushLocked()
 		return
 	}
 
-	// Rule 5: Start/reset delayed ACK timer
+	// Rule 5: Start/reset delayed ACK timer (counter increments in
+	// startTimerLocked AfterFunc body so we capture actual timer fires,
+	// not just timer arms).
 	e.startTimerLocked()
 }
 
@@ -198,6 +237,7 @@ func (e *ACKEngine) OnDuplicateReceived(seqNo uint32) {
 	defer e.mu.Unlock()
 	e.pending++
 	dbgACK.Printf("OnDuplicateReceived seq=%d — forcing immediate ACK to clear sender retransmit", seqNo)
+	ackEmitDuplicate.Add(1)
 	e.flushLocked()
 }
 
@@ -407,9 +447,51 @@ func (e *ACKEngine) startTimerLocked() {
 	if e.timer != nil {
 		e.timer.Stop()
 	}
-	e.timer = time.AfterFunc(e.policy.MaxDelay, func() {
+	// Adaptive delayed-ACK timeout: cap at min(MaxDelay, max(SRTT/4, 1ms))
+	// so the timer scales with the actual round-trip latency of the path
+	// rather than imposing a flat 25ms floor that dominates on fast LANs.
+	//
+	// Why SRTT/4: RFC 9002 §6.2 warns that a max_ack_delay above the
+	// measured RTT impairs the sender's congestion control — the sender's
+	// PTO and RTO are computed including the receiver's advertised ack
+	// delay, so over-quoting wastes loss-recovery budget. Modern QUIC
+	// implementations (quiche, msquic, nginx-quic) use SRTT/4 or
+	// SRTT/min_rtt_fraction. SRTT/4 keeps the Nagle-style batching
+	// benefit (4 packets per RTT can still coalesce) without bloating
+	// RTT estimates on short-RTT paths.
+	//
+	// Why max(_, 1ms): on jittery paths a sub-millisecond timer
+	// pathologically per-packet-acks every frame; 1ms keeps the
+	// coalescing floor that matters for throughput. The MaxDelay ceiling
+	// (25ms default) still applies as the worst case for high-RTT WAN.
+	//
+	// Was Batch 6 follow-up to the user's design question — a flat timer
+	// doesn't fit "as advanced, as capable and as intelligent as
+	// possible" once the path can be < MaxDelay. Adaptive timeout aligns
+	// with QUIC RFC 9002 and removes the 25ms RTT floor that was
+	// amplifying bimodal RPC latency on noise-UDP same-origin paths.
+	delay := e.policy.MaxDelay
+	if e.rttFn != nil {
+		if srtt := e.rttFn(); srtt > 0 {
+			adaptive := srtt / 4
+			if adaptive < delay {
+				delay = adaptive
+			}
+		}
+	}
+	if delay < time.Millisecond {
+		delay = time.Millisecond
+	}
+	e.timer = time.AfterFunc(delay, func() {
 		e.mu.Lock()
 		defer e.mu.Unlock()
+		// Only count an actual emit, not the no-op skip path at the top
+		// of flushLocked when pending+buffered are both zero (the typical
+		// post-flush race where another rule already drained pending).
+		willEmit := e.pending > 0 || e.recvWindow.BufferedCount() > 0
+		if willEmit {
+			ackEmitDelayTimer.Add(1)
+		}
 		e.flushLocked()
 	})
 }

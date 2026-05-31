@@ -111,6 +111,23 @@ type NoiseSession struct {
 	// rejected because the MaxConcurrentStreams cap is reached.
 	streamRefused uint64
 
+	// Batch 6 telemetry: cross-correlate aether-layer hypotheses against
+	// observed bimodal RPC latency spikes (the ~1-PTO cluster at 380-440ms
+	// on noise-UDP same-origin paths, while cross-origin WebSocket paths
+	// stay clean).
+	//
+	// cansendFalseReenqueues — every time CanSend returns false in the
+	// writeLoop and the frame is re-enqueued. High counts during a spike
+	// window indicate cwnd-limited backlog as the latency source (h4
+	// scheduler park/wake race or h2 CUBIC activation after Finding E).
+	//
+	// wakeOnAckCalls — every Wake() fired by handleACK after the gate was
+	// dropped from `len(acked)>0` to "always wake". The delta vs
+	// cansendFalseReenqueues approximates how often the writeLoop is
+	// blocked waiting for an ACK that already arrived but didn't wake it.
+	cansendFalseReenqueues uint64
+	wakeOnAckCalls         uint64
+
 	// ECN observation. The receive path increments ceObservedBytes
 	// when an inbound packet's IP/IPv6 TOS field carries the CE codepoint
 	// (0x03). The next outbound CompositeACK reads-and-resets this counter
@@ -770,6 +787,12 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 		fecEvicted += s.rsDecoder.EvictedCount()
 	}
 
+	// Batch 6 telemetry: surface aether-layer counters so the Library's
+	// MeshMetrics handler can publish them via /api/monitoring/mesh-debug.
+	// AckEmit{Immediate,Rule5,Duplicate} are global atomic counters
+	// across all engines (not per-session) — when summed across the
+	// fleet they reveal which ACK-trigger path dominates.
+	ackImmediate, ackDelayTimer, ackDup := reliability.AckEmitStats()
 	return aether.SessionMetrics{
 		RTT:              avg,
 		CWND:             s.congestion().CWND(),
@@ -788,6 +811,12 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 		ReplayDuplicates: replayDup,
 		ReplayAncient:    replayAncient,
 		ReplayRejects:    replayDup + replayAncient + seqWraps,
+
+		CanSendFalseReenqueues: atomic.LoadUint64(&s.cansendFalseReenqueues),
+		WakeOnAckCalls:         atomic.LoadUint64(&s.wakeOnAckCalls),
+		AckEmitDelayTimer:      ackDelayTimer,
+		AckEmitImmediate:       ackImmediate,
+		AckEmitDuplicate:       ackDup,
 	}
 }
 

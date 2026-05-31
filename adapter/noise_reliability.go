@@ -14,6 +14,7 @@ import (
 	"io"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ORBTR/aether"
@@ -61,7 +62,19 @@ func (s *NoiseSession) writeLoop() {
 			if !isProbe {
 				inFlightBytes := s.totalInFlightBytes()
 				if !s.congestion().CanSend(inFlightBytes + int64(frameSize)) {
+					// Re-enqueue puts the frame back. Enqueue already calls
+					// signalWake() internally, so the writeLoop is guaranteed
+					// to be re-armed for its next park. The explicit Wake()
+					// below is belt-and-suspenders against the scheduler
+					// park/wake race identified in the Batch 6 audit: if
+					// some other goroutine drains the wake channel between
+					// Enqueue and the parking select below, the writeLoop
+					// would otherwise wait for the next external wake.
+					// Wake() is a non-blocking buffered send (capped at 1);
+					// duplicates collapse and the call is cheap.
 					s.sched.Enqueue(frame.StreamID, frame)
+					atomic.AddUint64(&s.cansendFalseReenqueues, 1)
+					s.sched.Wake()
 					break
 				}
 			}

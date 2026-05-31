@@ -471,9 +471,16 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	// re-evaluates `CanSend`. Without this, frames re-enqueued after a
 	// CanSend=false break would wait until the next Enqueue (or
 	// indefinitely if traffic stops).
-	if len(acked) > 0 {
-		s.sched.Wake()
-	}
+	//
+	// Batch 6 (2026-05-31): removed the `len(acked) > 0` gate. Every ACK
+	// can advance cwnd via SACK info / PRR / BBR delivery samples even
+	// when no new entries are in acked[] (duplicate / reorder ACKs that
+	// still carry fresh window credit). Wake() is a non-blocking buffered
+	// signal capped at 1 — duplicate calls collapse — so removing the
+	// gate is cheap and closes the missed-wake race observed on
+	// noise-UDP same-origin paths exhibiting bimodal RPC latency.
+	s.sched.Wake()
+	atomic.AddUint64(&s.wakeOnAckCalls, 1)
 
 	// Track BaseACK progress for stall detection. State lives on the stream
 	// (not a session-level map) so it dies with the stream. Atomic CAS on
