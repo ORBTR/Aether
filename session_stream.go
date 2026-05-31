@@ -162,6 +162,45 @@ type SessionMetrics struct {
 	// Per-stream observe metrics (ACK-observe mode — pure observation, no enforcement).
 	// Available on all transport types. Keyed by stream ID.
 	StreamObserve map[uint64]StreamObserveData `json:"streamObserve,omitempty"`
+
+	// Batch 6 (aether v0.0.72): cross-correlate hypotheses about RPC
+	// latency spikes on noise-UDP same-origin paths against actual
+	// runtime behaviour. All counters are per-session totals since
+	// session create. Library surfaces them via MeshMetrics under the
+	// `aether_*` namespace.
+	//
+	// CanSendFalseReenqueues: writeLoop re-enqueued because CUBIC
+	// CanSend(inFlight+frameSize) returned false. Elevated counts during
+	// a latency spike window point at h2/h4 (CUBIC activation after
+	// Finding E surfaces a missed-wake race in the writeLoop park
+	// scheduler).
+	//
+	// WakeOnAckCalls: every ACK arrival now calls sched.Wake()
+	// unconditionally (was `len(acked)>0` gated pre-Batch-6). The delta
+	// between this and CanSendFalseReenqueues approximates how often
+	// the writeLoop blocked on a wake that the ACK has now provided.
+	//
+	// AckEmitDelayTimer: ACKs emitted because the adaptive delayed-ACK
+	// timer fired (no immediate trigger applied). The Batch 6 adaptive-
+	// timeout change caps the timer at min(MaxDelay, SRTT/4) so this
+	// counter alone is not bad — but a high ratio of delay-timer vs
+	// immediate emits on a low-RTT path indicates the timer is the
+	// dominant ACK trigger and the delayed-ACK floor is the latency
+	// source. Compare against AckEmitImmediate.
+	//
+	// AckEmitImmediate: ACKs emitted by immediate triggers (gap
+	// detected / control stream / first-after-idle / max-packets).
+	// High immediate-vs-timer ratio = healthy ACK-driven flow control.
+	//
+	// AckEmitDuplicate: ACKs emitted because OnDuplicateReceived
+	// forced an immediate flush (legitimate retransmit landed in the
+	// replay window). Elevated counts = lossy ACK-direction path; the
+	// sender keeps retransmitting frames whose ACKs were lost.
+	CanSendFalseReenqueues uint64 `json:"canSendFalseReenqueues,omitempty"`
+	WakeOnAckCalls         uint64 `json:"wakeOnAckCalls,omitempty"`
+	AckEmitDelayTimer      uint64 `json:"ackEmitDelayTimer,omitempty"`
+	AckEmitImmediate       uint64 `json:"ackEmitImmediate,omitempty"`
+	AckEmitDuplicate       uint64 `json:"ackEmitDuplicate,omitempty"`
 }
 
 // StreamObserveData holds per-stream observation metrics from the ObserveEngine.
