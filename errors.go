@@ -55,11 +55,10 @@ var (
 	// is a transient backpressure signal, not a transport failure.
 	//
 	// Use errors.Is(err, aether.ErrStreamCapExhausted) to detect.
-	// Was A1 from aether comprehensive audit 2026-06-02. Prior to
-	// this typed sentinel, Library callers (mesh_connection.go) saw
-	// a string-only error and treated every OpenStream failure as
-	// session-fatal — closing the session for what should have been
-	// a transient cap-hit.
+	// Callers that consume Stream via pools (Library StreamPool)
+	// should arm a brief backoff when this error fires — re-dialing
+	// immediately produces a busy-loop of OpenStream → refuse →
+	// retry.
 	ErrStreamCapExhausted = errors.New("transport: stream cap exhausted")
 
 	// ErrSessionStuck signals that a session has persistently been unable

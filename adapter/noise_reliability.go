@@ -53,25 +53,22 @@ func (s *NoiseSession) writeLoop() {
 			// wedge we saw in production. Regular frames still respect
 			// CanSend (and re-enqueue + park until cwnd advances).
 			//
-			// Finding E (aether deep-review 2026-05-31): CanSend's contract
-			// is `inFlight < cwnd`, but the previous call passed frameSize
-			// (the prospective send) instead of cumulative in-flight bytes.
-			// frameSize ≪ cwnd ⇒ CanSend ≡ true ⇒ CUBIC was disabled in
-			// production. Sum InFlightBytes across the session's streams,
-			// then test `inFlight + frameSize ≤ cwnd`.
+			// CanSend's contract is `inFlight < cwnd` — pass cumulative
+			// in-flight bytes across the session's streams plus the
+			// prospective frameSize. Passing frameSize alone would make
+			// CanSend ≡ true (frameSize ≪ cwnd) and disable CUBIC entirely.
 			if !isProbe {
 				inFlightBytes := s.totalInFlightBytes()
 				if !s.congestion().CanSend(inFlightBytes + int64(frameSize)) {
 					// Re-enqueue puts the frame back. Enqueue already calls
-					// signalWake() internally, so the writeLoop is guaranteed
-					// to be re-armed for its next park. The explicit Wake()
-					// below is belt-and-suspenders against the scheduler
-					// park/wake race identified in the Batch 6 audit: if
-					// some other goroutine drains the wake channel between
-					// Enqueue and the parking select below, the writeLoop
-					// would otherwise wait for the next external wake.
-					// Wake() is a non-blocking buffered send (capped at 1);
-					// duplicates collapse and the call is cheap.
+					// signalWake() internally so the writeLoop is re-armed
+					// for its next park. The explicit Wake() below is
+					// belt-and-suspenders against a park/wake race in the
+					// scheduler: if another goroutine drained the wake
+					// channel between Enqueue and the parking select below,
+					// the writeLoop would otherwise wait for the next
+					// external wake. Wake() is a non-blocking buffered send
+					// (capped at 1); duplicates collapse and the call is cheap.
 					s.sched.Enqueue(frame.StreamID, frame)
 					atomic.AddUint64(&s.cansendFalseReenqueues, 1)
 					s.sched.Wake()
@@ -108,7 +105,12 @@ func (s *NoiseSession) writeLoop() {
 			_ = s.congestion().OnSend(int64(frameSize))
 
 			// Update pacer rate from congestion controller after each send
-			if pacingRate := s.congestion().PacingRate(); pacingRate > 0 {
+			// Clamp controller pacing rate into the safe envelope
+			// (congestion.ClampPacingRate) so a buggy controller
+			// returning 0 or +Inf cannot lock the pacer at "never
+			// send" or "never wait". A return of 0 is preserved as
+			// the "pacing disabled" sentinel.
+			if pacingRate := congestion.ClampPacingRate(s.congestion().PacingRate()); pacingRate > 0 {
 				s.pacer.SetRate(pacingRate)
 			}
 		}
@@ -125,12 +127,11 @@ func (s *NoiseSession) writeLoop() {
 // totalInFlightBytes returns the session-wide in-flight byte count
 // across every stream's SendWindow.
 //
-// Was the O(streams) lock walk added in Finding E (Batch 2); replaced
-// with a single atomic.Load via the inFlightBytes counter that each
-// SendWindow maintains as a side effect of Add/Ack (A9 audit
-// 2026-06-02, batch 7). Per-send cost dropped from
-// O(streams × map-iteration + per-stream-lock) to O(1) atomic load —
-// roughly 50k contentions/s saved on a 50-stream session under load.
+// Fast path: a single atomic.Load on the session-level counter that
+// each SendWindow maintains as a side effect of Add/Ack (wired by
+// SetSessionInFlightCounter in createStream). Per-send cost is O(1)
+// — versus an O(streams × map-iteration + per-stream-lock) walk if
+// it had to fold each window's InFlightBytes() directly.
 //
 // Negative results are clamped to zero defensively: a non-zero return
 // is impossible from a correctly-wired SendWindow set, but the clamp
@@ -163,11 +164,9 @@ func (s *NoiseSession) reliabilityTick() {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	var lastHealthDump time.Time
-	// A7 audit fix: emit a periodic TypeSTATS frame so peers can feed
-	// our observed RTT/CWND/loss/etc. into their quality scorer. Frame
-	// type + codec were defined years ago but never had an emit path —
-	// the receive handler installed in dispatchFrame is paired with
-	// this 5s cadence.
+	// Emit a periodic TypeSTATS frame so peers can feed our observed
+	// RTT/CWND/loss/etc. into their quality scorer. The receive handler
+	// (handleStats in noise_dispatch.go) is paired with this 5s cadence.
 	var lastStatsEmit time.Time
 	type streamSnap struct {
 		id uint64
@@ -186,23 +185,18 @@ func (s *NoiseSession) reliabilityTick() {
 				lastHealthDump = time.Now()
 			}
 
-			// A7: Periodic STATS frame emission every 5s. Lets the peer
-			// learn our observed metrics (RTT/CWND/loss/etc.) for its
-			// quality scorer. Off-band from per-stream ACK traffic so it
-			// never delays an ACK; +34 bytes per peer every 5s = 7B/s,
-			// negligible bandwidth.
+			// Periodic STATS frame emission every 5s. Lets the peer learn
+			// our observed metrics (RTT/CWND/loss/etc.) for its quality
+			// scorer. Off-band from per-stream ACK traffic so it never
+			// delays an ACK; +34 bytes per peer every 5s ≈ 7B/s.
 			//
 			// INTENTIONAL: writeFrame is called directly (no pacer /
 			// CanSend / scheduler.Enqueue). STATS is metadata about
-			// session health, not data traffic — congestion control
-			// should NEVER prevent the peer from learning our state.
-			// The fixed 34-byte payload + 5s cadence guarantee the
-			// total bandwidth contribution is ~7B/s/peer, far below any
-			// meaningful congestion impact. This mirrors the bypass
-			// pattern used for TLP probes (RFC 8985 §7.5) for the same
-			// reason: control-plane signaling must not be subject to
-			// the very congestion it's used to diagnose. Was A7 fix
-			// from Batch 7 adversarial review 2026-06-02.
+			// session health, not data traffic — congestion control must
+			// NEVER prevent the peer from learning our state. Same bypass
+			// pattern as TLP probes (RFC 8985 §7.5): control-plane
+			// signalling cannot be subject to the very congestion it is
+			// used to diagnose.
 			if time.Since(lastStatsEmit) > 5*time.Second {
 				lastStatsEmit = time.Now()
 				m := s.Metrics()
@@ -493,14 +487,14 @@ func (s *NoiseSession) reliabilityTick() {
 
 			// Per-stream stuck detector. STALL-DETECT above is session-
 			// level: lastAnyProgressAt resets when ANY stream makes
-			// progress. So a wedged stream-1 (BidiRPC) while stream-0
-			// (gossip) ticks happily never trips session-level STALL-
-			// DETECT, and the BidiRPC wedge can persist for minutes.
-			// Was Finding K from aether deep-review 2026-05-31.
+			// progress, so a wedged stream-1 (BidiRPC) while stream-0
+			// (gossip) ticks happily would never trip session-level
+			// STALL-DETECT and the BidiRPC wedge could persist for
+			// minutes.
 			//
 			// Per-stream rule: any stream with in-flight > 0 AND no
 			// progress for stuckStreamThreshold while the SESSION is
-			// healthy (we just saw progress on some other stream) is
+			// healthy (some other stream just made progress) is
 			// individually wedged. Reset that stream's TLP exhaustion
 			// so probes can resume. Don't close the session — we have
 			// evidence the path is alive via the other stream(s).
@@ -531,10 +525,9 @@ func (s *NoiseSession) reliabilityTick() {
 
 				// [ACK-SILENT]: explicit warning when this stream has been
 				// sending without ACK progress for >30s but TLP isn't
-				// telling us anything is wrong (e.g. no probes scheduled
-				// because we already disarmed). One per stream per minute.
-				// Was Finding M from aether deep-review 2026-05-31 — the
-				// silent-ACK starvation case lacked an obvious log signal.
+				// signalling anything wrong (e.g. no probes scheduled
+				// because we already disarmed). One per stream per minute
+				// so a wedge surfaces clearly without spamming the log.
 				lastWarn := e.st.lastAckSilentLogUnixNano.Load()
 				if nowNano-lastWarn > int64(time.Minute) &&
 					e.st.lastAckSilentLogUnixNano.CompareAndSwap(lastWarn, nowNano) {
@@ -672,6 +665,15 @@ func (s *NoiseSession) connWrite(b []byte) error {
 // writeFrame serializes and writes a single frame to the Noise connection.
 // Applies compression (if enabled and payload > 64 bytes) and encryption (if key set).
 func (s *NoiseSession) writeFrame(frame *aether.Frame) error {
+	// Per-session frame and byte counters consumed by Metrics(). Count
+	// at attempt-time rather than at conn.Write success so the
+	// "bytes the session tried to send" is what gets surfaced — the
+	// difference vs at-success is negligible since writeFrame only
+	// errors during teardown / panicked conn.
+	s.framesSent.Add(1)
+	if frame != nil {
+		s.bytesSent.Add(uint64(frame.Length))
+	}
 	// Compression + encryption are IDEMPOTENT on the frame object. The
 	// crypto/aead.go Encrypt path mutates frame.Payload in place
 	// (plaintext → ciphertext + 16B auth tag), and compressPayload does

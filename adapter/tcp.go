@@ -403,9 +403,10 @@ func (s *TCPSession) registerStream(st *tcpStream, enforceRemoteCap bool) *tcpSt
 		return existing // duplicate peer OPEN for open stream — return existing
 	}
 	// MaxConcurrentStreams cap applies to BOTH locally-initiated and
-	// peer-initiated stream opens (A1 audit 2026-06-02). enforceRemoteCap
-	// now only controls whether a RESET is sent on refusal (peer-initiated)
-	// or the caller gets a typed error to surface (local).
+	// peer-initiated stream opens. enforceRemoteCap=true means
+	// peer-initiated → on refusal, send a RESET so the peer gives up;
+	// enforceRemoteCap=false means locally-initiated → return nil and
+	// let the caller surface ErrStreamCapExhausted.
 	{
 		cap := s.opts.MaxConcurrentStreams
 		if cap <= 0 {
@@ -528,7 +529,8 @@ func (s *TCPSession) handleImplicitOpen(frame *aether.Frame) {
 	st.attachGrantDebouncer()
 	st.state.Transition(aether.EventRecvData)
 
-	// Propagate cfg.LatencyClass (Finding D parity with noise adapter).
+	// Propagate cfg.LatencyClass — parity with the noise adapter so a
+	// caller's explicit class isn't silently dropped to ClassBULK.
 	// ClassUnset (zero value) → DefaultLatencyClass(streamID).
 	classAccepted := cfg.LatencyClass
 	if classAccepted == aether.ClassUnset {
@@ -842,11 +844,11 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 	}
 	st.state.Transition(aether.EventSendOpen)
 
-	// Locally-initiated open. registerStream(false) enforces the cap
-	// (A1 audit 2026-06-02 — was bypassed pre-Batch-7) but does NOT
-	// send a RESET; we surface the typed sentinel ErrStreamCapExhausted
-	// so callers (Library StreamPool, mesh_connection.go) can detect
-	// cap-hit via errors.Is and back off instead of closing the session.
+	// Locally-initiated open. registerStream(false) enforces the
+	// MaxConcurrentStreams cap but skips the peer-side RESET. Surface
+	// the typed sentinel ErrStreamCapExhausted so pool/dispatch
+	// callers can detect cap-hit via errors.Is and back off rather
+	// than closing the session.
 	if s.registerStream(st, false) == nil {
 		cap := s.opts.MaxConcurrentStreams
 		if cap <= 0 {
@@ -856,7 +858,8 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 	}
 	st.attachGrantDebouncer()
 
-	// Propagate cfg.LatencyClass (Finding D parity with noise adapter).
+	// Propagate cfg.LatencyClass — parity with the noise adapter so a
+	// caller's explicit class isn't silently dropped to ClassBULK.
 	// ClassUnset (zero value) → DefaultLatencyClass(streamID).
 	classOpen := cfg.LatencyClass
 	if classOpen == aether.ClassUnset {

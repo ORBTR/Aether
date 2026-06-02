@@ -25,22 +25,21 @@ import (
 var ackEmitCount atomic.Uint64
 var lastAckLogAt atomic.Int64 // unix nanos of last log emission
 
-// Batch 6 telemetry: distinguishes which OnDataReceived trigger
-// causes each flushLocked. The delay-timer path imposes a ~MaxDelay
-// (25ms default) RTT floor for small RPC responses that don't satisfy
-// any of the immediate triggers (gap / control / post-idle /
-// max-packets) — the candidate latency amplifier for noise-UDP RPC.
-//   ackEmitImmediate — emitted by one of the immediate triggers:
-//                      gap detected, control stream, first frame
-//                      after idle, or max-packets threshold.
-//   ackEmitDelayTimer — emitted because the adaptive delayed-ACK
-//                       timer fired (no immediate trigger applied).
-//   ackEmitDuplicate  — emitted by OnDuplicateReceived forcing an
-//                       immediate flush so the sender's retransmit
-//                       timer clears.
+// ACK-emit reason counters — distinguishes which OnDataReceived
+// trigger caused each flushLocked. The delay-timer path imposes a
+// ~MaxDelay (25ms default) RTT floor for small RPC responses that
+// don't satisfy any of the immediate triggers (gap / control /
+// post-idle / max-packets), so it is the candidate latency amplifier
+// for low-RTT RPC.
+//   ackEmitImmediate  — gap / control stream / first frame after
+//                       idle / max-packets threshold.
+//   ackEmitDelayTimer — adaptive delayed-ACK timer fired with no
+//                       immediate trigger applied.
+//   ackEmitDuplicate  — OnDuplicateReceived forced an immediate flush
+//                       so the sender's retransmit timer clears.
 //
-// Counted globally across all engines so they sum to ackEmitCount
-// minus the on-demand Flush() called by stream-close paths.
+// Counted globally across all engines; sum approximates ackEmitCount
+// minus on-demand Flush() calls from stream-close paths.
 var (
 	ackEmitImmediate atomic.Uint64
 	ackEmitDelayTimer    atomic.Uint64
@@ -120,10 +119,10 @@ type ACKEngine struct {
 	currentGrantFn     func() int64
 	lastEmittedCredit  uint64
 
-	// Delayed ACK timer
-	timerMu   sync.Mutex
-	timer     *time.Timer
-	timerStop chan struct{}
+	// Delayed ACK timer. time.Timer's own Stop() prevents the AfterFunc
+	// from running after teardown; no separate stop channel is needed.
+	timerMu sync.Mutex
+	timer   *time.Timer
 }
 
 // NewACKEngine creates an ACK engine for a stream.
@@ -135,7 +134,6 @@ func NewACKEngine(rw *RecvWindow, policy ACKPolicy, sendFn func(*aether.Composit
 		bitmapBits: 64,
 		sendACK:    sendFn,
 		rttFn:      rttFn,
-		timerStop:  make(chan struct{}),
 	}
 	return e
 }
@@ -255,10 +253,6 @@ func (e *ACKEngine) Stop() {
 	if e.timer != nil {
 		e.timer.Stop()
 	}
-	select {
-	case e.timerStop <- struct{}{}:
-	default:
-	}
 }
 
 // BuildCompositeACK constructs a CompositeACK from current state.
@@ -317,9 +311,9 @@ func (e *ACKEngine) flushLocked() {
 	// Deadline (10s). If e.mu were held across that, every subsequent
 	// OnDataReceived call would block on the lock — incoming frames pile
 	// up, recvCh fills, ACK generation grinds to a halt across the whole
-	// session. This was Finding B from the aether deep-review 2026-05-31:
-	// recurring multi-minute wedge symptom with ACK-engine-mu pinned by
-	// the AfterFunc callback at startTimerLocked() (line ~380).
+	// session. Symptom of holding the lock here is multi-minute session
+	// wedges with the engine mutex pinned by the AfterFunc callback at
+	// startTimerLocked().
 	//
 	// The lock-yield-then-call pattern requires the caller to hold e.mu
 	// at function entry — which all flushLocked() call sites do. We
@@ -343,10 +337,9 @@ func (e *ACKEngine) flushLocked() {
 		}
 		// First ACK after >1s of silence is suspicious — under healthy
 		// load this engine fires every 25ms or sooner. Always log it
-		// regardless of the 60s sampling window. Was Finding M from
-		// aether deep-review 2026-05-31: silent ACK starvation periods
-		// were diagnostically invisible because [ACK-EMIT] only sampled
-		// once per minute.
+		// regardless of the 60s sampling window so silent ACK
+		// starvation periods aren't diagnostically invisible behind
+		// the [ACK-EMIT] sampling cadence.
 		now := time.Now()
 		if !prevACK.IsZero() && now.Sub(prevACK) > time.Second {
 			log.Printf("[ACK-EMIT] resumed after %v silence baseACK=%d cumulative=%d",
@@ -464,12 +457,8 @@ func (e *ACKEngine) startTimerLocked() {
 	// pathologically per-packet-acks every frame; 1ms keeps the
 	// coalescing floor that matters for throughput. The MaxDelay ceiling
 	// (25ms default) still applies as the worst case for high-RTT WAN.
-	//
-	// Was Batch 6 follow-up to the user's design question — a flat timer
-	// doesn't fit "as advanced, as capable and as intelligent as
-	// possible" once the path can be < MaxDelay. Adaptive timeout aligns
-	// with QUIC RFC 9002 and removes the 25ms RTT floor that was
-	// amplifying bimodal RPC latency on noise-UDP same-origin paths.
+	// Aligns with QUIC RFC 9002 — a flat MaxDelay timer imposes a fixed
+	// RTT floor on every flush, amplifying RPC latency on low-RTT paths.
 	delay := e.policy.MaxDelay
 	if e.rttFn != nil {
 		if srtt := e.rttFn(); srtt > 0 {

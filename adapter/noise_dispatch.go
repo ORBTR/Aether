@@ -128,6 +128,12 @@ func (s *NoiseSession) processIncomingFrame(frame *aether.Frame, indicator byte)
 	//
 	// The deleted check was a third, redundant, AND incorrect layer.
 	s.Health().RecordActivity()
+	// Per-session frame and byte counters consumed by Metrics() — the
+	// receive-side companions to writeFrame's framesSent/bytesSent.
+	// Counted at dispatchFrame so the payload reflects what reached
+	// application-level decoding (not on-wire size including headers).
+	s.framesRecv.Add(1)
+	s.bytesRecv.Add(uint64(len(frame.Payload)))
 	s.dispatchFrame(frame)
 }
 
@@ -183,10 +189,8 @@ func (s *NoiseSession) handleCongestion(frame *aether.Frame) {
 // most-recent payload on the session for monitoring readers (Library
 // MeshMetrics, multipath quality scorer). The frame is informational
 // only — it never alters local protocol state and never triggers a
-// peer reply. Was A7 from aether comprehensive audit 2026-06-02:
-// codec was defined years ago but had no emit path nor dispatch
-// case, leaving the frame type effectively dead. The emit path is in
-// noise_reliability.go reliabilityTick (every 5s).
+// peer reply. The emit path is in noise_reliability.go
+// reliabilityTick (every 5s).
 func (s *NoiseSession) handleStats(frame *aether.Frame) {
 	if frame == nil || len(frame.Payload) < aether.StatsPayloadSize {
 		return
@@ -207,10 +211,10 @@ func (s *NoiseSession) Throttle() *aether.CongestionThrottle {
 
 func (s *NoiseSession) handleData(frame *aether.Frame) {
 	// Recover from a `send on closed channel` panic is scoped to the
-	// delivery loop below — broad function-wide recover would silently
-	// swallow unrelated bugs (nil deref, internal state corruption) and
-	// turn correctness regressions into invisible drops. Was Finding G
-	// from aether deep-review 2026-05-31.
+	// delivery loop below — a broad function-wide recover would
+	// silently swallow unrelated bugs (nil deref, internal state
+	// corruption) and turn correctness regressions into invisible
+	// drops.
 	s.mu.Lock()
 	st, ok := s.streams[frame.StreamID]
 	s.mu.Unlock()
@@ -283,15 +287,14 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 	// Reliability: insert into receive window for reordering
 	delivered := st.recvWindow.Insert(frame.SeqNo, frame.Payload)
 
-	// Notify ACK engine BEFORE the delivery loop. DeliverToRecvChWith-
-	// Signals can block up to maxBackpressure (now 25ms, was 200ms) on
-	// a slow consumer; deferring the ACK-engine notify behind that
-	// stall meant the readLoop pipeline held off ACK generation for
-	// EVERY frame on EVERY stream while one stream's recvCh was full.
-	// noise inbox (128 slots) overflows during that window, silently
-	// dropping inbound ACKs for OTHER streams. Was Finding C from
-	// aether deep-review 2026-05-31 — observed in production as
-	// rack.fackAge climbing across all streams concurrently.
+	// Notify ACK engine BEFORE the delivery loop. DeliverToRecvCh-
+	// WithSignals can block up to maxBackpressure (25ms) on a slow
+	// consumer; if the ACK-engine notify were deferred behind that
+	// stall the readLoop pipeline would hold off ACK generation for
+	// EVERY frame on EVERY stream while one stream's recvCh was full,
+	// and the noise inbox (128 slots) would overflow — silently
+	// dropping inbound ACKs for OTHER streams (rack.fackAge would
+	// climb across all streams concurrently).
 	//
 	// The ACK engine only does in-memory state updates + may emit a
 	// CompositeACK; it never blocks on a stream's recvCh. Safe to
@@ -302,8 +305,8 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 
 	// Delivery loop: handleReset / local Reset / streamGC sweep can run
 	// closeRecvOnce after this goroutine cached `st`, racing with the
-	// channel-send inside DeliverToRecvChWithSignals. Recover narrowly
-	// scoped to that send (Finding G).
+	// channel-send inside DeliverToRecvChWithSignals. Recover is
+	// narrowly scoped to that send only.
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -344,13 +347,12 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 		return // malformed
 	}
 
-	// A8 audit fix: track peer's observed max_ack_delay from the
-	// AckDelay field on every inbound CompositeACK and feed it into
-	// TLP's PTO calculation per RFC 9002 §6.2. Previously the peer's
-	// max_ack_delay was a hardcoded 25ms constant; with this EWMA
-	// learned from actual ACK pacing, PTO adapts to the peer's real
-	// ACK cadence rather than over- or under-shooting. AckDelay is
-	// encoded in AckDelayGranularity (8us) units on the wire.
+	// Feed the peer's observed max_ack_delay (from the AckDelay field
+	// on every inbound CompositeACK) into TLP's PTO calculation per
+	// RFC 9002 §6.2 — an EWMA learned from actual ACK pacing rather
+	// than a hardcoded constant, so PTO adapts to the peer's real ACK
+	// cadence instead of over- or under-shooting. AckDelay is encoded
+	// in AckDelayGranularity (8us) units on the wire.
 	if st.tlp != nil {
 		peerAckDelay := time.Duration(ack.AckDelay) * aether.AckDelayGranularity
 		st.tlp.UpdateMaxAckDelay(peerAckDelay)
@@ -460,8 +462,12 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	}
 	if bbr, ok := s.congestion().(*congestion.BBRController); ok {
 		for _, entry := range acked {
-			if sample, ok := entry.BBRSample.(congestion.DeliveryRateSample); ok {
-				bbr.OnAckSampled(int64(entry.Frame.Length), srtt, sample)
+			// SendEntry.BBRSample is *DeliveryRateSample — nil when the
+			// send happened under CUBIC and the BBR stamping path was
+			// skipped, OR when this entry was created before BBR became
+			// active on this session. Nil-check before deref.
+			if entry.BBRSample != nil {
+				bbr.OnAckSampled(int64(entry.Frame.Length), srtt, *entry.BBRSample)
 			} else {
 				bbr.OnAck(int64(entry.Frame.Length), srtt)
 			}
@@ -486,8 +492,26 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	}
 	// ECN feedback: peer reported CE-marked bytes since last ACK. Notify
 	// the controller so it can react one RTT before queue overflow.
+	//
+	// CEBytes is peer-supplied data — an inflated claim ("you sent 1GB
+	// and 1GB got CE-marked" when we sent 1KB) would drive cwnd
+	// collapses on a bad-faith peer. Cap against a plausibility upper
+	// bound (bytes acked in this CompositeACK, or stream-level
+	// outstanding when the ACK acks nothing new) and flag overruns as
+	// ACK-validation abuse so the rate limiter can defend us.
 	if ack.Flags&aether.CACKHasECN != 0 && ack.CEBytes > 0 {
-		s.congestion().OnCE(int64(ack.CEBytes))
+		var maxPlausibleCE int64 = ackedBytes
+		if maxPlausibleCE <= 0 {
+			maxPlausibleCE = st.window.Outstanding()
+		}
+		claimed := int64(ack.CEBytes)
+		if claimed > maxPlausibleCE && maxPlausibleCE > 0 {
+			s.reportAbuse(abuse.ReasonACKValidation)
+			claimed = maxPlausibleCE
+		}
+		if claimed > 0 {
+			s.congestion().OnCE(claimed)
+		}
 	}
 	// Piggybacked stream-level WINDOW_UPDATE. Same cumulative semantics
 	// as a standalone WINDOW_UPDATE frame — ApplyUpdate drops stale/
@@ -502,13 +526,13 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	// CanSend=false break would wait until the next Enqueue (or
 	// indefinitely if traffic stops).
 	//
-	// Batch 6 (2026-05-31): removed the `len(acked) > 0` gate. Every ACK
-	// can advance cwnd via SACK info / PRR / BBR delivery samples even
-	// when no new entries are in acked[] (duplicate / reorder ACKs that
-	// still carry fresh window credit). Wake() is a non-blocking buffered
-	// signal capped at 1 — duplicate calls collapse — so removing the
-	// gate is cheap and closes the missed-wake race observed on
-	// noise-UDP same-origin paths exhibiting bimodal RPC latency.
+	// Every ACK can advance cwnd via SACK info / PRR / BBR delivery
+	// samples even when no new entries are in acked[] (duplicate /
+	// reorder ACKs that still carry fresh window credit), so do NOT
+	// gate on `len(acked) > 0`. Wake() is a non-blocking buffered
+	// signal capped at 1 — duplicate calls collapse — so calling it
+	// unconditionally is cheap and closes the missed-wake race on
+	// the writeLoop park scheduler.
 	s.sched.Wake()
 	atomic.AddUint64(&s.wakeOnAckCalls, 1)
 
@@ -587,9 +611,9 @@ func (s *NoiseSession) handleOpen(frame *aether.Frame) {
 }
 
 func (s *NoiseSession) handleImplicitOpen(frame *aether.Frame) {
-	// Recover scoped to the delivery loop only (Finding G — same reasoning
-	// as handleData). Any panic outside the channel-send is a real bug and
-	// must not be silently swallowed.
+	// Recover scoped to the delivery-loop channel-send only (same
+	// reasoning as handleData). Any panic outside the channel-send is
+	// a real bug and must not be silently swallowed.
 	st := s.createStream(frame.StreamID, aether.DefaultStreamConfig(frame.StreamID), true /* enforceRemoteCap */)
 	if st == nil {
 		return
@@ -602,11 +626,10 @@ func (s *NoiseSession) handleImplicitOpen(frame *aether.Frame) {
 	delivered := st.recvWindow.Insert(frame.SeqNo, frame.Payload)
 
 	// Prime the ACK engine for the implicit-open's first frame BEFORE
-	// the delivery loop. Without this, the first frame on a peer-initiated
-	// stream sat un-ACKed until a SECOND frame arrived (which would call
-	// handleData's notify) — wasting a round-trip on every stream open.
-	// Mirrors handleData's reorder (Finding C). Was Finding H from
-	// aether deep-review 2026-05-31.
+	// the delivery loop — otherwise the first frame on a peer-initiated
+	// stream sits un-ACKed until a SECOND frame arrives and triggers
+	// handleData's notify, wasting a round-trip on every stream open.
+	// Mirrors the ordering in handleData above.
 	if st.ackEngine != nil {
 		st.ackEngine.OnDataReceived(frame.SeqNo, frame.StreamID == s.layout.Control)
 	}
@@ -868,9 +891,9 @@ func (s *NoiseSession) deliverToStream(streamID uint64, payload []byte) {
 	if !ok {
 		return
 	}
-	// Recover narrowly scoped to the channel-send (Finding G — same
-	// reasoning as handleData). handleReset / local Reset / streamGC
-	// sweep can run closeRecvOnce after the lookup above.
+	// Recover narrowly scoped to the channel-send only. handleReset /
+	// local Reset / streamGC sweep can run closeRecvOnce after the
+	// lookup above, racing the send on the recv channel.
 	defer func() {
 		if r := recover(); r != nil {
 			dbgNoise.Printf("deliverToStream: send-on-closed for stream %d (race with teardown): %v", streamID, r)

@@ -82,14 +82,11 @@ func TestS5_TCPSessionRefusesOverCap(t *testing.T) {
 	}
 }
 
-// TestS5_LocalOpenStreamCapHitReturnsTypedError — A1 audit follow-up
-// 2026-06-02. Verifies that locally-initiated OpenStream calls that
-// hit the MaxConcurrentStreams cap return aether.ErrStreamCapExhausted
-// (detectable via errors.Is) AND increment the streamRefused counter.
-// Library callers (mesh_connection.go, StreamPool.Fill) rely on this
-// typed error to back off without closing the entire session — a
-// stringly-typed error caused callers to misinterpret the transient
-// cap-hit as a session-fatal transport failure.
+// TestS5_LocalOpenStreamCapHitReturnsTypedError verifies the local
+// OpenStream cap-hit contract: hitting MaxConcurrentStreams returns a
+// wrapped aether.ErrStreamCapExhausted (detectable via errors.Is) AND
+// increments the streamRefused counter. Pool/dispatch callers depend
+// on the typed sentinel for back-off vs session-close decisions.
 func TestS5_LocalOpenStreamCapHitReturnsTypedError(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()

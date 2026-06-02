@@ -226,6 +226,21 @@ func (q *RetransmitQueue) Dequeue() *aether.Frame {
 	heap.Pop(&q.queue)
 	entryBytes := frameBytes(entry.Frame)
 
+	// Drop entries whose underlying SendWindow entry was already ACKed.
+	// ProcessCompositeACK marks Send.Acked=true and removes the entry
+	// from retransmitQ in two separate operations; an RTO firing
+	// between those operations would otherwise replay an already-
+	// delivered frame. Send is nil for callers that use the legacy
+	// Enqueue path without a shared *SendEntry — the check is gated
+	// so it stays back-compatible.
+	if entry.Send != nil && entry.Send.Acked {
+		q.bufferedBytes -= entryBytes
+		if q.bufferedBytes < 0 {
+			q.bufferedBytes = 0
+		}
+		return nil
+	}
+
 	entry.Retries++
 
 	// Check deadline — drop frames that have expired

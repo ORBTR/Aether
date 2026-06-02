@@ -70,12 +70,13 @@ const (
 	SourceLimitDefaultBurst = 10
 	// SourceLimitDefaultRate is the per-source refill rate (per second).
 	SourceLimitDefaultRate = 1.0
-	// SourceLimitMaxEntries caps the per-IP bucket map. Raised from 10k
-	// to 100k (A2 from aether audit 2026-06-02). At 10k, a spoofed-IP
-	// attacker could cycle through the cap within the global 1000/s
-	// ceiling — displacing legitimate peers' bucket state in ~10s. At
-	// 100k with TTL-based eviction (instead of FIFO), cycling requires
-	// sustained 100k+/sec for >5 minutes, well above the global cap.
+	// SourceLimitMaxEntries caps the per-IP bucket map. Sized at 100k
+	// so a spoofed-IP attacker constrained by the global 1000/s
+	// ceiling cannot cycle through the cap within the idle TTL window:
+	// sustained 100k+/sec for >5 minutes would be required, well above
+	// the global accept rate. Paired with TTL-based eviction (NOT
+	// FIFO) so active peers are never displaced in favour of stale or
+	// hostile sources.
 	SourceLimitMaxEntries = 100000
 	// SourceLimitEntryTTL is the idle timeout before a per-IP bucket
 	// is eligible for eviction. Legitimate peers re-handshake more
@@ -101,13 +102,13 @@ type sourceEntry struct {
 // sourceLimiter tracks per-source-IP token buckets with TTL-based
 // eviction when the entry cap is reached.
 //
-// Eviction policy (A2 audit fix): legitimate peers whose lastSeen is
-// within TTL are protected from being displaced by spoofed-IP traffic.
-// On cache-full, a single-pass scan finds the oldest entry; if it's
-// past TTL it is evicted to make room; if not (all entries are recent),
-// the new request is rejected. A background sweeper runs every
-// SourceLimitSweepInterval to keep the working set bounded under
-// steady-state load.
+// Eviction policy: legitimate peers whose lastSeen is within TTL are
+// protected from being displaced by spoofed-IP traffic. On cache-full,
+// a single-pass scan finds the oldest entry; it is evicted only if
+// past TTL — otherwise the new (likely spoofed) request is rejected.
+// A background sweeper runs every SourceLimitSweepInterval to keep
+// the working set bounded under steady-state load. Stop() must be
+// called on shutdown to terminate the sweeper goroutine.
 type sourceLimiter struct {
 	mu         sync.Mutex
 	burst      float64
@@ -180,12 +181,12 @@ func (sl *sourceLimiter) sweepExpired() {
 // rate budget. The key is the IP only (not IP+port) so an attacker can't
 // bypass by rolling source ports.
 //
-// Eviction policy (A2 audit 2026-06-02): TTL-based. On cache-full, only
-// entries older than SourceLimitEntryTTL are evicted to make room; if
-// every entry is fresh, the new (likely spoofed) request is dropped.
-// This makes the cache cycle-attack-resistant: an attacker rolling
-// spoofed IPs cannot displace legitimate peers within the TTL window,
-// regardless of attack rate.
+// Eviction is TTL-based. On cache-full, only entries older than
+// SourceLimitEntryTTL are evicted to make room; if every entry is
+// fresh, the new (likely spoofed) request is dropped. This makes the
+// cache cycle-attack-resistant: an attacker rolling spoofed IPs cannot
+// displace legitimate peers within the TTL window, regardless of
+// attack rate.
 func (sl *sourceLimiter) Allow(addr net.Addr) bool {
 	if sl == nil {
 		return true
