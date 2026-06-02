@@ -195,17 +195,13 @@ type StreamWindow struct {
 	// a brand-new stream can't fire TIMED on the very first payload.
 	lastGrantTime time.Time
 
-	// creditAbuseSince records the start of a sustained
+	// creditAbuseSince records the start of the CURRENT
+	// CreditAbuseDuration window for a sustained
 	// (grantsEmitted - consumed) / grantsEmitted > CreditAbuseRatio
-	// window. Zero when the gap is healthy. CheckCreditAbuse sets/clears
-	// this and reports true once the gap has persisted for
-	// CreditAbuseDuration. Updated under w.mu.
+	// imbalance. Zero when the gap is healthy. Re-anchored to the
+	// firing time when CheckCreditAbuse fires so persistent abuse
+	// keeps accruing score on each subsequent full window.
 	creditAbuseSince time.Time
-	// creditAbuseFired latches once CheckCreditAbuse returns true for a
-	// given imbalance window so subsequent calls within the same window
-	// don't flood the abuse scorer. Cleared whenever the gap recovers
-	// below CreditAbuseRatio.
-	creditAbuseFired bool
 }
 
 // CreditAbuseRatio is the (grantsEmitted - consumed) / grantsEmitted
@@ -562,12 +558,19 @@ func (w *StreamWindow) Outstanding() int64 {
 // CheckCreditAbuse reports whether the stream is currently exhibiting
 // a sustained credit-hoarding pattern: the receiver has granted more
 // bandwidth than the peer is consuming, and the imbalance has lasted
-// at least CreditAbuseDuration. Returns true exactly once per imbalance
-// window — once tripped, subsequent calls within the same imbalance
-// return false until the gap recovers below CreditAbuseRatio (which
-// resets the anchor) and the imbalance returns. Lets adapter callers
-// invoke this on every reliability tick without flooding the abuse
-// scorer.
+// at least CreditAbuseDuration.
+//
+// Persistent abuse keeps accruing score: once an imbalance window
+// fires, the anchor advances by another CreditAbuseDuration so the
+// next fire happens after the next full window of sustained
+// imbalance. The single-fire-then-quiet semantics would otherwise
+// limit a hostile peer to one +8 score increment per imbalance
+// episode regardless of duration — well below the 100-point abuse
+// threshold (see abuse.ReasonFlowControlAbuse weight).
+//
+// Returns true at most once per CreditAbuseDuration window for the
+// SAME ongoing imbalance, so adapter callers can invoke this on every
+// reliability tick without flooding the abuse scorer.
 //
 // Internally tracks creditAbuseSince so the duration is measured across
 // multiple calls without per-stream timer machinery. The window resets
@@ -583,26 +586,17 @@ func (w *StreamWindow) CheckCreditAbuse() bool {
 		// No grants ever issued — no imbalance possible. Reset any
 		// stale window-start so we don't fire when grants resume.
 		w.creditAbuseSince = time.Time{}
-		w.creditAbuseFired = false
 		return false
 	}
 
 	gap := w.grantsEmitted - w.consumed
 	if gap <= 0 {
 		w.creditAbuseSince = time.Time{}
-		w.creditAbuseFired = false
 		return false
 	}
 	ratio := float64(gap) / float64(w.grantsEmitted)
 	if ratio <= CreditAbuseRatio {
 		w.creditAbuseSince = time.Time{}
-		w.creditAbuseFired = false
-		return false
-	}
-
-	if w.creditAbuseFired {
-		// Already fired for this imbalance window; suppress until the
-		// gap recovers above the ratio and we anchor a new window.
 		return false
 	}
 
@@ -612,7 +606,11 @@ func (w *StreamWindow) CheckCreditAbuse() bool {
 		return false
 	}
 	if now.Sub(w.creditAbuseSince) >= CreditAbuseDuration {
-		w.creditAbuseFired = true
+		// Re-anchor the window so persistent abuse fires once per
+		// CreditAbuseDuration. A peer that keeps hoarding for an hour
+		// will produce 120 fires (one every 30s) — well past the
+		// 100-point abuse threshold even at weight 8.
+		w.creditAbuseSince = now
 		return true
 	}
 	return false
