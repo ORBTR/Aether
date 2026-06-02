@@ -264,6 +264,16 @@ type SessionMetrics struct {
 	// TCP / QUIC sessions don't ratchet through the noise rekey path.
 	RekeyTotal          uint64 `json:"rekeyTotal,omitempty"`
 	RekeyBytesSinceLast uint64 `json:"rekeyBytesSinceLast,omitempty"`
+	// OBS-13: recv-window head-of-line-block latency distribution. Each
+	// buffered frame records (deliveryTime − bufferArrivalTime) when it is
+	// flushed after its predecessor(s) arrive. Zero when no reordering has
+	// occurred. Paired with RecvWindowDrops: drops are the extreme end of
+	// the same distribution (frames that blocked long enough to be evicted
+	// rather than delivered). Elevated p99 with a low p50 is the "occasional
+	// burst reordering" shape; elevated p50 indicates sustained reordering
+	// (lossy or heavily misordered path).
+	RecvWindowHOLP50Us uint64 `json:"recvWindowHolP50Us,omitempty"`
+	RecvWindowHOLP99Us uint64 `json:"recvWindowHolP99Us,omitempty"`
 }
 
 // StreamObserveData holds per-stream observation metrics from the ObserveEngine.

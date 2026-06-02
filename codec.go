@@ -762,28 +762,100 @@ func DecodeHandshake(data []byte) HandshakePayload {
 // STATS Codec
 // ────────────────────────────────────────────────────────────────────────────
 
-// StatsPayloadSize is the fixed size of a STATS frame payload (34 bytes).
-const StatsPayloadSize = 34
+// StatsPayloadSize is the wire size of a STATS frame payload.
+//
+// Layout (74 bytes, big-endian):
+//
+//	[ 0: 4) RTT µs (uint32)
+//	[ 4: 8) LossPpm (uint32; LossPercent × 10000)
+//	[ 8:12) CWND bytes (uint32)
+//	[12:16) Retransmits (uint32 — saturating)
+//	[16:24) FramesSent (uint64)
+//	[24:32) BytesSent (uint64)
+//	[32:34) ActiveStreams (uint16)
+//	[34:42) FramesRecv (uint64)
+//	[42:50) BytesRecv (uint64)
+//	[50:54) TotalReorders (uint32 — saturating; sum across StreamObserve)
+//	[54:58) DroppedFrames (uint32 — saturating)
+//	[58:62) RttP50 µs (uint32)
+//	[62:66) RttP99 µs (uint32)
+//	[66:70) TLPFiresTotal (uint32 — saturating)
+//	[70:74) RACKMarksTotal (uint32 — saturating)
+//
+// The asymmetric-aware quality scorer (multipath.computeScoreLocked)
+// needs the receive-direction counters (FramesRecv / BytesRecv /
+// TotalReorders / DroppedFrames) and the peer's RTT distribution
+// (RttP50/P99) so a path where downstream looks healthy on our side
+// but upstream is silently lossy on the peer's side still scores low.
+// The TLP/RACK counts are diagnostic — a peer running hot on loss
+// recovery is a leading indicator the path is degrading even if the
+// LossPpm field hasn't moved yet.
+//
+// Saturating casts on the uint32-narrowed fields: a u64 value past
+// 0xFFFFFFFF is clamped, not truncated mod 2^32 — clamping preserves
+// the "abnormally high" signal, truncating would silently roll over.
+const StatsPayloadSize = 74
+
+// saturU32 clamps a uint64 down to uint32 — values past MaxUint32
+// stay at MaxUint32 instead of wrapping. Used by EncodeStats so
+// saturating-cast counter fields preserve the "abnormally high"
+// observability signal rather than rolling over to a small number.
+func saturU32(v uint64) uint32 {
+	if v > 0xFFFFFFFF {
+		return 0xFFFFFFFF
+	}
+	return uint32(v)
+}
 
 // EncodeStats encodes a SessionMetrics into a STATS frame payload.
+// See StatsPayloadSize for the wire layout. Saturating casts on the
+// uint32-narrowed fields preserve the "abnormally high" signal.
 func EncodeStats(m SessionMetrics) []byte {
 	data := make([]byte, StatsPayloadSize)
-	binary.BigEndian.PutUint32(data[0:4], uint32(m.RTT.Microseconds()))
-	binary.BigEndian.PutUint32(data[4:8], uint32(m.LossPercent*10000)) // ppm
-	binary.BigEndian.PutUint32(data[8:12], uint32(m.CWND))
-	binary.BigEndian.PutUint32(data[12:16], uint32(m.Retransmits))
+	binary.BigEndian.PutUint32(data[0:4], saturU32(uint64(m.RTT.Microseconds())))
+	binary.BigEndian.PutUint32(data[4:8], saturU32(uint64(m.LossPercent*10000))) // ppm
+	binary.BigEndian.PutUint32(data[8:12], saturU32(uint64(m.CWND)))
+	binary.BigEndian.PutUint32(data[12:16], saturU32(m.Retransmits))
 	binary.BigEndian.PutUint64(data[16:24], m.FramesSent)
 	binary.BigEndian.PutUint64(data[24:32], m.BytesSent)
 	binary.BigEndian.PutUint16(data[32:34], uint16(m.ActiveStreams))
+	binary.BigEndian.PutUint64(data[34:42], m.FramesRecv)
+	binary.BigEndian.PutUint64(data[42:50], m.BytesRecv)
+	// Sum stream-level reorder counts so the receiver's scorer can
+	// fold the peer's reorder rate into the asymmetric-loss signal.
+	// Per-stream detail isn't shipped — the dispatcher only needs the
+	// summed signal, and StreamObserve serialisation would bloat the
+	// 5s STATS cadence past the cheap-control-frame budget.
+	var totalReorders uint64
+	for _, sd := range m.StreamObserve {
+		if sd.ReorderCount > 0 {
+			totalReorders += uint64(sd.ReorderCount)
+		}
+	}
+	binary.BigEndian.PutUint32(data[50:54], saturU32(totalReorders))
+	binary.BigEndian.PutUint32(data[54:58], saturU32(m.DroppedFrames))
+	binary.BigEndian.PutUint32(data[58:62], saturU32(uint64(m.RttP50.Microseconds())))
+	binary.BigEndian.PutUint32(data[62:66], saturU32(uint64(m.RttP99.Microseconds())))
+	binary.BigEndian.PutUint32(data[66:70], saturU32(m.TLPFiresTotal))
+	binary.BigEndian.PutUint32(data[70:74], saturU32(m.RACKMarksTotal))
 	return data
 }
 
 // DecodeStats decodes a STATS frame payload into SessionMetrics.
+// Returns a zero-value SessionMetrics on short input (the handler in
+// noise_dispatch.go gates on StatsPayloadSize before calling, so this
+// is belt-and-suspenders against a malformed frame).
+//
+// The TotalReorders field is materialised back as a single synthetic
+// StreamObserve entry keyed by `0` (broadcast stream sentinel) so the
+// existing scorer reorder-sum loop in computeScoreLocked picks it up
+// without per-stream detail — the peer didn't ship the per-stream
+// breakdown, only the aggregate.
 func DecodeStats(data []byte) SessionMetrics {
 	if len(data) < StatsPayloadSize {
 		return SessionMetrics{}
 	}
-	return SessionMetrics{
+	m := SessionMetrics{
 		RTT:           time.Duration(binary.BigEndian.Uint32(data[0:4])) * time.Microsecond,
 		LossPercent:   float64(binary.BigEndian.Uint32(data[4:8])) / 10000,
 		CWND:          int64(binary.BigEndian.Uint32(data[8:12])),
@@ -791,7 +863,20 @@ func DecodeStats(data []byte) SessionMetrics {
 		FramesSent:    binary.BigEndian.Uint64(data[16:24]),
 		BytesSent:     binary.BigEndian.Uint64(data[24:32]),
 		ActiveStreams: int(binary.BigEndian.Uint16(data[32:34])),
+		FramesRecv:    binary.BigEndian.Uint64(data[34:42]),
+		BytesRecv:     binary.BigEndian.Uint64(data[42:50]),
+		DroppedFrames: uint64(binary.BigEndian.Uint32(data[54:58])),
+		RttP50:        time.Duration(binary.BigEndian.Uint32(data[58:62])) * time.Microsecond,
+		RttP99:        time.Duration(binary.BigEndian.Uint32(data[62:66])) * time.Microsecond,
+		TLPFiresTotal: uint64(binary.BigEndian.Uint32(data[66:70])),
+		RACKMarksTotal: uint64(binary.BigEndian.Uint32(data[70:74])),
 	}
+	if totalReorders := binary.BigEndian.Uint32(data[50:54]); totalReorders > 0 {
+		m.StreamObserve = map[uint64]StreamObserveData{
+			0: {ReorderCount: int64(totalReorders)},
+		}
+	}
+	return m
 }
 
 // ────────────────────────────────────────────────────────────────────────────

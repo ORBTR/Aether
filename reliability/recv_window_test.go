@@ -7,6 +7,9 @@ package reliability
 import (
 	"bytes"
 	"testing"
+	"time"
+
+	"github.com/ORBTR/aether/metrics"
 )
 
 func TestRecvWindow_InOrder(t *testing.T) {
@@ -121,6 +124,59 @@ func TestRecvWindow_MaxGap(t *testing.T) {
 	if w.BufferedCount() != 3 {
 		t.Errorf("buffer should be capped at 3, got %d", w.BufferedCount())
 	}
+}
+
+// TestRecvWindow_HOLHist verifies that the OBS-13 HOL-block histogram records
+// a sample for each buffered frame that is flushed when its gap is filled, and
+// records nothing for frames that arrive in order (zero HOL-block time).
+func TestRecvWindow_HOLHist(t *testing.T) {
+	var h metrics.DurationHist
+	w := NewRecvWindow(64)
+	w.SetHOLHist(&h)
+
+	// Deliver frame 0 first. No reordering — histogram must stay empty.
+	w.Insert(0, []byte("a"))
+	if h.Count() != 0 {
+		t.Fatalf("in-order frame should not record HOL sample; count=%d", h.Count())
+	}
+
+	// Buffer frames 2 and 3 (out of order — frame 1 is missing).
+	w.Insert(2, []byte("c"))
+	w.Insert(3, []byte("d"))
+	if h.Count() != 0 {
+		t.Fatalf("buffering frames must not record samples; count=%d", h.Count())
+	}
+
+	// Introduce a small sleep so buffered frames have a non-zero HOL age.
+	time.Sleep(2 * time.Millisecond)
+
+	// Deliver frame 1 — this triggers a flush of 2 and 3.
+	delivered := w.Insert(1, []byte("b"))
+	if len(delivered) != 3 {
+		t.Fatalf("expected 3 delivered payloads, got %d", len(delivered))
+	}
+
+	// Two buffered frames (2 and 3) were flushed → two HOL samples.
+	if h.Count() != 2 {
+		t.Fatalf("expected 2 HOL samples after flush; count=%d", h.Count())
+	}
+
+	// Both samples should be positive (the buffered frames waited at least
+	// the 2ms sleep before delivery).
+	p50, _, _ := h.PercentileSnapshot()
+	if p50 <= 0 {
+		t.Errorf("HOL p50 must be positive; got %d µs", p50)
+	}
+}
+
+// TestRecvWindow_HOLHist_NilSafe verifies that Insert does not panic when no
+// histogram is wired (holHist == nil), which is the default for most streams.
+func TestRecvWindow_HOLHist_NilSafe(t *testing.T) {
+	w := NewRecvWindow(64)
+	// No SetHOLHist call — holHist is nil.
+	w.Insert(1, []byte("b"))
+	// Filling the gap must not panic.
+	w.Insert(0, []byte("a"))
 }
 
 func TestSortUint32(t *testing.T) {

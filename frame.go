@@ -337,6 +337,12 @@ var minPayloadSizes = map[FrameType]uint32{
 	TypeRESET:      ResetPayloadSize,
 	TypeWINDOW:     WindowUpdateSize,
 	TypeCONGESTION: CongestionPayloadSize,
+	// STATS is fixed-size — gate undersized payloads at Validate so the
+	// abuse path fires instead of the handler silently dropping. Pairs
+	// with the StatsPayloadSize guard in noise_dispatch.handleStats
+	// (defence-in-depth — handler-level guard stays because Validate is
+	// skipped on a few short-header decode paths).
+	TypeSTATS: StatsPayloadSize,
 }
 
 // IsControl returns true if this is a control frame (not DATA).

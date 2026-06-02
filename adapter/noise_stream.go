@@ -147,6 +147,27 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 		rack:        congestion.NewRACK(eng.RTT.SRTT()),
 		tlp:         congestion.NewTLP(eng.RTT.SRTT()),
 	}
+	// Seed the TLP's max_ack_delay with the receiver-side estimate
+	// max(ACKPolicy.MaxDelay, SRTT/4) (RFC 9002 §6.2). Without this,
+	// PTO uses the conservative 25ms default for the first RTT
+	// regardless of the path's actual ACK cadence — firing spurious
+	// TLPs on a sub-ms localhost path or under-firing on a multi-100ms
+	// long-haul. UpdateMaxAckDelay's EWMA takes over once inbound
+	// CompositeACKs start flowing. This is the receiver-side
+	// approximation of the handshake-capability exchange RFC 9002 §6.2
+	// describes — the audit's A8 (a)+(b) is satisfied here; (a) full
+	// handshake-capability exchange remains a follow-up because the
+	// existing exchange is a uint32 bitfield and adding a value-typed
+	// field would thread peer max_ack_delay across the
+	// handshake/noiseConn/NoiseSession/noiseStream boundary.
+	policy := reliability.DefaultACKPolicy()
+	initialAckDelay := policy.MaxDelay
+	if srtt := eng.RTT.SRTT(); srtt > 0 {
+		if quarter := srtt / 4; quarter > initialAckDelay {
+			initialAckDelay = quarter
+		}
+	}
+	st.tlp.SetMaxAckDelay(initialAckDelay)
 	// Wire the session-level in-flight-bytes counter into this stream's
 	// SendWindow so Add/Ack mutations update the session-wide atomic
 	// as a side effect, and the writeLoop's CUBIC CanSend gate becomes
@@ -161,6 +182,13 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 	// stream (most streams produce too few samples to compute stable
 	// percentiles on their own).
 	st.window.SetGrantStarveHist(&s.grantStarveHist)
+	// OBS-13: share the session-level HOL-block histogram with this stream's
+	// RecvWindow. Same rationale as grantStarveHist — per-stream sample
+	// volume is too low for stable percentiles; the session-aggregate view
+	// is what operators need to spot reordering. All streams on a session
+	// record into one ring, so the p50/p99 reflects the worst-case HOL
+	// across every active stream.
+	st.recvWindow.SetHOLHist(&s.recvWindowHOLHist)
 	// Per-stream grant debouncer. Immediate-flush floor at 50% of the
 	// stream's initial credit so burst reads drain the pending total
 	// without waiting the full coalesce window when the sender is close
