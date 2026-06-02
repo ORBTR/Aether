@@ -64,9 +64,15 @@ type TLP struct {
 	// a floor on sub-millisecond paths.
 	srtt time.Duration
 
-	// maxAckDelay is the receiver's advertised maximum ACK delay. We
-	// don't currently parse this from peer ACK frames so it defaults
-	// to a conservative 25ms (matches QUIC default per RFC 9000).
+	// maxAckDelay is the receiver's advertised maximum ACK delay used
+	// in PTO = 2*SRTT + max_ack_delay. Lifecycle:
+	//   1. NewTLP initialises to tlpDefaultMaxAckDelay (25ms, QUIC default).
+	//   2. SetMaxAckDelay seeds it at session-open with the receiver-
+	//      computed estimate max(ACKPolicy.MaxDelay, SRTT/4) — RFC 9002
+	//      §6.2's receiver-side approximation pending a full handshake-
+	//      capability exchange.
+	//   3. UpdateMaxAckDelay's EWMA tracks the value from inbound
+	//      CompositeACK AckDelay fields once data flow is established.
 	maxAckDelay time.Duration
 }
 
@@ -132,6 +138,34 @@ func (t *TLP) UpdateSRTT(srtt time.Duration) {
 	}
 	t.mu.Lock()
 	t.srtt = srtt
+	t.mu.Unlock()
+}
+
+// SetMaxAckDelay replaces the current maxAckDelay estimate outright.
+// Used at session-open to seed the EWMA with a receiver-computed
+// initial value (typically max(ACKPolicy.MaxDelay, SRTT/4)) BEFORE
+// the first inbound CompositeACK arrives — without this, PTO uses
+// the conservative 25ms default for the first RTT regardless of the
+// path's actual ACK cadence, firing spurious TLPs on a sub-ms
+// localhost path or under-firing on a multi-100ms long-haul.
+//
+// RFC 9002 §6.2 says the sender's PTO must include the peer's
+// advertised max_ack_delay. The full RFC-compliant solution would
+// exchange max_ack_delay in the handshake; this seeder is the
+// receiver-side approximation pending that handshake-capability
+// addition. UpdateMaxAckDelay's EWMA then takes over once
+// CompositeACKs start flowing.
+//
+// Out-of-range values are clamped to [0, tlpPTOCeiling].
+func (t *TLP) SetMaxAckDelay(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	if d > tlpPTOCeiling {
+		d = tlpPTOCeiling
+	}
+	t.mu.Lock()
+	t.maxAckDelay = d
 	t.mu.Unlock()
 }
 

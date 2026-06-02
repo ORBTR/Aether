@@ -281,6 +281,22 @@ func (m *Manager) PickByQuality(op quality.DispatchOp) (aether.Session, bool) {
 	return bestSession, true
 }
 
+// PeerStatsReporter is the optional capability multipath probes for on
+// each session — when present, it returns the most recent STATS frame
+// the peer reported. Used by computeScoreLocked to fold the peer's
+// observed loss / reorder / RTT into the scoring inputs so an
+// asymmetric path (downstream healthy on our side, upstream lossy on
+// the peer's side) doesn't score as healthy on local signals alone.
+//
+// Sessions that don't ship STATS frames (TCP, QUIC, in-process fakes)
+// simply don't implement this interface; the type assertion below
+// fails silently and the scorer falls back to local-metrics-only — the
+// behaviour multipath had pre-STATS-wiring, so no regression for those
+// transports.
+type PeerStatsReporter interface {
+	LastPeerStats() aether.SessionMetrics
+}
+
 // computeScoreLocked computes the current quality score for a path.
 // Caller must hold m.mu. Reads metrics from the session's health
 // monitor and tracker — does NOT do I/O so safe under the lock.
@@ -312,6 +328,47 @@ func (m *Manager) computeScoreLocked(p *Path) quality.Score {
 	var reorders int64
 	for _, sd := range metrics.StreamObserve {
 		reorders += sd.ReorderCount
+	}
+
+	// Asymmetric-aware folding: probe the session for the peer's last
+	// STATS frame, then take the worse of {local, peer} for the loss /
+	// reorder / drop signals. Rationale: a path that's healthy in the
+	// direction we observe (downstream) but lossy in the direction we
+	// send (upstream) is invisible to local metrics alone — the peer's
+	// drop / reorder counts ARE the upstream loss signal. Taking the
+	// max-of-pair gives the scorer the worst-case view; a path that
+	// looks fine from both ends scores as well as before.
+	//
+	// FramesRecv: sum-of-pair (our frames-recv + peer's frames-recv =
+	// total frames the pair has exchanged) is the right denominator
+	// for normalising reorder rate — using only local FramesRecv
+	// under-weights peer-reported reorders against our own count.
+	//
+	// PeerStatsReporter is an optional capability: TCP / QUIC / fake
+	// sessions don't ship STATS frames and don't implement it, so the
+	// type assertion fails silently and the scorer behaves exactly as
+	// before for those transports.
+	if rep, ok := p.Session.(PeerStatsReporter); ok {
+		peer := rep.LastPeerStats()
+		if peerLossPpm := uint32(peer.LossPercent * 10000); peerLossPpm > uint32(metrics.LossPercent*10000) {
+			metrics.LossPercent = peer.LossPercent
+		}
+		if peer.DroppedFrames > metrics.DroppedFrames {
+			metrics.DroppedFrames = peer.DroppedFrames
+		}
+		if peer.FramesRecv > 0 {
+			// Fold the peer's total reorder roll-up (synthesised under
+			// StreamObserve[0] by DecodeStats) into our reorder sum.
+			for _, sd := range peer.StreamObserve {
+				reorders += sd.ReorderCount
+			}
+		}
+		// Throughput (BytesRecv): sum-of-pair so a path used only in
+		// one direction still surfaces as carrying traffic. The
+		// Tracker.UpdateThroughput call below feeds the EMA used for
+		// BytesPerSec — using local-only would zero-out a path that
+		// the peer is sending to us heavily while we're idle.
+		metrics.BytesRecv += peer.BytesRecv
 	}
 
 	// Translate session metrics into Inputs for the quality package.

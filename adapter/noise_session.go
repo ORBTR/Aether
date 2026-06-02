@@ -161,23 +161,30 @@ type NoiseSession struct {
 	// PercentileSnapshot is read once per Metrics() call (which is a
 	// monitoring-cadence operation, not a per-frame one).
 	//
-	//   writeSyscallHist  — OBS-1: time spent inside the conn.Write call
-	//                       (kernel send path / TLS encode / WS write).
-	//   writeloopParkHist — OBS-2: time the writeLoop blocked parked on
-	//                       its wake channel.
-	//   cwndBlockHist     — OBS-4: duration that CUBIC's CanSend stayed
-	//                       false on consecutive writeLoop iterations
-	//                       (block-entry to next successful CanSend).
-	//   grantStarveHist   — OBS-5: time flow.StreamWindow.Consume blocked
-	//                       on the credit semaphore. Shared by every
-	//                       stream on the session via SetGrantStarveHist.
-	//   cwndUtilRing      — OBS-10: per-mille (inFlight/cwnd) samples
-	//                       captured every cwndUtilSamplePeriod writes.
+	//   writeSyscallHist    — OBS-1: time spent inside the conn.Write call
+	//                         (kernel send path / TLS encode / WS write).
+	//   writeloopParkHist   — OBS-2: time the writeLoop blocked parked on
+	//                         its wake channel.
+	//   cwndBlockHist       — OBS-4: duration that CUBIC's CanSend stayed
+	//                         false on consecutive writeLoop iterations
+	//                         (block-entry to next successful CanSend).
+	//   grantStarveHist     — OBS-5: time flow.StreamWindow.Consume blocked
+	//                         on the credit semaphore. Shared by every
+	//                         stream on the session via SetGrantStarveHist.
+	//   cwndUtilRing        — OBS-10: per-mille (inFlight/cwnd) samples
+	//                         captured every cwndUtilSamplePeriod writes.
+	//   recvWindowHOLHist   — OBS-13: recv-window head-of-line-block latency.
+	//                         Time between a frame's buffer arrival and its
+	//                         ordered delivery to the application. Shared
+	//                         across all streams on the session (same pattern
+	//                         as grantStarveHist) via SetHOLHist at
+	//                         createStream time.
 	writeSyscallHist  metrics.DurationHist
 	writeloopParkHist metrics.DurationHist
 	cwndBlockHist     metrics.DurationHist
 	grantStarveHist   metrics.DurationHist
 	cwndUtilRing      metrics.PermilleRing
+	recvWindowHOLHist metrics.DurationHist
 
 	// cwndUtilCounter sequences writes so we sample cwnd-util every
 	// cwndUtilSamplePeriod-th send. Atomic so the writeLoop (single
@@ -933,6 +940,7 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 	cwndBlockP50, _, cwndBlockP99 := s.cwndBlockHist.PercentileSnapshot()
 	grantStarveP50, _, grantStarveP99 := s.grantStarveHist.PercentileSnapshot()
 	cwndUtilP50, cwndUtilP99 := s.cwndUtilRing.PercentileSnapshot()
+	holP50, _, holP99 := s.recvWindowHOLHist.PercentileSnapshot()
 
 	return aether.SessionMetrics{
 		RTT:              avg,
@@ -961,12 +969,14 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 
 		// Per-session frame and byte totals. See the bytesSent /
 		// bytesRecv / framesSent / framesRecv field doc on
-		// NoiseSession for payload-byte semantics. FramesRecv is not
-		// in SessionMetrics today; if added, it pairs with FramesSent
-		// to compute the per-session send/recv frame ratio.
+		// NoiseSession for payload-byte semantics. FramesRecv pairs
+		// with FramesSent to compute the per-session send/recv frame
+		// ratio and is one of the asymmetric-loss inputs the STATS
+		// codec ships to the peer's quality scorer.
 		BytesSent:  s.bytesSent.Load(),
 		BytesRecv:  s.bytesRecv.Load(),
 		FramesSent: s.framesSent.Load(),
+		FramesRecv: s.framesRecv.Load(),
 
 		RttP50: rttP50,
 		RttP95: rttP95,
@@ -995,6 +1005,12 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 		// noiseConnStats interface probe above.
 		RekeyTotal:          rekeyTotal,
 		RekeyBytesSinceLast: rekeyBytesSinceLast,
+
+		// OBS-13: recv-window HOL-block percentiles. Populated by every
+		// stream's RecvWindow when frames are flushed after waiting for
+		// predecessors. Zero when no reordering has occurred this session.
+		RecvWindowHOLP50Us: uint64(holP50),
+		RecvWindowHOLP99Us: uint64(holP99),
 	}
 }
 

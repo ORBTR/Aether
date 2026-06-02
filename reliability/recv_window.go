@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ORBTR/aether"
+	"github.com/ORBTR/aether/metrics"
 )
 
 // DefaultRecvWindowMaxBytes is the default byte cap for a RecvWindow's
@@ -23,16 +24,24 @@ const DefaultRecvWindowMaxBytes int64 = 512 * 1024
 // RecvWindow tracks received frames on the receiver side, reorders out-of-order
 // frames, and generates SACK blocks for selective acknowledgment.
 type RecvWindow struct {
-	mu           sync.Mutex
-	expected     uint32               // next expected SeqNo (cumulative ACK point)
-	buffer       map[uint32][]byte    // out-of-order frames: SeqNo → payload
-	bufTime      map[uint32]time.Time // out-of-order frames: SeqNo → buffer arrival time
-	maxGap       int                  // max reorder buffer size (frame count)
-	maxBytes     int64                // max total bytes buffered (0 = unlimited)
-	bufferedBytes int64               // current sum of buffered payload bytes
-	maxAge       time.Duration        // max time a frame can sit in reorder buffer (0 = unlimited)
-	lastRecvTime time.Time            // when the last data frame was received (for ACK delay)
-	dropCount    uint64               // atomic: frames dropped due to reorder buffer full
+	mu            sync.Mutex
+	expected      uint32               // next expected SeqNo (cumulative ACK point)
+	buffer        map[uint32][]byte    // out-of-order frames: SeqNo → payload
+	bufTime       map[uint32]time.Time // out-of-order frames: SeqNo → buffer arrival time
+	maxGap        int                  // max reorder buffer size (frame count)
+	maxBytes      int64                // max total bytes buffered (0 = unlimited)
+	bufferedBytes int64                // current sum of buffered payload bytes
+	maxAge        time.Duration        // max time a frame can sit in reorder buffer (0 = unlimited)
+	lastRecvTime  time.Time            // when the last data frame was received (for ACK delay)
+	dropCount     uint64               // atomic: frames dropped due to reorder buffer full
+
+	// OBS-13: HOL-block histogram. When non-nil, every buffered frame that
+	// is flushed in order records (deliveryTime − bufferArrivalTime) into
+	// this histogram. The distribution describes how long each frame was
+	// head-of-line blocked waiting for its predecessors. Set by the session
+	// adapter via SetHOLHist so all streams on one session share a single
+	// histogram; nil means no measurement (in-order or unmonitored streams).
+	holHist *metrics.DurationHist
 }
 
 // NewRecvWindow creates a receive window with the given maximum reorder
@@ -70,6 +79,17 @@ func (w *RecvWindow) SetMaxAge(d time.Duration) {
 	w.maxAge = d
 }
 
+// SetHOLHist wires an OBS-13 head-of-line-block histogram into this window.
+// When set, each buffered frame that is delivered in order records
+// (deliveryTime − bufferArrivalTime) so operators can see the HOL-block
+// latency distribution. Passing nil disables the measurement. Safe to call
+// before the first Insert; must not be called concurrently with Insert.
+func (w *RecvWindow) SetHOLHist(h *metrics.DurationHist) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.holHist = h
+}
+
 // Insert records a received frame. Returns the list of in-order payloads
 // that can be delivered to the application (may be empty if the frame is
 // out-of-order, or multiple if this frame fills a gap).
@@ -88,7 +108,13 @@ func (w *RecvWindow) Insert(seqNo uint32, payload []byte) [][]byte {
 		delivered := [][]byte{copyPayload(payload)}
 		w.expected++
 
-		// Flush buffered successors, skipping expired frames
+		// Flush buffered successors, skipping expired frames.
+		// OBS-13: for each flushed buffered frame, record the time it spent
+		// head-of-line blocked (bufferArrivalTime → now) into holHist.
+		// Frames that arrive in order and are delivered immediately have
+		// zero HOL-block time and are not recorded — the histogram represents
+		// only frames that were genuinely reordered and had to wait.
+		now := time.Now()
 		for {
 			p, ok := w.buffer[w.expected]
 			if !ok {
@@ -96,12 +122,18 @@ func (w *RecvWindow) Insert(seqNo uint32, payload []byte) [][]byte {
 			}
 			// MaxAge check: drop frames that sat in the buffer too long
 			if w.maxAge > 0 {
-				if arrived, hasTime := w.bufTime[w.expected]; hasTime && time.Since(arrived) > w.maxAge {
+				if arrived, hasTime := w.bufTime[w.expected]; hasTime && now.Sub(arrived) > w.maxAge {
 					w.bufferedBytes -= int64(len(p))
 					delete(w.buffer, w.expected)
 					delete(w.bufTime, w.expected)
 					w.expected++
 					continue // skip expired frame
+				}
+			}
+			// HOL-block measurement: time from buffer arrival to delivery.
+			if w.holHist != nil {
+				if arrived, hasTime := w.bufTime[w.expected]; hasTime {
+					w.holHist.Record(now.Sub(arrived))
 				}
 			}
 			delivered = append(delivered, p)
