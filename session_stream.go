@@ -197,6 +197,17 @@ type SessionMetrics struct {
 	AckEmitDelayTimer      uint64 `json:"ackEmitDelayTimer,omitempty"`
 	AckEmitImmediate       uint64 `json:"ackEmitImmediate,omitempty"`
 	AckEmitDuplicate       uint64 `json:"ackEmitDuplicate,omitempty"`
+
+	// RTT percentile distribution from the session's primary control
+	// stream over the most recent 256 samples. SRTT (above) is the
+	// EMA — "typical RTT right now". These three percentiles describe
+	// the recent latency distribution so operators can distinguish a
+	// uniformly-fast path from one that occasionally tails into the
+	// hundreds of milliseconds. Zero when no samples have been
+	// recorded yet on the chosen control stream.
+	RttP50 time.Duration `json:"rttP50Ns,omitempty"`
+	RttP95 time.Duration `json:"rttP95Ns,omitempty"`
+	RttP99 time.Duration `json:"rttP99Ns,omitempty"`
 }
 
 // StreamObserveData holds per-stream observation metrics from the ObserveEngine.

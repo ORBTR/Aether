@@ -800,7 +800,14 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 	s.mu.Lock()
 	streamCount := len(s.streams)
 	var suspiciousACKs, recvDrops, seqWraps, replayDup, replayAncient uint64
-	for _, st := range s.streams {
+	// rttSrc is the stream we read percentile RTT from for the
+	// session-level snapshot. Prefer the BidiRPC primary (control
+	// stream layout.Control) so SLO dashboards reflect RPC latency;
+	// fall back to any stream with initialised RTT samples if the
+	// control stream isn't yet seeing traffic.
+	var rttSrc *reliability.RTTEstimator
+	controlID := s.layout.Control
+	for id, st := range s.streams {
 		if st.sendWindow != nil {
 			suspiciousACKs += st.sendWindow.SuspiciousACKsCount()
 		}
@@ -812,8 +819,20 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 			replayDup += st.replay.DuplicateCount()
 			replayAncient += st.replay.AncientDropCount()
 		}
+		if st.rtt != nil {
+			if id == controlID {
+				rttSrc = st.rtt
+			} else if rttSrc == nil && st.rtt.IsInitialized() {
+				rttSrc = st.rtt
+			}
+		}
 	}
 	s.mu.Unlock()
+
+	var rttP50, rttP95, rttP99 time.Duration
+	if rttSrc != nil {
+		rttP50, rttP95, rttP99 = rttSrc.PercentileSnapshot()
+	}
 
 	// Transport-level counters from the underlying *noiseConn.
 	var decryptErr, inboxDrops uint64
@@ -867,6 +886,10 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 		BytesSent:  s.bytesSent.Load(),
 		BytesRecv:  s.bytesRecv.Load(),
 		FramesSent: s.framesSent.Load(),
+
+		RttP50: rttP50,
+		RttP95: rttP95,
+		RttP99: rttP99,
 	}
 }
 

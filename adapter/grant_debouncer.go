@@ -211,8 +211,15 @@ type grantDebouncer struct {
 	coalesceWindow time.Duration
 
 	pending int64
-	timer   *time.Timer
-	closed  bool
+	// timer is allocated lazily on the first Record and reused for the
+	// lifetime of the debouncer via Stop+Reset. armed tracks whether the
+	// timer is currently scheduled (re-arming an already-armed timer is
+	// a no-op — the existing fire absorbs the new Record). Reusing a
+	// single AfterFunc avoids the ~96 B + goroutine alloc that
+	// time.AfterFunc would otherwise incur on every Record.
+	timer  *time.Timer
+	armed  bool
+	closed bool
 
 	// Watchdog state: lastFlushUnix records the wall time of the most
 	// recent flush. The shared sweeper goroutine checks this on each
@@ -281,14 +288,20 @@ func (d *grantDebouncer) Record(n int64) {
 		d.mu.Unlock()
 		return
 	}
-	// Batched flush: start the timer if not already running. A subsequent
-	// Record within the window rides the same pending flush.
-	if d.timer == nil {
+	// Batched flush: arm the timer if not already armed. A subsequent
+	// Record within the coalesce window rides the same pending flush —
+	// re-arming an already-armed timer is a no-op.
+	if !d.armed {
+		if d.timer == nil {
+			d.timer = time.AfterFunc(d.coalesceWindow, d.timedFlush)
+		} else {
+			d.timer.Reset(d.coalesceWindow)
+		}
+		d.armed = true
 		if dbgGrant.Enabled() {
-			dbgGrant.Printf("stream=%d Record n=%d pending=%d → timer start (%s)",
+			dbgGrant.Printf("stream=%d Record n=%d pending=%d → timer arm (%s)",
 				d.streamID, n, d.pending, d.coalesceWindow)
 		}
-		d.timer = time.AfterFunc(d.coalesceWindow, d.timedFlush)
 	} else if dbgGrant.Enabled() {
 		dbgGrant.Printf("stream=%d Record n=%d pending=%d → timer running",
 			d.streamID, n, d.pending)
@@ -297,10 +310,11 @@ func (d *grantDebouncer) Record(n int64) {
 }
 
 // timedFlush runs when the debounce timer fires. Not called while holding
-// d.mu because AfterFunc fires on its own goroutine.
+// d.mu because AfterFunc fires on its own goroutine. The timer instance
+// is retained for the next Record to Reset rather than reallocate.
 func (d *grantDebouncer) timedFlush() {
 	d.mu.Lock()
-	d.timer = nil
+	d.armed = false
 	if !d.closed {
 		d.flushLocked("timer")
 	}
@@ -319,10 +333,10 @@ func (d *grantDebouncer) flushLocked(reason string) {
 	}
 	n := d.pending
 	d.pending = 0
-	if d.timer != nil {
+	if d.armed && d.timer != nil {
 		d.timer.Stop()
-		d.timer = nil
 	}
+	d.armed = false
 	d.lastFlushUnix = time.Now().UnixNano()
 	if d.window == nil {
 		if dbgGrant.Enabled() {
@@ -364,6 +378,7 @@ func (d *grantDebouncer) Close() {
 		d.timer.Stop()
 		d.timer = nil
 	}
+	d.armed = false
 	d.flushLocked("close")
 	d.mu.Unlock()
 	sharedWatchdog.deregister(d)
