@@ -402,7 +402,11 @@ func (s *TCPSession) registerStream(st *tcpStream, enforceRemoteCap bool) *tcpSt
 		s.mu.Unlock()
 		return existing // duplicate peer OPEN for open stream — return existing
 	}
-	if enforceRemoteCap {
+	// MaxConcurrentStreams cap applies to BOTH locally-initiated and
+	// peer-initiated stream opens (A1 audit 2026-06-02). enforceRemoteCap
+	// now only controls whether a RESET is sent on refusal (peer-initiated)
+	// or the caller gets a typed error to surface (local).
+	{
 		cap := s.opts.MaxConcurrentStreams
 		if cap <= 0 {
 			cap = DefaultTCPMaxConcurrentStreams
@@ -411,16 +415,18 @@ func (s *TCPSession) registerStream(st *tcpStream, enforceRemoteCap bool) *tcpSt
 			s.mu.Unlock()
 			atomic.AddUint64(&s.streamRefused, 1)
 			s.reportAbuse(abuse.ReasonStreamRefused)
-			payload := aether.EncodeReset(aether.ResetRefused)
-			reset := &aether.Frame{
-				SenderID:   s.LocalPeerID(),
-				ReceiverID: s.RemotePeerID(),
-				StreamID:   st.streamID,
-				Type:       aether.TypeRESET,
-				Length:     uint32(len(payload)),
-				Payload:    payload,
+			if enforceRemoteCap {
+				payload := aether.EncodeReset(aether.ResetRefused)
+				reset := &aether.Frame{
+					SenderID:   s.LocalPeerID(),
+					ReceiverID: s.RemotePeerID(),
+					StreamID:   st.streamID,
+					Type:       aether.TypeRESET,
+					Length:     uint32(len(payload)),
+					Payload:    payload,
+				}
+				s.writeFrame(reset)
 			}
-			s.writeFrame(reset)
 			return nil
 		}
 	}
@@ -836,9 +842,17 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 	}
 	st.state.Transition(aether.EventSendOpen)
 
-	// Locally-initiated open: no remote cap enforcement.
+	// Locally-initiated open. registerStream(false) enforces the cap
+	// (A1 audit 2026-06-02 — was bypassed pre-Batch-7) but does NOT
+	// send a RESET; we surface the typed sentinel ErrStreamCapExhausted
+	// so callers (Library StreamPool, mesh_connection.go) can detect
+	// cap-hit via errors.Is and back off instead of closing the session.
 	if s.registerStream(st, false) == nil {
-		return nil, fmt.Errorf("stream %d: registerStream returned nil", cfg.StreamID)
+		cap := s.opts.MaxConcurrentStreams
+		if cap <= 0 {
+			cap = DefaultTCPMaxConcurrentStreams
+		}
+		return nil, fmt.Errorf("OpenStream cap=%d: %w", cap, aether.ErrStreamCapExhausted)
 	}
 	st.attachGrantDebouncer()
 

@@ -135,6 +135,47 @@ func (t *TLP) UpdateSRTT(srtt time.Duration) {
 	t.mu.Unlock()
 }
 
+// UpdateMaxAckDelay updates the peer's observed maximum ACK delay,
+// learned from inbound CompositeACK frames' AckDelay field. RFC 9002
+// §6.2 specifies that the sender's PTO calculation must include the
+// peer's advertised max_ack_delay so the sender doesn't fire TLPs
+// faster than the peer's actual ACK pacing.
+//
+// Was A8 from aether comprehensive audit 2026-06-02: previously the
+// max_ack_delay was hardcoded to tlpDefaultMaxAckDelay (25ms). The
+// audit recommended full handshake negotiation, but a smaller-risk
+// path (this implementation) uses an EWMA over the peer's per-ACK
+// AckDelay field — every CompositeACK already carries this value —
+// so PTO adapts to the actual peer ACK cadence without changing the
+// handshake wire format.
+//
+// The EWMA biases toward the high-water-mark to be conservative:
+// PTO that is slightly too long re-fires TLP later (acceptable);
+// PTO that is too short fires spurious TLPs (RFC violation). Coefficients:
+//   - rising:  alpha = 1/4 (track increases moderately quickly)
+//   - falling: alpha = 1/16 (decay slowly so jitter doesn't reduce PTO)
+//
+// Caller passes the raw ackDelay value from the inbound CompositeACK
+// (already in time.Duration units after the AckDelayGranularity decode).
+// Out-of-range values are clamped to [0, tlpPTOCeiling].
+func (t *TLP) UpdateMaxAckDelay(ackDelay time.Duration) {
+	if ackDelay < 0 {
+		ackDelay = 0
+	}
+	if ackDelay > tlpPTOCeiling {
+		ackDelay = tlpPTOCeiling
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if ackDelay > t.maxAckDelay {
+		// Rising: alpha = 1/4
+		t.maxAckDelay += (ackDelay - t.maxAckDelay) / 4
+	} else {
+		// Falling: alpha = 1/16 (decay slowly)
+		t.maxAckDelay -= (t.maxAckDelay - ackDelay) / 16
+	}
+}
+
 // Arm schedules a TLP for `inFlightSince + PTO`. Called by the adapter
 // each time a new data frame is sent (or the in-flight set otherwise
 // changes such that the "tail" packet is younger). Idempotent — calling

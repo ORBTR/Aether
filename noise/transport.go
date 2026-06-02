@@ -677,6 +677,11 @@ func (t *NoiseTransport) Close() error {
 	if t.forwarder != nil {
 		t.forwarder.Close()
 	}
+	// A2 audit fix: stop the per-source TTL sweeper goroutine so
+	// transport teardown doesn't leak it.
+	if t.sourceLimit != nil {
+		t.sourceLimit.Stop()
+	}
 	return nil
 }
 

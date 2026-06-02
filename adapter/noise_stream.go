@@ -147,6 +147,12 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 		rack:        congestion.NewRACK(eng.RTT.SRTT()),
 		tlp:         congestion.NewTLP(eng.RTT.SRTT()),
 	}
+	// A9 audit fix: wire the session-level in-flight-bytes counter into
+	// this stream's SendWindow. Subsequent Add/Ack mutations on the
+	// SendWindow update the session-wide atomic as a side effect, so the
+	// writeLoop's CUBIC CanSend check no longer needs the per-send
+	// O(streams) lock walk. MUST run before any Send on this stream.
+	eng.SendWin.SetSessionInFlightCounter(&s.inFlightBytes)
 	// Per-stream grant debouncer. Immediate-flush floor at 50% of the
 	// stream's initial credit so burst reads drain the pending total
 	// without waiting the full coalesce window when the sender is close
@@ -189,7 +195,14 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 		s.mu.Unlock()
 		return existing
 	}
-	if enforceRemoteCap {
+	// MaxConcurrentStreams cap applies to BOTH locally-initiated and
+	// peer-initiated stream opens. Locally-initiated bypass was a
+	// resource-exhaustion hazard: a caller leaking streams would not be
+	// gated by the configured cap. Was A1 from aether comprehensive
+	// audit 2026-06-02. enforceRemoteCap now only controls whether we
+	// send a RESET reply (peer-initiated) or just return nil to the
+	// local caller for them to surface as an error.
+	{
 		cap := s.opts.MaxConcurrentStreams
 		if cap <= 0 {
 			cap = aether.DefaultMaxConcurrentStreams
@@ -198,17 +211,20 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 			s.mu.Unlock()
 			atomic.AddUint64(&s.streamRefused, 1)
 			s.reportAbuse(abuse.ReasonStreamRefused)
-			// Reply with RESET so the peer gives up; no state created locally.
-			payload := aether.EncodeReset(aether.ResetRefused)
-			reset := &aether.Frame{
-				SenderID:   s.LocalPeerID(),
-				ReceiverID: s.RemotePeerID(),
-				StreamID:   streamID,
-				Type:       aether.TypeRESET,
-				Length:     uint32(len(payload)),
-				Payload:    payload,
+			if enforceRemoteCap {
+				// Peer-initiated: reply with RESET so the peer gives up;
+				// no state created locally.
+				payload := aether.EncodeReset(aether.ResetRefused)
+				reset := &aether.Frame{
+					SenderID:   s.LocalPeerID(),
+					ReceiverID: s.RemotePeerID(),
+					StreamID:   streamID,
+					Type:       aether.TypeRESET,
+					Length:     uint32(len(payload)),
+					Payload:    payload,
+				}
+				s.writeFrame(reset)
 			}
-			s.writeFrame(reset)
 			return nil
 		}
 	}

@@ -46,6 +46,22 @@ var (
 	ErrTicketExpired   = errors.New("transport: session ticket expired")
 	ErrTicketInvalid   = errors.New("transport: session ticket invalid")
 
+	// ErrStreamCapExhausted signals that an OpenStream call was
+	// refused because the session's MaxConcurrentStreams cap was
+	// reached. The session remains healthy — the caller should
+	// either back off and retry once existing streams close, or
+	// surface a per-stream error to its own caller. Closing the
+	// whole session in response to this error is INCORRECT: this
+	// is a transient backpressure signal, not a transport failure.
+	//
+	// Use errors.Is(err, aether.ErrStreamCapExhausted) to detect.
+	// Was A1 from aether comprehensive audit 2026-06-02. Prior to
+	// this typed sentinel, Library callers (mesh_connection.go) saw
+	// a string-only error and treated every OpenStream failure as
+	// session-fatal — closing the session for what should have been
+	// a transient cap-hit.
+	ErrStreamCapExhausted = errors.New("transport: stream cap exhausted")
+
 	// ErrSessionStuck signals that a session has persistently been unable
 	// to make forward progress (e.g. sustained Consume timeouts on the
 	// send path while in-flight frames sit unACKed) long past any
