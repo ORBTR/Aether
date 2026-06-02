@@ -108,51 +108,56 @@ type NoiseSession struct {
 	packetReplay *reliability.PacketReplayWindow
 
 	// streamRefused counts every stream open rejected because the
-	// MaxConcurrentStreams cap is reached — INCLUDING both peer-initiated
-	// OPENs (and implicit-OPENs piggy-backed on the first DATA frame)
-	// AND locally-initiated OpenStream calls. Was previously
-	// peer-only; A1 from aether comprehensive audit 2026-06-02 made the
-	// cap apply universally to protect against local resource
-	// exhaustion. Operators reading this counter should NOT treat a
-	// rising value as exclusively-adversarial peer behaviour — a
-	// leak in the local caller (e.g. StreamPool not releasing streams
-	// fast enough) also bumps the counter.
+	// MaxConcurrentStreams cap is reached — both peer-initiated OPENs
+	// (and implicit-OPENs piggy-backed on the first DATA frame) AND
+	// locally-initiated OpenStream calls. Operators reading this
+	// counter should NOT treat a rising value as exclusively-
+	// adversarial peer behaviour — a leak in the local caller (e.g.
+	// StreamPool not releasing streams fast enough) also bumps the
+	// counter.
 	streamRefused uint64
 
-	// Batch 6 telemetry: cross-correlate aether-layer hypotheses against
-	// observed bimodal RPC latency spikes (the ~1-PTO cluster at 380-440ms
-	// on noise-UDP same-origin paths, while cross-origin WebSocket paths
-	// stay clean).
-	//
-	// cansendFalseReenqueues — every time CanSend returns false in the
-	// writeLoop and the frame is re-enqueued. High counts during a spike
-	// window indicate cwnd-limited backlog as the latency source (h4
-	// scheduler park/wake race or h2 CUBIC activation after Finding E).
-	//
-	// wakeOnAckCalls — every Wake() fired by handleACK after the gate was
-	// dropped from `len(acked)>0` to "always wake". The delta vs
-	// cansendFalseReenqueues approximates how often the writeLoop is
-	// blocked waiting for an ACK that already arrived but didn't wake it.
+	// writeLoop wake telemetry — pair these two to diagnose missed
+	// wakes during cwnd backoff:
+	//   cansendFalseReenqueues — incremented every time the writeLoop's
+	//     CUBIC.CanSend check fails and the frame is re-enqueued.
+	//   wakeOnAckCalls — incremented every time handleACK wakes the
+	//     scheduler (every ACK, unconditionally).
+	// Surfaced through Metrics(); ConnectionManager.AggregateAetherStats
+	// sums them fleet-wide for /api/monitoring/mesh-debug.
 	cansendFalseReenqueues uint64
 	wakeOnAckCalls         uint64
 
 	// inFlightBytes aggregates the on-wire size of every unacked frame
-	// across every stream's SendWindow. Wired into each stream's window
-	// via SetSessionInFlightCounter at createStream time so the
-	// SendWindow's Add/Ack paths increment/decrement it as a side
-	// effect. writeLoop's CUBIC CanSend check then becomes a single
-	// atomic.Load instead of the O(streams) lock walk it was before
-	// (A9 audit fix). The counter never under-reports: each mutation
-	// happens under the per-stream SendWindow.mu, sequencing the
-	// entries-map update with the counter update.
+	// across every stream's SendWindow. Each stream's SendWindow is
+	// wired into this counter via SetSessionInFlightCounter at
+	// createStream time, so SendWindow.Add / .Ack paths
+	// increment/decrement it as a side effect. writeLoop's CUBIC
+	// CanSend check reads via a single atomic.Load instead of walking
+	// every stream's window under per-stream locks.
+	//
+	// Consistency: each mutation is sequenced under the per-stream
+	// SendWindow.mu, so the counter never under-reports relative to the
+	// per-stream entries-map content.
 	inFlightBytes atomic.Int64
+
+	// Session-aggregate frame and byte counters consumed by Metrics().
+	// bytesSent/framesSent are bumped in writeFrame (counts every send
+	// attempt — see writeFrame for the at-attempt-vs-at-success
+	// rationale). bytesRecv/framesRecv are bumped at dispatchFrame on
+	// the receive path. Payload-byte semantics (matches
+	// aether.SessionMetrics.BytesSent / BytesRecv), not on-wire bytes
+	// including frame headers.
+	bytesSent  atomic.Uint64
+	bytesRecv  atomic.Uint64
+	framesSent atomic.Uint64
+	framesRecv atomic.Uint64
 
 	// lastPeerStats stores the most-recent STATS frame the peer emitted.
 	// Updated by handleStats (every ~5s per the peer's reliabilityTick).
 	// Read-only consumers (monitoring, Library MeshMetrics) call
 	// LastPeerStats() to get a snapshot. atomic.Pointer for lock-free
 	// readers; nil until the peer's first STATS frame arrives.
-	// Was A7 from aether comprehensive audit 2026-06-02.
 	lastPeerStats atomic.Pointer[aether.SessionMetrics]
 
 	// ECN observation. The receive path increments ceObservedBytes
@@ -434,16 +439,15 @@ func (s *NoiseSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) 
 		return nil, fmt.Errorf("stream ID %d exceeds MaxStreamID (%d) — send GOAWAY", cfg.StreamID, aether.MaxStreamID)
 	}
 
-	// Locally-initiated open. The MaxConcurrentStreams cap applies
-	// universally (A1 from aether audit 2026-06-02 — was previously
-	// bypassed for local opens, allowing unbounded local resource
-	// exhaustion). `enforceRemoteCap=false` here means: enforce the cap
-	// but do NOT send a RESET back (no peer to RESET — the caller
-	// gets the error directly).
+	// Locally-initiated open. enforceRemoteCap=false means: enforce
+	// the MaxConcurrentStreams cap but do NOT send a RESET back (no
+	// peer to RESET — the caller gets the error directly). The cap
+	// applies universally so a leaking local caller can't exhaust the
+	// session's stream-slot table.
 	st := s.createStream(cfg.StreamID, cfg, false)
 	if st == nil {
 		// Cap reached. streamRefused counter already incremented inside
-		// createStream; abuse signal recorded. Surface as the typed
+		// createStream; abuse signal recorded. Surface the typed
 		// sentinel ErrStreamCapExhausted so callers can detect cap-hit
 		// via errors.Is and back off instead of closing the session.
 		cap := s.opts.MaxConcurrentStreams
@@ -825,11 +829,10 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 		fecEvicted += s.rsDecoder.EvictedCount()
 	}
 
-	// Batch 6 telemetry: surface aether-layer counters so the Library's
-	// MeshMetrics handler can publish them via /api/monitoring/mesh-debug.
-	// AckEmit{Immediate,Rule5,Duplicate} are global atomic counters
-	// across all engines (not per-session) — when summed across the
-	// fleet they reveal which ACK-trigger path dominates.
+	// ACK-emit triggers — global counters across all engines on this
+	// process (not per-session). Reveal which ACK path dominates when
+	// summed fleet-wide: high delay-timer counts on sub-RTT paths point
+	// at the adaptive delayed-ACK floor as the latency source.
 	ackImmediate, ackDelayTimer, ackDup := reliability.AckEmitStats()
 	return aether.SessionMetrics{
 		RTT:              avg,
@@ -855,6 +858,15 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 		AckEmitDelayTimer:      ackDelayTimer,
 		AckEmitImmediate:       ackImmediate,
 		AckEmitDuplicate:       ackDup,
+
+		// Per-session frame and byte totals. See the bytesSent /
+		// bytesRecv / framesSent / framesRecv field doc on
+		// NoiseSession for payload-byte semantics. FramesRecv is not
+		// in SessionMetrics today; if added, it pairs with FramesSent
+		// to compute the per-session send/recv frame ratio.
+		BytesSent:  s.bytesSent.Load(),
+		BytesRecv:  s.bytesRecv.Load(),
+		FramesSent: s.framesSent.Load(),
 	}
 }
 
@@ -866,8 +878,9 @@ func (s *NoiseSession) StreamRefusedCount() uint64 {
 
 // LastPeerStats returns a copy of the most-recent STATS frame received
 // from the peer, or a zero-value SessionMetrics if no STATS frame has
-// arrived yet. Lock-free read via atomic.Pointer. Was A7 from aether
-// comprehensive audit 2026-06-02.
+// arrived yet. Lock-free read via atomic.Pointer. Periodic STATS
+// emission from the peer is driven by reliabilityTick → handleSTATS in
+// noise_dispatch.go.
 func (s *NoiseSession) LastPeerStats() aether.SessionMetrics {
 	if p := s.lastPeerStats.Load(); p != nil {
 		return *p

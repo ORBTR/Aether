@@ -71,9 +71,9 @@ type noiseStream struct {
 	lastProgressAtUnixNano atomic.Int64
 
 	// lastAckSilentLogUnixNano throttles the [ACK-SILENT] warning so
-	// reliabilityTick logs at most once per minute per stream. Otherwise
-	// a wedged stream would flood the log at 10 ms ticker resolution.
-	// Was Finding M from aether deep-review 2026-05-31.
+	// reliabilityTick logs at most once per minute per stream — at the
+	// 10ms ticker resolution a wedged stream would otherwise flood the
+	// log.
 	lastAckSilentLogUnixNano atomic.Int64
 
 	// rack runs RFC 8985 time-based loss detection on this stream.
@@ -147,11 +147,12 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 		rack:        congestion.NewRACK(eng.RTT.SRTT()),
 		tlp:         congestion.NewTLP(eng.RTT.SRTT()),
 	}
-	// A9 audit fix: wire the session-level in-flight-bytes counter into
-	// this stream's SendWindow. Subsequent Add/Ack mutations on the
-	// SendWindow update the session-wide atomic as a side effect, so the
-	// writeLoop's CUBIC CanSend check no longer needs the per-send
-	// O(streams) lock walk. MUST run before any Send on this stream.
+	// Wire the session-level in-flight-bytes counter into this stream's
+	// SendWindow so Add/Ack mutations update the session-wide atomic
+	// as a side effect, and the writeLoop's CUBIC CanSend gate becomes
+	// a single atomic.Load instead of an O(streams) lock walk per send.
+	// MUST run before any Send on this stream — earlier sends would
+	// under-report by the size of their in-flight frames.
 	eng.SendWin.SetSessionInFlightCounter(&s.inFlightBytes)
 	// Per-stream grant debouncer. Immediate-flush floor at 50% of the
 	// stream's initial credit so burst reads drain the pending total
@@ -196,12 +197,11 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 		return existing
 	}
 	// MaxConcurrentStreams cap applies to BOTH locally-initiated and
-	// peer-initiated stream opens. Locally-initiated bypass was a
-	// resource-exhaustion hazard: a caller leaking streams would not be
-	// gated by the configured cap. Was A1 from aether comprehensive
-	// audit 2026-06-02. enforceRemoteCap now only controls whether we
-	// send a RESET reply (peer-initiated) or just return nil to the
-	// local caller for them to surface as an error.
+	// peer-initiated stream opens — otherwise a caller leaking streams
+	// would not be gated by the configured cap. enforceRemoteCap=true
+	// means peer-initiated → reply with RESET so the peer gives up;
+	// enforceRemoteCap=false means locally-initiated → return nil and
+	// let the caller surface the typed ErrStreamCapExhausted.
 	{
 		cap := s.opts.MaxConcurrentStreams
 		if cap <= 0 {
@@ -234,17 +234,15 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 	// Register with stream GC for idle timeout tracking
 	s.streamGC.Register(streamID)
 
-	// Propagate cfg.LatencyClass to the scheduler. The previous call to
-	// s.sched.Register(...) defaulted every stream to DefaultLatencyClass
-	// (ClassBULK), so callers like Library that explicitly requested
-	// ClassINTERACTIVE on stream 1 (BidiRPC) saw their setting silently
-	// dropped — RPC dispatch competed with gossip at the lowest priority.
-	// Was Finding D from aether deep-review 2026-05-31.
+	// Propagate cfg.LatencyClass to the scheduler. The caller's setting
+	// MUST be honoured: Library opens stream 1 (BidiRPC) with
+	// ClassINTERACTIVE and dropping it leaves RPC dispatch competing
+	// with gossip at the lowest priority.
 	//
 	// ClassUnset (zero value) means the caller didn't specify a class —
-	// fall back to DefaultLatencyClass(streamID) rather than treating the
-	// omission as ClassREALTIME (which would funnel every default-config
-	// stream past the scheduler's 10% bandwidth cap).
+	// fall back to DefaultLatencyClass(streamID) rather than treating
+	// the omission as ClassREALTIME, which would funnel every
+	// default-config stream past the scheduler's 10% bandwidth cap.
 	class := cfg.LatencyClass
 	if class == aether.ClassUnset {
 		class = aether.DefaultLatencyClass(streamID)
@@ -349,12 +347,15 @@ func (st *noiseStream) sendSingleFrame(ctx context.Context, data []byte) error {
 	frame.SeqNo = seqNo
 
 	// BBRv2 per-packet sample stamping. When the active controller is
-	// BBR, ask it to mint a per-packet DeliveryRateSample and store it on
-	// the SendEntry for OnAckSampled to recover later. CUBIC ignores the
-	// hook (interface assertion fails silently).
+	// BBR, mint a per-packet DeliveryRateSample and store it on the
+	// SendEntry so OnAckSampled can recover the delivery context when
+	// the matching ACK arrives. CUBIC sessions skip this entirely (the
+	// type assertion fails) and entry.BBRSample stays nil — the ACK
+	// handler nil-checks before dereferencing.
 	if bbr, ok := st.session.congestion().(*congestion.BBRController); ok {
 		if entry := st.sendWindow.GetEntry(seqNo); entry != nil {
-			entry.BBRSample = bbr.OnSend(int64(frame.Length))
+			sample := bbr.OnSend(int64(frame.Length))
+			entry.BBRSample = &sample
 		}
 	}
 

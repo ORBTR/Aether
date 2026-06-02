@@ -231,6 +231,11 @@ func (s *Scheduler) Dequeue() (*aether.Frame, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// s.order iteration safety: every mutator of s.order
+	// (Register / Unregister / RegisterWithClass) also acquires s.mu,
+	// so the backing array cannot be reallocated mid-iteration. If a
+	// future refactor introduces an unlock-relock pattern inside this
+	// function, snapshot s.order into a local slice before iterating.
 	if len(s.order) == 0 {
 		return nil, false
 	}

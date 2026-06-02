@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ORBTR/aether"
+	"github.com/ORBTR/aether/congestion"
 )
 
 // Caps preventing CPU exhaustion from malicious Composite ACK frames.
@@ -21,14 +22,13 @@ const (
 	// base and ack.BaseACK. A normal peer's BaseACK advances by small numbers
 	// per ACK; jumps larger than this are rejected.
 	//
-	// Raised from 4096 to 65536 (Finding L from aether deep-review
-	// 2026-05-31). At 4096, a peer that fell behind during a stall and
-	// then resumed (e.g. catching up after a 5s wedge) could send a
-	// cumulative ACK covering > 4096 seq numbers, causing this validator
-	// to reject EVERY recovery ACK as "suspicious" — leaving the sender's
-	// window stuck forever. The new ceiling is sendWindow.maxSize × 2,
-	// which is still well below the 2^31 attack threshold but big enough
-	// to absorb realistic backlogs from recovery-after-wedge.
+	// Sized so a peer recovering from a stall (catching up after a
+	// multi-second wedge) can send a cumulative ACK covering thousands
+	// of seq numbers without tripping the validator. Set at
+	// sendWindow.maxSize × 2 — still well below the 2^31 attack
+	// threshold but big enough to absorb realistic recovery backlogs.
+	// At too-tight ceilings, every recovery ACK is rejected as
+	// "suspicious" and the sender's window stays stuck forever.
 	MaxACKCumulativeJump uint32 = 65536
 
 	// MaxACKRangeSize caps the size of any ExtRange / DroppedRange block.
@@ -58,9 +58,10 @@ type SendEntry struct {
 	// BBRv2 per-packet delivery-rate sample. Stamped at send time by the
 	// adapter via congestion.BBRController.OnSend, read back by the
 	// adapter when the matching ACK arrives so it can call OnAckSampled
-	// instead of the degraded OnAck path. Opaque value — the SendWindow
-	// doesn't introspect it.
-	BBRSample interface{}
+	// instead of the degraded OnAck path. Pointer (rather than value)
+	// so a nil read distinguishes "no sample stamped" (CUBIC active,
+	// not BBR) from "zero-value sample" without a type assertion.
+	BBRSample *congestion.DeliveryRateSample
 }
 
 // SendWindow tracks unacknowledged frames on the sender side.
@@ -79,19 +80,15 @@ type SendWindow struct {
 
 	// Atomic counter of ACKs silently no-op'd because BaseACK < base
 	// (stale / reordered ACK against an already-advanced send window).
-	// Surfaced via StaleBaseACKsCount() for observability — was Finding I
-	// from aether deep-review 2026-05-31: high counts of stale ACKs after
-	// reorder produced a silent ACK starvation window with no signal.
+	// Surfaced via StaleBaseACKsCount() so a high stale-ACK rate after
+	// reorder doesn't manifest as silent ACK starvation with no signal.
 	staleBaseACKs uint64
 
 	// sessionInFlight, if non-nil, is updated on every Add/remove so a
 	// session-level atomic counter reflects the total in-flight bytes
-	// across all of the session's SendWindows. Was A9 from aether audit
-	// 2026-06-02: previously, NoiseSession.writeLoop computed
-	// totalInFlightBytes via an O(streams) lock walk per send (~50k
-	// contentions/s on a busy 50-stream session). With this counter
-	// wired in, the writeLoop's CanSend check becomes a single
-	// atomic.Load.
+	// across all of the session's SendWindows. Lets the writeLoop's
+	// CanSend check be a single atomic.Load instead of an O(streams)
+	// lock walk per send.
 	//
 	// Consistency model: every mutation of w.entries happens under w.mu,
 	// and the counter update happens under the same lock — readers via
@@ -532,16 +529,15 @@ func (w *SendWindow) InFlight() int {
 // InFlightBytes returns the on-wire size of all unacknowledged frames in
 // this window (sum of HeaderSize + Frame.Length per entry).
 //
-// Was Finding E from aether deep-review 2026-05-31: NoiseSession.writeLoop
-// previously called c.congestion().CanSend(frameSize) — passing the next
-// frame's size as if it were the cumulative in-flight byte count. CUBIC's
-// contract is `inFlight < cwnd`, so a per-frame call with frameSize ≪ cwnd
-// always returned true, bypassing congestion control entirely. Callers now
-// sum InFlightBytes() across the session's live streams and pass that plus
-// the prospective frameSize so CUBIC actually gates sends.
+// Callers MUST sum InFlightBytes() across the session's live streams and
+// pass that plus the prospective frameSize into CUBIC.CanSend — CUBIC's
+// contract is `inFlight < cwnd`, so a per-frame call with frameSize
+// alone would return true unconditionally and bypass congestion control.
+// Preferred fast path is the session's sessionInFlight atomic counter
+// (wired via SetSessionInFlightCounter); this method exists for callers
+// that need the precise per-window total.
 //
-// O(entries) per call under the SendWindow lock. Acceptable: invoked once
-// per writeLoop send (a few times per ms at peak), with entries.count
+// O(entries) per call under the SendWindow lock — entries count is
 // bounded by maxSize (typically a few hundred).
 func (w *SendWindow) InFlightBytes() int64 {
 	w.mu.Lock()

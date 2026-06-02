@@ -520,6 +520,17 @@ func (w *StreamWindow) Available() int64 {
 	return w.currentWindow - w.dataOutstanding
 }
 
+// Outstanding returns the bytes the sender has Consume()d but not yet
+// seen ACKed (i.e. in-flight on this stream). Consumed by the ACK
+// validator as the plausibility upper bound for peer-claimed CEBytes
+// — an inflated CE claim above the actual outstanding is a cwnd
+// collapse vector.
+func (w *StreamWindow) Outstanding() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.dataOutstanding
+}
+
 // CurrentGrant returns the current cumulative-emitted value so callers can
 // periodically re-transmit it as a WINDOW_UPDATE. Safe on unreliable
 // transports: the sender's ApplyUpdate drops any re-emit where the

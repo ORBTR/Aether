@@ -141,13 +141,10 @@ func (t *TLP) UpdateSRTT(srtt time.Duration) {
 // peer's advertised max_ack_delay so the sender doesn't fire TLPs
 // faster than the peer's actual ACK pacing.
 //
-// Was A8 from aether comprehensive audit 2026-06-02: previously the
-// max_ack_delay was hardcoded to tlpDefaultMaxAckDelay (25ms). The
-// audit recommended full handshake negotiation, but a smaller-risk
-// path (this implementation) uses an EWMA over the peer's per-ACK
-// AckDelay field — every CompositeACK already carries this value —
-// so PTO adapts to the actual peer ACK cadence without changing the
-// handshake wire format.
+// An EWMA over the peer's per-ACK AckDelay field — every CompositeACK
+// already carries this value — keeps PTO adapting to the peer's real
+// ACK cadence without changing the handshake wire format. Call this
+// from the inbound CompositeACK handler in noise_dispatch.go.
 //
 // The EWMA biases toward the high-water-mark to be conservative:
 // PTO that is slightly too long re-fires TLP later (acceptable);

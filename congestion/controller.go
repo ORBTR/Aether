@@ -9,6 +9,43 @@ package congestion
 
 import "time"
 
+// PacingRate bounds clamp the controller-reported send rate to a sane
+// envelope before it reaches the pacer. A buggy controller returning 0
+// or +Inf would otherwise lock the pacer at "never send" or "never
+// wait". Bounds:
+//   - MinPacingRate (1400 B/s = 1 MSS/sec) is the slowest useful link;
+//     below this, the writeLoop stalls for seconds between sends.
+//   - MaxPacingRate (10 Gbps) clamps a +Inf into a finite value so
+//     pacer.SetRate doesn't propagate the sentinel.
+//
+// Callers (writeLoop in adapter/noise_reliability.go) should consume
+// the result of ClampPacingRate(controller.PacingRate()) rather than
+// the raw value. Returning 0 is preserved as the "pacing disabled"
+// sentinel — CUBIC returns 0 intentionally to mean no pacing.
+const (
+	MinPacingRate = float64(1400)             // 1 MSS / sec
+	MaxPacingRate = float64(10 * 1024 * 1024 * 1024) // 10 Gbps
+)
+
+// ClampPacingRate bounds a raw controller pacing rate into the safe
+// [MinPacingRate, MaxPacingRate] envelope. Returns 0 only for the
+// "pacing disabled" sentinel (the CUBIC controller returns 0
+// intentionally to mean "no pacing"); any positive value below the
+// floor is bumped UP to the floor (a tiny but real rate is still a
+// rate, not a request to disable pacing).
+func ClampPacingRate(raw float64) float64 {
+	if raw == 0 {
+		return 0 // pacing-disabled sentinel
+	}
+	if raw < MinPacingRate {
+		return MinPacingRate
+	}
+	if raw > MaxPacingRate {
+		return MaxPacingRate
+	}
+	return raw
+}
+
 // Controller is the interface for congestion control algorithms.
 // Both CUBIC and BBR implement this interface.
 type Controller interface {

@@ -559,11 +559,10 @@ const (
 // Numeric reservation: 0 is reserved as ClassUnset so callers who leave
 // StreamConfig.LatencyClass at its zero value can be distinguished from
 // callers who explicitly chose REALTIME. Adapter call sites translate
-// ClassUnset → DefaultLatencyClass(streamID). Was Finding D follow-up
-// from aether deep-review 2026-05-31 — the previous numbering
-// (REALTIME=0) silently routed every config-omits-class stream into
-// REALTIME, then the scheduler's 10%-bandwidth cap demoted them past
-// every other class on the same session, stalling delivery.
+// ClassUnset → DefaultLatencyClass(streamID). If REALTIME were 0, every
+// config-omits-class stream would silently route into REALTIME and the
+// scheduler's 10%-bandwidth cap would demote them past every other
+// class on the same session — stalling delivery.
 //
 // LatencyClass is NOT carried on the wire (OpenPayload encodes only
 // Reliability + Priority + Dependency). Each peer schedules its own

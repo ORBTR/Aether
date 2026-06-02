@@ -255,11 +255,9 @@ func (c *noiseConn) decryptAndDeliver(msg []byte) error {
 		default:
 			drops := atomic.AddUint64(&c.inboxDrops, 1)
 			// Promote the FIRST drop of a burst to log.Printf so a wedge
-			// that causes silent ACK starvation surfaces immediately —
-			// the prior debug-gated dbgSession.Printf was invisible in
-			// production. Continue to log every 1000th drop unconditionally
-			// so a sustained drop storm still produces signal without
-			// log spam. Was Finding F from aether deep-review 2026-05-31.
+			// that causes silent ACK starvation surfaces immediately;
+			// then log every 1000th drop unconditionally so a sustained
+			// drop storm still produces signal without log spam.
 			if drops == 1 || drops%1000 == 0 {
 				log.Printf("[INBOX-DROP] peer=%s dropping packet (%d bytes, total drops: %d)",
 					c.remoteNode, len(payload), drops)
@@ -851,16 +849,13 @@ func (l *noiseListener) runReader(ctx context.Context, conn *net.UDPConn) {
 
 		// FAST PATH — established session dispatch BEFORE rate limits.
 		//
-		// Critical fix for the "rack.fackAge climbs to minutes / cwnd
-		// unchanged / TLP probes go out but no ACKs return" production
-		// fingerprint observed 2026-05-31. The per-source rate limiter
-		// is configured as a HANDSHAKE-flood defence (10 burst, 1/sec
-		// refill at ratelimit.go:68-76), but the previous flow applied
-		// it to EVERY inbound packet — including AEAD-authenticated
-		// data + ACK frames on long-lived sessions. Any active session
-		// emitting >1 packet/sec sustained exhausted its source bucket;
-		// subsequent ACKs were silently dropped; sender's send-window
-		// never advanced; STALL-DETECT fired repeatedly with no recovery.
+		// The per-source rate limiter is sized as a HANDSHAKE-flood
+		// defence (10 burst, 1/sec refill in ratelimit.go:68-76). It
+		// MUST NOT apply to AEAD-authenticated data + ACK frames on
+		// long-lived sessions: any active session emitting >1 packet/sec
+		// sustained would exhaust its source bucket, subsequent ACKs
+		// would be silently dropped, the sender's send-window would
+		// never advance, and STALL-DETECT would fire with no recovery.
 		//
 		// AEAD-authenticated traffic on established sessions is trusted
 		// — the cryptographic check is the gate. Skip the per-source +
