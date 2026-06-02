@@ -37,9 +37,24 @@ import (
 func (s *NoiseSession) writeLoop() {
 	wake := s.sched.WakeCh()
 	var pacingTimer *time.Timer
+	// OBS-4 cubicCwndBlock_us: when CUBIC.CanSend returns false the
+	// writeLoop re-enqueues + parks. We mark the wall-clock at first
+	// rejection (cwndBlockStart non-zero), and on the next successful
+	// CanSend we record the elapsed block duration. Single time.Time on
+	// the goroutine stack — no atomic / mutex needed because writeLoop
+	// is single-goroutine.
+	var cwndBlockStart time.Time
 	defer func() {
 		if pacingTimer != nil {
 			pacingTimer.Stop()
+		}
+		// Flush any in-progress cwnd-blocked duration into the
+		// histogram on terminal exit. Without this the OBS-4 dashboard
+		// is blind to exactly the case it exists to surface: a session
+		// that black-holed long enough for the connection manager to
+		// tear it down (CloseSignal fires while CanSend stays false).
+		if !cwndBlockStart.IsZero() {
+			s.cwndBlockHist.Record(time.Since(cwndBlockStart))
 		}
 	}()
 	for {
@@ -85,8 +100,22 @@ func (s *NoiseSession) writeLoop() {
 					// (capped at 1); duplicates collapse and the call is cheap.
 					s.sched.Enqueue(frame.StreamID, frame)
 					atomic.AddUint64(&s.cansendFalseReenqueues, 1)
+					// OBS-4: mark block-entry on the first reject in a
+					// run. Subsequent rejects keep the earlier start so
+					// the histogram captures the full cwnd-blocked
+					// duration, not just the per-iteration retry cost.
+					if cwndBlockStart.IsZero() {
+						cwndBlockStart = time.Now()
+					}
 					s.sched.Wake()
 					break
+				}
+				// CanSend returned true; if we were in a block run, close
+				// it and record the duration. Reset cwndBlockStart so the
+				// next run starts a fresh measurement.
+				if !cwndBlockStart.IsZero() {
+					s.cwndBlockHist.Record(time.Since(cwndBlockStart))
+					cwndBlockStart = time.Time{}
 				}
 			}
 
@@ -111,6 +140,27 @@ func (s *NoiseSession) writeLoop() {
 			}
 
 			s.pacer.OnSend(frameSize)
+
+			// OBS-10 cwnd-util permille: sample inFlight/cwnd once per
+			// cwndUtilSamplePeriod writes. The full-rate version would
+			// add ~1.5% overhead per send (an extra atomic load + ring
+			// push); a 1-in-16 sample keeps cost negligible while still
+			// filling the 256-entry ring within ~10 seconds of sustained
+			// sending — long enough to be representative of the cwnd
+			// regime the session is operating in.
+			if c := atomic.AddUint64(&s.cwndUtilCounter, 1); c%cwndUtilSamplePeriod == 0 {
+				if cw := s.congestion().CWND(); cw > 0 {
+					inFlight := s.totalInFlightBytes()
+					ratio := (inFlight * 1000) / cw
+					if ratio < 0 {
+						ratio = 0
+					}
+					if ratio > 1000 {
+						ratio = 1000
+					}
+					s.cwndUtilRing.Record(uint32(ratio))
+				}
+			}
 
 			if s.opts.FrameLogging {
 				dbgNoise.Printf("TX stream=%d type=%d seq=%d len=%d",
@@ -138,13 +188,27 @@ func (s *NoiseSession) writeLoop() {
 		}
 
 		// Park until either new work arrives or the session closes.
+		// OBS-2 aether_writeloop_park_us: time the writeLoop spent
+		// blocked on the wake channel. High p99 here is the canonical
+		// "no work, idle" signal — bimodal latency in this histogram
+		// (low p50 with very long p99 spikes) usually means individual
+		// frames arrive in clumps separated by long idle gaps, which
+		// rules in app-side send pacing as the source of bimodality.
+		parkStart := time.Now()
 		select {
 		case <-s.CloseSignal():
 			return
 		case <-wake:
 		}
+		s.writeloopParkHist.Record(time.Since(parkStart))
 	}
 }
+
+// cwndUtilSamplePeriod governs the per-N-writes sampling rate of OBS-10.
+// 16 keeps cost negligible (single atomic add per write, ring push on
+// every 16th) while still filling the 256-entry ring within ~10s of
+// sustained sending. Power-of-two so the modulo compiles to a mask.
+const cwndUtilSamplePeriod = 16
 
 // totalInFlightBytes returns the session-wide in-flight byte count
 // across every stream's SendWindow.
@@ -302,14 +366,26 @@ func (s *NoiseSession) reliabilityTick() {
 					}
 					lost, _ := st.rack.DetectLost(rackSnap, tickNow)
 					if len(lost) > 0 {
+						// OBS-11 aether_rack_marks_total: count only seqs
+						// that were both RACK-flagged AND actually
+						// retransmitted on the wire. RACK works off a
+						// snapshot copy of the send window, so a
+						// concurrent handleACK can evict entries between
+						// DetectLost and GetEntry — those phantom marks
+						// should NOT pollute the counter, otherwise the
+						// TLP-vs-RACK ratio dashboard skews toward RACK
+						// recovery under high ACK concurrency.
 						pipe := int64(inFlight) * mssBytes
+						var actuallyRetx uint64
 						for _, seq := range lost {
 							if entry := st.sendWindow.GetEntry(seq); entry != nil {
 								s.sched.MarkRetransmit(streamID)
 								s.sched.Enqueue(streamID, entry.Frame)
 								st.sendWindow.BumpXmitTime(seq, tickNow)
+								actuallyRetx++
 							}
 						}
+						atomic.AddUint64(&s.rackMarksTotal, actuallyRetx)
 						s.congestion().OnLossWithPipe(pipe)
 					}
 
@@ -331,6 +407,14 @@ func (s *NoiseSession) reliabilityTick() {
 							s.sched.EnqueueProbe(streamID, entry.Frame)
 							st.sendWindow.BumpXmitTime(highSeq, tickNow)
 							st.tlp.MarkProbeSent(highSeq)
+							// OBS-11 aether_tlp_fires_total: increment
+							// only inside the inner branch where the
+							// probe is actually enqueued — ShouldProbe
+							// can fire on a stream whose highSeq entry
+							// has already been ACKed/evicted, in which
+							// case nothing reaches the wire and no
+							// counter bump is warranted.
+							atomic.AddUint64(&s.tlpFiresTotal, 1)
 							log.Printf("[TLP] peer=%s stream=%d probeSeq=%d inFlight=%d cwnd=%d",
 								s.RemoteNodeID().Short(), streamID, highSeq, inFlight, s.congestion().CWND())
 						}
@@ -688,10 +772,18 @@ type writeDeadlineConn interface {
 // again. CloseWithError is closeOnce-guarded and idempotent, so calling
 // it here is safe even if another path is closing concurrently.
 func (s *NoiseSession) connWrite(b []byte) error {
+	// OBS-1 aether_write_syscall_us: time the actual syscall (or the
+	// transport adapter's effective send path) so operators can see
+	// when kernel send-buffer pressure / TLS encode / WS framing is the
+	// latency source vs in-process scheduling. Single time.Now() pair on
+	// the success path; on error path we skip the histogram record since
+	// the duration is meaningless (the session is being torn down).
+	start := time.Now()
 	if _, err := s.conn.Write(b); err != nil {
 		s.CloseWithError(fmt.Errorf("aether: frame write failed: %w", err))
 		return err
 	}
+	s.writeSyscallHist.Record(time.Since(start))
 	return nil
 }
 

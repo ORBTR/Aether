@@ -616,6 +616,30 @@ func (c *noiseConn) InboxDrops() uint64 {
 	return atomic.LoadUint64(&c.inboxDrops)
 }
 
+// RekeyTotal returns the lifetime count of send-side rekeys completed on
+// this connection (OBS-15). Pass-through to the embedded RekeyTracker.
+// Probed via the adapter's noiseConnStats interface so the aether
+// adapter pkg doesn't need a direct import of noise/.
+func (c *noiseConn) RekeyTotal() uint64 {
+	if c.rekey == nil {
+		return 0
+	}
+	return c.rekey.TotalRekeys()
+}
+
+// RekeyBytesSinceLast returns bytes encrypted on the send path since the
+// most recent rekey (or session start if no rekey has occurred yet).
+// Pair with RekeyTotal — low total with high bytes-since-last on a
+// session that's been live for hours suggests the byte threshold is set
+// too high; high total with low bytes-since-last on a fresh session
+// suggests something is bumping the time threshold artificially.
+func (c *noiseConn) RekeyBytesSinceLast() uint64 {
+	if c.rekey == nil {
+		return 0
+	}
+	return c.rekey.BytesSent()
+}
+
 func (c *noiseConn) LocalAddr() net.Addr  { return c.localAddr }
 func (c *noiseConn) RemoteAddr() net.Addr { return c.remote }
 

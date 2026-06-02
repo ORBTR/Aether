@@ -87,6 +87,16 @@ type TCPSession struct {
 	// CONGESTION frame arrives. Send-path consumers can consult Throttle()
 	// for RateFactor/ShouldStall before committing to large sends.
 	throttle aether.CongestionThrottle
+
+	// OBS-8: per-session delivery-side flow-control telemetry. Cross-
+	// adapter parity with NoiseSession.deliveryStats — every
+	// DeliverToRecvChWithSignals call on this session points at this
+	// shared DeliveryStats so receive-path delivery / drop /
+	// backpressure / bytes-dropped counters are session-aggregate.
+	// Surfaced through DeliveryStats(); Library MeshMetrics consumes
+	// it via AggregateAetherStats to publish aether_deliver_* under
+	// /api/monitoring/mesh-debug.
+	deliveryStats DeliveryStats
 }
 
 // tcpStream is a single Aether stream multiplexed over a TCP connection.
@@ -358,7 +368,7 @@ func (s *TCPSession) deliverToStream(frame *aether.Frame) {
 			dbgTCP.Printf("deliverToStream: send-on-closed for stream %d (race with handleClose): %v", frame.StreamID, r)
 		}
 	}()
-	delivered := DeliverToRecvChWithSignals(st.recvCh, frame.Payload, st.window, frame.StreamID, s.sendWindowUpdateAgnostic, s.SendCongestion)
+	delivered := DeliverToRecvChWithSignals(st.recvCh, frame.Payload, st.window, frame.StreamID, s.sendWindowUpdateAgnostic, s.SendCongestion, &s.deliveryStats)
 	if delivered {
 		// ACK-observe: track metrics (no wire ACK, no retransmit)
 		if st.observe != nil {
@@ -663,6 +673,15 @@ func (s *TCPSession) SendCongestion(p aether.CongestionPayload) error {
 // dispatching large sends.
 func (s *TCPSession) Throttle() *aether.CongestionThrottle {
 	return &s.throttle
+}
+
+// DeliveryStats exposes the session's receive-path delivery counters
+// (OBS-8). Cross-adapter parity with NoiseSession.DeliveryStats. The
+// returned pointer is stable for the session's lifetime — callers can
+// sample Delivered / Dropped / Backpressure / BytesDropped via Load()
+// at monitoring cadence without holding any session lock.
+func (s *TCPSession) DeliveryStats() *DeliveryStats {
+	return &s.deliveryStats
 }
 
 // writeLoop reads from the scheduler and writes frames to the TCP connection.

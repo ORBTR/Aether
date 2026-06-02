@@ -209,6 +209,16 @@ func (s *NoiseSession) Throttle() *aether.CongestionThrottle {
 	return &s.throttle
 }
 
+// DeliveryStats exposes the session's receive-path delivery counters
+// (OBS-8). The returned pointer is stable for the session's lifetime —
+// callers can sample Delivered / Dropped / Backpressure / BytesDropped
+// via Load() at monitoring cadence without holding any session lock.
+// Updated by DeliverToRecvChWithSignals on every receive-side delivery
+// attempt against any stream on this session.
+func (s *NoiseSession) DeliveryStats() *DeliveryStats {
+	return &s.deliveryStats
+}
+
 func (s *NoiseSession) handleData(frame *aether.Frame) {
 	// Recover from a `send on closed channel` panic is scoped to the
 	// delivery loop below — a broad function-wide recover would
@@ -314,7 +324,7 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 			}
 		}()
 		for _, payload := range delivered {
-			ok := DeliverToRecvChWithSignals(st.recvCh, payload, st.window, st.streamID, s.sendWindowUpdateAgnostic, s.SendCongestion)
+			ok := DeliverToRecvChWithSignals(st.recvCh, payload, st.window, st.streamID, s.sendWindowUpdateAgnostic, s.SendCongestion, &s.deliveryStats)
 			// Conn-level flow control: successful delivery grants credit at
 			// application-read time via the session debouncer (Receive →
 			// connGrantDebouncer.Record). On drop, the debouncer will never
@@ -641,7 +651,7 @@ func (s *NoiseSession) handleImplicitOpen(frame *aether.Frame) {
 			}
 		}()
 		for _, payload := range delivered {
-			ok := DeliverToRecvChWithSignals(st.recvCh, payload, st.window, st.streamID, s.sendWindowUpdateAgnostic, s.SendCongestion)
+			ok := DeliverToRecvChWithSignals(st.recvCh, payload, st.window, st.streamID, s.sendWindowUpdateAgnostic, s.SendCongestion, &s.deliveryStats)
 			// Drop-only conn-level credit: see handleData.
 			if !ok {
 				if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
@@ -899,7 +909,7 @@ func (s *NoiseSession) deliverToStream(streamID uint64, payload []byte) {
 			dbgNoise.Printf("deliverToStream: send-on-closed for stream %d (race with teardown): %v", streamID, r)
 		}
 	}()
-	delivered := DeliverToRecvChWithSignals(st.recvCh, payload, st.window, streamID, s.sendWindowUpdateAgnostic, s.SendCongestion)
+	delivered := DeliverToRecvChWithSignals(st.recvCh, payload, st.window, streamID, s.sendWindowUpdateAgnostic, s.SendCongestion, &s.deliveryStats)
 	// Drop-only conn-level credit: see handleData.
 	if !delivered {
 		if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {

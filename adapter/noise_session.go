@@ -22,6 +22,7 @@ import (
 	aethercrypto "github.com/ORBTR/aether/crypto"
 	"github.com/ORBTR/aether/flow"
 	"github.com/ORBTR/aether/health"
+	"github.com/ORBTR/aether/metrics"
 	"github.com/ORBTR/aether/migration"
 	"github.com/ORBTR/aether/pmtu"
 	"github.com/ORBTR/aether/reliability"
@@ -127,6 +128,62 @@ type NoiseSession struct {
 	// sums them fleet-wide for /api/monitoring/mesh-debug.
 	cansendFalseReenqueues uint64
 	wakeOnAckCalls         uint64
+
+	// OBS-8: per-session delivery-side flow-control telemetry. Every
+	// DeliverToRecvChWithSignals call on this session points at this
+	// shared DeliveryStats so receive-path delivery / drop /
+	// backpressure / bytes-dropped counters are session-aggregate.
+	// Lock-free atomics inside DeliveryStats let the readLoop (single
+	// writer per counter per call) and monitoring goroutines
+	// (AggregateAetherStats → DeliveryStats() accessor) coexist
+	// without synchronisation. Library MeshMetrics consumes it to
+	// surface aether_deliver_* under /api/monitoring/mesh-debug.
+	deliveryStats DeliveryStats
+
+	// tlpFiresTotal counts every TLP probe fire (RFC 8985 §7.4). See
+	// reliabilityTick's TLP block. Paired with rackMarksTotal — together
+	// they describe how loss recovery is splitting between fast-recovery
+	// (RACK marks) and tail-recovery (TLP probes). High TLP relative to
+	// RACK on a stream that should be sending steadily usually means the
+	// sender's ack-clocking is starved (no follow-up data after the last
+	// in-flight frame), pointing at app-level send-pacing rather than a
+	// loss problem.
+	tlpFiresTotal uint64
+
+	// rackMarksTotal counts every seq RACK declares lost (RFC 8985 §6.2).
+	// Each call to reliabilityTick's MarkLost loop bumps this by len(lost).
+	// Elevated relative to FramesSent indicates either a genuinely lossy
+	// path or aggressive RACK reorder-window sizing.
+	rackMarksTotal uint64
+
+	// Observability histograms (see metrics/duration_hist.go). All four
+	// histograms are populated on writeLoop / writeFrame hot paths;
+	// PercentileSnapshot is read once per Metrics() call (which is a
+	// monitoring-cadence operation, not a per-frame one).
+	//
+	//   writeSyscallHist  — OBS-1: time spent inside the conn.Write call
+	//                       (kernel send path / TLS encode / WS write).
+	//   writeloopParkHist — OBS-2: time the writeLoop blocked parked on
+	//                       its wake channel.
+	//   cwndBlockHist     — OBS-4: duration that CUBIC's CanSend stayed
+	//                       false on consecutive writeLoop iterations
+	//                       (block-entry to next successful CanSend).
+	//   grantStarveHist   — OBS-5: time flow.StreamWindow.Consume blocked
+	//                       on the credit semaphore. Shared by every
+	//                       stream on the session via SetGrantStarveHist.
+	//   cwndUtilRing      — OBS-10: per-mille (inFlight/cwnd) samples
+	//                       captured every cwndUtilSamplePeriod writes.
+	writeSyscallHist  metrics.DurationHist
+	writeloopParkHist metrics.DurationHist
+	cwndBlockHist     metrics.DurationHist
+	grantStarveHist   metrics.DurationHist
+	cwndUtilRing      metrics.PermilleRing
+
+	// cwndUtilCounter sequences writes so we sample cwnd-util every
+	// cwndUtilSamplePeriod-th send. Atomic so the writeLoop (single
+	// goroutine today, but future multi-writer designs would race on a
+	// plain uint64). Wrap is harmless — we only inspect counter % period.
+	cwndUtilCounter uint64
 
 	// inFlightBytes aggregates the on-wire size of every unacked frame
 	// across every stream's SendWindow. Each stream's SendWindow is
@@ -775,12 +832,19 @@ func (s *NoiseSession) SessionKey() []byte      { return s.sessionKey }
 func (s *NoiseSession) CongestionWindow() int64 { return s.congestion().CWND() }
 // noiseConnStats is the optional observability surface exposed by the
 // underlying *noiseConn. We probe via interface so `decryptErrors`,
-// `inboxDrops`, and ECN CE-byte observations can flow through to
-// SessionMetrics without the adapter needing a direct import of the
-// noise/ package.
+// `inboxDrops`, rekey counters (OBS-15), and ECN CE-byte observations
+// can flow through to SessionMetrics without the adapter needing a
+// direct import of the noise/ package.
 type noiseConnStats interface {
 	DecryptErrors() uint64
 	InboxDrops() uint64
+	// OBS-15 rekey telemetry: lifetime rekey count + bytes encrypted
+	// since the last rekey. Pass-through to the embedded RekeyTracker
+	// on the noiseConn (noise/rekey.go). Older noiseConn types that
+	// haven't grown these methods miss the type assertion and the
+	// counters stay zero — graceful degradation by design.
+	RekeyTotal() uint64
+	RekeyBytesSinceLast() uint64
 }
 
 // noiseConnCE is the optional ECN hook exposed by *noiseConn — the
@@ -834,11 +898,17 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 		rttP50, rttP95, rttP99 = rttSrc.PercentileSnapshot()
 	}
 
-	// Transport-level counters from the underlying *noiseConn.
-	var decryptErr, inboxDrops uint64
+	// Transport-level counters from the underlying *noiseConn. The same
+	// type-assertion gates all four pass-throughs: when the conn is a
+	// non-noise net.Conn (e.g. test loopback) every counter is zero,
+	// which matches the documented "noise-only" semantics on the
+	// SessionMetrics RekeyTotal / RekeyBytesSinceLast fields.
+	var decryptErr, inboxDrops, rekeyTotal, rekeyBytesSinceLast uint64
 	if stats, ok := s.conn.(noiseConnStats); ok {
 		decryptErr = stats.DecryptErrors()
 		inboxDrops = stats.InboxDrops()
+		rekeyTotal = stats.RekeyTotal()
+		rekeyBytesSinceLast = stats.RekeyBytesSinceLast()
 	}
 
 	// FEC eviction total must include all three decoders — XOR, interleaved,
@@ -853,6 +923,17 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 	// summed fleet-wide: high delay-timer counts on sub-RTT paths point
 	// at the adaptive delayed-ACK floor as the latency source.
 	ackImmediate, ackDelayTimer, ackDup := reliability.AckEmitStats()
+
+	// Observability histogram percentile readouts. Computed once per
+	// Metrics() call (a monitoring-cadence operation, not a hot path).
+	// Each PercentileSnapshot acquires its histogram's mutex briefly to
+	// copy the ring then sorts the copy — cost is a few µs each.
+	writeSyscallP50, _, writeSyscallP99 := s.writeSyscallHist.PercentileSnapshot()
+	parkP50, _, parkP99 := s.writeloopParkHist.PercentileSnapshot()
+	cwndBlockP50, _, cwndBlockP99 := s.cwndBlockHist.PercentileSnapshot()
+	grantStarveP50, _, grantStarveP99 := s.grantStarveHist.PercentileSnapshot()
+	cwndUtilP50, cwndUtilP99 := s.cwndUtilRing.PercentileSnapshot()
+
 	return aether.SessionMetrics{
 		RTT:              avg,
 		CWND:             s.congestion().CWND(),
@@ -890,6 +971,30 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 		RttP50: rttP50,
 		RttP95: rttP95,
 		RttP99: rttP99,
+
+		// Observability histograms (OBS-1/2/4/5/10) and counters
+		// (OBS-11). Percentile readouts are computed above; the int64
+		// microsecond values from DurationHist are cast to uint64 here
+		// to match the SessionMetrics field type. Negative values are
+		// impossible (Record drops d <= 0) so the cast is lossless.
+		WriteSyscallP50Us:   uint64(writeSyscallP50),
+		WriteSyscallP99Us:   uint64(writeSyscallP99),
+		WriteloopParkP50Us:  uint64(parkP50),
+		WriteloopParkP99Us:  uint64(parkP99),
+		CubicCwndBlockP50Us: uint64(cwndBlockP50),
+		CubicCwndBlockP99Us: uint64(cwndBlockP99),
+		GrantStarveP50Us:    uint64(grantStarveP50),
+		GrantStarveP99Us:    uint64(grantStarveP99),
+		CwndUtilP50Permille: cwndUtilP50,
+		CwndUtilP99Permille: cwndUtilP99,
+		TLPFiresTotal:       atomic.LoadUint64(&s.tlpFiresTotal),
+		RACKMarksTotal:      atomic.LoadUint64(&s.rackMarksTotal),
+
+		// OBS-15: surface noise send-cipher rekey telemetry. Sourced
+		// from the RekeyTracker on the underlying *noiseConn via the
+		// noiseConnStats interface probe above.
+		RekeyTotal:          rekeyTotal,
+		RekeyBytesSinceLast: rekeyBytesSinceLast,
 	}
 }
 
