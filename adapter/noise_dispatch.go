@@ -162,6 +162,8 @@ func (s *NoiseSession) dispatchFrame(frame *aether.Frame) {
 		s.handleHandshake(frame)
 	case aether.TypeCONGESTION:
 		s.handleCongestion(frame)
+	case aether.TypeSTATS:
+		s.handleStats(frame)
 	case aether.TypeWHOIS, aether.TypeRENDEZVOUS, aether.TypeNETWORK_CONFIG:
 		// Control plane — deliver to control stream
 		s.deliverToStream(s.layout.Control, frame.Payload)
@@ -175,6 +177,22 @@ func (s *NoiseSession) handleCongestion(frame *aether.Frame) {
 	p := aether.HandleCongestionFrame(&s.throttle, frame)
 	dbgNoise.Printf("CONGESTION recv severity=%d reason=%d backoff=%dms",
 		p.Severity, p.Reason, p.BackoffMs)
+}
+
+// handleStats processes a peer's periodic STATS frame and stores the
+// most-recent payload on the session for monitoring readers (Library
+// MeshMetrics, multipath quality scorer). The frame is informational
+// only — it never alters local protocol state and never triggers a
+// peer reply. Was A7 from aether comprehensive audit 2026-06-02:
+// codec was defined years ago but had no emit path nor dispatch
+// case, leaving the frame type effectively dead. The emit path is in
+// noise_reliability.go reliabilityTick (every 5s).
+func (s *NoiseSession) handleStats(frame *aether.Frame) {
+	if frame == nil || len(frame.Payload) < aether.StatsPayloadSize {
+		return
+	}
+	m := aether.DecodeStats(frame.Payload)
+	s.lastPeerStats.Store(&m)
 }
 
 // SendCongestion emits a CONGESTION frame to the peer.
@@ -324,6 +342,18 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	if ack == nil {
 		s.reportAbuse(abuse.ReasonACKValidation)
 		return // malformed
+	}
+
+	// A8 audit fix: track peer's observed max_ack_delay from the
+	// AckDelay field on every inbound CompositeACK and feed it into
+	// TLP's PTO calculation per RFC 9002 §6.2. Previously the peer's
+	// max_ack_delay was a hardcoded 25ms constant; with this EWMA
+	// learned from actual ACK pacing, PTO adapts to the peer's real
+	// ACK cadence rather than over- or under-shooting. AckDelay is
+	// encoded in AckDelayGranularity (8us) units on the wire.
+	if st.tlp != nil {
+		peerAckDelay := time.Duration(ack.AckDelay) * aether.AckDelayGranularity
+		st.tlp.UpdateMaxAckDelay(peerAckDelay)
 	}
 
 	// Snapshot suspicious-ACK counter before ProcessCompositeACK so we can

@@ -83,6 +83,73 @@ type SendWindow struct {
 	// from aether deep-review 2026-05-31: high counts of stale ACKs after
 	// reorder produced a silent ACK starvation window with no signal.
 	staleBaseACKs uint64
+
+	// sessionInFlight, if non-nil, is updated on every Add/remove so a
+	// session-level atomic counter reflects the total in-flight bytes
+	// across all of the session's SendWindows. Was A9 from aether audit
+	// 2026-06-02: previously, NoiseSession.writeLoop computed
+	// totalInFlightBytes via an O(streams) lock walk per send (~50k
+	// contentions/s on a busy 50-stream session). With this counter
+	// wired in, the writeLoop's CanSend check becomes a single
+	// atomic.Load.
+	//
+	// Consistency model: every mutation of w.entries happens under w.mu,
+	// and the counter update happens under the same lock — readers via
+	// atomic.Load may see a slightly stale value when concurrent
+	// modifications race, but the absolute total is eventually correct
+	// and never under-reports (the CanSend gate is conservative anyway).
+	sessionInFlight *atomic.Int64
+}
+
+// SetSessionInFlightCounter wires this SendWindow into a session-level
+// atomic that aggregates in-flight bytes across all of the session's
+// streams. Subsequent Add/Ack operations update this counter as a
+// side effect. Pass nil to disable (default).
+//
+// Must be called BEFORE any Add — otherwise the counter will under-
+// report by the size of the pre-wired frames. Adapter call sites wire
+// this in createStream right after NewSendWindow.
+func (w *SendWindow) SetSessionInFlightCounter(c *atomic.Int64) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.sessionInFlight = c
+}
+
+// addInFlightLocked / subInFlightLocked update the optional session
+// counter. Both must be called under w.mu (the SendWindow lock) so the
+// counter update is sequenced with the corresponding entries-map
+// mutation. The session-level reader is a lock-free atomic.Load so
+// these can use a non-blocking Add even without holding w.mu — but
+// keeping the call inside the lock keeps the consistency invariant
+// "counter == sum of entries[*].on-wire-size" trivially provable for
+// any moment where w.mu is held.
+func (w *SendWindow) addInFlightLocked(frame *aether.Frame) {
+	if w.sessionInFlight == nil || frame == nil {
+		return
+	}
+	w.sessionInFlight.Add(int64(aether.HeaderSize) + int64(frame.Length))
+}
+
+func (w *SendWindow) subInFlightLocked(entry *SendEntry) {
+	if w.sessionInFlight == nil || entry == nil || entry.Frame == nil {
+		return
+	}
+	w.sessionInFlight.Add(-(int64(aether.HeaderSize) + int64(entry.Frame.Length)))
+}
+
+// removeEntryLocked deletes seq from w.entries, decrementing the
+// optional session inflight counter by the entry's on-wire size before
+// the delete. No-op if seq isn't present. Centralises the
+// counter+delete invariant so future removal call sites stay
+// consistent.
+func (w *SendWindow) removeEntryLocked(seq uint32) (*SendEntry, bool) {
+	entry, ok := w.entries[seq]
+	if !ok {
+		return nil, false
+	}
+	w.subInFlightLocked(entry)
+	delete(w.entries, seq)
+	return entry, true
 }
 
 // SuspiciousACKsCount returns the number of Composite ACKs rejected
@@ -130,6 +197,7 @@ func (w *SendWindow) AddEntry(frame *aether.Frame) (uint32, *SendEntry) {
 		XmitTime: now,
 	}
 	w.entries[seq] = entry
+	w.addInFlightLocked(frame)
 	w.next++
 	return seq, entry
 }
@@ -185,6 +253,7 @@ func (w *SendWindow) Ack(seqNo uint32) *SendEntry {
 		return nil
 	}
 	entry.Acked = true
+	w.subInFlightLocked(entry)
 	delete(w.entries, seqNo)
 
 	// Advance base past all acked entries
@@ -223,6 +292,7 @@ func (w *SendWindow) AckRange(start, end uint32) int {
 	for i := uint64(0); i <= span; i++ {
 		if entry, ok := w.entries[seq]; ok {
 			entry.Acked = true
+			w.subInFlightLocked(entry)
 			delete(w.entries, seq)
 			count++
 		}
@@ -302,6 +372,7 @@ func (w *SendWindow) ProcessCompositeACK(ack *aether.CompositeACK, reorderThresh
 		if entry, ok := w.entries[seq]; ok {
 			entry.Acked = true
 			acked = append(acked, entry)
+			w.subInFlightLocked(entry)
 			delete(w.entries, seq)
 		}
 	}
@@ -341,6 +412,7 @@ func (w *SendWindow) ProcessCompositeACK(ack *aether.CompositeACK, reorderThresh
 				if entry, ok := w.entries[seqNo]; ok {
 					entry.Acked = true
 					acked = append(acked, entry)
+					w.subInFlightLocked(entry)
 					delete(w.entries, seqNo)
 				}
 			} else {
@@ -374,6 +446,7 @@ func (w *SendWindow) ProcessCompositeACK(ack *aether.CompositeACK, reorderThresh
 			if entry, ok := w.entries[seq]; ok {
 				entry.Acked = true
 				acked = append(acked, entry)
+				w.subInFlightLocked(entry)
 				delete(w.entries, seq)
 			}
 		}
@@ -395,7 +468,7 @@ func (w *SendWindow) ProcessCompositeACK(ack *aether.CompositeACK, reorderThresh
 			continue
 		}
 		for seq := block.Start; seq <= block.End; seq++ {
-			delete(w.entries, seq)
+			w.removeEntryLocked(seq)
 		}
 	}
 

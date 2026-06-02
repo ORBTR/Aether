@@ -107,8 +107,16 @@ type NoiseSession struct {
 	// Packet-level anti-replay (connection-scoped, 128-bit window)
 	packetReplay *reliability.PacketReplayWindow
 
-	// streamRefused counts peer-initiated OPEN / implicit-OPEN requests
-	// rejected because the MaxConcurrentStreams cap is reached.
+	// streamRefused counts every stream open rejected because the
+	// MaxConcurrentStreams cap is reached — INCLUDING both peer-initiated
+	// OPENs (and implicit-OPENs piggy-backed on the first DATA frame)
+	// AND locally-initiated OpenStream calls. Was previously
+	// peer-only; A1 from aether comprehensive audit 2026-06-02 made the
+	// cap apply universally to protect against local resource
+	// exhaustion. Operators reading this counter should NOT treat a
+	// rising value as exclusively-adversarial peer behaviour — a
+	// leak in the local caller (e.g. StreamPool not releasing streams
+	// fast enough) also bumps the counter.
 	streamRefused uint64
 
 	// Batch 6 telemetry: cross-correlate aether-layer hypotheses against
@@ -127,6 +135,25 @@ type NoiseSession struct {
 	// blocked waiting for an ACK that already arrived but didn't wake it.
 	cansendFalseReenqueues uint64
 	wakeOnAckCalls         uint64
+
+	// inFlightBytes aggregates the on-wire size of every unacked frame
+	// across every stream's SendWindow. Wired into each stream's window
+	// via SetSessionInFlightCounter at createStream time so the
+	// SendWindow's Add/Ack paths increment/decrement it as a side
+	// effect. writeLoop's CUBIC CanSend check then becomes a single
+	// atomic.Load instead of the O(streams) lock walk it was before
+	// (A9 audit fix). The counter never under-reports: each mutation
+	// happens under the per-stream SendWindow.mu, sequencing the
+	// entries-map update with the counter update.
+	inFlightBytes atomic.Int64
+
+	// lastPeerStats stores the most-recent STATS frame the peer emitted.
+	// Updated by handleStats (every ~5s per the peer's reliabilityTick).
+	// Read-only consumers (monitoring, Library MeshMetrics) call
+	// LastPeerStats() to get a snapshot. atomic.Pointer for lock-free
+	// readers; nil until the peer's first STATS frame arrives.
+	// Was A7 from aether comprehensive audit 2026-06-02.
+	lastPeerStats atomic.Pointer[aether.SessionMetrics]
 
 	// ECN observation. The receive path increments ceObservedBytes
 	// when an inbound packet's IP/IPv6 TOS field carries the CE codepoint
@@ -407,12 +434,23 @@ func (s *NoiseSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) 
 		return nil, fmt.Errorf("stream ID %d exceeds MaxStreamID (%d) — send GOAWAY", cfg.StreamID, aether.MaxStreamID)
 	}
 
-	// Locally-initiated open: no remote cap enforcement (we control when
-	// we open streams).
+	// Locally-initiated open. The MaxConcurrentStreams cap applies
+	// universally (A1 from aether audit 2026-06-02 — was previously
+	// bypassed for local opens, allowing unbounded local resource
+	// exhaustion). `enforceRemoteCap=false` here means: enforce the cap
+	// but do NOT send a RESET back (no peer to RESET — the caller
+	// gets the error directly).
 	st := s.createStream(cfg.StreamID, cfg, false)
 	if st == nil {
-		// Should never happen with enforceRemoteCap=false, but defend.
-		return nil, fmt.Errorf("createStream returned nil")
+		// Cap reached. streamRefused counter already incremented inside
+		// createStream; abuse signal recorded. Surface as the typed
+		// sentinel ErrStreamCapExhausted so callers can detect cap-hit
+		// via errors.Is and back off instead of closing the session.
+		cap := s.opts.MaxConcurrentStreams
+		if cap <= 0 {
+			cap = aether.DefaultMaxConcurrentStreams
+		}
+		return nil, fmt.Errorf("OpenStream cap=%d: %w", cap, aether.ErrStreamCapExhausted)
 	}
 	st.state.Transition(aether.EventSendOpen)
 
@@ -824,6 +862,17 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 // rejected because MaxConcurrentStreams was reached.
 func (s *NoiseSession) StreamRefusedCount() uint64 {
 	return atomic.LoadUint64(&s.streamRefused)
+}
+
+// LastPeerStats returns a copy of the most-recent STATS frame received
+// from the peer, or a zero-value SessionMetrics if no STATS frame has
+// arrived yet. Lock-free read via atomic.Pointer. Was A7 from aether
+// comprehensive audit 2026-06-02.
+func (s *NoiseSession) LastPeerStats() aether.SessionMetrics {
+	if p := s.lastPeerStats.Load(); p != nil {
+		return *p
+	}
+	return aether.SessionMetrics{}
 }
 
 // reportAbuse records a misbehaviour event against the remote peer.

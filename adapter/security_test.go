@@ -8,6 +8,7 @@ package adapter
 
 import (
 	"context"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -78,5 +79,65 @@ func TestS5_TCPSessionRefusesOverCap(t *testing.T) {
 	// Metrics plumbing sanity-check.
 	if m := server.Metrics(); m.StreamRefused < 1 {
 		t.Errorf("SessionMetrics.StreamRefused = %d, want >= 1", m.StreamRefused)
+	}
+}
+
+// TestS5_LocalOpenStreamCapHitReturnsTypedError — A1 audit follow-up
+// 2026-06-02. Verifies that locally-initiated OpenStream calls that
+// hit the MaxConcurrentStreams cap return aether.ErrStreamCapExhausted
+// (detectable via errors.Is) AND increment the streamRefused counter.
+// Library callers (mesh_connection.go, StreamPool.Fill) rely on this
+// typed error to back off without closing the entire session — a
+// stringly-typed error caused callers to misinterpret the transient
+// cap-hit as a session-fatal transport failure.
+func TestS5_LocalOpenStreamCapHitReturnsTypedError(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	client := NewTCPSession(clientConn, "vl1_client", "vl1_server", aether.ProtoTCP, aether.DefaultSessionOptions())
+	server := NewTCPSession(serverConn, "vl1_server", "vl1_client", aether.ProtoTCP, aether.DefaultSessionOptions())
+	defer client.Close()
+	defer server.Close()
+
+	// Cap the LOCAL side this time so the typed error fires on the
+	// client.OpenStream path (the audit-fix surface) rather than the
+	// peer-side reset path the original S5 test covers.
+	client.opts.MaxConcurrentStreams = 2
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Open up to the cap — these should all succeed.
+	for i := 0; i < 2; i++ {
+		_, err := client.OpenStream(ctx, aether.StreamConfig{
+			StreamID:    uint64(100 + i),
+			Reliability: aether.ReliableOrdered,
+			Priority:    128,
+		})
+		if err != nil {
+			t.Fatalf("open %d unexpectedly failed: %v", i, err)
+		}
+	}
+
+	// The cap+1 open MUST return aether.ErrStreamCapExhausted (wrapped).
+	_, err := client.OpenStream(ctx, aether.StreamConfig{
+		StreamID:    200,
+		Reliability: aether.ReliableOrdered,
+		Priority:    128,
+	})
+	if err == nil {
+		t.Fatal("OpenStream past cap returned nil error, want ErrStreamCapExhausted")
+	}
+	if !errors.Is(err, aether.ErrStreamCapExhausted) {
+		t.Errorf("err = %v; want errors.Is(err, ErrStreamCapExhausted) == true", err)
+	}
+
+	// Local streamRefused counter must reflect the rejection.
+	if got := client.StreamRefusedCount(); got < 1 {
+		t.Errorf("local StreamRefusedCount = %d, want >= 1", got)
+	}
+	if m := client.Metrics(); m.StreamRefused < 1 {
+		t.Errorf("local SessionMetrics.StreamRefused = %d, want >= 1", m.StreamRefused)
 	}
 }

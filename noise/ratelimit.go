@@ -70,20 +70,54 @@ const (
 	SourceLimitDefaultBurst = 10
 	// SourceLimitDefaultRate is the per-source refill rate (per second).
 	SourceLimitDefaultRate = 1.0
-	// SourceLimitMaxEntries caps the LRU map of per-IP buckets to avoid
-	// unbounded memory if attacker spoofs millions of source IPs.
-	SourceLimitMaxEntries = 10000
+	// SourceLimitMaxEntries caps the per-IP bucket map. Raised from 10k
+	// to 100k (A2 from aether audit 2026-06-02). At 10k, a spoofed-IP
+	// attacker could cycle through the cap within the global 1000/s
+	// ceiling — displacing legitimate peers' bucket state in ~10s. At
+	// 100k with TTL-based eviction (instead of FIFO), cycling requires
+	// sustained 100k+/sec for >5 minutes, well above the global cap.
+	SourceLimitMaxEntries = 100000
+	// SourceLimitEntryTTL is the idle timeout before a per-IP bucket
+	// is eligible for eviction. Legitimate peers re-handshake more
+	// frequently than this so their bucket state is preserved; an
+	// attacker spoofing fresh IPs gets fresh buckets that expire
+	// after TTL without disturbing legit peer state.
+	SourceLimitEntryTTL = 5 * time.Minute
+	// SourceLimitSweepInterval is how often the background sweep
+	// removes expired entries. One pass per minute keeps the working
+	// set small in steady state without blocking the hot path.
+	SourceLimitSweepInterval = 1 * time.Minute
 )
 
-// sourceLimiter tracks per-source-IP token buckets with FIFO eviction
-// when the entry cap is reached.
+// sourceEntry is one per-IP bucket plus its last-seen timestamp.
+// lastSeen is updated atomically on every Allow hit (the per-source
+// limiter's primary mutex serialises updates, so the read in the
+// background sweeper is consistent without further synchronisation).
+type sourceEntry struct {
+	bucket   *tokenBucket
+	lastSeen time.Time
+}
+
+// sourceLimiter tracks per-source-IP token buckets with TTL-based
+// eviction when the entry cap is reached.
+//
+// Eviction policy (A2 audit fix): legitimate peers whose lastSeen is
+// within TTL are protected from being displaced by spoofed-IP traffic.
+// On cache-full, a single-pass scan finds the oldest entry; if it's
+// past TTL it is evicted to make room; if not (all entries are recent),
+// the new request is rejected. A background sweeper runs every
+// SourceLimitSweepInterval to keep the working set bounded under
+// steady-state load.
 type sourceLimiter struct {
 	mu         sync.Mutex
 	burst      float64
 	refillRate float64
 	maxEntries int
-	buckets    map[string]*tokenBucket
-	order      []string // FIFO eviction order
+	ttl        time.Duration
+	buckets    map[string]*sourceEntry
+
+	stopOnce sync.Once
+	stopCh   chan struct{}
 }
 
 func newSourceLimiter(burst, refillRate float64, maxEntries int) *sourceLimiter {
@@ -96,12 +130,49 @@ func newSourceLimiter(burst, refillRate float64, maxEntries int) *sourceLimiter 
 	if maxEntries <= 0 {
 		maxEntries = SourceLimitMaxEntries
 	}
-	return &sourceLimiter{
+	sl := &sourceLimiter{
 		burst:      burst,
 		refillRate: refillRate,
 		maxEntries: maxEntries,
-		buckets:    make(map[string]*tokenBucket, maxEntries),
-		order:      make([]string, 0, maxEntries),
+		ttl:        SourceLimitEntryTTL,
+		buckets:    make(map[string]*sourceEntry, 1024), // grow on demand; cap at maxEntries
+		stopCh:     make(chan struct{}),
+	}
+	go sl.sweepLoop()
+	return sl
+}
+
+// Stop terminates the background sweeper goroutine. Idempotent.
+func (sl *sourceLimiter) Stop() {
+	if sl == nil {
+		return
+	}
+	sl.stopOnce.Do(func() { close(sl.stopCh) })
+}
+
+// sweepLoop periodically evicts entries past TTL so the working set
+// reflects only recently-active source IPs.
+func (sl *sourceLimiter) sweepLoop() {
+	t := time.NewTicker(SourceLimitSweepInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-sl.stopCh:
+			return
+		case <-t.C:
+			sl.sweepExpired()
+		}
+	}
+}
+
+func (sl *sourceLimiter) sweepExpired() {
+	sl.mu.Lock()
+	defer sl.mu.Unlock()
+	cutoff := time.Now().Add(-sl.ttl)
+	for k, e := range sl.buckets {
+		if e.lastSeen.Before(cutoff) {
+			delete(sl.buckets, k)
+		}
 	}
 }
 
@@ -109,11 +180,12 @@ func newSourceLimiter(burst, refillRate float64, maxEntries int) *sourceLimiter 
 // rate budget. The key is the IP only (not IP+port) so an attacker can't
 // bypass by rolling source ports.
 //
-// On hit, the entry's LRU position is refreshed to the back of `order` so
-// active legitimate peers don't get evicted ahead of bursty strangers.
-// Without this refresh, a long-lived peer that happened to be registered
-// early would remain at the front of `order` indefinitely and be evicted
-// first under pressure — inverting the intent of the LRU policy.
+// Eviction policy (A2 audit 2026-06-02): TTL-based. On cache-full, only
+// entries older than SourceLimitEntryTTL are evicted to make room; if
+// every entry is fresh, the new (likely spoofed) request is dropped.
+// This makes the cache cycle-attack-resistant: an attacker rolling
+// spoofed IPs cannot displace legitimate peers within the TTL window,
+// regardless of attack rate.
 func (sl *sourceLimiter) Allow(addr net.Addr) bool {
 	if sl == nil {
 		return true
@@ -125,29 +197,34 @@ func (sl *sourceLimiter) Allow(addr net.Addr) bool {
 	sl.mu.Lock()
 	defer sl.mu.Unlock()
 
-	bucket, ok := sl.buckets[key]
-	if !ok {
-		// Evict oldest if at capacity.
-		if len(sl.order) >= sl.maxEntries {
-			oldest := sl.order[0]
-			sl.order = sl.order[1:]
-			delete(sl.buckets, oldest)
-		}
-		bucket = newTokenBucket(sl.burst, sl.refillRate, time.Second)
-		sl.buckets[key] = bucket
-		sl.order = append(sl.order, key)
-	} else {
-		// Refresh LRU position: remove the old slot and append to the back.
-		// O(N) scan but N ≤ maxEntries and the call rate is bounded by
-		// the global handshake rate limit — not a hot path.
-		for i, k := range sl.order {
-			if k == key {
-				sl.order = append(sl.order[:i], sl.order[i+1:]...)
-				break
+	now := time.Now()
+	e, ok := sl.buckets[key]
+	if ok {
+		e.lastSeen = now
+		return e.bucket.Allow(1)
+	}
+
+	// New source. If at capacity, only evict if oldest entry is past TTL.
+	if len(sl.buckets) >= sl.maxEntries {
+		cutoff := now.Add(-sl.ttl)
+		var oldestKey string
+		var oldestTime time.Time
+		for k, v := range sl.buckets {
+			if oldestKey == "" || v.lastSeen.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = v.lastSeen
 			}
 		}
-		sl.order = append(sl.order, key)
+		if oldestTime.After(cutoff) {
+			// Every cached entry is recently active. Refuse the new
+			// request — prevents cycle-attack displacement of legit peers.
+			return false
+		}
+		delete(sl.buckets, oldestKey)
 	}
+
+	bucket := newTokenBucket(sl.burst, sl.refillRate, time.Second)
+	sl.buckets[key] = &sourceEntry{bucket: bucket, lastSeen: now}
 	return bucket.Allow(1)
 }
 
