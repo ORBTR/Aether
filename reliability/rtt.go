@@ -84,3 +84,13 @@ func (e *RTTEstimator) isInitialized() bool { return e.e.IsInitialized() }
 // IsInitialized is the public counterpart to isInitialized() — added
 // for parity with the new API.
 func (e *RTTEstimator) IsInitialized() bool { return e.e.IsInitialized() }
+
+// Percentile returns the p-th percentile RTT from the underlying
+// estimator's ring-buffer histogram. See rtt.Estimator.Percentile.
+func (e *RTTEstimator) Percentile(p int) time.Duration { return e.e.Percentile(p) }
+
+// PercentileSnapshot returns (p50, p95, p99) RTT from the histogram
+// in one ring-buffer copy + sort pass. See rtt.Estimator.PercentileSnapshot.
+func (e *RTTEstimator) PercentileSnapshot() (p50, p95, p99 time.Duration) {
+	return e.e.PercentileSnapshot()
+}

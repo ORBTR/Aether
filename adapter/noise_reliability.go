@@ -26,8 +26,21 @@ import (
 // CUBIC and BBR). Parks on the scheduler's wake channel instead of
 // polling — polling with time.Sleep(1ms) adds ~0.5 ms latency to every
 // send and burns CPU when idle.
+//
+// A single goroutine owns writeLoop, so the local pacingTimer below
+// is goroutine-private: no synchronisation needed. Reusing one
+// *time.Timer across every paced frame avoids a per-frame runtimeTimer
+// + channel allocation (~96 B + GC pressure under high-throughput
+// bandwidth-limited streams). Go 1.23+ Timer semantics let us Reset
+// without manual channel draining.
 func (s *NoiseSession) writeLoop() {
 	wake := s.sched.WakeCh()
+	var pacingTimer *time.Timer
+	defer func() {
+		if pacingTimer != nil {
+			pacingTimer.Stop()
+		}
+	}()
 	for {
 		// Drain everything currently scheduled before re-parking.
 		for {
@@ -76,12 +89,20 @@ func (s *NoiseSession) writeLoop() {
 				}
 			}
 
-			// Pacing: park exactly as long as the pacer says.
+			// Pacing: park exactly as long as the pacer says. Use the
+			// session-scoped pacingTimer (allocated on first use) to
+			// avoid a per-frame timer allocation that time.After would
+			// otherwise incur on every paced send.
 			wait := s.pacer.TimeUntilSend(frameSize)
 			if wait > 0 {
 				s.sched.Enqueue(frame.StreamID, frame)
+				if pacingTimer == nil {
+					pacingTimer = time.NewTimer(wait)
+				} else {
+					pacingTimer.Reset(wait)
+				}
 				select {
-				case <-time.After(wait):
+				case <-pacingTimer.C:
 				case <-s.CloseSignal():
 					return
 				}
