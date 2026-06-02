@@ -208,6 +208,62 @@ type SessionMetrics struct {
 	RttP50 time.Duration `json:"rttP50Ns,omitempty"`
 	RttP95 time.Duration `json:"rttP95Ns,omitempty"`
 	RttP99 time.Duration `json:"rttP99Ns,omitempty"`
+
+	// Observability histograms surfaced as p50/p99 microseconds — the
+	// minimum cardinality that lets operators localize the bimodal RPC
+	// latency tail the fleet has been seeing. Source histograms live on
+	// NoiseSession; consumers (Library MeshMetrics, dashboards) read
+	// them via STATS frames + monitoring endpoints.
+	//
+	// OBS-1: time inside the underlying transport's write call. High
+	// p99 here points at kernel send-buffer pressure / TLS encode /
+	// WebSocket framing — i.e. cost *outside* aether's control.
+	WriteSyscallP50Us uint64 `json:"writeSyscallP50Us,omitempty"`
+	WriteSyscallP99Us uint64 `json:"writeSyscallP99Us,omitempty"`
+	// OBS-2: time the writeLoop spent parked on its wake channel.
+	// High p99 with a low p50 is the classic "idle stream with bursts"
+	// shape; sustained-high p50 indicates app-side send pacing is the
+	// throughput bottleneck (not aether's congestion control).
+	WriteloopParkP50Us uint64 `json:"writeloopParkP50Us,omitempty"`
+	WriteloopParkP99Us uint64 `json:"writeloopParkP99Us,omitempty"`
+	// OBS-4: duration that CUBIC.CanSend stayed false in a run of
+	// consecutive writeLoop re-enqueue iterations. Paired with the
+	// CanSendFalseReenqueues counter (above) — counter gives the
+	// frequency, percentiles give the per-event severity.
+	CubicCwndBlockP50Us uint64 `json:"cubicCwndBlockP50Us,omitempty"`
+	CubicCwndBlockP99Us uint64 `json:"cubicCwndBlockP99Us,omitempty"`
+	// OBS-5: time flow.StreamWindow.Consume spent blocked on the
+	// credit semaphore. Skips samples below ~100µs (uncontended fast
+	// path) so the distribution reflects real grant starvation, not
+	// semaphore-acquire overhead. Elevated p99 here means the peer's
+	// WINDOW_UPDATE channel is the bottleneck — usually a lossy ACK-
+	// direction path or a malfunctioning auto-tuner.
+	GrantStarveP50Us uint64 `json:"grantStarveP50Us,omitempty"`
+	GrantStarveP99Us uint64 `json:"grantStarveP99Us,omitempty"`
+	// OBS-10: cwnd utilisation per-mille (inFlight/cwnd * 1000)
+	// sampled every 16th write. p50 ≈ 1000 = cwnd-bound for most
+	// sends; p50 << 1000 = app-bound (the cwnd is bigger than the
+	// session needs). p99 close to 1000 with low p50 = bursty cwnd-
+	// bound spikes inside an otherwise app-bound regime.
+	CwndUtilP50Permille uint32 `json:"cwndUtilP50Permille,omitempty"`
+	CwndUtilP99Permille uint32 `json:"cwndUtilP99Permille,omitempty"`
+	// OBS-11: loss-recovery counters. TLPFiresTotal counts every
+	// successfully-enqueued Tail Loss Probe; RACKMarksTotal counts
+	// every seq RACK declared lost. High TLP/RACK ratio = tail-
+	// recovery dominated (app pacing); low ratio = fast-recovery
+	// dominated (genuine packet loss).
+	TLPFiresTotal  uint64 `json:"tlpFiresTotal,omitempty"`
+	RACKMarksTotal uint64 `json:"rackMarksTotal,omitempty"`
+	// OBS-15: noise send-cipher rekey telemetry. RekeyTotal is the
+	// lifetime count of send-side rekeys on this session (bumped inside
+	// RekeyTracker.ResetSend); RekeyBytesSinceLast is the rolling byte
+	// count since the last rekey reset. Together they let the operator
+	// distinguish "byte-threshold triggered" (steady throughput, total
+	// climbs) from "time-threshold triggered" (long idle, bytes-since-
+	// last stays small but total climbs). Zero on non-noise adapters —
+	// TCP / QUIC sessions don't ratchet through the noise rekey path.
+	RekeyTotal          uint64 `json:"rekeyTotal,omitempty"`
+	RekeyBytesSinceLast uint64 `json:"rekeyBytesSinceLast,omitempty"`
 }
 
 // StreamObserveData holds per-stream observation metrics from the ObserveEngine.

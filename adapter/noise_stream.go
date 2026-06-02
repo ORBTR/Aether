@@ -154,6 +154,13 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 	// MUST run before any Send on this stream — earlier sends would
 	// under-report by the size of their in-flight frames.
 	eng.SendWin.SetSessionInFlightCounter(&s.inFlightBytes)
+	// OBS-5: share the session-level grant-starvation histogram with this
+	// stream's flow window. All streams on a session record into the same
+	// histogram so the percentile readout describes session-wide
+	// credit-starvation tail behaviour rather than fragmenting per
+	// stream (most streams produce too few samples to compute stable
+	// percentiles on their own).
+	st.window.SetGrantStarveHist(&s.grantStarveHist)
 	// Per-stream grant debouncer. Immediate-flush floor at 50% of the
 	// stream's initial credit so burst reads drain the pending total
 	// without waiting the full coalesce window when the sender is close

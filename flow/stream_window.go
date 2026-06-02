@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ORBTR/aether/metrics"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -202,7 +203,29 @@ type StreamWindow struct {
 	// firing time when CheckCreditAbuse fires so persistent abuse
 	// keeps accruing score on each subsequent full window.
 	creditAbuseSince time.Time
+
+	// grantStarveHist (optional) is a session-shared DurationHist that
+	// records how long Consume blocked acquiring credit. Set via
+	// SetGrantStarveHist by the owning session at stream construction;
+	// nil means Consume skips recording. Stored as a raw pointer (NOT
+	// atomic.Pointer) because the field is wired once at construction
+	// and never swapped after — concurrent reads of an immutable
+	// pointer are safe without atomic protection.
+	//
+	// Samples below grantStarveFloor are skipped (uncontended fast
+	// path); recording every-Consume-success would dominate the
+	// distribution with sub-microsecond samples and bury the actual
+	// starvation signal.
+	grantStarveHist *metrics.DurationHist
 }
+
+// grantStarveFloor is the minimum Consume duration that gets recorded
+// into the grantStarveHist. Below this we treat the call as uncontended
+// (semaphore acquired without blocking) and skip the record. 100µs is
+// well above the typical microbenchmark for an uncontended
+// semaphore.Acquire call but well below any latency we care about
+// surfacing.
+const grantStarveFloor = 100 * time.Microsecond
 
 // CreditAbuseRatio is the (grantsEmitted - consumed) / grantsEmitted
 // threshold above which a stream is considered to be hoarding credit
@@ -281,6 +304,19 @@ func NewStreamWindowWithCap(initialCredit, maxCredit int64) *StreamWindow {
 	}
 }
 
+// SetGrantStarveHist wires a session-shared OBS-5 histogram into this
+// stream window. Consume records the wall-clock it spent blocked on the
+// credit semaphore into the histogram, skipping samples below
+// grantStarveFloor (the uncontended fast path). Pass nil to disable
+// recording (default for windows constructed via NewStreamWindow).
+//
+// Must be called BEFORE Consume sees concurrent traffic. The field is
+// wired once at session-create time and never swapped — concurrent
+// reads of an immutable pointer don't need atomic protection.
+func (w *StreamWindow) SetGrantStarveHist(h *metrics.DurationHist) {
+	w.grantStarveHist = h
+}
+
 // Consume reserves n bytes of sender credit before a Send.
 //
 // Small frames (≤ MinGuaranteedWindow) are NOT metered — they bypass the
@@ -300,10 +336,47 @@ func (w *StreamWindow) Consume(ctx context.Context, n int64) error {
 		return nil
 	}
 
+	// Fast path: try a non-blocking acquire first. When credit is
+	// immediately available (the common case on a healthy stream) we
+	// skip both the timeout-context construction and the entire OBS-5
+	// timing instrumentation. The wired-histogram cost is therefore
+	// zero on uncontended Consume calls — matching what the OBS-5
+	// design promises.
+	if w.sem.TryAcquire(n) {
+		w.mu.Lock()
+		w.dataOutstanding += n
+		if w.dataOutstanding > w.peakOutstanding {
+			w.peakOutstanding = w.dataOutstanding
+		}
+		outstanding := w.dataOutstanding
+		w.mu.Unlock()
+		dbgFlow.Printf("Consume FAST n=%d outstanding=%d avail=%d", n, outstanding, w.currentWindow-outstanding)
+		return nil
+	}
+
 	acquireCtx, cancel := context.WithTimeout(ctx, ConsumeTimeout)
 	defer cancel()
 
-	if err := w.sem.Acquire(acquireCtx, n); err != nil {
+	// Contended path: TryAcquire above already failed so we KNOW this
+	// Consume is going to block on real credit-starvation. Time it
+	// unconditionally and record on BOTH success and timeout paths —
+	// every sample here represents real semaphore contention worth
+	// surfacing in OBS-5. No floor gate: the worst-case ~10s timeout
+	// path is the single most important starvation signal an operator
+	// needs in a credit-deadlock dashboard, and the fast-path skip
+	// above already filters out uncontended noise.
+	var starveStart time.Time
+	if w.grantStarveHist != nil {
+		starveStart = time.Now()
+	}
+
+	err := w.sem.Acquire(acquireCtx, n)
+
+	if w.grantStarveHist != nil {
+		w.grantStarveHist.Record(time.Since(starveStart))
+	}
+
+	if err != nil {
 		avail := w.Available()
 		dbgFlow.Printf("Consume TIMEOUT need=%d have=%d outstanding=%d maxSize=%d",
 			n, avail, w.dataOutstanding, w.maxSize)
