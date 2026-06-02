@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/ORBTR/aether"
+	"github.com/ORBTR/aether/abuse"
 	"github.com/ORBTR/aether/congestion"
 )
 
@@ -364,6 +365,17 @@ func (s *NoiseSession) reliabilityTick() {
 					}
 					log.Printf("[STREAM-HEALTH] peer=%s stream=%d inflight=%d sendBase=%d progressAge=%s",
 						remoteShort, streamID, inFlight, st.sendWindow.Base(), progressAge)
+				}
+
+				// Credit-audit abuse signal: a peer that hoards granted
+				// bandwidth without delivering data is either bug-broken
+				// or actively stalling our receive path. The check
+				// latches once per imbalance window so calling it on
+				// every tick doesn't flood the scorer.
+				if st.window != nil && st.window.CheckCreditAbuse() {
+					s.reportAbuse(abuse.ReasonFlowControlAbuse)
+					log.Printf("[CREDIT-ABUSE] peer=%s stream=%d sustained credit-vs-consume imbalance — reported",
+						s.RemoteNodeID().Short(), streamID)
 				}
 			}
 

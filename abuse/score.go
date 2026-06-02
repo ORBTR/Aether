@@ -24,13 +24,14 @@ import (
 type Reason int
 
 const (
-	ReasonDecryptFail    Reason = iota // noise/session.go decrypt error
-	ReasonMalformedFrame               // frame decode / validate failure
-	ReasonACKValidation                // S1 — Composite ACK rejected
-	ReasonStreamRefused                // S5 — peer hit MaxConcurrentStreams
-	ReasonWHOISFlood                   // application: WHOIS spam
-	ReasonReplayDetected               // anti-replay window rejection
-	ReasonProtocolViolation            // any unexpected sequence/state
+	ReasonDecryptFail     Reason = iota // noise/session.go decrypt error
+	ReasonMalformedFrame                // frame decode / validate failure
+	ReasonACKValidation                 // S1 — Composite ACK rejected
+	ReasonStreamRefused                 // S5 — peer hit MaxConcurrentStreams
+	ReasonWHOISFlood                    // application: WHOIS spam
+	ReasonReplayDetected                // anti-replay window rejection
+	ReasonProtocolViolation             // any unexpected sequence/state
+	ReasonFlowControlAbuse              // peer hoarding credit without delivering (sustained grantsEmitted vs consumed imbalance)
 )
 
 func (r Reason) String() string {
@@ -49,6 +50,8 @@ func (r Reason) String() string {
 		return "replay-detected"
 	case ReasonProtocolViolation:
 		return "protocol-violation"
+	case ReasonFlowControlAbuse:
+		return "flow-control-abuse"
 	default:
 		return "unknown"
 	}
@@ -72,6 +75,11 @@ func DefaultWeight(r Reason) float64 {
 		return 8
 	case ReasonProtocolViolation:
 		return 10
+	case ReasonFlowControlAbuse:
+		// Sustained-imbalance signal — not a single-event attack.
+		// Weight matches ReplayDetected: notable but not by itself
+		// near the threshold; 4 sustained windows in a row would.
+		return 8
 	default:
 		return 1
 	}

@@ -194,7 +194,35 @@ type StreamWindow struct {
 	// call. Drives the TIMED trigger; also initialized at construction so
 	// a brand-new stream can't fire TIMED on the very first payload.
 	lastGrantTime time.Time
+
+	// creditAbuseSince records the start of a sustained
+	// (grantsEmitted - consumed) / grantsEmitted > CreditAbuseRatio
+	// window. Zero when the gap is healthy. CheckCreditAbuse sets/clears
+	// this and reports true once the gap has persisted for
+	// CreditAbuseDuration. Updated under w.mu.
+	creditAbuseSince time.Time
+	// creditAbuseFired latches once CheckCreditAbuse returns true for a
+	// given imbalance window so subsequent calls within the same window
+	// don't flood the abuse scorer. Cleared whenever the gap recovers
+	// below CreditAbuseRatio.
+	creditAbuseFired bool
 }
+
+// CreditAbuseRatio is the (grantsEmitted - consumed) / grantsEmitted
+// threshold above which a stream is considered to be hoarding credit
+// — the receiver extended bandwidth via WINDOW_UPDATE but the peer is
+// not delivering data to consume it. Mirrors the sustained-imbalance
+// definition used by the S7 abuse scorer for other flow-control
+// anomalies.
+const CreditAbuseRatio = 0.5
+
+// CreditAbuseDuration is how long the (grantsEmitted vs consumed) gap
+// must persist past CreditAbuseRatio before CheckCreditAbuse reports
+// abuse. 30s matches the credit-audit advisory in the comprehensive
+// audit: short-lived imbalances under bursty traffic are normal; a
+// persistent imbalance for a full half-minute on an active stream is
+// the anomalous signal.
+const CreditAbuseDuration = 30 * time.Second
 
 // NewStreamWindow creates a flow control window with the given initial credit.
 //
@@ -529,6 +557,65 @@ func (w *StreamWindow) Outstanding() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.dataOutstanding
+}
+
+// CheckCreditAbuse reports whether the stream is currently exhibiting
+// a sustained credit-hoarding pattern: the receiver has granted more
+// bandwidth than the peer is consuming, and the imbalance has lasted
+// at least CreditAbuseDuration. Returns true exactly once per imbalance
+// window — once tripped, subsequent calls within the same imbalance
+// return false until the gap recovers below CreditAbuseRatio (which
+// resets the anchor) and the imbalance returns. Lets adapter callers
+// invoke this on every reliability tick without flooding the abuse
+// scorer.
+//
+// Internally tracks creditAbuseSince so the duration is measured across
+// multiple calls without per-stream timer machinery. The window resets
+// to zero whenever the imbalance recovers below CreditAbuseRatio,
+// so transient spikes don't accumulate toward the duration.
+//
+// Safe to call from any goroutine.
+func (w *StreamWindow) CheckCreditAbuse() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.grantsEmitted <= 0 {
+		// No grants ever issued — no imbalance possible. Reset any
+		// stale window-start so we don't fire when grants resume.
+		w.creditAbuseSince = time.Time{}
+		w.creditAbuseFired = false
+		return false
+	}
+
+	gap := w.grantsEmitted - w.consumed
+	if gap <= 0 {
+		w.creditAbuseSince = time.Time{}
+		w.creditAbuseFired = false
+		return false
+	}
+	ratio := float64(gap) / float64(w.grantsEmitted)
+	if ratio <= CreditAbuseRatio {
+		w.creditAbuseSince = time.Time{}
+		w.creditAbuseFired = false
+		return false
+	}
+
+	if w.creditAbuseFired {
+		// Already fired for this imbalance window; suppress until the
+		// gap recovers above the ratio and we anchor a new window.
+		return false
+	}
+
+	now := time.Now()
+	if w.creditAbuseSince.IsZero() {
+		w.creditAbuseSince = now
+		return false
+	}
+	if now.Sub(w.creditAbuseSince) >= CreditAbuseDuration {
+		w.creditAbuseFired = true
+		return true
+	}
+	return false
 }
 
 // CurrentGrant returns the current cumulative-emitted value so callers can
