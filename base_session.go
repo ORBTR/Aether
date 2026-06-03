@@ -44,6 +44,18 @@ type BaseSession struct {
 
 	idleTimeoutOverride time.Duration
 	idleTimeoutDefault  time.Duration
+
+	// createdAt is stamped at construction and consumed by stall
+	// detectors (per-session warmup grace) and lifetime logging.
+	// Frozen for the session lifetime — read lock-free.
+	createdAt time.Time
+
+	// closeMu guards closeErr so reads via CloseErr() never race with
+	// SetCloseErr() writes. The shared close signal lives on closed +
+	// closeOnce; closeErr is the human-readable reason supplied to
+	// CloseWithError that callers want to surface later.
+	closeMu  sync.Mutex
+	closeErr error
 }
 
 // NewBaseSession allocates and initialises a BaseSession bound to the
@@ -66,6 +78,7 @@ func NewBaseSession(localNodeID, remoteNodeID NodeID, proto Protocol) *BaseSessi
 		connID:       connID,
 		proto:        proto,
 		closed:       make(chan struct{}),
+		createdAt:    time.Now(),
 	}
 }
 
@@ -159,3 +172,28 @@ func (b *BaseSession) IdleTimeout() time.Duration {
 	}
 	return b.idleTimeoutDefault
 }
+
+// CreatedAt returns the wall-clock construction time. Consumed by
+// stall detectors comparing session age to SessionWarmupGrace and by
+// lifetime logging at close.
+func (b *BaseSession) CreatedAt() time.Time { return b.createdAt }
+
+// CloseErr returns the error supplied to the adapter's CloseWithError,
+// or nil if the session was closed cleanly or is still open. Safe for
+// concurrent callers under closeMu.
+func (b *BaseSession) CloseErr() error {
+	b.closeMu.Lock()
+	defer b.closeMu.Unlock()
+	return b.closeErr
+}
+
+// SetCloseErr records the close reason. Adapters call this from inside
+// their CloseWithError teardown once SignalClose has returned true.
+// Subsequent calls overwrite; the SignalClose gate is what makes the
+// first write the canonical one in practice.
+func (b *BaseSession) SetCloseErr(err error) {
+	b.closeMu.Lock()
+	b.closeErr = err
+	b.closeMu.Unlock()
+}
+

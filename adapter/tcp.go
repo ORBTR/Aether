@@ -70,8 +70,6 @@ type TCPSession struct {
 	connWindow *flow.ConnWindow
 	compressor *aether.Compressor
 
-	closeErr error
-
 	// streamRefused counts peer-initiated OPEN requests rejected because
 	// MaxConcurrentStreams was reached. See _SECURITY.md §3.12.
 	streamRefused uint64
@@ -279,7 +277,7 @@ func (s *TCPSession) readLoop() {
 		if err != nil {
 			dbgTCP.Printf("readLoop: EXIT err=%v remote=%s", err, s.RemoteNodeID().Short())
 			if err != io.EOF {
-				s.closeErr = err
+				s.SetCloseErr(err)
 			}
 			return
 		}
@@ -978,7 +976,7 @@ func (s *TCPSession) CloseWithError(err error) error {
 		return nil
 	}
 	if err != nil {
-		s.closeErr = err
+		s.SetCloseErr(err)
 	}
 	// Capture the caller chain so the FIRST closer in a close
 	// cascade is identifiable. Frame 0 is this closure, 1 is
@@ -1024,15 +1022,6 @@ func (s *TCPSession) CloseWithError(err error) error {
 	}
 	s.conn.Close()
 	return nil
-}
-
-// CloseErr returns the error the session was closed with, or nil if it
-// was closed cleanly (or is still open). Satisfies the optional
-// aether.CloseErrorReporter interface so the HSTLES connection manager
-// can trigger grade-based transport fallback when it sees
-// aether.ErrSessionStuck (or another fatal close reason).
-func (s *TCPSession) CloseErr() error {
-	return s.closeErr
 }
 
 // housekeepingTick runs the protocol-agnostic periodic maintenance

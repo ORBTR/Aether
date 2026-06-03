@@ -82,11 +82,14 @@ func freshServerTransport(t *testing.T) (*GrpcTransport, ed25519.PrivateKey, aet
 	if err != nil {
 		t.Fatalf("NewNodeID: %v", err)
 	}
-	gt := NewGrpcTransport(GrpcTransportConfig{
+	gt, err := NewGrpcTransport(GrpcTransportConfig{
 		LocalNode:  nodeID,
 		PrivateKey: priv,
 		ListenAddr: "",
 	})
+	if err != nil {
+		t.Fatalf("NewGrpcTransport: %v", err)
+	}
 	return gt, priv, nodeID
 }
 

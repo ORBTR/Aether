@@ -531,7 +531,7 @@ func (s *NoiseSession) reliabilityTick() {
 				warmupGrace = aether.DefaultSessionWarmupGrace
 			}
 			effectiveThreshold := stallThreshold
-			if warmupGrace > 0 && time.Since(s.createdAt) < warmupGrace {
+			if warmupGrace > 0 && time.Since(s.CreatedAt()) < warmupGrace {
 				effectiveThreshold = stallThreshold * 2
 			}
 			s.mu.Lock()
@@ -590,7 +590,7 @@ func (s *NoiseSession) reliabilityTick() {
 						}
 					}
 				}
-				sessionAge := time.Since(s.createdAt)
+				sessionAge := time.Since(s.CreatedAt())
 				warmupActive := warmupGrace > 0 && sessionAge < warmupGrace
 				if probeOK {
 					s.mu.Lock()
