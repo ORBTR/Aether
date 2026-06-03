@@ -20,6 +20,21 @@ import (
 	"github.com/ORBTR/aether/reliability"
 )
 
+// isAckImmediateStream reports whether arriving DATA on streamID should
+// elicit an immediate ACK (skip the delayed-ACK timer). Control frames
+// always get immediate ACKs by RFC; the RPC stream opts in via
+// layout.RPC because request/response pairs are latency-sensitive and
+// the delayed-ACK timer (default ~25ms) stalls back-to-back calls.
+func (s *NoiseSession) isAckImmediateStream(streamID uint64) bool {
+	if streamID == s.layout.Control {
+		return true
+	}
+	if s.layout.RPC != 0 && streamID == s.layout.RPC {
+		return true
+	}
+	return false
+}
+
 // readLoop reads Aether frames from the Noise connection and dispatches to streams.
 // Delegates decode to aether.ReadNextFrame; the post-decode pipeline
 // (decrypt → decompress → anti-replay → dispatch) stays here in
@@ -310,7 +325,7 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 	// CompositeACK; it never blocks on a stream's recvCh. Safe to
 	// promote ahead of delivery.
 	if st.ackEngine != nil {
-		st.ackEngine.OnDataReceived(frame.SeqNo, frame.StreamID == s.layout.Control)
+		st.ackEngine.OnDataReceived(frame.SeqNo, s.isAckImmediateStream(frame.StreamID))
 	}
 
 	// Delivery loop: handleReset / local Reset / streamGC sweep can run
@@ -641,7 +656,7 @@ func (s *NoiseSession) handleImplicitOpen(frame *aether.Frame) {
 	// handleData's notify, wasting a round-trip on every stream open.
 	// Mirrors the ordering in handleData above.
 	if st.ackEngine != nil {
-		st.ackEngine.OnDataReceived(frame.SeqNo, frame.StreamID == s.layout.Control)
+		st.ackEngine.OnDataReceived(frame.SeqNo, s.isAckImmediateStream(frame.StreamID))
 	}
 
 	func() {
