@@ -534,10 +534,21 @@ func (m *Manager) aliveCount() int {
 	return n
 }
 
-// sessionAge returns time since the path's session was first observed
-// by this manager (LastSuccess at AddPath time stands in for creation
-// because aether.Session doesn't expose CreatedAt directly).
+// sessionAge returns time since the path was first added to this
+// manager (Path.CreatedAt). Stable across the path's lifetime — does
+// NOT reset on probe success — so the quality scorer's AgeGrace gate
+// ramps from 0→1 monotonically over the path's lifetime instead of
+// re-entering the grace window every probe ACK. With the prior
+// LastSuccess-based age, a 5s noise-UDP probe cadence kept the path
+// permanently in the AgeGrace=0 window, multiplicatively zeroing the
+// Aggregate score. See workflow w4p7hi4zb S4. Falls back to LastSuccess
+// for paths added before the CreatedAt field existed (zero-value
+// CreatedAt with non-zero LastSuccess) so a rolling deploy doesn't
+// briefly score every legacy path at AgeGrace=0.
 func sessionAge(p *Path) time.Duration {
+	if !p.CreatedAt.IsZero() {
+		return time.Since(p.CreatedAt)
+	}
 	if p.LastSuccess.IsZero() {
 		return 0
 	}

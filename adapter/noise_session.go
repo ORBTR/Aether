@@ -978,13 +978,20 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 	streamCount := len(s.streams)
 	var suspiciousACKs, recvDrops, seqWraps, replayDup, replayAncient uint64
 	// rttSrc is the stream we read percentile RTT from for the
-	// session-level snapshot. Prefer the BidiRPC primary (control
-	// stream layout.Control) so SLO dashboards reflect RPC latency;
-	// fall back to any stream with initialised RTT samples if the
-	// control stream isn't yet seeing traffic.
+	// session-level snapshot. Pick the FIRST stream whose RTT estimator
+	// is initialised — any data-carrying stream produces samples on
+	// every ACK (noise_dispatch.go::handleACK → st.rtt.UpdateWithDelay).
+	//
+	// The prior selection preferred s.layout.Control unconditionally
+	// (StreamControl is HSTLES's key-rotation / 5s STATS stream — by
+	// design carries no application TypeDATA), so its RTT estimator
+	// never saw a delay sample, never initialised, and the assignment
+	// at id==controlID clobbered every other stream's estimator. Net
+	// effect was RttP50=0 on every noise session fleet-wide despite
+	// streams 0 (gossip) and 1 (RPC) actively recording samples. See
+	// workflow w4p7hi4zb S3.
 	var rttSrc *reliability.RTTEstimator
-	controlID := s.layout.Control
-	for id, st := range s.streams {
+	for _, st := range s.streams {
 		if st.sendWindow != nil {
 			suspiciousACKs += st.sendWindow.SuspiciousACKsCount()
 		}
@@ -996,12 +1003,8 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 			replayDup += st.replay.DuplicateCount()
 			replayAncient += st.replay.AncientDropCount()
 		}
-		if st.rtt != nil {
-			if id == controlID {
-				rttSrc = st.rtt
-			} else if rttSrc == nil && st.rtt.IsInitialized() {
-				rttSrc = st.rtt
-			}
+		if rttSrc == nil && st.rtt != nil && st.rtt.IsInitialized() {
+			rttSrc = st.rtt
 		}
 	}
 	s.mu.Unlock()
