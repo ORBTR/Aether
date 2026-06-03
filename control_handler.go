@@ -5,8 +5,6 @@
 package aether
 
 import (
-	"time"
-
 	"github.com/ORBTR/aether/flow"
 	"github.com/ORBTR/aether/health"
 )
@@ -75,14 +73,20 @@ func (h *ControlFrameHandler) HandlePing(frame *Frame) {
 	})
 }
 
-// HandlePong records inbound activity + feeds the PONG SeqNo +
-// timestamp pair into the health monitor for SRTT update. SeqNo carries
-// the low 32 bits of the PING's UnixNano send time so the monitor can
-// derive the round-trip without per-session bookkeeping.
+// HandlePong records inbound activity + feeds the SRTT update.
+//
+// sentAt comes from the local Monitor's PingSentAt(), not from any
+// timestamp encoded in the frame. The PONG SeqNo is the seq parameter
+// RecordPongRecv uses to match against pendingPingSeq; reconstructing
+// the send time from SeqNo would require carrying the full 64-bit
+// UnixNano on the wire, but only the low 32 bits fit in the frame
+// header — round-tripping that as time.Unix(0, low32) gives a 1970-
+// epoch garbage value and sample = now - 1970 produces ~Unix-ms
+// nonsense in m.lastRTT. The local PingSentAt() is the authoritative
+// stamp.
 func (h *ControlFrameHandler) HandlePong(frame *Frame) {
 	h.HealthMon.RecordActivity()
-	sentAt := time.Unix(0, int64(frame.SeqNo))
-	h.HealthMon.RecordPongRecv(frame.SeqNo, sentAt)
+	h.HealthMon.RecordPongRecv(frame.SeqNo, h.HealthMon.PingSentAt())
 }
 
 // HandlePriority applies a peer-initiated stream weight change to the
