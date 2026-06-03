@@ -45,7 +45,7 @@ func (s *NoiseSession) readLoop() {
 		frame, indicator, batch, err := aether.ReadNextFrame(s.conn, s.compressor)
 		if err != nil {
 			if err != io.EOF {
-				s.closeErr = err
+				s.SetCloseErr(err)
 			}
 			return
 		}

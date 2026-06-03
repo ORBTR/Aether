@@ -19,7 +19,10 @@ func TestGrpcTransportConfig(t *testing.T) {
 		ListenAddr: ":9000",
 	}
 
-	gt := NewGrpcTransport(cfg)
+	gt, err := NewGrpcTransport(cfg)
+	if err != nil {
+		t.Fatalf("NewGrpcTransport returned error: %v", err)
+	}
 	if gt == nil {
 		t.Fatal("NewGrpcTransport returned nil")
 	}
@@ -63,7 +66,10 @@ func TestNewGrpcTransportDefaults(t *testing.T) {
 		LocalNode: "node-1",
 	}
 
-	gt := NewGrpcTransport(cfg)
+	gt, err := NewGrpcTransport(cfg)
+	if err != nil {
+		t.Fatalf("NewGrpcTransport returned error: %v", err)
+	}
 
 	// Empty listen addr should be handled
 	if gt.listenAddr != "" {

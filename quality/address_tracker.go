@@ -212,7 +212,7 @@ func (t *AddressTracker) PruneOlderThan(maxAge time.Duration) int {
 		if a.LastFailure.After(last) {
 			last = a.LastFailure
 		}
-		if last.Before(cutoff) {
+		if !last.After(cutoff) {
 			delete(t.entries, k)
 			removed++
 		}

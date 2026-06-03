@@ -331,11 +331,6 @@ type NoiseSession struct {
 	encryptor  *aethercrypto.FrameEncryptor
 	sessionKey []byte
 
-	// closeErr captures the cause supplied to CloseWithError so callers
-	// can later inspect it via CloseErr(). BaseSession owns the lifecycle
-	// channel (CloseSignal / SignalClose) — Noise stores only the reason.
-	closeErr error
-
 	// throttle holds the explicit-CONGESTION signal state from the peer.
 	// Zero value is "no throttle"; handleCongestion updates it on incoming
 	// CONGESTION frames. Send-path consumers can consult Throttle() for
@@ -362,13 +357,6 @@ type NoiseSession struct {
 	// a lower-grade transport (e.g. Noise-UDP → WS) rather than thrash
 	// on a black-holed path. Updated under s.mu during reliabilityTick.
 	lastAnyProgressAt time.Time
-
-	// createdAt is the wall-clock time the session was constructed.
-	// Used by the stall detector together with opts.SessionWarmupGrace
-	// to compute an effective stall threshold that's larger during
-	// the session's initial lifetime — see reliabilityTick. Set once
-	// in NewNoiseSession and read lock-free thereafter.
-	createdAt time.Time
 
 	// peerMaxAckDelay is the peer's advertised max_ack_delay (RFC 9002
 	// §6.2) extracted from the Noise handshake NodeInfo payload via the
@@ -416,7 +404,6 @@ func NewNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 		interleavedEncoder: reliability.NewInterleavedFECEncoder(reliability.DefaultFECGroupSize),
 		interleavedDecoder: reliability.NewInterleavedFECDecoder(),
 		compressor:         aether.NewCompressor(),
-		createdAt:          time.Now(),
 	}
 	// Reed-Solomon encoder/decoder — instantiated even when no stream is
 	// using FECReedSolomon, because the cost is just a small Galois-field
@@ -721,13 +708,6 @@ func (s *NoiseSession) releaseStream(streamID uint64) {
 	}
 }
 
-// CloseErr returns the error the session was closed with, or nil if it
-// was closed cleanly (or is still open). Safe to call after Close; the
-// underlying field is only written inside closeOnce.Do.
-func (s *NoiseSession) CloseErr() error {
-	return s.closeErr
-}
-
 func (s *NoiseSession) Close() error {
 	return s.CloseWithError(nil)
 }
@@ -751,7 +731,7 @@ func (s *NoiseSession) CloseWithError(err error) error {
 	if !s.lastAnyProgressAt.IsZero() {
 		stallSince = fmt.Sprintf("%v", time.Since(s.lastAnyProgressAt))
 	}
-	lifetime := time.Since(s.createdAt)
+	lifetime := time.Since(s.CreatedAt())
 	warmupGrace := s.opts.SessionWarmupGrace
 	if warmupGrace == 0 {
 		warmupGrace = aether.DefaultSessionWarmupGrace
@@ -760,7 +740,7 @@ func (s *NoiseSession) CloseWithError(err error) error {
 	log.Printf("[SESSION-CLOSE] noise peer=%s lifetime=%v warmup=%v err=%v stalled=%s callers=%s",
 		remoteShort, lifetime, warmupActive, err, stallSince, callerChain)
 	if err != nil {
-		s.closeErr = err
+		s.SetCloseErr(err)
 	}
 	if s.streamGC != nil {
 		s.streamGC.Stop()
@@ -863,7 +843,7 @@ func (s *NoiseSession) dumpFlowDiagOnStall(reason string) {
 		pacing = cong.PacingRate()
 	}
 	connStats := s.connWindow.Stats()
-	sessionAge := now.Sub(s.createdAt)
+	sessionAge := now.Sub(s.CreatedAt())
 
 	log.Printf("[FLOW-DIAG] %s reason=%s sessionAge=%v cwnd=%d pacing=%.0fbps autoTuneAge=%v grantRefreshAge=%v conn{out=%d credit=%d cons=%d gE=%d gR=%d thr=%d eag=%d wm=%d tim=%d} streams=%d",
 		remoteShort, reason, sessionAge, cwnd, pacing, autoTuneAge, grantRefreshAge,
