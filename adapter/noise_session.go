@@ -1098,6 +1098,16 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 		RttP95: rttP95,
 		RttP99: rttP99,
 
+		// Health-monitor SRTT — populated by Pong arrivals via the
+		// WaitForActivityPing → hm.RecordPingSent → hm.RecordPongRecv
+		// chain (S2 fix). Independent of the per-stream RTT estimator
+		// (RttP50/95/99) which requires DATA-frame ACKs. On low-traffic
+		// sessions (no data sent) the per-stream values stay 0 while
+		// HealthSRTT still surfaces ping-derived RTT, giving operators
+		// visibility into liveness without depending on application
+		// traffic.
+		HealthSRTTUs: uint64(s.Health().SRTT().Microseconds()),
+
 		// Observability histograms (OBS-1/2/4/5/10) and counters
 		// (OBS-11). Percentile readouts are computed above; the int64
 		// microsecond values from DurationHist are cast to uint64 here
