@@ -57,22 +57,25 @@ type GrpcTransport struct {
 	incoming   chan aether.IncomingSession
 }
 
-// NewGrpcTransport creates a new gRPC aether.
-func NewGrpcTransport(cfg GrpcTransportConfig) *GrpcTransport {
+// NewGrpcTransport creates a new gRPC transport. Returns (T, error)
+// for signature symmetry with NewNoiseTransport / NewQuicTransport /
+// NewWebsocketTransport — every Transport constructor in aether shares
+// the same shape so a generic factory can wrap them all.
+func NewGrpcTransport(cfg GrpcTransportConfig) (*GrpcTransport, error) {
 	return &GrpcTransport{
 		localNode:  cfg.LocalNode,
 		privateKey: cfg.PrivateKey,
 		listenAddr: cfg.ListenAddr,
 		tlsConfig:  cfg.TLSConfig,
 		incoming:   make(chan aether.IncomingSession, 32),
-	}
+	}, nil
 }
 
 // NewGrpcTransportFromConfig creates a gRPC transport from the unified Config.
-// Returns nil if Config.GRPC is nil (protocol disabled).
-func NewGrpcTransportFromConfig(cfg aether.Config) *GrpcTransport {
+// Returns (nil, nil) if Config.GRPC is nil (protocol disabled).
+func NewGrpcTransportFromConfig(cfg aether.Config) (*GrpcTransport, error) {
 	if cfg.GRPC == nil {
-		return nil
+		return nil, nil
 	}
 	return NewGrpcTransport(GrpcTransportConfig{
 		LocalNode:  cfg.NodeID,
