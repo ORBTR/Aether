@@ -213,6 +213,16 @@ type NoiseSession struct {
 	cwndUtilRing        metrics.PermilleRing
 	recvWindowHOLHist   metrics.DurationHist
 	streamSendBlockHist metrics.DurationHist
+	// OBS-14b: per-phase decomposition of streamSendBlockHist. Recorded
+	// at each phase boundary inside noiseStream.Send so operators can
+	// attribute application-facing send latency to per-stream credit
+	// starvation vs per-conn credit starvation vs the post-credit
+	// encrypt/write/park path. Same fast-path skip as streamSendBlockHist
+	// applies — phase durations below streamSendBlockFloor are not
+	// recorded so the fast path doesn't dominate.
+	perStreamWindowWaitHist metrics.DurationHist
+	connWindowWaitHist      metrics.DurationHist
+	postCreditSendHist      metrics.DurationHist
 	// schedulerDepthRing — OBS-9: scheduler queue-depth distribution.
 	// Wired into s.sched via SetDepthHist at session construction so
 	// every Enqueue / EnqueueProbe / external Wake and every writeLoop
@@ -1040,6 +1050,9 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 	cwndUtilP50, cwndUtilP99 := s.cwndUtilRing.PercentileSnapshot()
 	holP50, _, holP99 := s.recvWindowHOLHist.PercentileSnapshot()
 	streamSendBlockP50, _, streamSendBlockP99 := s.streamSendBlockHist.PercentileSnapshot()
+	perStreamWaitP50, _, perStreamWaitP99 := s.perStreamWindowWaitHist.PercentileSnapshot()
+	connWaitP50, _, connWaitP99 := s.connWindowWaitHist.PercentileSnapshot()
+	postCreditP50, _, postCreditP99 := s.postCreditSendHist.PercentileSnapshot()
 	schedulerDepthP50, schedulerDepthP99 := s.schedulerDepthRing.PercentileSnapshot()
 
 	return aether.SessionMetrics{
@@ -1131,6 +1144,19 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 		StreamSendBlockP50Us: uint64(streamSendBlockP50),
 		StreamSendBlockP99Us: uint64(streamSendBlockP99),
 		StreamSendFastTotal:  s.streamSendFastTotal.Load(),
+
+		// OBS-14b: per-phase decomposition of StreamSendBlock. Recorded
+		// at each phase boundary inside noiseStream.Send so operators
+		// can attribute application-facing send latency to (a) per-stream
+		// credit starvation, (b) per-conn credit starvation, or (c) the
+		// post-credit encrypt+write+park path. Sum approximation:
+		// StreamSendBlock ≈ PerStreamWindowWait + ConnWindowWait + PostCreditSend.
+		PerStreamWindowWaitP50Us: uint64(perStreamWaitP50),
+		PerStreamWindowWaitP99Us: uint64(perStreamWaitP99),
+		ConnWindowWaitP50Us:      uint64(connWaitP50),
+		ConnWindowWaitP99Us:      uint64(connWaitP99),
+		PostCreditSendP50Us:      uint64(postCreditP50),
+		PostCreditSendP99Us:      uint64(postCreditP99),
 
 		// OBS-9: scheduler queue-depth percentiles. Sampled on every
 		// signalWake (Enqueue / EnqueueProbe / external Wake) and on

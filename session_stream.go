@@ -295,6 +295,28 @@ type SessionMetrics struct {
 	// operator the "how many sends were uncontended" denominator that
 	// would otherwise be hidden by the percentile-only readout.
 	StreamSendFastTotal uint64 `json:"streamSendFastTotal,omitempty"`
+	// OBS-14b: per-phase decomposition of the StreamSendBlock total. Each
+	// percentile pair attributes the application-facing send latency to a
+	// specific phase of the Send hot path:
+	//   - PerStreamWindowWait — block in st.window.Consume (per-stream
+	//     credit; blocks waiting for the peer's WINDOW_UPDATE)
+	//   - ConnWindowWait — block in st.session.connWindow.Consume
+	//     (per-conn credit; typically non-blocking unless cap is reached)
+	//   - PostCreditSendUs — wall-clock from credit-acquired to Send
+	//     return (covers encrypt + write_syscall + writeloop_park)
+	// The three histograms share the same below-floor skip as
+	// StreamSendBlock — phase durations below streamSendBlockFloor are
+	// not recorded so the fast path doesn't dominate the distribution.
+	// Sum approximation: StreamSendBlock ≈ PerStreamWindowWait +
+	// ConnWindowWait + PostCreditSend (within rounding + fragment loop
+	// overhead). Use the three sub-histograms to attribute which phase
+	// is starving when StreamSendBlock is elevated.
+	PerStreamWindowWaitP50Us uint64 `json:"perStreamWindowWaitP50Us,omitempty"`
+	PerStreamWindowWaitP99Us uint64 `json:"perStreamWindowWaitP99Us,omitempty"`
+	ConnWindowWaitP50Us      uint64 `json:"connWindowWaitP50Us,omitempty"`
+	ConnWindowWaitP99Us      uint64 `json:"connWindowWaitP99Us,omitempty"`
+	PostCreditSendP50Us      uint64 `json:"postCreditSendP50Us,omitempty"`
+	PostCreditSendP99Us      uint64 `json:"postCreditSendP99Us,omitempty"`
 	// OBS-18: per-decrypt AEAD latency distribution (microseconds). Each
 	// recv-side noise Decrypt call records its wall-clock cost; the
 	// percentile readout exposes the bimodal split that single-mean
