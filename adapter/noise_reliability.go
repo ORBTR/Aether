@@ -649,12 +649,21 @@ func (s *NoiseSession) reliabilityTick() {
 				// Stream individually wedged. Reset its TLP so probes can
 				// resume; the next ACK (or its absence) decides whether
 				// the path is genuinely stuck or just under temporary
-				// loss. Log once per stream per detection.
+				// loss. Throttled to once per second per stream: the
+				// 10ms reliability ticker would otherwise call
+				// AnyAckReceived() on every iteration where TLP has just
+				// re-armed a probe between ticks, producing a ~100Hz
+				// reset/log loop on genuinely-stuck streams (observed
+				// live on app-orbtr-io IAD under heavy 6PN loss).
 				tlpState := e.st.tlp.Snapshot()
 				if tlpState.ConsecutiveProbes > 0 {
-					e.st.tlp.AnyAckReceived()
-					log.Printf("[STREAM-STUCK-DETECT] peer=%s stream=%d inFlight=%d progressAge=%v tlpReset",
-						s.RemoteNodeID().Short(), e.id, inFlight, time.Duration(nowNano-lastProgressNs))
+					lastReset := e.st.lastStuckResetUnixNano.Load()
+					if nowNano-lastReset >= int64(time.Second) &&
+						e.st.lastStuckResetUnixNano.CompareAndSwap(lastReset, nowNano) {
+						e.st.tlp.AnyAckReceived()
+						log.Printf("[STREAM-STUCK-DETECT] peer=%s stream=%d inFlight=%d progressAge=%v tlpReset",
+							s.RemoteNodeID().Short(), e.id, inFlight, time.Duration(nowNano-lastProgressNs))
+					}
 				}
 
 				// [ACK-SILENT]: explicit warning when this stream has been

@@ -85,6 +85,17 @@ type noiseStream struct {
 	// log.
 	lastAckSilentLogUnixNano atomic.Int64
 
+	// lastStuckResetUnixNano throttles STREAM-STUCK-DETECT's tlp reset
+	// to once per second per stream. Without the throttle, the 10ms
+	// reliability ticker calls tlp.AnyAckReceived() on every iteration
+	// where ConsecutiveProbes > 0, and TLP re-arms a fresh probe
+	// between ticks — producing a ~100Hz tlpReset/log spam loop on
+	// genuinely-stuck streams (observed live on app-orbtr-io IAD
+	// under heavy Fly 6PN packet loss). One reset per second is still
+	// aggressive enough to recover transient losses, while bounding the
+	// log/CPU cost when the path is durably broken.
+	lastStuckResetUnixNano atomic.Int64
+
 	// rack runs RFC 8985 time-based loss detection on this stream.
 	// Updated by handleACK on every successful ACK (Ack call), consulted
 	// each reliability tick to enumerate freshly-lost seqs to retransmit.
