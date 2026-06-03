@@ -64,7 +64,24 @@ func WaitForActivityPing(
 	}
 	before := hm.LastActivity()
 	start := time.Now()
-	if err := writePing(uint32(start.UnixNano() & 0xFFFFFFFF)); err != nil {
+	// Derive a non-zero seqNo (RecordPongRecv rejects seq==0). UnixNano
+	// rarely produces a zero low-word, but a defensive bump avoids the
+	// pathological case where the very Pong we depend on for SRTT is
+	// silently discarded.
+	seqNo := uint32(start.UnixNano() & 0xFFFFFFFF)
+	if seqNo == 0 {
+		seqNo = 1
+	}
+	// Arm the Monitor's pendingPingSeq BEFORE writePing so the inbound
+	// Pong's seq comparison in RecordPongRecv (monitor.go:85) succeeds.
+	// Prior versions skipped this call, leaving pendingPingSeq=0; every
+	// Pong then failed the `seq != 0 && seq == m.pendingPingSeq` gate
+	// and the RTT estimator never received an UpdateWithDelay sample.
+	// Net effect was rtt_ms=0 on every peer_transports row fleet-wide
+	// despite Pongs arriving correctly — they were dropped silently at
+	// the Monitor layer. See workflow w4p7hi4zb S2.
+	hm.RecordPingSent(seqNo)
+	if err := writePing(seqNo); err != nil {
 		return 0, err
 	}
 	deadline := time.Now().Add(PingDefaultDeadline)

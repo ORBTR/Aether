@@ -90,6 +90,18 @@ type Path struct {
 	LastSuccess time.Time
 	ConsecutiveFailures int
 
+	// CreatedAt is the wall-clock at addPathLocked time. Stable across
+	// the path's lifetime — written ONCE on path creation and never
+	// rewritten by probe success. The quality scorer's sessionAge gate
+	// reads CreatedAt (not LastSuccess) so AgeGrace ramps from 0→1
+	// monotonically over the path's lifetime instead of resetting on
+	// every probe ACK. Without this, OnProbeSuccess overwrites
+	// LastSuccess every probe and a path on the 5s noise-UDP cadence
+	// re-enters the AgeGrace=0 window every probe — multiplicatively
+	// zeroing Aggregate score for the path's entire lifetime. See
+	// workflow w4p7hi4zb S4.
+	CreatedAt time.Time
+
 	// LastFailure timestamp drives the dead→standby resurrection path.
 	// OnPrimaryFailure stamps this when marking PathDead; the probe loop
 	// (and PickByQuality / PickPath opportunistically) check that
@@ -354,12 +366,14 @@ func (m *Manager) addPathLocked(session aether.Session, proto aether.Protocol, q
 		seed /= 2
 	}
 
+	now := time.Now()
 	path := &Path{
 		Session:        session,
 		Protocol:       proto,
 		State:          PathStandby,
 		Quality:        quality,
-		LastSuccess:    time.Now(),
+		LastSuccess:    now,
+		CreatedAt:      now,
 		bytesScheduled: seed,
 	}
 
