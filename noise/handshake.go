@@ -854,6 +854,16 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 	l.mu.Unlock()
 	s := aether.NewConnection(l.transport.localNode, remoteNode, nc)
 	s.OnClose(func() { nc.Close() })
+	// Recover from panic if the listener has already closed l.incoming
+	// (noiseListener.run's `defer close(l.incoming)` at session.go:819).
+	// A handshake that completed AFTER ctx cancellation reaches this
+	// select with a closed channel; the ctx.Done() arm would normally
+	// race the close-then-send and lose. The recover matches the
+	// dispatchToSession defense at session.go:1007 — keeps the partial
+	// handshake from taking down the whole node.
+	defer func() {
+		_ = recover()
+	}()
 	select {
 	case l.incoming <- aether.IncomingSession{Session: s, Reader: nc, Writer: nc}:
 	case <-ctx.Done():
