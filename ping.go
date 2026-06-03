@@ -73,13 +73,11 @@ func WaitForActivityPing(
 		seqNo = 1
 	}
 	// Arm the Monitor's pendingPingSeq BEFORE writePing so the inbound
-	// Pong's seq comparison in RecordPongRecv (monitor.go:85) succeeds.
-	// Prior versions skipped this call, leaving pendingPingSeq=0; every
-	// Pong then failed the `seq != 0 && seq == m.pendingPingSeq` gate
-	// and the RTT estimator never received an UpdateWithDelay sample.
-	// Net effect was rtt_ms=0 on every peer_transports row fleet-wide
-	// despite Pongs arriving correctly — they were dropped silently at
-	// the Monitor layer. See workflow w4p7hi4zb S2.
+	// Pong's RecordPongRecv finds a non-zero pendingPingSeq and feeds
+	// the SRTT estimator. Without this arming the Pong's seq comparison
+	// fails the `seq != 0 && seq == m.pendingPingSeq` gate and the RTT
+	// estimator never updates — every health.Monitor SRTT read returns
+	// 0 even though Pongs are arriving correctly.
 	hm.RecordPingSent(seqNo)
 	if err := writePing(seqNo); err != nil {
 		return 0, err

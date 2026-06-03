@@ -538,12 +538,16 @@ func (m *Manager) aliveCount() int {
 // manager (Path.CreatedAt). Stable across the path's lifetime — does
 // NOT reset on probe success — so the quality scorer's AgeGrace gate
 // ramps from 0→1 monotonically over the path's lifetime instead of
-// re-entering the grace window every probe ACK. With the prior
-// LastSuccess-based age, a 5s noise-UDP probe cadence kept the path
-// permanently in the AgeGrace=0 window, multiplicatively zeroing the
-// Aggregate score. See workflow w4p7hi4zb S4. Falls back to LastSuccess
-// for paths added before the CreatedAt field existed (zero-value
-// CreatedAt with non-zero LastSuccess) so a rolling deploy doesn't
+// re-entering the grace window every probe ACK.
+//
+// Caveat: reading LastSuccess as a creation-time proxy is wrong because
+// OnProbeSuccess rewrites LastSuccess every probe, and on a fast probe
+// cadence the path stays permanently inside AgeGrace=0 (multiplicatively
+// zeroing the Aggregate score). Use CreatedAt for sessionAge, not
+// LastSuccess.
+//
+// LastSuccess fallback covers paths constructed before the CreatedAt
+// field existed (zero-value CreatedAt) so a rolling upgrade doesn't
 // briefly score every legacy path at AgeGrace=0.
 func sessionAge(p *Path) time.Duration {
 	if !p.CreatedAt.IsZero() {
