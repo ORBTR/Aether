@@ -95,11 +95,10 @@ type Path struct {
 	// rewritten by probe success. The quality scorer's sessionAge gate
 	// reads CreatedAt (not LastSuccess) so AgeGrace ramps from 0→1
 	// monotonically over the path's lifetime instead of resetting on
-	// every probe ACK. Without this, OnProbeSuccess overwrites
-	// LastSuccess every probe and a path on the 5s noise-UDP cadence
-	// re-enters the AgeGrace=0 window every probe — multiplicatively
-	// zeroing Aggregate score for the path's entire lifetime. See
-	// workflow w4p7hi4zb S4.
+	// every probe ACK. LastSuccess is rewritten by OnProbeSuccess on
+	// every probe, so reading it as a creation-time proxy would re-
+	// enter the AgeGrace=0 window on every probe and multiplicatively
+	// zero the path's Aggregate score for its entire lifetime.
 	CreatedAt time.Time
 
 	// LastFailure timestamp drives the dead→standby resurrection path.

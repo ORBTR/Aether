@@ -982,14 +982,12 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 	// is initialised — any data-carrying stream produces samples on
 	// every ACK (noise_dispatch.go::handleACK → st.rtt.UpdateWithDelay).
 	//
-	// The prior selection preferred s.layout.Control unconditionally
-	// (StreamControl is HSTLES's key-rotation / 5s STATS stream — by
-	// design carries no application TypeDATA), so its RTT estimator
-	// never saw a delay sample, never initialised, and the assignment
-	// at id==controlID clobbered every other stream's estimator. Net
-	// effect was RttP50=0 on every noise session fleet-wide despite
-	// streams 0 (gossip) and 1 (RPC) actively recording samples. See
-	// workflow w4p7hi4zb S3.
+	// Do NOT prefer s.layout.Control: that's the key-rotation / STATS
+	// stream and by design carries no application TypeDATA, so its rtt
+	// estimator never initialises. An unconditional controlID-first
+	// assignment would clobber every data stream's estimator and the
+	// session-level RTT would be 0 even when streams 0 (gossip) and 1
+	// (RPC) have fresh samples.
 	var rttSrc *reliability.RTTEstimator
 	for _, st := range s.streams {
 		if st.sendWindow != nil {
@@ -1100,12 +1098,10 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 
 		// Health-monitor SRTT — populated by Pong arrivals via the
 		// WaitForActivityPing → hm.RecordPingSent → hm.RecordPongRecv
-		// chain (S2 fix). Independent of the per-stream RTT estimator
-		// (RttP50/95/99) which requires DATA-frame ACKs. On low-traffic
-		// sessions (no data sent) the per-stream values stay 0 while
-		// HealthSRTT still surfaces ping-derived RTT, giving operators
-		// visibility into liveness without depending on application
-		// traffic.
+		// chain. Independent of the per-stream RTT estimator
+		// (RttP50/95/99) which only updates on DATA-frame ACKs; on a
+		// session with no application traffic the per-stream values
+		// stay 0 while HealthSRTT still reflects ping-derived liveness.
 		HealthSRTTUs: uint64(s.Health().SRTT().Microseconds()),
 
 		// Observability histograms (OBS-1/2/4/5/10) and counters
