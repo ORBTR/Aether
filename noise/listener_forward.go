@@ -141,7 +141,14 @@ func (l *noiseListener) handleForwarderPacket(buf []byte, addr *net.UDPAddr, con
 	}
 
 	// Routing preamble — M_r side ingress from the public anycast.
+	// Counter records receipt before any drop classification: without it,
+	// 12/12 cross_org_preamble_dials_failed paired with 0 forwarder_drops
+	// is ambiguous (packet never arrived at M_r vs. arrived and silently
+	// failed). Comparing CrossOrgMsg1Received against the dialer's
+	// preamble_dials_attempted reveals which side of the wire is the
+	// failing layer.
 	if IsRoutingPreamble(buf) {
+		fwd.recordCrossOrgMsg1Received()
 		return l.onRoutingPreamble(fwd, buf, addr, conn)
 	}
 

@@ -308,6 +308,12 @@ type IntraOrgForwarder struct {
 	// lock and observers can read without contending the table mutexes.
 	drops [dropReasonCount]uint64
 
+	// crossOrgMsg1Received counts arrivals at the M_r anycast ingress
+	// before any classify/drop decision. Paired with the dialer's
+	// preamble_dials_attempted counter, it distinguishes the failure
+	// mode (packet never arrived vs arrived and dropped downstream).
+	crossOrgMsg1Received uint64
+
 	// Stopped via Close so the sweeper goroutine exits cleanly.
 	stop chan struct{}
 	once sync.Once
@@ -351,6 +357,25 @@ func (f *IntraOrgForwarder) recordDrop(reason dropReason) {
 		return
 	}
 	atomic.AddUint64(&f.drops[reason], 1)
+}
+
+// recordCrossOrgMsg1Received bumps the ingress success counter at M_r
+// before any drop classification. Caller is the listener routing-
+// preamble dispatch path.
+func (f *IntraOrgForwarder) recordCrossOrgMsg1Received() {
+	if f == nil {
+		return
+	}
+	atomic.AddUint64(&f.crossOrgMsg1Received, 1)
+}
+
+// CrossOrgMsg1Received returns the current value of the M_r ingress
+// counter. Surfaced via /api/monitoring/mesh-debug.mesh_metrics.
+func (f *IntraOrgForwarder) CrossOrgMsg1Received() uint64 {
+	if f == nil {
+		return 0
+	}
+	return atomic.LoadUint64(&f.crossOrgMsg1Received)
 }
 
 // Drops returns a snapshot of the per-reason drop counters. Used by

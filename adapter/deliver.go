@@ -50,12 +50,15 @@ const (
 	minBackpressure = 10 * time.Millisecond
 
 	// maxBackpressure is the longest wait before dropping a frame.
-	// Sized at ACKEngine.MaxDelay so a single slow consumer can never
-	// stall the readLoop for longer than the ACK-delay budget — beyond
-	// that the noise inbox (128 slots) could overflow and silently
-	// drop inbound ACKs for OTHER streams. At 25ms a fully-saturated
-	// burst is bounded to one ACK-delay cycle.
-	maxBackpressure = 25 * time.Millisecond
+	// Lowered to 2ms diagnostic value: investigation showed bidirpc_wait
+	// p99 ~= total p99 on WS same-origin, suggesting a per-stream stall
+	// somewhere on the deliver path. If raising the drop bar surfaces
+	// climbing deliver_backpressure with p99 dropping, this constant is
+	// the dominant contributor and we keep it at 2ms. If
+	// deliver_backpressure stays ~0 and p99 unchanged, the dominant
+	// cause is upstream of deliver (writeLoop HoL) and we accept the
+	// slightly-higher drop bar as cheap.
+	maxBackpressure = 2 * time.Millisecond
 
 	// dropRateThreshold: when the recent drop rate exceeds this,
 	// reduce backpressure to avoid stalling the readLoop.
@@ -73,7 +76,7 @@ const (
 //  1. Fast path: non-blocking send to recvCh (zero latency on the readLoop)
 //  2. Slow path: recvCh full — wait with adaptive backpressure for the
 //     application to drain. Duration scales with recent drop rate:
-//     - Low drops (< 10%): wait up to 200ms (application is generally keeping up)
+//     - Low drops (< 10%): wait up to 2ms (keeps readLoop responsive)
 //     - High drops (>= 10%): wait only 10ms (sustained overload, don't stall)
 //  3. After backpressure expires: drop the frame but grant credit anyway
 //     to prevent permanent sender stall
@@ -203,7 +206,12 @@ func dropGrantCredit(window *flow.StreamWindow, payload []byte, streamID uint64,
 
 // recvChCapacity returns the receive channel buffer size for a given stream ID.
 // Sized per stream type to reduce maximum payload accumulation:
-//   - Gossip (0): 16 slots (2 messages/exchange, 8× headroom)
+//   - Gossip (0): 32 slots (full-sync IBLT bursts on WS-family adapters
+//     can saturate the original 16-slot channel during convergence,
+//     forcing readLoop into adaptive-backpressure stall that serializes
+//     with stream-1 (RPC) under WS's single-conn write path. 32 slots
+//     gives ~2× headroom for a single full-snapshot burst at the cost
+//     of an extra ~1 MB worst-case buffer per peer.)
 //   - RPC (1): 32 slots (up to 3 parallel probes, 10× headroom)
 //   - Keepalive (2): 4 slots (1 ping per 10-30s)
 //   - Control (3): 4 slots (infrequent handshake)
@@ -211,7 +219,7 @@ func dropGrantCredit(window *flow.StreamWindow, payload []byte, streamID uint64,
 func recvChCapacity(streamID uint64) int {
 	switch streamID {
 	case 0:
-		return 16
+		return 32
 	case 1:
 		return 32
 	case 2:
