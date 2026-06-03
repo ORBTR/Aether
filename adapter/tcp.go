@@ -718,8 +718,19 @@ func (s *TCPSession) writeLoop() {
 			continue
 		}
 
-		// Check for batch opportunity — coalesce up to 16 queued frames
-		if s.opts.HeaderComp && s.sched.Len() > 0 {
+		// Check for batch opportunity — coalesce up to 16 queued frames.
+		// Skip batching when the head frame is stream-0 (gossip): gossip
+		// frames are already ~64KB max-size chunks, so batching gains
+		// nothing in compression but extends the writeMu hold and HoL-
+		// blocks stream-1 (RPC). Releasing writeMu after every gossip
+		// frame lets stream-1 interleave instead of waiting for a 16-
+		// frame snapshot burst to drain. Observed effect on v0.0.379:
+		// deliver_backpressure==deliver_dropped grew 1:1 at ~1.5/sec
+		// due to this exact HoL pattern; skipping stream-0 batching
+		// converts the shared writeMu into per-frame fairness without
+		// requiring the per-class writeLoop split that F8's larger
+		// refactor would entail.
+		if s.opts.HeaderComp && frame.StreamID != 0 && s.sched.Len() > 0 {
 			batch := []*aether.Frame{frame}
 			for s.sched.Len() > 0 && len(batch) < 16 {
 				next, _ := s.sched.Dequeue()
