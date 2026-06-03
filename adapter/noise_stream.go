@@ -364,8 +364,17 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 	// WINDOW_UPDATE will ever return them). Without the release we
 	// reproduce the production-observed drain of a 1 MB stream window
 	// to ~40 KB after 13 failed exchanges.
+	//
+	// OBS-14b: record per-phase timing so streamSendBlockHist's total can
+	// be attributed to per-stream credit vs conn credit vs the post-credit
+	// path. Same below-floor skip as the aggregate to keep the fast-path
+	// (uncontended) noise out of the percentile distribution.
+	perStreamStart := time.Now()
 	if err := st.window.Consume(ctx, n); err != nil {
 		return fmt.Errorf("stream %d: %w", st.streamID, err)
+	}
+	if d := time.Since(perStreamStart); d >= streamSendBlockFloor {
+		st.session.perStreamWindowWaitHist.Record(d)
 	}
 	streamCredited := true
 	defer func() {
@@ -374,8 +383,12 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 		}
 	}()
 
+	connWaitStart := time.Now()
 	if err := st.session.connWindow.Consume(ctx, n); err != nil {
 		return fmt.Errorf("stream %d conn: %w", st.streamID, err)
+	}
+	if d := time.Since(connWaitStart); d >= streamSendBlockFloor {
+		st.session.connWindowWaitHist.Record(d)
 	}
 	connCredited := true
 	defer func() {
@@ -383,6 +396,18 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 			st.session.connWindow.ReleaseUnsent(n)
 		}
 	}()
+
+	// postCreditStart wraps the encrypt + writeloop + park path that
+	// runs after credit is acquired. Recorded by both the fragment-loop
+	// branch (large payload) and the single-frame branch (small payload)
+	// at their respective return sites so the histogram excludes the
+	// release-on-error fall-throughs above.
+	postCreditStart := time.Now()
+	recordPostCredit := func() {
+		if d := time.Since(postCreditStart); d >= streamSendBlockFloor {
+			st.session.postCreditSendHist.Record(d)
+		}
+	}
 
 	// MTU-aware fragmentation (Task 12): split large payloads into MSS-sized
 	// fragments so each fragment is a single UDP packet (no IP fragmentation).
@@ -401,6 +426,7 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 		// and will be released by the peer's WINDOW_UPDATE / ACK paths.
 		streamCredited = false
 		connCredited = false
+		recordPostCredit()
 		return nil
 	}
 
@@ -410,6 +436,7 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 	}
 	streamCredited = false
 	connCredited = false
+	recordPostCredit()
 	return nil
 }
 
