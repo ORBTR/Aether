@@ -156,6 +156,18 @@ type NoiseSession struct {
 	// path or aggressive RACK reorder-window sizing.
 	rackMarksTotal uint64
 
+	// tlpResetTotal counts every time the session-level STALL-DETECT
+	// false-positive recovery path runs — i.e. the stall detector
+	// declared "no progress" but the probe-before-close Ping
+	// succeeded and we reset per-stream TLP exhaustion counters.
+	// Bumped once per STALL-DETECT false-positive event in
+	// reliabilityTick. Surfaced through SessionMetrics.TLPResetTotal;
+	// the connection manager owning the multipath.Manager polls the
+	// delta and forwards each event into Manager.RecordTLPReset to
+	// drive the PathFlapping demote tier. See multipath/manager.go
+	// for the demote semantics.
+	tlpResetTotal uint64
+
 	// Observability histograms (see metrics/duration_hist.go). All four
 	// histograms are populated on writeLoop / writeFrame hot paths;
 	// PercentileSnapshot is read once per Metrics() call (which is a
@@ -179,12 +191,44 @@ type NoiseSession struct {
 	//                         across all streams on the session (same pattern
 	//                         as grantStarveHist) via SetHOLHist at
 	//                         createStream time.
-	writeSyscallHist  metrics.DurationHist
-	writeloopParkHist metrics.DurationHist
-	cwndBlockHist     metrics.DurationHist
-	grantStarveHist   metrics.DurationHist
-	cwndUtilRing      metrics.PermilleRing
-	recvWindowHOLHist metrics.DurationHist
+	//   streamSendBlockHist — OBS-14: caller-block latency inside noiseStream.Send.
+	//                         Wall-clock time the application spent inside the
+	//                         Send call (window.Consume + connWindow.Consume +
+	//                         sendSingleFrame) from entry to return. Distinct
+	//                         from writeloopParkHist (OBS-2), which measures
+	//                         the writeLoop's internal park on its wake
+	//                         channel — that's the sender-side scheduler view;
+	//                         this is the application-facing view of "how long
+	//                         did my Send block". Shared across all streams
+	//                         on the session via the streamSendBlockHist ptr
+	//                         field on noiseStream (set at createStream).
+	//                         Samples below streamSendBlockFloor are skipped
+	//                         and counted in streamSendFastTotal instead — the
+	//                         same fast-path skip pattern as OBS-5's
+	//                         grantStarveHist.
+	writeSyscallHist    metrics.DurationHist
+	writeloopParkHist   metrics.DurationHist
+	cwndBlockHist       metrics.DurationHist
+	grantStarveHist     metrics.DurationHist
+	cwndUtilRing        metrics.PermilleRing
+	recvWindowHOLHist   metrics.DurationHist
+	streamSendBlockHist metrics.DurationHist
+	// schedulerDepthRing — OBS-9: scheduler queue-depth distribution.
+	// Wired into s.sched via SetDepthHist at session construction so
+	// every Enqueue / EnqueueProbe / external Wake and every writeLoop
+	// pre-park ObserveDepth() pushes the current queue depth into the
+	// ring. PercentileSnapshot is read once per Metrics() call.
+	schedulerDepthRing metrics.Uint32Ring
+
+	// streamSendFastTotal counts the number of noiseStream.Send calls that
+	// completed faster than streamSendBlockFloor. These calls bypass the
+	// streamSendBlockHist Record — recording every microsecond-fast send
+	// would dominate the distribution with uncontended noise and bury the
+	// real caller-block signal we want OBS-14 to surface. The fast-total
+	// counter preserves the "how many sends were uncontended" signal that
+	// would otherwise be lost. Same pattern as OBS-5's fast-path skip in
+	// flow.StreamWindow.Consume.
+	streamSendFastTotal atomic.Uint64
 
 	// cwndUtilCounter sequences writes so we sample cwnd-util every
 	// cwndUtilSamplePeriod-th send. Atomic so the writeLoop (single
@@ -315,6 +359,19 @@ type NoiseSession struct {
 	// the session's initial lifetime — see reliabilityTick. Set once
 	// in NewNoiseSession and read lock-free thereafter.
 	createdAt time.Time
+
+	// peerMaxAckDelay is the peer's advertised max_ack_delay (RFC 9002
+	// §6.2) extracted from the Noise handshake NodeInfo payload via the
+	// optional noiseConnAckDelay interface on conn. Used by createStream
+	// to seed each new noiseStream's TLP.SetMaxAckDelay with the peer's
+	// actually-advertised value — replacing the previous receiver-side
+	// approximation max(ACKPolicy.MaxDelay, SRTT/4) which we used while
+	// the handshake didn't carry the value. Zero means the peer didn't
+	// advertise (e.g. an over-conn substrate that uses the minimal
+	// NodeInfo encoding) — createStream falls back to the receiver-side
+	// approximation in that case. Read lock-free since the field is
+	// frozen at construction.
+	peerMaxAckDelay time.Duration
 }
 
 // NewNoiseSession creates an Aether session over a Noise-encrypted
@@ -357,6 +414,17 @@ func NewNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 	s.rsEncoder, _ = reliability.NewRSEncoder(reliability.DefaultRSDataShards, reliability.DefaultRSParityShards)
 	s.rsDecoder, _ = reliability.NewRSDecoder(reliability.DefaultRSDataShards, reliability.DefaultRSParityShards)
 
+	// Lift the peer's advertised max_ack_delay off the underlying
+	// noiseConn (when the substrate supports the handshake-capability
+	// surface). createStream uses this to seed each stream's TLP PTO
+	// per RFC 9002 §6.2 instead of the receiver-side approximation.
+	// A nil / minimal substrate (e.g. over-conn handshake without the
+	// extended NodeInfo) leaves the field zero and createStream falls
+	// back to max(ACKPolicy.MaxDelay, SRTT/4).
+	if pmad, ok := conn.(noiseConnAckDelay); ok {
+		s.peerMaxAckDelay = pmad.PeerMaxAckDelay()
+	}
+
 	// Session-wide conn-level grant debouncer. Immediate-flush floor at
 	// 50% of DefaultConnCredit so burst patterns don't wait the full
 	// coalesce window when the sender is close to the conn-level edge.
@@ -376,6 +444,13 @@ func NewNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 		Closed:    base.CloseSignal(),
 		ErrClosed: aether.ErrSessionClosed,
 	})
+
+	// OBS-9: wire the scheduler-depth histogram so every Enqueue /
+	// EnqueueProbe / Wake samples the current queue depth and every
+	// writeLoop pre-park ObserveDepth() captures the drained-empty
+	// tail of the distribution. Must happen before the writeLoop and
+	// any RPC traffic so the first signal is recorded.
+	s.sched.SetDepthHist(&s.schedulerDepthRing)
 
 	// Initial congestion controller — stored atomically so the setter
 	// can swap without racing the ACK / write / tick paths.
@@ -852,6 +927,12 @@ type noiseConnStats interface {
 	// counters stay zero — graceful degradation by design.
 	RekeyTotal() uint64
 	RekeyBytesSinceLast() uint64
+	// OBS-18 AEAD-decrypt latency distribution: p50/p99 of the per-call
+	// recv-side decrypt cost in microseconds. Sourced from the
+	// noiseConn's decryptLatencyHist ring buffer (noise/session.go).
+	// Bimodal p50/p99 split = CPU-saturated host queuing decrypt
+	// goroutines; both tiers in µs = healthy. Zero when no samples yet.
+	DecryptLatencySnapshot() (p50Us, p99Us uint64)
 }
 
 // noiseConnCE is the optional ECN hook exposed by *noiseConn — the
@@ -864,6 +945,21 @@ type noiseConnStats interface {
 // fallback for test scenarios that write directly via RecordCEBytes.
 type noiseConnCE interface {
 	DrainCEBytes() uint64
+}
+
+// noiseConnAckDelay is the optional handshake-capability surface exposed
+// by *noiseConn — the noise/ handshake completion path captures the
+// peer's advertised max_ack_delay (RFC 9002 §6.2) from the NodeInfo
+// payload onto the noiseConn before NewNoiseSession ever sees the conn,
+// and the constructor probes via this interface to lift the value onto
+// the session. Kept separate from noiseConnStats because tests can
+// compose substitute net.Conn implementations that don't need to satisfy
+// the full stats surface to exercise stream open paths. A nil / unknown
+// implementation produces a zero result, which createStream interprets
+// as "peer didn't advertise — fall back to the receiver-side
+// approximation".
+type noiseConnAckDelay interface {
+	PeerMaxAckDelay() time.Duration
 }
 
 func (s *NoiseSession) Metrics() aether.SessionMetrics {
@@ -911,11 +1007,13 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 	// which matches the documented "noise-only" semantics on the
 	// SessionMetrics RekeyTotal / RekeyBytesSinceLast fields.
 	var decryptErr, inboxDrops, rekeyTotal, rekeyBytesSinceLast uint64
+	var decryptLatencyP50Us, decryptLatencyP99Us uint64
 	if stats, ok := s.conn.(noiseConnStats); ok {
 		decryptErr = stats.DecryptErrors()
 		inboxDrops = stats.InboxDrops()
 		rekeyTotal = stats.RekeyTotal()
 		rekeyBytesSinceLast = stats.RekeyBytesSinceLast()
+		decryptLatencyP50Us, decryptLatencyP99Us = stats.DecryptLatencySnapshot()
 	}
 
 	// FEC eviction total must include all three decoders — XOR, interleaved,
@@ -941,6 +1039,8 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 	grantStarveP50, _, grantStarveP99 := s.grantStarveHist.PercentileSnapshot()
 	cwndUtilP50, cwndUtilP99 := s.cwndUtilRing.PercentileSnapshot()
 	holP50, _, holP99 := s.recvWindowHOLHist.PercentileSnapshot()
+	streamSendBlockP50, _, streamSendBlockP99 := s.streamSendBlockHist.PercentileSnapshot()
+	schedulerDepthP50, schedulerDepthP99 := s.schedulerDepthRing.PercentileSnapshot()
 
 	return aether.SessionMetrics{
 		RTT:              avg,
@@ -999,6 +1099,7 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 		CwndUtilP99Permille: cwndUtilP99,
 		TLPFiresTotal:       atomic.LoadUint64(&s.tlpFiresTotal),
 		RACKMarksTotal:      atomic.LoadUint64(&s.rackMarksTotal),
+		TLPResetTotal:       atomic.LoadUint64(&s.tlpResetTotal),
 
 		// OBS-15: surface noise send-cipher rekey telemetry. Sourced
 		// from the RekeyTracker on the underlying *noiseConn via the
@@ -1006,11 +1107,41 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 		RekeyTotal:          rekeyTotal,
 		RekeyBytesSinceLast: rekeyBytesSinceLast,
 
+		// OBS-18: per-decrypt AEAD latency distribution. Sourced from
+		// the decryptLatencyHist on the underlying *noiseConn via the
+		// same noiseConnStats interface probe. Captures the bimodal
+		// uncontended-vs-CPU-queued split that ordinary RTT histograms
+		// hide. Zero on non-noise adapters (test loopback etc.).
+		DecryptLatencyP50Us: decryptLatencyP50Us,
+		DecryptLatencyP99Us: decryptLatencyP99Us,
+
 		// OBS-13: recv-window HOL-block percentiles. Populated by every
 		// stream's RecvWindow when frames are flushed after waiting for
 		// predecessors. Zero when no reordering has occurred this session.
 		RecvWindowHOLP50Us: uint64(holP50),
 		RecvWindowHOLP99Us: uint64(holP99),
+
+		// OBS-14: caller-block percentiles for Stream.Send. Populated by
+		// noiseStream.Send via a defer that records (Send-return − Send-
+		// entry). Distinct from WriteloopParkP*Us: this is the application-
+		// facing block, that is the writeLoop's internal park. Samples
+		// below streamSendBlockFloor (50µs) bypass the histogram and are
+		// counted in StreamSendFastTotal so operators see both the tail
+		// and the uncontended denominator.
+		StreamSendBlockP50Us: uint64(streamSendBlockP50),
+		StreamSendBlockP99Us: uint64(streamSendBlockP99),
+		StreamSendFastTotal:  s.streamSendFastTotal.Load(),
+
+		// OBS-9: scheduler queue-depth percentiles. Sampled on every
+		// signalWake (Enqueue / EnqueueProbe / external Wake) and on
+		// every writeLoop pre-park ObserveDepth() call inside
+		// noise_reliability.go's writeLoop, so the distribution
+		// covers both the "work arrives" face (instantaneous depth
+		// post-Enqueue) and the "drained-empty" tail (depth just
+		// before the writeLoop parks on WakeCh). Zero on transports
+		// that don't wire a depth ring into their scheduler.
+		SchedulerDepthP50: schedulerDepthP50,
+		SchedulerDepthP99: schedulerDepthP99,
 	}
 }
 

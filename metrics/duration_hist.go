@@ -176,3 +176,65 @@ func (r *PermilleRing) copy() []uint32 {
 	copy(out, r.buf[:r.count])
 	return out
 }
+
+// Uint32Ring is a fixed-capacity ring buffer of raw uint32 samples used
+// for OBS-9 scheduler queue-depth sampling. Unlike PermilleRing it does
+// not clamp to 1000 — depth values are unbounded in principle (any
+// number of frames may queue across all streams) so the caller-supplied
+// value is recorded verbatim.
+//
+// Used by the scheduler to record per-Wake / per-Park queue-depth
+// observations. The p50/p99 readout tells operators whether work piles
+// up behind the writeLoop (sustained high depth) or is consumed as fast
+// as it arrives (depth near zero). Per-Record cost is one mutex acquire
+// + one uint32 store — well under 100ns on modern hardware.
+type Uint32Ring struct {
+	mu    sync.Mutex
+	buf   [histRingSize]uint32
+	head  int
+	count int
+}
+
+// Record appends a uint32 sample to the ring buffer.
+func (r *Uint32Ring) Record(v uint32) {
+	r.mu.Lock()
+	r.buf[r.head] = v
+	r.head = (r.head + 1) % histRingSize
+	if r.count < histRingSize {
+		r.count++
+	}
+	r.mu.Unlock()
+}
+
+// PercentileSnapshot returns the p50/p99 samples. Returns (0, 0) if no
+// samples have been recorded yet. p95 is not surfaced — p50 and p99 are
+// sufficient for scheduler-depth triage (typical vs tail).
+func (r *Uint32Ring) PercentileSnapshot() (p50, p99 uint32) {
+	buf := r.copy()
+	if len(buf) == 0 {
+		return 0, 0
+	}
+	sort.Slice(buf, func(i, j int) bool { return buf[i] < buf[j] })
+	n := len(buf)
+	p50 = buf[(50*(n-1))/100]
+	p99 = buf[(99*(n-1))/100]
+	return p50, p99
+}
+
+// Count returns the number of samples currently retained.
+func (r *Uint32Ring) Count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.count
+}
+
+func (r *Uint32Ring) copy() []uint32 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.count == 0 {
+		return nil
+	}
+	out := make([]uint32, r.count)
+	copy(out, r.buf[:r.count])
+	return out
+}

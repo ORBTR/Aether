@@ -26,10 +26,11 @@ import (
 type PathState int
 
 const (
-	PathActive  PathState = iota // primary path, carrying all traffic
-	PathStandby                   // backup path, periodic probes only
-	PathProbing                   // checking if standby is still alive
-	PathDead                      // failed probes, not usable
+	PathActive   PathState = iota // primary path, carrying all traffic
+	PathStandby                    // backup path, periodic probes only
+	PathProbing                    // checking if standby is still alive
+	PathDead                       // failed probes, not usable
+	PathFlapping                   // STALL-DETECT false-positive repeated; demoted for a cooldown window
 )
 
 // String returns a human-readable state.
@@ -43,10 +44,40 @@ func (s PathState) String() string {
 		return "probing"
 	case PathDead:
 		return "dead"
+	case PathFlapping:
+		return "flapping"
 	default:
 		return "unknown"
 	}
 }
+
+// PathFlapping demote tier — see RecordTLPReset.
+//
+// The session-level STALL-DETECT false-positive path in the noise
+// adapter (see adapter/noise_reliability.go [STALL-DETECT]
+// "false-positive") fires when the stall detector declares "no
+// progress" but the probe-before-close Ping then succeeds. A single
+// false-positive is a transient blip that the inline recovery (cwnd
+// reset + TLP reset) handles fine. Repeated false-positives within a
+// short window mean the path is not crashing but IS losing tail
+// packets often enough that the stall detector keeps firing —
+// typical of a flaky cross-region UDP path with bursty NAT /
+// conntrack drops. Demoting traffic to a steadier transport (WS,
+// TCP) until the path settles is preferable to letting the
+// bimodal-latency tail accumulate on the noise path.
+//
+//   - flappingResetThreshold: tlpReset hits-in-window before demote.
+//   - flappingWindowDur: sliding window over which hits are counted.
+//   - flappingDemoteDur: how long the path stays in PathFlapping
+//     after the most recent qualifying hit before reverting to
+//     PathStandby. Re-emitted by every subsequent hit while the
+//     path is already PathFlapping, so a sustained burst keeps the
+//     path demoted for the full window past the LAST event.
+const (
+	flappingResetThreshold = 3
+	flappingWindowDur      = 5 * time.Minute
+	flappingDemoteDur      = 60 * time.Second
+)
 
 // Path represents a single transport path to a peer.
 type Path struct {
@@ -74,6 +105,17 @@ type Path struct {
 	Loss          float64 // 0.0 (no loss) → 1.0 (total loss)
 	weightCache   float64
 	bytesScheduled int64
+
+	// PathFlapping bookkeeping. tlpResetEvents is a sliding-window
+	// ring of the last `flappingResetThreshold` tlpReset event
+	// timestamps; flappingUntil is the absolute time at which the
+	// path may transition back from PathFlapping → PathStandby (its
+	// pre-demote state was Healthy/Standby/Active — we always restore
+	// to Standby and let promotebestStandby + setPrimary re-elect).
+	// Events older than flappingWindowDur are ignored on insert.
+	tlpResetEvents [flappingResetThreshold]time.Time
+	tlpResetIdx    int
+	flappingUntil  time.Time
 }
 
 // deadResurrectCooldown is the minimum time a path stays in PathDead
@@ -109,6 +151,24 @@ type Manager struct {
 	// EnsureK; populated lazily by either, so existing AddPath +
 	// PrimarySession callers continue to work unchanged.
 	qstate *qualityState
+
+	// nowFunc is an injectable clock for tests. nil → time.Now. The
+	// PathFlapping demote tier checks both the 5-minute sliding
+	// window for tlpReset hits AND a 60-second demote-expiry timer,
+	// neither of which is practical to exercise under wall-clock in
+	// a unit test. now() routes both through nowFunc so the test
+	// can advance virtual time deterministically.
+	nowFunc func() time.Time
+}
+
+// now returns the current time, honouring nowFunc when injected.
+// Field is set once at construction (or by a test) and read-only
+// afterwards, so no lock needed for the read.
+func (m *Manager) now() time.Time {
+	if m.nowFunc != nil {
+		return m.nowFunc()
+	}
+	return time.Now()
 }
 
 // NewManager creates a multipath manager.
@@ -184,9 +244,10 @@ func (m *Manager) PickPath(n int) aether.Session {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Opportunistic dead-path resurrection: even without RunProbeLoop
-	// running, paths whose cooldown has elapsed get re-considered here.
+	// Opportunistic resurrection: even without RunProbeLoop running,
+	// paths whose cooldown has elapsed get re-considered here.
 	m.resurrectExpiredDeadPathsLocked()
+	m.resurrectExpiredFlappingPathsLocked()
 
 	if !m.weightedLB || len(m.paths) <= 1 {
 		if m.primary < len(m.paths) {
@@ -199,7 +260,10 @@ func (m *Manager) PickPath(n int) aether.Session {
 	// bytes-sent-per-unit-weight is lowest. The path "owes" itself the
 	// most bytes given its weight share, so it should carry the next
 	// frame. Formula: cost(p) = bytesScheduled(p) / weight(p); pick
-	// argmin(cost). Dead paths excluded.
+	// argmin(cost). Dead and Flapping paths excluded — same rationale
+	// as in promotebestStandby: a flapping path's session is alive but
+	// the whole point of the demote is to keep traffic OFF it for
+	// flappingDemoteDur.
 	//
 	// The previous formula `weight - bytesScheduled/weight` inverted the
 	// fair-share semantics — a high-weight path earned deficit 10× faster
@@ -209,7 +273,7 @@ func (m *Manager) PickPath(n int) aether.Session {
 	var bestCost float64
 	first := true
 	for _, p := range m.paths {
-		if p.State == PathDead {
+		if p.State == PathDead || p.State == PathFlapping {
 			continue
 		}
 		if p.weightCache <= 0 {
@@ -433,12 +497,15 @@ func (m *Manager) OnPrimaryFailure() {
 	if m.promotebestStandby() {
 		return
 	}
-	// No live standby — force every Dead path with a non-closed session
-	// back to Standby (skip cooldown) so we can promote one of them.
-	dbgMultipath.Printf("All standbys also Dead — forcing dead-resurrect to break wedge")
+	// No live standby — force every Dead/Flapping path with a non-closed
+	// session back to Standby (skip cooldown) so we can promote one of
+	// them. A flapping path is unambiguously preferable to no primary at
+	// all, so the demote tier yields here.
+	dbgMultipath.Printf("All standbys also Dead/Flapping — forcing resurrect to break wedge")
 	for _, p := range m.paths {
-		if p.State == PathDead && p.Session != nil && !p.Session.IsClosed() {
+		if (p.State == PathDead || p.State == PathFlapping) && p.Session != nil && !p.Session.IsClosed() {
 			p.State = PathStandby
+			p.flappingUntil = time.Time{}
 		}
 	}
 	m.promotebestStandby()
@@ -464,6 +531,34 @@ func (m *Manager) resurrectExpiredDeadPathsLocked() {
 		}
 		p.State = PathStandby
 		dbgMultipath.Printf("Path %s resurrected from Dead → Standby (cooldown elapsed)", p.Protocol)
+	}
+}
+
+// resurrectExpiredFlappingPathsLocked transitions PathFlapping paths
+// back to PathStandby once flappingDemoteDur has elapsed since the
+// most recent qualifying tlpReset. Called from the same opportunistic-
+// resurrection sites as resurrectExpiredDeadPathsLocked (PickPath,
+// PickByQuality, probeNonPrimary) so the demote auto-recovers without
+// a dedicated goroutine. Caller must hold m.mu.
+func (m *Manager) resurrectExpiredFlappingPathsLocked() {
+	now := m.now()
+	for _, p := range m.paths {
+		if p.State != PathFlapping {
+			continue
+		}
+		if p.Session == nil || p.Session.IsClosed() {
+			continue
+		}
+		if !p.flappingUntil.IsZero() && now.Before(p.flappingUntil) {
+			continue
+		}
+		p.State = PathStandby
+		p.flappingUntil = time.Time{}
+		// Don't clear tlpResetEvents — the sliding window still
+		// considers events from before the demote in case another
+		// burst arrives. They'll naturally fall out of the window
+		// when their age exceeds flappingWindowDur.
+		dbgMultipath.Printf("Path %s recovered from Flapping → Standby (demote elapsed)", p.Protocol)
 	}
 }
 
@@ -528,6 +623,7 @@ const primaryProbeEvery uint64 = 4
 func (m *Manager) probeNonPrimary(ctx context.Context) {
 	m.mu.Lock()
 	m.resurrectExpiredDeadPathsLocked()
+	m.resurrectExpiredFlappingPathsLocked()
 	m.probeTick++
 	probePrimary := m.probeTick%primaryProbeEvery == 0
 	type probeTarget struct {
@@ -545,6 +641,12 @@ func (m *Manager) probeNonPrimary(ctx context.Context) {
 		}
 		if p.State == PathDead {
 			// Still cooling down — skip.
+			continue
+		}
+		if p.State == PathFlapping {
+			// Demoted — skip probes too so we don't accidentally
+			// transition it back to Standby via OnProbeSuccess
+			// before the demote-expiry timer elapses.
 			continue
 		}
 		targets = append(targets, probeTarget{idx: i, session: p.Session, proto: p.Protocol})
@@ -596,14 +698,45 @@ func (m *Manager) PathCount() int {
 	return len(m.paths)
 }
 
+// PathFlappingCount returns the number of paths currently in the
+// PathFlapping demote tier. Library surfaces this through
+// aether_path_flapping_total so operators can correlate the
+// bimodal-latency tail against the demote rate. Cheap; safe to call
+// from monitoring goroutines.
+//
+// Side-effect: runs resurrectExpiredFlappingPathsLocked first so the
+// returned count reflects the post-recovery state — callers polling
+// this every Nseconds will see paths return to zero promptly without
+// needing a separate tick.
+func (m *Manager) PathFlappingCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.resurrectExpiredFlappingPathsLocked()
+	n := 0
+	for _, p := range m.paths {
+		if p.State == PathFlapping {
+			n++
+		}
+	}
+	return n
+}
+
 // setPrimary makes path at index i the active primary.
 func (m *Manager) setPrimary(i int) {
 	if i >= len(m.paths) {
 		return
 	}
-	// Demote old primary to standby
+	// Demote old primary to standby — but PRESERVE PathFlapping and
+	// PathDead. RecordTLPReset / OnPrimaryFailure both mark the old
+	// primary's state BEFORE calling promotebestStandby → setPrimary,
+	// and the new primary election must not silently un-mark that
+	// state (otherwise promotebestStandby would immediately re-elect
+	// the just-demoted path on its next call).
 	if m.primary < len(m.paths) {
-		m.paths[m.primary].State = PathStandby
+		old := m.paths[m.primary]
+		if old.State != PathFlapping && old.State != PathDead {
+			old.State = PathStandby
+		}
 	}
 	m.primary = i
 	m.paths[i].State = PathActive
@@ -624,14 +757,26 @@ func (m *Manager) setPrimary(i int) {
 	dbgMultipath.Printf("Primary path: %s (quality=%d)", m.paths[i].Protocol, m.paths[i].Quality)
 }
 
-// promotebestStandby finds the best non-dead path and makes it primary.
-// Returns true on success, false when no live standby exists (caller
-// can react by resurrecting Dead paths — see OnPrimaryFailure).
+// promotebestStandby finds the best non-dead, non-flapping path and
+// makes it primary. Returns true on success, false when no live
+// standby exists (caller can react by resurrecting Dead paths — see
+// OnPrimaryFailure).
+//
+// PathFlapping is excluded the same way PathDead is, but for a
+// different reason: a flapping path's session is still alive (its
+// Ping succeeded during the false-positive recovery) so it would
+// otherwise look like a perfectly good promotion candidate. The
+// whole point of the PathFlapping tier is to keep dispatch away from
+// it for flappingDemoteDur so a steadier transport (WS, TCP) carries
+// traffic while the noise-UDP path settles.
 func (m *Manager) promotebestStandby() bool {
 	bestIdx := -1
 	bestQuality := -1
 	for i, p := range m.paths {
-		if p.State != PathDead && p.Quality > bestQuality {
+		if p.State == PathDead || p.State == PathFlapping {
+			continue
+		}
+		if p.Quality > bestQuality {
 			bestIdx = i
 			bestQuality = p.Quality
 		}
@@ -641,4 +786,93 @@ func (m *Manager) promotebestStandby() bool {
 		return true
 	}
 	return false
+}
+
+// RecordTLPReset is invoked by the noise adapter (via the higher-level
+// connection manager that owns this multipath Manager) every time
+// STALL-DETECT fires its false-positive recovery path on a session
+// owned by this Manager. The path identified by `session` accumulates
+// the event in a sliding flappingWindowDur (5-minute) window; once
+// flappingResetThreshold (3) events have landed in the window, the
+// path is demoted to PathFlapping for flappingDemoteDur (60 s) —
+// promotebestStandby skips it during the demote so a steadier
+// transport carries traffic. After flappingDemoteDur with no further
+// hits, the path reverts to PathStandby (cheapest re-entry state;
+// setPrimary / WDRR will re-elect it on its next round if its quality
+// justifies the role).
+//
+// Callers that don't track a multipath.Manager (single-path peers,
+// tests that don't exercise the demote tier) can safely never call
+// this — Manager behaves exactly as before.
+//
+// Returns true when the call moved the path INTO PathFlapping (so the
+// caller can log / surface the demote event); false on every other
+// outcome (path not found, hit recorded but threshold not yet
+// crossed, path already in PathFlapping).
+func (m *Manager) RecordTLPReset(session aether.Session) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var target *Path
+	for _, p := range m.paths {
+		if p.Session == session {
+			target = p
+			break
+		}
+	}
+	if target == nil {
+		return false
+	}
+	now := m.now()
+
+	// Sliding-window ring insert. The ring is sized to exactly
+	// flappingResetThreshold so a full ring of in-window timestamps
+	// IS the threshold-crossed condition. Re-scan the ring on every
+	// insert to count in-window hits — the ring is small (3
+	// entries) so the scan is cheap and we don't need a separate
+	// decay tick.
+	target.tlpResetEvents[target.tlpResetIdx] = now
+	target.tlpResetIdx = (target.tlpResetIdx + 1) % len(target.tlpResetEvents)
+
+	if target.State == PathFlapping {
+		// Already demoted — extend the recovery deadline so a
+		// sustained burst of resets keeps the path demoted for the
+		// FULL flappingDemoteDur past the LAST event, not the
+		// first one. Without this, a slow drip of resets at, say,
+		// 50 s intervals would let the path recover between hits
+		// even though it's still misbehaving.
+		target.flappingUntil = now.Add(flappingDemoteDur)
+		return false
+	}
+
+	cutoff := now.Add(-flappingWindowDur)
+	hits := 0
+	for _, t := range target.tlpResetEvents {
+		if !t.IsZero() && !t.Before(cutoff) {
+			hits++
+		}
+	}
+	if hits < flappingResetThreshold {
+		return false
+	}
+
+	// Threshold crossed — demote.
+	wasPrimary := false
+	for i, p := range m.paths {
+		if p == target && i == m.primary {
+			wasPrimary = true
+			break
+		}
+	}
+	target.State = PathFlapping
+	target.flappingUntil = now.Add(flappingDemoteDur)
+	dbgMultipath.Printf("Path %s demoted to Flapping (hits=%d in %v, demoteUntil=%v)",
+		target.Protocol, hits, flappingWindowDur, target.flappingUntil)
+	if wasPrimary && len(m.paths) > 1 {
+		// Hand traffic to whichever non-flapping, non-dead standby
+		// ranks best — exactly what OnPrimaryFailure would do, minus
+		// the PathDead bookkeeping (the flapping path's session is
+		// alive, just being shunned).
+		m.promotebestStandby()
+	}
+	return true
 }

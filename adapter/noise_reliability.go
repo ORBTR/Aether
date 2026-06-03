@@ -187,6 +187,15 @@ func (s *NoiseSession) writeLoop() {
 			}
 		}
 
+		// OBS-9 aether_scheduler_depth: sample queue depth at the
+		// "queue drained, about to park" moment so the histogram
+		// captures the idle tail of the depth distribution in
+		// addition to the work-arrives samples that signalWake
+		// pushes inside the scheduler. Cost is one atomic.Load + one
+		// mutex'd uint32 store — well under 100 ns and dominated by
+		// the upcoming park anyway.
+		s.sched.ObserveDepth()
+
 		// Park until either new work arrives or the session closes.
 		// OBS-2 aether_writeloop_park_us: time the writeLoop spent
 		// blocked on the wake channel. High p99 here is the canonical
@@ -586,6 +595,14 @@ func (s *NoiseSession) reliabilityTick() {
 							tlpResetCount++
 						}
 					}
+					// Session-level false-positive observability — bump
+					// even when no per-stream TLP needed resetting,
+					// because the EVENT itself (cwnd-collapse + probe-
+					// rescue) is the signal the multipath PathFlapping
+					// demote tier consumes. See
+					// SessionMetrics.TLPResetTotal docs +
+					// multipath.Manager.RecordTLPReset.
+					atomic.AddUint64(&s.tlpResetTotal, 1)
 					log.Printf("[STALL-DETECT] false-positive peer=%s age=%v warmup=%v effThresh=%s cwnd=%d→%d tlpReset=%d (persistent-congestion exit)",
 						s.RemoteNodeID().Short(), sessionAge, warmupActive, effectiveThreshold, prevCwnd, newCwnd, tlpResetCount)
 					s.dumpFlowDiagOnStall("false-positive")

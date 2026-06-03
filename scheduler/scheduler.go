@@ -10,8 +10,10 @@ package scheduler
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/ORBTR/aether"
+	"github.com/ORBTR/aether/metrics"
 )
 
 // DefaultWeight is the default scheduling weight for new streams.
@@ -40,6 +42,24 @@ type Scheduler struct {
 	// Buffered at 1: a single pending signal collapses any number of
 	// Enqueue events that landed before the writeLoop drained.
 	wakeCh chan struct{}
+
+	// queueDepth tracks the total number of frames currently queued
+	// across all streams (including pending TLP probes). Maintained as
+	// an atomic counter so OBS-9 scheduler-depth sampling does not need
+	// to acquire s.mu and walk the stream map (which Len() does).
+	// Mutated inside the same s.mu critical sections that own the
+	// queues — eventual consistency is bounded to the moment between
+	// queue-mutation and counter-add.
+	queueDepth atomic.Int64
+
+	// depthHist is the optional OBS-9 scheduler-depth histogram. Wired
+	// by the owning session via SetDepthHist; nil disables sampling
+	// (default for schedulers constructed via NewScheduler). Sampled on
+	// every wake-signal path (Enqueue / EnqueueProbe / external Wake)
+	// and on every ObserveDepth call (writeLoop just before parking on
+	// WakeCh) — the two events the audit identified as the natural
+	// sampling points for queue depth.
+	depthHist *metrics.Uint32Ring
 }
 
 type scheduledStream struct {
@@ -76,10 +96,61 @@ func (s *Scheduler) WakeCh() <-chan struct{} {
 	return s.wakeCh
 }
 
+// SetDepthHist wires an OBS-9 scheduler-depth histogram into the
+// scheduler. Sampled on every wake signal (Enqueue / EnqueueProbe /
+// external Wake) and on every ObserveDepth call (writeLoop just before
+// it parks on WakeCh) so the histogram captures both the "work arrives"
+// and "queue drained, idle" faces of the queue-depth distribution.
+//
+// Must be called BEFORE the scheduler sees concurrent traffic. The
+// field is wired once at session-create time and never swapped —
+// concurrent reads of an immutable pointer don't need atomic protection.
+// Pass nil to disable (default for schedulers constructed via
+// NewScheduler).
+func (s *Scheduler) SetDepthHist(h *metrics.Uint32Ring) {
+	s.depthHist = h
+}
+
+// recordDepth pushes the current queue depth into the wired OBS-9
+// histogram (no-op if SetDepthHist hasn't been called). Internal
+// helper shared by signalWake (work-arrives face) and ObserveDepth
+// (drained-idle face). Cost: one atomic.Load plus one mutex'd uint32
+// store to the ring — well under 100 ns.
+func (s *Scheduler) recordDepth() {
+	if s.depthHist == nil {
+		return
+	}
+	d := s.queueDepth.Load()
+	if d < 0 {
+		d = 0
+	}
+	if d > 0xFFFFFFFF {
+		d = 0xFFFFFFFF
+	}
+	s.depthHist.Record(uint32(d))
+}
+
+// ObserveDepth records the current queue depth into the wired OBS-9
+// histogram. Called by the writeLoop just before it parks on WakeCh so
+// the histogram sees the "queue drained, idle" tail of the
+// distribution as well as the "work arrives" tail captured at
+// signalWake. No-op if SetDepthHist hasn't been called.
+func (s *Scheduler) ObserveDepth() {
+	s.recordDepth()
+}
+
 // signalWake performs a non-blocking send on wakeCh.
 // Caller must NOT hold s.mu (a blocked send would deadlock with
 // any consumer that tries to take s.mu after waking).
+//
+// Side-effect: samples the current queue depth into the OBS-9
+// histogram if wired. signalWake fires on every Enqueue /
+// EnqueueProbe / external Wake() so this samples the "work-arrives"
+// face of the depth distribution; the writeLoop's pre-park
+// ObserveDepth() captures the "queue-drained, idle" face. Together
+// they describe the full scheduler-occupancy distribution.
 func (s *Scheduler) signalWake() {
+	s.recordDepth()
 	select {
 	case s.wakeCh <- struct{}{}:
 	default:
@@ -145,8 +216,12 @@ func (s *Scheduler) Unregister(streamID uint64) (droppedFrames []*aether.Frame, 
 	if ss, ok := s.streams[streamID]; ok {
 		if len(ss.queue) > 0 {
 			droppedFrames = append([]*aether.Frame(nil), ss.queue...)
+			s.queueDepth.Add(-int64(len(ss.queue)))
 		}
 		droppedProbe = ss.probe
+		if droppedProbe != nil {
+			s.queueDepth.Add(-1)
+		}
 	}
 	delete(s.streams, streamID)
 
@@ -181,6 +256,7 @@ func (s *Scheduler) Enqueue(streamID uint64, frame *aether.Frame) {
 	if ss, ok := s.streams[streamID]; ok {
 		ss.queue = append(ss.queue, frame)
 		queued = true
+		s.queueDepth.Add(1)
 	}
 	s.mu.Unlock()
 	if queued {
@@ -204,6 +280,12 @@ func (s *Scheduler) EnqueueProbe(streamID uint64, frame *aether.Frame) {
 	s.mu.Lock()
 	queued := false
 	if ss, ok := s.streams[streamID]; ok {
+		// Probes replace any prior pending probe — only the net delta
+		// (+1 if no probe was pending, 0 if one was) goes into the
+		// depth counter so it tracks actual queue occupancy.
+		if ss.probe == nil {
+			s.queueDepth.Add(1)
+		}
 		ss.probe = frame
 		queued = true
 	}
@@ -251,6 +333,7 @@ func (s *Scheduler) Dequeue() (*aether.Frame, bool) {
 		}
 		frame := ss.probe
 		ss.probe = nil
+		s.queueDepth.Add(-1)
 		// Probes do not consume the REALTIME cap counters — they are
 		// recovery traffic, not application traffic.
 		return frame, true
@@ -327,6 +410,7 @@ func (s *Scheduler) dequeueFromClass(targetClass aether.LatencyClass) *aether.Fr
 	ss := s.streams[streamID]
 	frame := ss.queue[0]
 	ss.queue = ss.queue[1:]
+	s.queueDepth.Add(-1)
 
 	// Advance virtual time
 	frameSize := float64(aether.HeaderSize) + float64(frame.Length)
