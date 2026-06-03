@@ -64,13 +64,15 @@ type TLP struct {
 	// a floor on sub-millisecond paths.
 	srtt time.Duration
 
-	// maxAckDelay is the receiver's advertised maximum ACK delay used
+	// maxAckDelay is the peer's advertised maximum ACK delay used
 	// in PTO = 2*SRTT + max_ack_delay. Lifecycle:
 	//   1. NewTLP initialises to tlpDefaultMaxAckDelay (25ms, QUIC default).
-	//   2. SetMaxAckDelay seeds it at session-open with the receiver-
-	//      computed estimate max(ACKPolicy.MaxDelay, SRTT/4) — RFC 9002
-	//      §6.2's receiver-side approximation pending a full handshake-
-	//      capability exchange.
+	//   2. SetMaxAckDelay seeds it at session-open with the value the
+	//      peer advertised in its Noise handshake NodeInfo payload
+	//      (RFC 9002 §6.2's full handshake-capability exchange — see
+	//      crypto/identity.NodeInfo.MaxAckDelayUS). Falls back to the
+	//      receiver-side approximation max(ACKPolicy.MaxDelay, SRTT/4)
+	//      when the peer didn't advertise (older build / minimal NodeInfo).
 	//   3. UpdateMaxAckDelay's EWMA tracks the value from inbound
 	//      CompositeACK AckDelay fields once data flow is established.
 	maxAckDelay time.Duration
@@ -89,8 +91,10 @@ const (
 	// tlpPTOMultiplier — RFC 8985 §7.2 specifies 2*SRTT + max_ack_delay.
 	tlpPTOMultiplier = 2
 
-	// tlpDefaultMaxAckDelay — receiver's advertised max ACK delay.
-	// Matches QUIC default. Real value would come from the handshake.
+	// tlpDefaultMaxAckDelay — pre-handshake fallback for max_ack_delay.
+	// Matches QUIC default. NewTLP uses this until SetMaxAckDelay
+	// installs the peer-advertised value from the Noise handshake (or
+	// the receiver-side approximation if the peer didn't advertise).
 	tlpDefaultMaxAckDelay = 25 * time.Millisecond
 
 	// maxConsecutiveProbes — give up after this many back-to-back
@@ -142,18 +146,20 @@ func (t *TLP) UpdateSRTT(srtt time.Duration) {
 }
 
 // SetMaxAckDelay replaces the current maxAckDelay estimate outright.
-// Used at session-open to seed the EWMA with a receiver-computed
-// initial value (typically max(ACKPolicy.MaxDelay, SRTT/4)) BEFORE
-// the first inbound CompositeACK arrives — without this, PTO uses
-// the conservative 25ms default for the first RTT regardless of the
-// path's actual ACK cadence, firing spurious TLPs on a sub-ms
-// localhost path or under-firing on a multi-100ms long-haul.
+// Used at session-open to seed the EWMA BEFORE the first inbound
+// CompositeACK arrives — without this, PTO uses the conservative 25ms
+// default for the first RTT regardless of the path's actual ACK
+// cadence, firing spurious TLPs on a sub-ms localhost path or
+// under-firing on a multi-100ms long-haul.
 //
 // RFC 9002 §6.2 says the sender's PTO must include the peer's
-// advertised max_ack_delay. The full RFC-compliant solution would
-// exchange max_ack_delay in the handshake; this seeder is the
-// receiver-side approximation pending that handshake-capability
-// addition. UpdateMaxAckDelay's EWMA then takes over once
+// advertised max_ack_delay. The caller (NoiseSession.createStream)
+// satisfies this by passing the peer-advertised value carried in the
+// Noise handshake NodeInfo payload (crypto/identity.NodeInfo.
+// MaxAckDelayUS) — the full handshake-capability exchange. When the
+// peer didn't advertise (older build / minimal NodeInfo encoding) the
+// caller passes the receiver-side approximation max(ACKPolicy.MaxDelay,
+// SRTT/4) as a fallback. UpdateMaxAckDelay's EWMA then takes over once
 // CompositeACKs start flowing.
 //
 // Out-of-range values are clamped to [0, tlpPTOCeiling].

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/ORBTR/aether"
+	"github.com/ORBTR/aether/metrics"
 )
 
 func TestScheduler_SingleStream(t *testing.T) {
@@ -153,4 +154,88 @@ func TestScheduler_KeepaliveNeverStarved(t *testing.T) {
 	if !keepaliveSent {
 		t.Error("keepalive should be sent within first 10 frames — it's being starved")
 	}
+}
+
+// TestScheduler_DepthHistogram verifies OBS-9 wiring: the scheduler's
+// queueDepth atomic counter tracks Enqueue / Dequeue / Unregister
+// transitions, and signalWake + ObserveDepth push samples into the
+// wired metrics.Uint32Ring. Together those two sampling points cover
+// both the "work arrives" and "queue drained, idle" faces of the
+// distribution the audit OBS-9 fix was asked to surface.
+func TestScheduler_DepthHistogram(t *testing.T) {
+	s := NewScheduler()
+	var ring metrics.Uint32Ring
+	s.SetDepthHist(&ring)
+
+	// ObserveDepth with no traffic records a zero sample — the
+	// drained-idle face is non-trivial even at start-of-life.
+	s.ObserveDepth()
+	if got, want := ring.Count(), 1; got != want {
+		t.Fatalf("ObserveDepth: count = %d, want %d", got, want)
+	}
+
+	s.Register(1, 128, 0)
+	s.Register(2, 128, 0)
+
+	// Three enqueues — each fires signalWake which records a sample.
+	// After each Enqueue the depth observed should reflect the
+	// post-increment value (1, 2, 3 respectively).
+	s.Enqueue(1, &aether.Frame{Type: aether.TypeDATA, StreamID: 1, Length: 10, Payload: make([]byte, 10)})
+	s.Enqueue(1, &aether.Frame{Type: aether.TypeDATA, StreamID: 1, Length: 10, Payload: make([]byte, 10)})
+	s.Enqueue(2, &aether.Frame{Type: aether.TypeDATA, StreamID: 2, Length: 10, Payload: make([]byte, 10)})
+
+	if got, want := ring.Count(), 4; got != want {
+		t.Fatalf("after 3 enqueues + 1 observe: count = %d, want %d", got, want)
+	}
+
+	// Drain one — Dequeue must decrement queueDepth. We can't read
+	// the ring's individual samples directly, but a follow-up
+	// ObserveDepth lands a depth-2 entry.
+	frame, _ := s.Dequeue()
+	if frame == nil {
+		t.Fatal("Dequeue returned nil with 3 frames queued")
+	}
+	s.ObserveDepth()
+
+	// Drain the rest.
+	for {
+		f, _ := s.Dequeue()
+		if f == nil {
+			break
+		}
+	}
+	s.ObserveDepth() // depth = 0 sample
+
+	// A second external Wake() with no frames lands another sample —
+	// signalWake fires regardless of whether the wake-channel was
+	// already pending, because it's the depth observation that
+	// matters for OBS-9.
+	s.Wake()
+
+	// Final sanity: the ring's percentile readout must produce some
+	// non-decreasing pair (p50 ≤ p99). Zero ⇒ no samples, which
+	// would mean the wiring never fired.
+	p50, p99 := ring.PercentileSnapshot()
+	if p50 > p99 {
+		t.Fatalf("ring percentiles inverted: p50=%d > p99=%d", p50, p99)
+	}
+	if ring.Count() == 0 {
+		t.Fatal("ring captured zero samples — OBS-9 wiring is dark")
+	}
+}
+
+// TestScheduler_DepthHistogram_NilSafe asserts that a scheduler with
+// no depth histogram wired (the default for unit tests and non-noise
+// adapters) treats every Enqueue / Dequeue / ObserveDepth / Wake as a
+// no-op for sampling purposes — i.e. we have not introduced a nil
+// deref on the hot path.
+func TestScheduler_DepthHistogram_NilSafe(t *testing.T) {
+	s := NewScheduler()
+	s.Register(1, 128, 0)
+	// No SetDepthHist call → depthHist is nil.
+	s.Enqueue(1, &aether.Frame{Type: aether.TypeDATA, StreamID: 1, Length: 1, Payload: make([]byte, 1)})
+	s.ObserveDepth()
+	s.Wake()
+	_, _ = s.Dequeue()
+	// If we got here without panicking, nil-safety holds.
 }

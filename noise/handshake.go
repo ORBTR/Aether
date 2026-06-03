@@ -158,7 +158,7 @@ func (t *NoiseTransport) performInitiatorHandshakeAttempt(ctx context.Context, u
 		dbgHandshake.Printf("Failed to read message 2: %v", err)
 		return nil, fmt.Errorf("%w: %v", aether.ErrHandshakeFailed, err)
 	}
-	remoteNode, _, remoteCaps, err := t.verifyNodeInfo(hs.PeerStatic(), payload, path.NodeID)
+	remoteNode, _, remoteCaps, remoteMaxAckDelayUS, err := t.verifyNodeInfo(hs.PeerStatic(), payload, path.NodeID)
 	if err != nil {
 		dbgHandshake.Printf("Failed to verify remote node: %v", err)
 		return nil, fmt.Errorf("%w: %v", aether.ErrHandshakeFailed, err)
@@ -185,6 +185,7 @@ func (t *NoiseTransport) performInitiatorHandshakeAttempt(ctx context.Context, u
 	_ = udpConn.SetReadDeadline(time.Time{})
 	nc := newNoiseConnDial(udpConn, path.Address, remoteNode, sendCS, recvCS, t.maxPacket, t)
 	nc.scopeID = preambleTenantID
+	nc.peerMaxAckDelay = decodeMaxAckDelay(remoteMaxAckDelayUS)
 
 	// Negotiate explicit nonce mode if both sides support it
 	if remoteCaps&capExplicitNonce != 0 {
@@ -418,7 +419,7 @@ recvLoop:
 		}
 		return nil, fmt.Errorf("%w: msg2 read: %v", aether.ErrHandshakeFailed, err)
 	}
-	remoteNode, _, remoteCaps, err := t.verifyNodeInfo(hs.PeerStatic(), payload, path.NodeID)
+	remoteNode, _, remoteCaps, remoteMaxAckDelayUS, err := t.verifyNodeInfo(hs.PeerStatic(), payload, path.NodeID)
 	if err != nil {
 		return nil, fmt.Errorf("%w: verify: %v", aether.ErrHandshakeFailed, err)
 	}
@@ -457,6 +458,7 @@ recvLoop:
 	// Create session using the listener's shared socket (like listener-accepted sessions)
 	nc := newNoiseConnListener(listener, sendCS, recvCS, addr, remoteNode)
 	nc.scopeID = preambleTenantID
+	nc.peerMaxAckDelay = decodeMaxAckDelay(remoteMaxAckDelayUS)
 	// Cross-org: persist the preamble target on the noiseConn so the
 	// writeFunc continues to prepend it on every post-handshake send.
 	// Without this, data packets from initiator → cross-org peer land
@@ -548,10 +550,53 @@ func (t *NoiseTransport) encodeNodeInfo() ([]byte, error) {
 	if t.ticketStore != nil {
 		caps |= capSessionTicket
 	}
-	return t.identity.EncodeNodeInfo(caps)
+	return t.identity.EncodeNodeInfo(caps, t.initialMaxAckDelayUS())
 }
 
-func (t *NoiseTransport) verifyNodeInfo(peerStatic []byte, payload []byte, expected aether.NodeID) (aether.NodeID, ed25519.PublicKey, uint32, error) {
+// initialMaxAckDelayUS returns the sender's advertised max_ack_delay (RFC
+// 9002 §6.2) in microseconds, to be stamped into the outbound handshake
+// NodeInfo payload. At handshake time there's no SRTT measurement yet —
+// the receiver-side approximation max(ACKPolicy.MaxDelay, SRTT/4)
+// degenerates to ACKPolicy.MaxDelay alone. Both initiator and responder
+// stamp this same value so each peer's TLP can seed its PTO with the
+// other's actual policy instead of the conservative 25ms default.
+//
+// Returns 0 if the policy MaxDelay is zero or negative (treated as
+// "not advertised"); receivers fall back to their local approximation.
+func (t *NoiseTransport) initialMaxAckDelayUS() uint32 {
+	d := reliabilityACKPolicyMaxDelay
+	if d <= 0 {
+		return 0
+	}
+	us := d.Microseconds()
+	if us <= 0 {
+		return 0
+	}
+	if us > int64(^uint32(0)) {
+		return ^uint32(0)
+	}
+	return uint32(us)
+}
+
+// reliabilityACKPolicyMaxDelay mirrors reliability.DefaultACKPolicy().MaxDelay
+// without importing the reliability package (which would be a layering
+// inversion — reliability already imports aether's core types). 25ms
+// matches the QUIC default and is the receiver-side policy that
+// NoiseSession's ACKEngine emits ACKs against — advertising it as our
+// max_ack_delay tells the peer's TLP not to PTO faster than our ACK pacing.
+const reliabilityACKPolicyMaxDelay = 25 * time.Millisecond
+
+// decodeMaxAckDelay converts the wire-format uint32 microseconds field
+// into a time.Duration. Zero means "peer did not advertise" — callers
+// fall back to the receiver-side approximation in that case.
+func decodeMaxAckDelay(us uint32) time.Duration {
+	if us == 0 {
+		return 0
+	}
+	return time.Duration(us) * time.Microsecond
+}
+
+func (t *NoiseTransport) verifyNodeInfo(peerStatic []byte, payload []byte, expected aether.NodeID) (aether.NodeID, ed25519.PublicKey, uint32, uint32, error) {
 	return transportCrypto.VerifyNodeInfo(peerStatic, payload, expected)
 }
 
@@ -700,7 +745,7 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 		l.mu.Unlock()
 		return
 	}
-	remoteNode, _, remoteCaps, err := l.transport.verifyNodeInfo(state.PeerStatic(), payload, "")
+	remoteNode, _, remoteCaps, remoteMaxAckDelayUS, err := l.transport.verifyNodeInfo(state.PeerStatic(), payload, "")
 	if err != nil {
 		delete(l.handshakes, key)
 		l.mu.Unlock()
@@ -715,6 +760,7 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 	// - cs2 is for responder→initiator (responder uses for send)
 	nc := newNoiseConnListener(l, cs2, cs1, addr, remoteNode)
 	nc.scopeID = scopeID
+	nc.peerMaxAckDelay = decodeMaxAckDelay(remoteMaxAckDelayUS)
 
 	// Negotiate explicit nonce mode if both sides support it
 	if remoteCaps&capExplicitNonce != 0 {

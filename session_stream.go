@@ -274,6 +274,83 @@ type SessionMetrics struct {
 	// (lossy or heavily misordered path).
 	RecvWindowHOLP50Us uint64 `json:"recvWindowHolP50Us,omitempty"`
 	RecvWindowHOLP99Us uint64 `json:"recvWindowHolP99Us,omitempty"`
+	// OBS-14: caller-block latency distribution for Stream.Send. Each
+	// call records wall-clock from entry to return — the time the
+	// application thread spent BLOCKED inside Send (window.Consume +
+	// connWindow.Consume + sendSingleFrame). Distinct from
+	// WriteloopParkP*Us (OBS-2), which measures the writeLoop's internal
+	// park on its wake channel: that's the sender-side scheduler view;
+	// this is the application-facing view of "how long did my Send
+	// block". Samples below ~50µs are skipped (uncontended fast path)
+	// and counted in StreamSendFastTotal instead. Elevated p99 here with
+	// a healthy WriteloopPark*Us indicates the flow-control credit
+	// semaphore — not the wire — is the application-facing latency
+	// source; elevated p50 indicates sustained credit starvation across
+	// most sends on the session.
+	StreamSendBlockP50Us uint64 `json:"streamSendBlockP50Us,omitempty"`
+	StreamSendBlockP99Us uint64 `json:"streamSendBlockP99Us,omitempty"`
+	// StreamSendFastTotal counts every Stream.Send call that completed
+	// faster than the OBS-14 floor (i.e. the fast path, no credit-
+	// starvation block). Paired with StreamSendBlockP*Us, this gives the
+	// operator the "how many sends were uncontended" denominator that
+	// would otherwise be hidden by the percentile-only readout.
+	StreamSendFastTotal uint64 `json:"streamSendFastTotal,omitempty"`
+	// OBS-18: per-decrypt AEAD latency distribution (microseconds). Each
+	// recv-side noise Decrypt call records its wall-clock cost; the
+	// percentile readout exposes the bimodal split that single-mean
+	// averages hide. On a healthy CPU-uncontended host p50 and p99 both
+	// sit in the few-µs tier; under sustained CPU saturation the decrypt
+	// goroutine queues behind other work and p99 climbs into the
+	// millisecond range while p50 stays µs — that asymmetric shape is
+	// the canonical signal to scale up or shed load. Sustained ms p50
+	// indicates ongoing starvation, not just bursts. Zero on non-noise
+	// adapters (test loopback / TCP / QUIC) — only the noise/ session
+	// path runs AEAD per packet on the recv hot path.
+	DecryptLatencyP50Us uint64 `json:"decryptLatencyP50Us,omitempty"`
+	DecryptLatencyP99Us uint64 `json:"decryptLatencyP99Us,omitempty"`
+	// OBS-9: scheduler queue-depth distribution. Sampled on every wake
+	// signal (Enqueue / EnqueueProbe / external Wake) and on every
+	// writeLoop pre-park observation. Depth = total frames queued
+	// across all streams + any pending TLP probes. Sustained-high p50
+	// means work piles up faster than the writeLoop can drain it
+	// (cwnd-bound or syscall-bound); p99 >> p50 indicates bursty
+	// arrivals that the writeLoop catches up on between bursts;
+	// near-zero on both means the queue is consistently drained as
+	// fast as it fills (healthy regime). Zero on transports that
+	// haven't wired the histogram into their scheduler (any adapter
+	// other than the noise session today).
+	SchedulerDepthP50 uint32 `json:"schedulerDepthP50,omitempty"`
+	SchedulerDepthP99 uint32 `json:"schedulerDepthP99,omitempty"`
+
+	// TLPResetTotal counts every time the session-level STALL-DETECT
+	// path fires its false-positive recovery — i.e. the stall
+	// detector declared "no progress" but the probe-before-close
+	// Ping then succeeded and the recovery code reset per-stream
+	// TLP exhaustion counters. Cumulative since session create.
+	//
+	// Paired with TLPFiresTotal: a high TLPResetTotal:TLPFiresTotal
+	// ratio means most TLPs are firing because of stall-detect
+	// rescue (path is flaky, not genuinely lossy). Multipath
+	// surfaces it through aether_tlp_reset_total; the connection
+	// manager that owns the multipath.Manager forwards the same
+	// signal into Manager.RecordTLPReset for the PathFlapping
+	// demote tier (see multipath/manager.go).
+	//
+	// Zero on non-noise transports (TCP / QUIC / in-process fakes
+	// have no STALL-DETECT path).
+	TLPResetTotal uint64 `json:"tlpResetTotal,omitempty"`
+
+	// PathFlappingCount surfaces multipath.Manager.PathFlappingCount
+	// at the moment Metrics() is read. Cumulative summation across
+	// a peer's paths happens at the Library layer (it owns the
+	// per-peer Manager). The field is on SessionMetrics rather than
+	// a separate getter so existing observability that snapshots
+	// Metrics() once per scrape picks up the value for free.
+	//
+	// Zero when the session is not registered with any multipath
+	// Manager (single-path peer), OR when none of the manager's
+	// paths are currently in PathFlapping.
+	PathFlappingCount uint32 `json:"pathFlappingCount,omitempty"`
 }
 
 // StreamObserveData holds per-stream observation metrics from the ObserveEngine.

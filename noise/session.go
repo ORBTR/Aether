@@ -21,6 +21,7 @@ import (
 	aether "github.com/ORBTR/aether"
 	transportHealth "github.com/ORBTR/aether/health"
 	vl1 "github.com/ORBTR/aether"
+	"github.com/ORBTR/aether/metrics"
 	"github.com/ORBTR/aether/relay"
 	"github.com/pion/stun"
 )
@@ -92,6 +93,19 @@ type noiseConn struct {
 	// reaches the right same-org machine in the destination app.
 	crossOrgPreambleTarget aether.NodeID
 
+	// peerMaxAckDelay is the peer's advertised max_ack_delay (RFC 9002
+	// §6.2) extracted from the handshake NodeInfo payload. Used by the
+	// adapter layer to seed TLP's PTO calculation at session-open —
+	// previously the adapter had only a receiver-side approximation
+	// max(ACKPolicy.MaxDelay, SRTT/4) because the handshake didn't
+	// carry the peer's actual value. Zero means "peer did not
+	// advertise" (older build) — adapter falls back to the
+	// approximation. Set once in the handshake completion path before
+	// the adapter ever reads it; exposed to the adapter via the
+	// PeerMaxAckDelay() method, probed by NoiseSession via the
+	// optional noiseConnAckDelay interface.
+	peerMaxAckDelay time.Duration
+
 	// Observability counters (Concerns #5, #6)
 	decryptErrors uint64 // atomic: failed decrypt attempts
 	inboxDrops    uint64 // atomic: inbox-full drops
@@ -103,6 +117,18 @@ type noiseConn struct {
 	// adapter's own `ceObservedBytes` counter so the two layers compose
 	// without extra locking.
 	ceBytes uint64
+
+	// OBS-18: per-decrypt AEAD latency distribution. Records the wall-
+	// clock cost of every recv-side Decrypt call (both explicit-nonce
+	// window.Decrypt and CipherState recv.Decrypt paths) so a bimodal
+	// distribution — uncontended µs-tier vs goroutine-queued ms-tier on
+	// a CPU-saturated host — surfaces as a p99/p50 split rather than a
+	// single misleading average. Drained at metrics-publication time by
+	// the adapter via the noiseConnStats interface (DecryptLatencySnapshot)
+	// so the adapter package never imports noise/ directly. Same lock-
+	// free Record / mutex-Snapshot pattern as the adapter-side
+	// writeSyscallHist / recvWindowHOLHist histograms.
+	decryptLatencyHist metrics.DurationHist
 }
 
 func newNoiseConnDial(conn *net.UDPConn, remote *net.UDPAddr, remoteNode aether.NodeID, send, recv *noise.CipherState, maxPacket int, nt *NoiseTransport) *noiseConn {
@@ -189,6 +215,16 @@ func (c *noiseConn) enableExplicitNonce() {
 	c.explicitNonce = true
 }
 
+// PeerMaxAckDelay returns the peer's advertised max_ack_delay (RFC 9002
+// §6.2) extracted from the Noise handshake NodeInfo payload. Zero means
+// "peer did not advertise" — callers (NoiseSession at session-construct
+// time) fall back to a receiver-side approximation. Set once during
+// handshake completion before the adapter ever observes the noiseConn,
+// so no synchronisation is required.
+func (c *noiseConn) PeerMaxAckDelay() time.Duration {
+	return c.peerMaxAckDelay
+}
+
 func (c *noiseConn) runReader() {
 	buf := make([]byte, c.maxPacket)
 	for {
@@ -215,6 +251,15 @@ func (c *noiseConn) decryptAndDeliver(msg []byte) error {
 	var plaintext []byte
 	var err error
 
+	// OBS-18: time the AEAD call itself so the latency histogram
+	// captures the cost goroutines pay when the host is CPU-saturated.
+	// time.Now() / time.Since are nanosecond-resolution wall-clock —
+	// they include any goroutine-scheduling queue time between the
+	// reader and the AEAD work, which is exactly the signal we want
+	// (a bimodal p50/p99 split shows when decrypt is queued vs hot-
+	// path). Recorded on both success and failure paths because a
+	// failing AEAD still consumed CPU before returning.
+	start := time.Now()
 	if c.explicitNonce {
 		plaintext, err = c.window.Decrypt(nil, nil, msg)
 	} else {
@@ -222,6 +267,7 @@ func (c *noiseConn) decryptAndDeliver(msg []byte) error {
 		plaintext, err = c.recv.Decrypt(nil, nil, msg)
 		c.recvMu.Unlock()
 	}
+	c.decryptLatencyHist.Record(time.Since(start))
 	if err != nil {
 		return err
 	}
@@ -638,6 +684,23 @@ func (c *noiseConn) RekeyBytesSinceLast() uint64 {
 		return 0
 	}
 	return c.rekey.BytesSent()
+}
+
+// DecryptLatencySnapshot returns the p50 and p99 of the recv-side AEAD
+// decrypt-call wall-clock cost in microseconds (OBS-18). Probed via the
+// adapter's noiseConnStats interface so the adapter package never
+// imports noise/ directly — mirrors the RekeyTotal / DecryptErrors
+// pass-through pattern.
+//
+// A bimodal p50/p99 split is the canonical signal that the host is
+// CPU-saturated and decrypt goroutines are queuing behind other work:
+// p50 stays in the few-µs uncontended tier while p99 climbs into the
+// ms range. Both at ms scale = sustained CPU starvation; both at µs
+// scale = healthy. Zero when no samples have been recorded yet (fresh
+// session or test conn that hasn't carried traffic).
+func (c *noiseConn) DecryptLatencySnapshot() (p50Us, p99Us uint64) {
+	p50, _, p99 := c.decryptLatencyHist.PercentileSnapshot()
+	return uint64(p50), uint64(p99)
 }
 
 func (c *noiseConn) LocalAddr() net.Addr  { return c.localAddr }

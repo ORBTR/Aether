@@ -22,6 +22,15 @@ import (
 	"github.com/ORBTR/aether/reliability"
 )
 
+// streamSendBlockFloor is the minimum noiseStream.Send wall-clock duration
+// that gets recorded into the session's streamSendBlockHist. Sub-floor
+// samples are counted in streamSendFastTotal instead — a Send that
+// completes in under 50µs almost certainly hit the flow.StreamWindow
+// fast path (Consume's non-blocking TryAcquire) and the writeLoop wake
+// path, neither of which the caller-block percentile should be dominated
+// by. The same fast-path skip pattern OBS-5 applies to its grantStarveHist.
+const streamSendBlockFloor = 50 * time.Microsecond
+
 // noiseStream is a single Aether stream over Noise-UDP with full reliability.
 type noiseStream struct {
 	streamID uint64
@@ -147,24 +156,32 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 		rack:        congestion.NewRACK(eng.RTT.SRTT()),
 		tlp:         congestion.NewTLP(eng.RTT.SRTT()),
 	}
-	// Seed the TLP's max_ack_delay with the receiver-side estimate
-	// max(ACKPolicy.MaxDelay, SRTT/4) (RFC 9002 §6.2). Without this,
+	// Seed the TLP's max_ack_delay (RFC 9002 §6.2). Without a seed,
 	// PTO uses the conservative 25ms default for the first RTT
 	// regardless of the path's actual ACK cadence — firing spurious
 	// TLPs on a sub-ms localhost path or under-firing on a multi-100ms
 	// long-haul. UpdateMaxAckDelay's EWMA takes over once inbound
-	// CompositeACKs start flowing. This is the receiver-side
-	// approximation of the handshake-capability exchange RFC 9002 §6.2
-	// describes — the audit's A8 (a)+(b) is satisfied here; (a) full
-	// handshake-capability exchange remains a follow-up because the
-	// existing exchange is a uint32 bitfield and adding a value-typed
-	// field would thread peer max_ack_delay across the
-	// handshake/noiseConn/NoiseSession/noiseStream boundary.
-	policy := reliability.DefaultACKPolicy()
-	initialAckDelay := policy.MaxDelay
-	if srtt := eng.RTT.SRTT(); srtt > 0 {
-		if quarter := srtt / 4; quarter > initialAckDelay {
-			initialAckDelay = quarter
+	// CompositeACKs start flowing.
+	//
+	// Source priority:
+	//   1. PEER-ADVERTISED value carried in the Noise handshake
+	//      NodeInfo payload (s.peerMaxAckDelay, captured at
+	//      NewNoiseSession via the noiseConnAckDelay probe). This is
+	//      the RFC 9002-compliant path — full handshake-capability
+	//      exchange now satisfies both halves of the audit's A8.
+	//   2. RECEIVER-SIDE APPROXIMATION max(ACKPolicy.MaxDelay, SRTT/4)
+	//      when (1) is zero (peer didn't advertise, e.g. an older
+	//      build, or an over-conn substrate using the minimal NodeInfo
+	//      encoding that doesn't carry the field). Preserves correct
+	//      behaviour against legacy peers and over-conn substrates.
+	initialAckDelay := s.peerMaxAckDelay
+	if initialAckDelay <= 0 {
+		policy := reliability.DefaultACKPolicy()
+		initialAckDelay = policy.MaxDelay
+		if srtt := eng.RTT.SRTT(); srtt > 0 {
+			if quarter := srtt / 4; quarter > initialAckDelay {
+				initialAckDelay = quarter
+			}
 		}
 	}
 	st.tlp.SetMaxAckDelay(initialAckDelay)
@@ -303,6 +320,26 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 	if !st.state.CanSend() {
 		return fmt.Errorf("stream %d: cannot send", st.streamID)
 	}
+
+	// OBS-14: caller-block instrumentation. Measures wall-clock time the
+	// application spent inside Send (window.Consume + connWindow.Consume +
+	// sendSingleFrame for each fragment) from entry to return. Samples
+	// below streamSendBlockFloor bypass the histogram Record and increment
+	// streamSendFastTotal instead — same fast-path skip pattern OBS-5
+	// applies to grant-starvation, for the same reason: recording every
+	// microsecond-fast send would dominate the distribution with
+	// uncontended noise. CanSend gate is excluded — it's a single atomic
+	// load before the wall-clock starts, so the "stream not open" error
+	// path doesn't pollute the histogram either.
+	sendStart := time.Now()
+	defer func() {
+		elapsed := time.Since(sendStart)
+		if elapsed < streamSendBlockFloor {
+			st.session.streamSendFastTotal.Add(1)
+			return
+		}
+		st.session.streamSendBlockHist.Record(elapsed)
+	}()
 
 	n := int64(len(data))
 

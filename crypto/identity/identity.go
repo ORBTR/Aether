@@ -69,56 +69,72 @@ func SignatureMessage(staticPub []byte) [32]byte {
 }
 
 // NodeInfo represents the identity payload exchanged during Noise handshakes.
+//
+// MaxAckDelayUS is the sender's advertised maximum ACK delay in microseconds,
+// piggybacked here so RFC 9002 §6.2's "sender PTO must include the peer's
+// max_ack_delay" requirement can be satisfied at session-open BEFORE the first
+// inbound CompositeACK arrives. Zero means "not advertised" — receivers fall
+// back to a receiver-side approximation max(ACKPolicy.MaxDelay, SRTT/4).
+//
+// `json:",omitempty"` keeps the wire compact when the field is zero (peer
+// from an older build that didn't stamp it). New initiator/responder paths
+// always stamp a non-zero value.
 type NodeInfo struct {
-	NodeID    string `json:"node_id"`
-	PubKey    []byte `json:"ed25519_pub"`
-	Signature []byte `json:"sig"`
-	Caps      uint32 `json:"caps,omitempty"`
+	NodeID        string `json:"node_id"`
+	PubKey        []byte `json:"ed25519_pub"`
+	Signature     []byte `json:"sig"`
+	Caps          uint32 `json:"caps,omitempty"`
+	MaxAckDelayUS uint32 `json:"max_ack_delay_us,omitempty"`
 }
 
 // EncodeNodeInfo creates a signed NodeInfo payload for handshake exchange.
-func (id *Identity) EncodeNodeInfo(caps uint32) ([]byte, error) {
+// maxAckDelayUS is the sender's advertised max_ack_delay (RFC 9002 §6.2) in
+// microseconds; pass 0 if not advertising.
+func (id *Identity) EncodeNodeInfo(caps uint32, maxAckDelayUS uint32) ([]byte, error) {
 	msg := SignatureMessage(id.Curve25519Pub)
 	signature := ed25519.Sign(id.Ed25519Priv, msg[:])
 	info := NodeInfo{
-		NodeID:    string(id.NodeID),
-		PubKey:    append([]byte(nil), id.Ed25519Pub...),
-		Signature: signature,
-		Caps:      caps,
+		NodeID:        string(id.NodeID),
+		PubKey:        append([]byte(nil), id.Ed25519Pub...),
+		Signature:     signature,
+		Caps:          caps,
+		MaxAckDelayUS: maxAckDelayUS,
 	}
 	return json.Marshal(info)
 }
 
 // VerifyNodeInfo validates a received NodeInfo payload.
-// Returns the derived NodeID, Ed25519 public key, and capabilities.
-func VerifyNodeInfo(peerStatic []byte, payload []byte, expected aether.NodeID) (aether.NodeID, ed25519.PublicKey, uint32, error) {
+// Returns the derived NodeID, Ed25519 public key, capabilities, and the
+// peer's advertised max_ack_delay in microseconds (0 = not advertised;
+// caller falls back to receiver-side approximation).
+func VerifyNodeInfo(peerStatic []byte, payload []byte, expected aether.NodeID) (aether.NodeID, ed25519.PublicKey, uint32, uint32, error) {
 	var info NodeInfo
 	if err := json.Unmarshal(payload, &info); err != nil {
-		return "", nil, 0, err
+		return "", nil, 0, 0, err
 	}
 	if len(info.PubKey) != ed25519.PublicKeySize {
-		return "", nil, 0, errors.New("crypto: invalid ed25519 key")
+		return "", nil, 0, 0, errors.New("crypto: invalid ed25519 key")
 	}
 	edPub := ed25519.PublicKey(info.PubKey)
 	derived, err := aether.NewNodeID(edPub)
 	if err != nil {
-		return "", nil, 0, err
+		return "", nil, 0, 0, err
 	}
 	if expected != "" && derived != expected {
-		return "", nil, 0, errors.New("crypto: unexpected node id in handshake")
+		return "", nil, 0, 0, errors.New("crypto: unexpected node id in handshake")
 	}
 	curve, err := Ed25519PublicKeyToCurve(edPub)
 	if err != nil {
-		return "", nil, 0, err
+		return "", nil, 0, 0, err
 	}
 	if len(peerStatic) != len(curve) || !equalBytes(peerStatic, curve[:]) {
-		return "", nil, 0, errors.New("crypto: static key mismatch")
+		return "", nil, 0, 0, errors.New("crypto: static key mismatch")
 	}
 	msg := SignatureMessage(peerStatic)
 	if !ed25519.Verify(edPub, msg[:], info.Signature) {
-		return "", nil, 0, errors.New("crypto: handshake signature verification failed")
+		return "", nil, 0, 0, errors.New("crypto: handshake signature verification failed")
 	}
-	return derived, edPub, info.Caps, nil
+	return derived, edPub, info.Caps, info.MaxAckDelayUS, nil
 }
 
 // --- Ed25519 → Curve25519 conversion ---
