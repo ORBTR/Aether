@@ -203,15 +203,54 @@ func (s *NoiseSession) writeLoop() {
 		// (low p50 with very long p99 spikes) usually means individual
 		// frames arrive in clumps separated by long idle gaps, which
 		// rules in app-side send pacing as the source of bimodality.
+		//
+		// cwnd-blocked busy-spin guard: when we just rejected a frame
+		// in the inner loop (cwndBlockStart != zero), the re-Enqueue
+		// path called signalWake AND we ourselves called Wake() — so
+		// the wake channel holds a self-induced signal. Parking on it
+		// fires immediately, we re-dequeue the same frame, CanSend
+		// still returns false, repeat. Live capture showed 19,116,308
+		// cansend_false_reenqueues vs 17 frames_sent (>1M:1 reject:send
+		// ratio) — the writeLoop was burning CPU spinning against its
+		// own wake. Fix: drain the self-wake, then park with a 1ms
+		// timer arm so an ACK that arrives (via noise_dispatch.go:546
+		// Wake()) still wakes us instantly, but absent any external
+		// signal we re-check CanSend at 1kHz instead of MHz. The timer
+		// also gives congestion-controller timer-driven advances a
+		// chance to fire before our retry.
 		parkStart := time.Now()
-		select {
-		case <-s.CloseSignal():
-			return
-		case <-wake:
+		if !cwndBlockStart.IsZero() {
+			select {
+			case <-wake: // drain self-induced wake
+			default:
+			}
+			timer := time.NewTimer(cwndBlockedProbeInterval)
+			select {
+			case <-s.CloseSignal():
+				timer.Stop()
+				return
+			case <-wake:
+				timer.Stop()
+			case <-timer.C:
+			}
+		} else {
+			select {
+			case <-s.CloseSignal():
+				return
+			case <-wake:
+			}
 		}
 		s.writeloopParkHist.Record(time.Since(parkStart))
 	}
 }
+
+// cwndBlockedProbeInterval bounds the writeLoop's CanSend retry rate
+// when cwnd is blocking. 1ms gives ACKs (which wake via signalWake)
+// instant priority while preventing the self-wake busy-spin observed
+// in fleet capture (19M reject events / 17 frames sent — >1M:1 ratio).
+// Tuned conservative: lower values risk spin-amplification; higher
+// values delay legitimate cwnd-recovery beyond a typical SRTT.
+const cwndBlockedProbeInterval = 1 * time.Millisecond
 
 // cwndUtilSamplePeriod governs the per-N-writes sampling rate of OBS-10.
 // 16 keeps cost negligible (single atomic add per write, ring push on
