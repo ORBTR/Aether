@@ -216,8 +216,13 @@ const StreamConnectionLevel uint64 = 0xFFFFFFFFFFFFFFFF
 type StreamLayout struct {
 	Keepalive uint64 // stream for ping/pong liveness (0 = disabled)
 	Control   uint64 // stream for control frames (GOAWAY, migration, etc.)
-	// Application streams (gossip, RPC, etc.) are consumer-defined and
-	// not part of the session layout.
+	// RPC marks a stream as latency-sensitive request/response so the
+	// reliability engine emits ACKs immediately (no delayed-ACK timer)
+	// and the writer can take low-latency fast paths. Zero = consumer
+	// did not opt in; the adapter treats the stream as bulk data.
+	RPC uint64
+	// Application streams (gossip, etc.) are consumer-defined and not
+	// part of the session layout.
 }
 
 // DefaultStreamLayout returns the default stream layout.
