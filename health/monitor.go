@@ -168,6 +168,15 @@ func (m *Monitor) AvgRTT() time.Duration { return m.rttEst.SRTT() }
 // reliability layer.
 func (m *Monitor) SRTT() time.Duration { return m.rttEst.SRTT() }
 
+// SampleCount returns the number of pong samples the estimator has
+// consumed. Callers use this as a confidence gate: SRTT and RTO before
+// the estimator has seen at least a few correlated pongs are dominated
+// by the InitialRTO seed and any first-packet jitter from gossip or
+// connection establishment. A consumer that drives scaling, suppression,
+// or path selection from RTT should require SampleCount() ≥ 3 before
+// trusting the reading.
+func (m *Monitor) SampleCount() uint64 { return m.rttEst.SampleCount() }
+
 // RTTVar returns the smoothed RTT mean deviation (RFC 6298) over the
 // ping/pong sample stream. Zero before the first pong.
 func (m *Monitor) RTTVar() time.Duration { return m.rttEst.RTTVar() }
