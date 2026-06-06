@@ -30,14 +30,14 @@ const (
 	// 0x00-0x7F: Full 50-byte header (SenderID[0] is always < 0x80 for VL1 NodeIDs)
 
 	ShortDataIndicator      byte = 0x82 // DATA frames, 9 bytes, uint32 Length
-	ShortControlIndicator   byte = 0x83 // PING/PONG/CLOSE/RESET, 4 bytes
+	ShortControlIndicator   byte = 0x83 // PING/PONG/CLOSE/RESET, 8 bytes
 	ShortACKIndicator       byte = 0x84 // Composite ACK, 11 bytes (lite) or 3+N (full)
 	ShortBatchIndicator     byte = 0x85 // Batch of sub-frames, 2 + N×sub
 	ShortDataVarIndicator   byte = 0x86 // DATA frames, varint Length, 6-10 bytes
 	ShortEncryptedIndicator byte = 0x87 // Encrypted DATA, 9 bytes, Nonce-in-payload
 
 	ShortDataSize    = 9  // [indicator:1][streamID:2][seqDelta:2][length:4]
-	ShortControlSize = 4  // [indicator:1][type:1][streamID:2]
+	ShortControlSize = 8  // [indicator:1][type:1][streamID:2][seqNo:4]
 	ShortACKLiteSize = 11 // [indicator:1][streamID:2][baseACK:4][ackDelay:2][bitmapLen:1][flags:1]
 
 	// Full header sent every N frames per stream for state resync
@@ -309,16 +309,24 @@ func (c *Compressor) DecodeEncryptedDataShort(r io.Reader) (*Frame, error) {
 // Control Short Header (0x83): 4 bytes
 // ────────────────────────────────────────────────────────────────────────────
 
-// EncodeControlShort writes a 4-byte control short header (no payload).
+// EncodeControlShort writes an 8-byte control short header (no payload).
+// Layout: [indicator:1][type:1][streamID:2][seqNo:4]. The seqNo round-
+// trips PING <-> PONG so the receiver's pendingPingSeq gate in
+// RecordPongRecv can correlate the matching pong and feed an RTT sample
+// to the RFC 6298 estimator. Earlier 4-byte revisions dropped seqNo on
+// the wire, leaving the estimator permanently at its InitialRTO seed.
 func (c *Compressor) EncodeControlShort(w io.Writer, f *Frame) (int, error) {
 	var hdr [ShortControlSize]byte
 	hdr[0] = ShortControlIndicator
 	hdr[1] = byte(f.Type)
 	binary.BigEndian.PutUint16(hdr[2:4], uint16(f.StreamID))
+	binary.BigEndian.PutUint32(hdr[4:8], f.SeqNo)
 	return w.Write(hdr[:])
 }
 
-// DecodeControlShort reads a 4-byte control header (indicator already consumed).
+// DecodeControlShort reads an 8-byte control header (indicator already
+// consumed). Layout: [type:1][streamID:2][seqNo:4]. SeqNo is preserved
+// so RecordPongRecv can match the inbound PONG against pendingPingSeq.
 func (c *Compressor) DecodeControlShort(r io.Reader) (*Frame, error) {
 	var hdr [ShortControlSize - 1]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
@@ -335,6 +343,7 @@ func (c *Compressor) DecodeControlShort(r io.Reader) (*Frame, error) {
 		ReceiverID: receiver,
 		Type:       FrameType(hdr[0]),
 		StreamID:   uint64(binary.BigEndian.Uint16(hdr[1:3])),
+		SeqNo:      binary.BigEndian.Uint32(hdr[3:7]),
 	}, nil
 }
 

@@ -82,9 +82,16 @@ func WaitForActivityPing(
 	if err := writePing(seqNo); err != nil {
 		return 0, err
 	}
-	deadline := time.Now().Add(PingDefaultDeadline)
-	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
-		deadline = dl
+	// Honour the caller's ctx deadline as the authoritative budget. Only
+	// fall back to PingDefaultDeadline when the caller hasn't set one.
+	// Earlier revisions capped the deadline at the smaller of the two,
+	// which meant a caller wanting a 5 s budget on a slow path was
+	// silently clamped to the 2 s PingDefaultDeadline. The keepalive
+	// loop passes an explicit adaptiveKeepaliveTimeout(RTO) ctx; that
+	// budget MUST be the one that fires.
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(PingDefaultDeadline)
 	}
 	pollTicker := time.NewTicker(pingActivityPollInterval)
 	defer pollTicker.Stop()
@@ -94,7 +101,15 @@ func WaitForActivityPing(
 			return 0, ErrSessionClosed
 		default:
 		}
-		if hm.LastActivity().After(before) {
+		// Wait for an inbound Pong specifically — not any inbound frame.
+		// LastActivity advances on gossip / RPC / control traffic too,
+		// which produces false-positive "ping succeeded" returns and
+		// hides the broken SeqNo correlation behind the noise of a
+		// chatty session. LastPongRecv is set inside RecordPongRecv
+		// only when the Pong actually decodes with a valid SeqNo
+		// match (post-codec-widen), so this check now means what it
+		// reads.
+		if hm.LastPongReceived().After(before) {
 			_, avg := hm.RTT()
 			return avg, nil
 		}

@@ -81,7 +81,13 @@ func (m *Monitor) RecordPingSent(seq uint32) {
 func (m *Monitor) RecordPongRecv(seq uint32, sentAt time.Time) {
 	m.mu.Lock()
 	now := time.Now()
-	// Only update RTT if this pong matches the pending ping
+	// lastPongRecv, missedPings and pendingPingSeq only mutate when
+	// this pong actually correlates with the pending ping. A stray
+	// pong with a stale or zero seq must not reset pendingPingSeq —
+	// doing so makes the NEXT real pong fail the seq != 0 gate. It
+	// must also not advance lastPongRecv, which would falsely satisfy
+	// WaitForActivityPing's "ping succeeded" check and mask a path
+	// that has stopped responding.
 	if seq != 0 && seq == m.pendingPingSeq {
 		sample := now.Sub(sentAt)
 		m.lastRTT = sample
@@ -89,10 +95,10 @@ func (m *Monitor) RecordPongRecv(seq uint32, sentAt time.Time) {
 		// Update is internally locked, so calling under m.mu is
 		// safe.
 		m.rttEst.Update(sample)
+		m.lastPongRecv = now
+		m.missedPings = 0
+		m.pendingPingSeq = 0
 	}
-	m.lastPongRecv = now
-	m.missedPings = 0
-	m.pendingPingSeq = 0
 	m.mu.Unlock()
 }
 
