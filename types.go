@@ -236,10 +236,23 @@ const DefaultSessionIdleTimeout = 5 * time.Minute
 // that has data in-flight but no ACK progress on any stream is
 // declared stuck. Tuned to be comfortably larger than the worst
 // expected cross-region RTT × retransmit cycle (5-10 s observed) plus
-// the periodic WINDOW_UPDATE re-emission interval (2 s) — at 30 s a
-// stuck session has missed roughly 15 re-emissions and is not going to
-// recover on its own.
-const DefaultSessionStallThreshold = 30 * time.Second
+// the periodic WINDOW_UPDATE re-emission interval (2 s).
+//
+// Sized at 120 s to give the keepalive layer time to declare the
+// session dead first when a path goes one-way-quiet. The previous
+// 30 s threshold fired BEFORE the per-peer keepalive retry budget
+// could complete (5 retries × 5 s warmup floor + 4 × 1 s gaps = 29 s
+// to first declared keepalive death, with the stall detector then
+// adding its own 3 × 1 s probe-before-close at exactly the wrong
+// moment). The combined effect on a freshly-installed noise-UDP
+// session whose first ping went one-way: stall detector fired at
+// 30 s, ran probe-before-close, declared stuck, closed the session
+// before keepalive could escalate to fallback. Sessions clustered at
+// ~34 s lifetime in connection_history. Pushing the threshold to
+// 120 s lets the keepalive layer own liveness; the stall detector
+// remains as a backstop for paths the keepalive declared healthy
+// but where streams have actually wedged.
+const DefaultSessionStallThreshold = 120 * time.Second
 
 // DefaultSessionWarmupGrace is the initial-lifetime window during
 // which the stall detector uses 2× SessionStallThreshold. Covers the
