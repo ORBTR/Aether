@@ -140,6 +140,23 @@ type NoiseSession struct {
 	// surface aether_deliver_* under /api/monitoring/mesh-debug.
 	deliveryStats DeliveryStats
 
+	// A4 (_SECURITY.md §3.x): per-ACK-interval upper bound for the
+	// peer's CEBytes claim. Each outbound payload byte (writeFrame)
+	// adds to this counter; each inbound CompositeACK carrying an
+	// ECN-piggyback drains it via atomic.Swap and uses the drained
+	// value as the maximum-plausible CE claim for that interval.
+	// Without this cap a bad-faith peer can advertise CEBytes far
+	// larger than anything they could have actually received from us,
+	// driving our congestion controller into spurious cwnd collapses
+	// (handleACK's per-ACK ackedBytes cap doesn't help when the peer
+	// spreads inflated claims across pure-dup ACKs where ackedBytes=0).
+	// Overruns are clamped to the drained budget and flagged through
+	// reportAbuse(ReasonACKValidation) so the S7 abuse scorer can
+	// take action against a repeat offender. Reset semantics: we
+	// drain on every CE-bearing ACK, so the "interval" is the time
+	// between consecutive CE-bearing ACKs — short and self-clocked.
+	bytesSentSinceLastCE atomic.Uint64
+
 	// tlpFiresTotal counts every TLP probe fire (RFC 8985 §7.4). See
 	// reliabilityTick's TLP block. Paired with rackMarksTotal — together
 	// they describe how loss recovery is splitting between fast-recovery

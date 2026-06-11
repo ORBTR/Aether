@@ -7,6 +7,7 @@ package reliability
 import (
 	"container/heap"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ORBTR/aether"
@@ -63,6 +64,15 @@ type RetransmitQueue struct {
 	// finding — evicted entries vanished without notice). Called WITH
 	// q.mu held; callbacks must not re-enter the queue.
 	onEvict func(*RetransmitEntry)
+
+	// ackedOnDequeue is an atomic counter of entries dropped at Dequeue
+	// time because their underlying SendEntry was already marked Acked.
+	// Closes the ProcessCompositeACK TOCTOU window between
+	// "Send.Acked=true" and "retransmitQ.Remove(seq)"; without observable
+	// counting, post-ACK retransmits would silently amplify under load
+	// (was the A5 security audit finding — TOCTOU duplicate-retransmit).
+	// Read via AckedOnDequeueCount().
+	ackedOnDequeue uint64
 }
 
 // SetOnEvict installs the eviction callback. Pass nil to clear.
@@ -208,39 +218,60 @@ func (q *RetransmitQueue) EnqueueFromSend(se *SendEntry) {
 // Dequeue returns the next frame due for retransmit (NextRetry <= now).
 // Returns nil if no frames are due. Automatically re-enqueues the entry
 // with doubled RTO (exponential backoff) if maxRetries is not exceeded.
+//
+// Loops past any heap-top entries whose SendWindow side has already been
+// marked Acked — ProcessCompositeACK marks Send.Acked=true and removes
+// the entry from retransmitQ in two separate operations, and an RTO
+// firing in that TOCTOU window would otherwise replay an already-
+// delivered frame. Silently dropping just the heap top would block the
+// next legitimately-due entry behind it for one tick; loop so callers
+// always see the freshest unACKed due frame in a single call (A5
+// security audit fix).
 func (q *RetransmitQueue) Dequeue() *aether.Frame {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	if q.queue.Len() == 0 {
-		return nil
-	}
-
-	// Peek at the earliest entry
-	entry := q.queue.data[0]
-	if time.Now().Before(entry.NextRetry) {
-		return nil // not due yet
-	}
-
-	// Pop it
-	heap.Pop(&q.queue)
-	entryBytes := frameBytes(entry.Frame)
-
-	// Drop entries whose underlying SendWindow entry was already ACKed.
-	// ProcessCompositeACK marks Send.Acked=true and removes the entry
-	// from retransmitQ in two separate operations; an RTO firing
-	// between those operations would otherwise replay an already-
-	// delivered frame. Send is nil for callers that use the legacy
-	// Enqueue path without a shared *SendEntry — the check is gated
-	// so it stays back-compatible.
-	if entry.Send != nil && entry.Send.Acked {
-		q.bufferedBytes -= entryBytes
-		if q.bufferedBytes < 0 {
-			q.bufferedBytes = 0
+	for {
+		if q.queue.Len() == 0 {
+			return nil
 		}
-		return nil
-	}
 
+		// Peek at the earliest entry
+		entry := q.queue.data[0]
+		if time.Now().Before(entry.NextRetry) {
+			return nil // not due yet
+		}
+
+		// Pop it
+		heap.Pop(&q.queue)
+		entryBytes := frameBytes(entry.Frame)
+
+		// Drop entries whose underlying SendWindow entry was already ACKed.
+		// Send is nil for callers that use the legacy Enqueue path
+		// without a shared *SendEntry — the check is gated so it stays
+		// back-compatible. Counter surfaces the drop so post-ACK RTO
+		// races don't manifest as silent retransmit suppression.
+		if entry.Send != nil && entry.Send.Acked {
+			q.bufferedBytes -= entryBytes
+			if q.bufferedBytes < 0 {
+				q.bufferedBytes = 0
+			}
+			atomic.AddUint64(&q.ackedOnDequeue, 1)
+			continue // try the next due entry
+		}
+
+		return q.advanceEntryLocked(entry, entryBytes)
+	}
+}
+
+// advanceEntryLocked handles the post-pop bookkeeping for a non-ACKed
+// retransmit entry: retry counting, deadline/cap checks, RTO backoff,
+// re-enqueue. Returns the frame to retransmit, or nil if the entry was
+// dropped because of deadline or maxRetries.
+//
+// Caller holds q.mu. Split out of Dequeue so the ACKed-on-dequeue loop
+// can `continue` past stale entries without nesting all of this logic.
+func (q *RetransmitQueue) advanceEntryLocked(entry *RetransmitEntry, entryBytes int64) *aether.Frame {
 	entry.Retries++
 
 	// Check deadline — drop frames that have expired
@@ -303,6 +334,16 @@ func (q *RetransmitQueue) Remove(seqNo uint32) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.removeBySeq(seqNo)
+}
+
+// AckedOnDequeueCount returns the number of retransmit entries dropped
+// at Dequeue time because their underlying SendEntry was already Acked
+// by ProcessCompositeACK in the TOCTOU window before Remove ran. A
+// non-zero rate is benign (the bug it fixes used to cause silent
+// duplicate retransmits); a sustained high rate suggests pathological
+// ACK/RTO interleaving worth investigating. See A5 security audit.
+func (q *RetransmitQueue) AckedOnDequeueCount() uint64 {
+	return atomic.LoadUint64(&q.ackedOnDequeue)
 }
 
 // Len returns the number of entries in the queue.

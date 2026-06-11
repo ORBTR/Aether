@@ -176,13 +176,26 @@ func (s *NoiseSession) writeLoop() {
 			// only see the frame, not the entry, so we just notify).
 			_ = s.congestion().OnSend(int64(frameSize))
 
-			// Update pacer rate from congestion controller after each send
+			// Update pacer rate from congestion controller after each send.
 			// Clamp controller pacing rate into the safe envelope
-			// (congestion.ClampPacingRate) so a buggy controller
-			// returning 0 or +Inf cannot lock the pacer at "never
-			// send" or "never wait". A return of 0 is preserved as
-			// the "pacing disabled" sentinel.
-			if pacingRate := congestion.ClampPacingRate(s.congestion().PacingRate()); pacingRate > 0 {
+			// (congestion.ClampPacingRate) so a buggy/subverted
+			// controller returning 0 or +Inf cannot lock the pacer at
+			// "never send" or "never wait". A return of 0 is preserved
+			// as the "pacing disabled" sentinel (CUBIC returns 0
+			// intentionally to mean no pacing); any non-zero raw value
+			// outside [MinPacingRate, MaxPacingRate] is clamped and
+			// surfaced via dbgNoise so a misbehaving controller is
+			// visible in debug builds rather than silently corrupting
+			// the pacer. After clamping, pacingRate is guaranteed > 0
+			// for the SetRate call below — the > 0 guard preserves the
+			// pacing-disabled sentinel without forwarding a zero rate.
+			rawPacingRate := s.congestion().PacingRate()
+			pacingRate := congestion.ClampPacingRate(rawPacingRate)
+			if pacingRate != rawPacingRate {
+				dbgNoise.Printf("pacing-rate clamped: raw=%g clamped=%g (min=%g max=%g)",
+					rawPacingRate, pacingRate, congestion.MinPacingRate, congestion.MaxPacingRate)
+			}
+			if pacingRate > 0 {
 				s.pacer.SetRate(pacingRate)
 			}
 		}
@@ -863,6 +876,10 @@ func (s *NoiseSession) writeFrame(frame *aether.Frame) error {
 	s.framesSent.Add(1)
 	if frame != nil {
 		s.bytesSent.Add(uint64(frame.Length))
+		// A4: feed the per-CE-interval cap. handleACK drains this counter
+		// when the peer's CompositeACK carries CACKHasECN, using the
+		// drained value as the upper bound on a plausible CEBytes claim.
+		s.bytesSentSinceLastCE.Add(uint64(frame.Length))
 	}
 	// Compression + encryption are IDEMPOTENT on the frame object. The
 	// crypto/aead.go Encrypt path mutates frame.Payload in place

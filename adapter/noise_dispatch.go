@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"sync/atomic"
 	"time"
 
@@ -520,17 +521,29 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	//
 	// CEBytes is peer-supplied data — an inflated claim ("you sent 1GB
 	// and 1GB got CE-marked" when we sent 1KB) would drive cwnd
-	// collapses on a bad-faith peer. Cap against a plausibility upper
-	// bound (bytes acked in this CompositeACK, or stream-level
-	// outstanding when the ACK acks nothing new) and flag overruns as
-	// ACK-validation abuse so the rate limiter can defend us.
+	// collapses on a bad-faith peer. A4: cap against the strongest
+	// upper bound available — the total bytes WE sent in this CE
+	// interval (bytesSentSinceLastCE, drained per CE-bearing ACK). The
+	// per-ACK ackedBytes and per-stream Outstanding() are used as a
+	// fallback for sessions where the counter has been deliberately
+	// reset (paranoid handlers / tests) but the interval counter is
+	// the authoritative bound — the peer cannot have CE-marked more
+	// bytes than they have actually received from us.
 	if ack.Flags&aether.CACKHasECN != 0 && ack.CEBytes > 0 {
-		var maxPlausibleCE int64 = ackedBytes
+		intervalBytes := int64(s.bytesSentSinceLastCE.Swap(0))
+		maxPlausibleCE := intervalBytes
+		if maxPlausibleCE <= 0 {
+			maxPlausibleCE = ackedBytes
+		}
 		if maxPlausibleCE <= 0 {
 			maxPlausibleCE = st.window.Outstanding()
 		}
 		claimed := int64(ack.CEBytes)
 		if claimed > maxPlausibleCE && maxPlausibleCE > 0 {
+			if os.Getenv("AETHER_DEBUG_CE") == "1" {
+				log.Printf("aether: A4 cap CEBytes claim=%d > interval=%d acked=%d outstanding=%d — clamping + flagging",
+					claimed, intervalBytes, ackedBytes, st.window.Outstanding())
+			}
 			s.reportAbuse(abuse.ReasonACKValidation)
 			claimed = maxPlausibleCE
 		}
