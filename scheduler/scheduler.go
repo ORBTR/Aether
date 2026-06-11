@@ -313,20 +313,23 @@ func (s *Scheduler) Dequeue() (*aether.Frame, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// s.order iteration safety: every mutator of s.order
-	// (Register / Unregister / RegisterWithClass) also acquires s.mu,
-	// so the backing array cannot be reallocated mid-iteration. If a
-	// future refactor introduces an unlock-relock pattern inside this
-	// function, snapshot s.order into a local slice before iterating.
+	// Snapshot s.order into a local slice before iterating. Even though
+	// every mutator of s.order acquires s.mu, snapshotting decouples the
+	// iteration from any future refactor that introduces an unlock-relock
+	// pattern (or a helper that mutates s.order while iterating) — a
+	// concurrent Unregister reallocating the backing array mid-iteration
+	// would otherwise cause an index skip or out-of-bounds crash. The
+	// copy is cheap (uint64 per stream) and immune to mutation.
 	if len(s.order) == 0 {
 		return nil, false
 	}
+	order := append([]uint64(nil), s.order...)
 
-	// 1. TLP probes have absolute priority. Walk s.order so probes are
+	// 1. TLP probes have absolute priority. Walk order so probes are
 	// drained in a stable, registration-ordered sequence rather than
 	// map-iteration order (deterministic ordering helps tests + log
 	// readability without affecting correctness).
-	for _, streamID := range s.order {
+	for _, streamID := range order {
 		ss, ok := s.streams[streamID]
 		if !ok || ss.probe == nil {
 			continue
@@ -356,7 +359,7 @@ func (s *Scheduler) Dequeue() (*aether.Frame, bool) {
 		if targetClass == aether.ClassREALTIME && realtimeCapped {
 			continue // REALTIME over 10% cap — demote to INTERACTIVE round
 		}
-		frame := s.dequeueFromClass(targetClass)
+		frame := s.dequeueFromClass(targetClass, order)
 		if frame != nil {
 			// Track bandwidth per class for REALTIME cap
 			bytesOut := int64(aether.HeaderSize) + int64(frame.Length)
@@ -372,11 +375,14 @@ func (s *Scheduler) Dequeue() (*aether.Frame, bool) {
 }
 
 // dequeueFromClass picks the best frame within a specific latency class using WFQ.
-func (s *Scheduler) dequeueFromClass(targetClass aether.LatencyClass) *aether.Frame {
+// order is the caller's snapshot of s.order (see Dequeue): iterating the snapshot
+// keeps this routine immune to concurrent Unregister reallocations even if a
+// future refactor unlocks s.mu mid-Dequeue.
+func (s *Scheduler) dequeueFromClass(targetClass aether.LatencyClass, order []uint64) *aether.Frame {
 	var bestIdx int = -1
 	var bestFinish float64
 
-	for i, streamID := range s.order {
+	for i, streamID := range order {
 		ss, ok := s.streams[streamID]
 		if !ok || len(ss.queue) == 0 || ss.latencyClass != targetClass {
 			continue
@@ -406,7 +412,7 @@ func (s *Scheduler) dequeueFromClass(targetClass aether.LatencyClass) *aether.Fr
 		return nil
 	}
 
-	streamID := s.order[bestIdx]
+	streamID := order[bestIdx]
 	ss := s.streams[streamID]
 	frame := ss.queue[0]
 	ss.queue = ss.queue[1:]

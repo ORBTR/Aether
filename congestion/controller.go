@@ -10,21 +10,23 @@ package congestion
 import "time"
 
 // PacingRate bounds clamp the controller-reported send rate to a sane
-// envelope before it reaches the pacer. A buggy controller returning 0
-// or +Inf would otherwise lock the pacer at "never send" or "never
-// wait". Bounds:
+// envelope before it reaches the pacer. A buggy/subverted controller
+// returning 0 or +Inf would otherwise lock the pacer at "never send"
+// or "never wait". Bounds:
 //   - MinPacingRate (1400 B/s = 1 MSS/sec) is the slowest useful link;
 //     below this, the writeLoop stalls for seconds between sends.
-//   - MaxPacingRate (10 Gbps) clamps a +Inf into a finite value so
-//     pacer.SetRate doesn't propagate the sentinel.
+//   - MaxPacingRate (10 Gbps expressed in bytes/sec = 1,342,177,280)
+//     clamps a +Inf into a finite value so pacer.SetRate doesn't
+//     propagate the sentinel. 10 Gbps is a realistic upper bound for
+//     a single-flow aether session on any present-day link.
 //
 // Callers (writeLoop in adapter/noise_reliability.go) should consume
 // the result of ClampPacingRate(controller.PacingRate()) rather than
 // the raw value. Returning 0 is preserved as the "pacing disabled"
 // sentinel — CUBIC returns 0 intentionally to mean no pacing.
 const (
-	MinPacingRate = float64(1400)             // 1 MSS / sec
-	MaxPacingRate = float64(10 * 1024 * 1024 * 1024) // 10 Gbps
+	MinPacingRate = float64(1400)                        // 1 MSS / sec
+	MaxPacingRate = float64(10*1024*1024*1024) / float64(8) // 10 Gbps in bytes/sec = 1,342,177,280
 )
 
 // ClampPacingRate bounds a raw controller pacing rate into the safe
