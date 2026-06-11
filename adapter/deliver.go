@@ -63,6 +63,19 @@ const (
 	// dropRateThreshold: when the recent drop rate exceeds this,
 	// reduce backpressure to avoid stalling the readLoop.
 	dropRateThreshold = 0.1 // 10%
+
+	// stream1MaxBackpressure is the wait window before dropping a
+	// stream-1 frame. Stream-1 carries reliable bidi RPC: the caller
+	// blocks on its reply channel up to the full callerRequestTTL
+	// (Library/dispatch/hwp_dispatch.go: 30s) waiting for a response.
+	// A silent drop here desynchronises caller and credit accounting
+	// and produces a 30s deadline-exceeded sample with no retry. Pay
+	// a per-call latency penalty of waiting up to 1s rather than
+	// burning the 30s deadline. The readLoop still services other
+	// streams — a 1s blip on stream-1 under transient load is far
+	// cheaper than the silent 30s RPC timeouts ws_same-origin p99
+	// has been pinned to. See workflow wd4zasivv synthesis.
+	stream1MaxBackpressure = 1 * time.Second
 )
 
 // DeliverToRecvCh delivers a payload to a stream's receive channel with
@@ -148,6 +161,14 @@ func DeliverToRecvChWithSignals(
 		}
 	}
 
+	// Stream-1 carries reliable bidi RPC. Override the adaptive wait
+	// with a much longer ceiling so a transient recvCh full does NOT
+	// translate into a 30s deadline-exceeded on the caller. See the
+	// comment on stream1MaxBackpressure above.
+	if streamID == 1 {
+		wait = stream1MaxBackpressure
+	}
+
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	select {
@@ -212,7 +233,12 @@ func dropGrantCredit(window *flow.StreamWindow, payload []byte, streamID uint64,
 //     with stream-1 (RPC) under WS's single-conn write path. 32 slots
 //     gives ~2× headroom for a single full-snapshot burst at the cost
 //     of an extra ~1 MB worst-case buffer per peer.)
-//   - RPC (1): 32 slots (up to 3 parallel probes, 10× headroom)
+//   - RPC (1): 128 slots (was 32 — bumped after wd4zasivv synthesis
+//     showed cross-region ws_same-origin sessions running 8-11 active
+//     parallel streams saturated the 32-slot channel during burst,
+//     forcing stream-1 into the drop path and producing 30s RPC
+//     timeouts. 128 slots gives ~16× headroom for realistic concurrency
+//     at the cost of an extra ~24 KB worst-case buffer per peer.)
 //   - Keepalive (2): 4 slots (1 ping per 10-30s)
 //   - Control (3): 4 slots (infrequent handshake)
 //   - Dynamic (10+): 8 slots (one-shot request/response)
@@ -221,7 +247,7 @@ func recvChCapacity(streamID uint64) int {
 	case 0:
 		return 32
 	case 1:
-		return 32
+		return 128
 	case 2:
 		return 4
 	case 3:
