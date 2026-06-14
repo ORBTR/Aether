@@ -80,11 +80,11 @@ func SignatureMessage(staticPub []byte) [32]byte {
 // from an older build that didn't stamp it). New initiator/responder paths
 // always stamp a non-zero value.
 type NodeInfo struct {
-	NodeID        string `json:"node_id"`
-	PubKey        []byte `json:"ed25519_pub"`
+	NodeID        string `json:"nodeId"`
+	PubKey        []byte `json:"ed25519Pub"`
 	Signature     []byte `json:"sig"`
 	Caps          uint32 `json:"caps,omitempty"`
-	MaxAckDelayUS uint32 `json:"max_ack_delay_us,omitempty"`
+	MaxAckDelayUS uint32 `json:"maxAckDelayUs,omitempty"`
 }
 
 // EncodeNodeInfo creates a signed NodeInfo payload for handshake exchange.

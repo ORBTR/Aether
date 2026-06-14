@@ -271,13 +271,19 @@ func NewTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 // implementation. Adapter-specific responsibilities stay here:
 // structural validation gate + abuse-on-malformed + per-frame logging.
 func (s *TCPSession) readLoop() {
-	defer s.CloseWithError(fmt.Errorf("readLoop exited"))
+	// exitErr carries the real ReadNextFrame failure (or nil on clean
+	// EOF) into the deferred CloseWithError, so [SESSION-CLOSE]
+	// reason= surfaces the actual transport/decode error instead of a
+	// generic "readLoop exited" placeholder that masked the cause.
+	var exitErr error
+	defer func() { s.CloseWithError(exitErr) }()
 	for {
 		frame, _, batch, err := aether.ReadNextFrame(s.conn, s.compressor)
 		if err != nil {
 			dbgTCP.Printf("readLoop: EXIT err=%v remote=%s", err, s.RemoteNodeID().Short())
 			if err != io.EOF {
 				s.SetCloseErr(err)
+				exitErr = err
 			}
 			return
 		}
@@ -447,6 +453,17 @@ func (s *TCPSession) registerStream(st *tcpStream, enforceRemoteCap bool) *tcpSt
 		s.streamGC.Register(st.streamID)
 	}
 	return st
+}
+
+// unregisterStream undoes registerStream — removes the stream from the
+// session map and the GC tracker. Paired rollback for OpenStream's
+// commit/rollback flow when a post-registration step (writeFrame, etc.)
+// fails. Idempotent; safe to call even if the stream was never inserted.
+func (s *TCPSession) unregisterStream(streamID uint64) {
+	s.mu.Lock()
+	delete(s.streams, streamID)
+	s.mu.Unlock()
+	s.releaseStream(streamID)
 }
 
 // StreamRefusedCount returns the number of peer-initiated stream opens
@@ -699,7 +716,7 @@ func (s *TCPSession) writeLoop() {
 	ticker := time.NewTicker(2 * time.Millisecond)
 	defer ticker.Stop()
 	wake := s.sched.WakeCh()
-	var consecutiveFails int
+	var consecutiveWriteFailures int
 	for {
 		select {
 		case <-s.CloseSignal():
@@ -745,11 +762,11 @@ func (s *TCPSession) writeLoop() {
 				s.writeMu.Unlock()
 				if err != nil {
 					dbgTCP.Printf("writeLoop: batch err=%v count=%d", err, len(batch))
-					if s.bumpWriteFailLocked(&consecutiveFails, err) {
+					if s.bumpWriteFailLocked(&consecutiveWriteFailures, err) {
 						return
 					}
 				} else {
-					consecutiveFails = 0
+					consecutiveWriteFailures = 0
 				}
 				continue
 			}
@@ -763,11 +780,11 @@ func (s *TCPSession) writeLoop() {
 		}
 		if err := s.writeFrame(frame); err != nil {
 			dbgTCP.Printf("writeLoop: writeFrame err=%v stream=%d", err, frame.StreamID)
-			if s.bumpWriteFailLocked(&consecutiveFails, err) {
+			if s.bumpWriteFailLocked(&consecutiveWriteFailures, err) {
 				return
 			}
 		} else {
-			consecutiveFails = 0
+			consecutiveWriteFailures = 0
 		}
 	}
 }
@@ -775,9 +792,9 @@ func (s *TCPSession) writeLoop() {
 // writeFailTolerance bounds how many consecutive non-temporary write
 // failures writeLoop tolerates before tearing down the session. Picked
 // to ride out a small burst of transient errors (rebind, ARP refresh)
-// without sacrificing fail-fast on a genuinely broken conn — 3 attempts
-// at ~2 ms tick interval is ~6 ms before close.
-const writeFailTolerance = 3
+// without sacrificing fail-fast on a genuinely broken conn — 5 attempts
+// at ~2 ms tick interval is ~10 ms before close.
+const writeFailTolerance = 5
 
 // bumpWriteFailLocked increments the per-session consecutive failure
 // counter. Returns true when writeLoop should exit (session closed via
@@ -785,8 +802,8 @@ const writeFailTolerance = 3
 // counter via the normal success path).
 //
 // "Locked" in the name refers to the writeLoop's exclusive ownership of
-// consecutiveFails — not a mutex; the counter is goroutine-local to
-// writeLoop.
+// consecutiveWriteFailures — not a mutex; the counter is goroutine-local
+// to writeLoop.
 func (s *TCPSession) bumpWriteFailLocked(counter *int, err error) bool {
 	if isTemporaryNetError(err) {
 		return false
@@ -884,6 +901,23 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 		}
 		return nil, fmt.Errorf("OpenStream cap=%d: %w", cap, aether.ErrStreamCapExhausted)
 	}
+
+	// committed flips to true after every post-registration step succeeds.
+	// Until then, the deferred rollback unwinds every side-effect that
+	// registerStream + attachGrantDebouncer + scheduler.Register + writeFrame
+	// installed. Repeated probes against a dying peer used to grow s.streams
+	// unboundedly because a writeFrame failure returned (nil, err) but left
+	// the map entry + GC + scheduler slot + grantDebouncer goroutine pinned.
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		st.teardown()
+		s.unregisterStream(cfg.StreamID)
+		st.closeRecvOnce()
+	}()
+
 	st.attachGrantDebouncer()
 
 	// Propagate cfg.LatencyClass — parity with the noise adapter so a
@@ -913,21 +947,10 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 		Payload:    openPayload,
 	}
 	if err := s.writeFrame(frame); err != nil {
-		// Rollback every registration that registerStream + Register +
-		// attachGrantDebouncer just performed. Without this, OpenStream
-		// returned (nil, err) but left s.streams + scheduler + streamGC +
-		// the grantDebouncer goroutine all pinned. Repeated probes
-		// against a dying peer grew s.streams unboundedly (was the
-		// H-TCP-OpenStream-Rollback finding).
-		st.teardown()
-		s.mu.Lock()
-		delete(s.streams, cfg.StreamID)
-		s.mu.Unlock()
-		s.releaseStream(cfg.StreamID)
-		st.closeRecvOnce()
 		return nil, fmt.Errorf("send SYN+DATA: %w", err)
 	}
 
+	committed = true
 	return st, nil
 }
 

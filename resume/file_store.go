@@ -28,7 +28,7 @@ type FileStore struct {
 // sanitised (sanitizePeerID is lossy — multiple distinct peer IDs
 // can collide onto the same filename).
 type fileEntry struct {
-	PeerID     string `json:"peer_id,omitempty"`
+	PeerID     string `json:"peerId,omitempty"`
 	TokenData  []byte `json:"token"`
 	SessionKey []byte `json:"key"`
 }

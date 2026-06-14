@@ -407,7 +407,7 @@ type CompositeACK struct {
 	// Optional extensions (present only if flagged)
 	ExtRanges     []SACKBlock // extended SACK ranges beyond bitmap window (max 8)
 	DroppedRanges []SACKBlock // ranges receiver has dropped (max 4)
-	LossRate      uint16      // loss% × 100 over last 256 packets (0-10000). Advisory only.
+	LossRate      uint16      // loss% × 100 over a sliding wall-clock window (default 5s, see reliability.DefaultLossWindow) of received-packet samples; 0-10000. Receiver gates emission on ACKEngine.HasWarmedUp() so the warmup-skew of a fixed-length ring (the previous 256-slot bool ring) is no longer present on the wire. Advisory only.
 	CEBytes       uint32      // ECN: cumulative bytes of CE-marked packets observed since last ACK
 	WindowCredit  uint64      // Cumulative stream-level WINDOW_UPDATE grant piggybacked on this ACK. Same semantics as the WINDOW_UPDATE frame payload: cumulative, not delta; sender's ApplyUpdate drops stale/duplicate values via the grantsReceived cursor.
 }

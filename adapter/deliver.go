@@ -27,11 +27,77 @@ type CongestionSignaler func(payload aether.CongestionPayload) error
 // DeliveryStats tracks per-stream delivery metrics for monitoring and
 // adaptive behavior. Counters are atomic for lock-free access from
 // the readLoop and monitoring goroutines.
+//
+// Per-stream-class breakout (Stream0*, Stream1*, StreamOther*) lets the
+// caller attribute drops/backpressure to gossip (stream-0), reliable
+// RPC (stream-1), or dynamic streams without growing the map by streamID.
+// This is the verification surface used to confirm whether a recvCh
+// capacity bump on a specific stream actually moves the needle: a fix
+// for stream-0 should show Stream0Dropped flattening while Stream1Dropped
+// and StreamOtherDropped continue to track their own pressure.
 type DeliveryStats struct {
 	Delivered    atomic.Int64 // frames successfully delivered to recvCh
 	Dropped      atomic.Int64 // frames dropped (recvCh full after backpressure)
 	Backpressure atomic.Int64 // frames that hit the slow path (recvCh was full initially)
 	BytesDropped atomic.Int64 // total bytes in dropped frames
+
+	// Per-stream-class counters. Mirror the aggregate fields above so the
+	// monitoring layer can compare a single class against its own total
+	// without dividing by guesswork.
+	Stream0Delivered    atomic.Int64 // gossip frames delivered
+	Stream0Dropped      atomic.Int64 // gossip frames dropped after backpressure
+	Stream0Backpressure atomic.Int64 // gossip frames that hit the slow path
+
+	Stream1Delivered    atomic.Int64 // reliable-RPC frames delivered
+	Stream1Dropped      atomic.Int64 // reliable-RPC frames dropped after backpressure
+	Stream1Backpressure atomic.Int64 // reliable-RPC frames that hit the slow path
+
+	StreamOtherDelivered    atomic.Int64 // keepalive/control/dynamic frames delivered
+	StreamOtherDropped      atomic.Int64 // keepalive/control/dynamic frames dropped
+	StreamOtherBackpressure atomic.Int64 // keepalive/control/dynamic frames slow-path
+}
+
+// recordDelivered increments the aggregate and per-stream-class delivered
+// counter for streamID.
+func (s *DeliveryStats) recordDelivered(streamID uint64) {
+	s.Delivered.Add(1)
+	switch streamID {
+	case 0:
+		s.Stream0Delivered.Add(1)
+	case 1:
+		s.Stream1Delivered.Add(1)
+	default:
+		s.StreamOtherDelivered.Add(1)
+	}
+}
+
+// recordBackpressure increments the aggregate and per-stream-class
+// backpressure counter for streamID.
+func (s *DeliveryStats) recordBackpressure(streamID uint64) {
+	s.Backpressure.Add(1)
+	switch streamID {
+	case 0:
+		s.Stream0Backpressure.Add(1)
+	case 1:
+		s.Stream1Backpressure.Add(1)
+	default:
+		s.StreamOtherBackpressure.Add(1)
+	}
+}
+
+// recordDropped increments the aggregate and per-stream-class dropped
+// counter for streamID.
+func (s *DeliveryStats) recordDropped(streamID uint64, nbytes int) {
+	s.Dropped.Add(1)
+	s.BytesDropped.Add(int64(nbytes))
+	switch streamID {
+	case 0:
+		s.Stream0Dropped.Add(1)
+	case 1:
+		s.Stream1Dropped.Add(1)
+	default:
+		s.StreamOtherDropped.Add(1)
+	}
 }
 
 // DropRate returns the fraction of frames dropped (0.0 to 1.0).
@@ -143,7 +209,7 @@ func DeliverToRecvChWithSignals(
 	select {
 	case recvCh <- payload:
 		if len(stats) > 0 && stats[0] != nil {
-			stats[0].Delivered.Add(1)
+			stats[0].recordDelivered(streamID)
 		}
 		return true
 	default:
@@ -154,7 +220,7 @@ func DeliverToRecvChWithSignals(
 	wait := maxBackpressure
 	sustained := false
 	if len(stats) > 0 && stats[0] != nil {
-		stats[0].Backpressure.Add(1)
+		stats[0].recordBackpressure(streamID)
 		if stats[0].DropRate() >= dropRateThreshold {
 			wait = minBackpressure // sustained overload — don't stall
 			sustained = true
@@ -174,7 +240,7 @@ func DeliverToRecvChWithSignals(
 	select {
 	case recvCh <- payload:
 		if len(stats) > 0 && stats[0] != nil {
-			stats[0].Delivered.Add(1)
+			stats[0].recordDelivered(streamID)
 		}
 		return true
 	case <-timer.C:
@@ -183,8 +249,7 @@ func DeliverToRecvChWithSignals(
 		// will never reach Receive(), so the debouncer won't see them).
 		dropGrantCredit(window, payload, streamID, sendUpdate)
 		if len(stats) > 0 && stats[0] != nil {
-			stats[0].Dropped.Add(1)
-			stats[0].BytesDropped.Add(int64(len(payload)))
+			stats[0].recordDropped(streamID, len(payload))
 		}
 		// Receiver-driven backpressure: signal the sender to slow down so
 		// future frames arrive at a pace the application can actually
@@ -227,12 +292,14 @@ func dropGrantCredit(window *flow.StreamWindow, payload []byte, streamID uint64,
 
 // recvChCapacity returns the receive channel buffer size for a given stream ID.
 // Sized per stream type to reduce maximum payload accumulation:
-//   - Gossip (0): 32 slots (full-sync IBLT bursts on WS-family adapters
-//     can saturate the original 16-slot channel during convergence,
-//     forcing readLoop into adaptive-backpressure stall that serializes
-//     with stream-1 (RPC) under WS's single-conn write path. 32 slots
-//     gives ~2× headroom for a single full-snapshot burst at the cost
-//     of an extra ~1 MB worst-case buffer per peer.)
+//   - Gossip (0): 128 slots (was 32 — a 32-slot channel paired with the
+//     2ms maxBackpressure ceiling cascaded into CongestionDownstream
+//     sev=80 reason=5 emissions on UDP, throttling the sender and
+//     surfacing as walker proving timeouts on noise-UDP edges. 128 slots
+//     gives ~4× headroom for a single full-snapshot IBLT burst at the
+//     cost of an extra ~3 MB worst-case buffer per peer. Verify with
+//     DeliveryStats.Stream0Dropped flattening post-deploy while
+//     Stream1Dropped / StreamOtherDropped track their own pressure.)
 //   - RPC (1): 128 slots (was 32 — bumped after wd4zasivv synthesis
 //     showed cross-region ws_same-origin sessions running 8-11 active
 //     parallel streams saturated the 32-slot channel during burst,
@@ -245,7 +312,7 @@ func dropGrantCredit(window *flow.StreamWindow, payload []byte, streamID uint64,
 func recvChCapacity(streamID uint64) int {
 	switch streamID {
 	case 0:
-		return 32
+		return 128
 	case 1:
 		return 128
 	case 2:
