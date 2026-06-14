@@ -30,7 +30,7 @@ type MDNSPeer struct {
 
 // MDNSAnnouncement is the data advertised via mDNS TXT records.
 type MDNSAnnouncement struct {
-	NodeID    string   `json:"node_id"`
+	NodeID    string   `json:"nodeId"`
 	Addresses []string `json:"addresses"`
 	Signature []byte   `json:"signature"` // ed25519 over "MDNS:v1:<nodeID>:<addrs>"
 }

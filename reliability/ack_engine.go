@@ -86,6 +86,30 @@ func DefaultACKPolicy() ACKPolicy {
 // declaring a gap as a loss (fast retransmit). Matches QUIC RFC 9002 §6.1.1.
 const ReorderThreshold = 3
 
+// Loss-rate sliding-window defaults. Replaces the previous fixed 256-slot
+// bool ring whose zero-init slots inflated apparent loss during warmup.
+// The window covers the last DefaultLossWindow of stream activity; the
+// warmup gate clears once DefaultLossMinSamples real samples are recorded
+// OR DefaultLossMinDuration of wall-clock has elapsed since engine
+// creation — whichever fires first. A bounded cap on the slice prevents
+// pathological growth on extremely high-rate streams between evictions.
+const (
+	DefaultLossWindow      = 5 * time.Second
+	DefaultLossMinSamples  = 32
+	DefaultLossMinDuration = 2 * time.Second
+	DefaultLossSampleCap   = 4096
+)
+
+// lossSample is one entry in the time-windowed loss ring. lost=false means
+// the packet was received (the OnDataReceived path is the only producer);
+// lost=true is reserved for the future gap-detection wiring that will feed
+// declared losses into the same window without inflating the denominator
+// the way the previous bool-ring did.
+type lossSample struct {
+	ts   time.Time
+	lost bool
+}
+
 // ACKEngine manages ACK generation for a single stream.
 type ACKEngine struct {
 	mu         sync.Mutex
@@ -96,10 +120,25 @@ type ACKEngine struct {
 	lastIdle   time.Time // last time stream was idle (for ACK-on-first-after-idle)
 	bitmapBits int       // current bitmap size (auto-scaled)
 
-	// Loss tracking for LossDensity extension
-	lossRing [256]bool // ring buffer: true=received, false=lost
-	ringHead uint8     // current position
-	received int       // count of received in ring
+	// Loss tracking for LossDensity extension.
+	//
+	// Time-windowed sample ring: each entry is (timestamp, lost). Samples
+	// older than lossWindow are evicted on read so the rate reflects the
+	// last lossWindow of traffic regardless of packet rate. The previous
+	// fixed 256-slot bool ring under-counted during warmup — first <256
+	// packets after engine creation always reported a loss rate skewed by
+	// the zero-init "lost" slots that had never received traffic.
+	//
+	// HasWarmedUp() gates downstream emission: callers must not surface
+	// LossRate to the wire (via CompositeACK LossDensity flag) until either
+	// lossMinSamples samples or lossMinDuration of stream lifetime have
+	// elapsed, whichever comes first.
+	lossSamples   []lossSample
+	lossSampleCap int
+	lossWindow    time.Duration
+	lossMinSamples int
+	lossMinDuration time.Duration
+	createdAt     time.Time
 
 	// Callback to send the ACK
 	sendACK func(ack *aether.CompositeACK)
@@ -129,11 +168,16 @@ type ACKEngine struct {
 // rttFn returns the current SRTT estimate — used for first-after-idle threshold.
 func NewACKEngine(rw *RecvWindow, policy ACKPolicy, sendFn func(*aether.CompositeACK), rttFn func() time.Duration) *ACKEngine {
 	e := &ACKEngine{
-		recvWindow: rw,
-		policy:     policy,
-		bitmapBits: 64,
-		sendACK:    sendFn,
-		rttFn:      rttFn,
+		recvWindow:      rw,
+		policy:          policy,
+		bitmapBits:      64,
+		sendACK:         sendFn,
+		rttFn:           rttFn,
+		lossWindow:      DefaultLossWindow,
+		lossSampleCap:   DefaultLossSampleCap,
+		lossMinSamples:  DefaultLossMinSamples,
+		lossMinDuration: DefaultLossMinDuration,
+		createdAt:       time.Now(),
 	}
 	return e
 }
@@ -161,10 +205,10 @@ func (e *ACKEngine) OnDataReceived(seqNo uint32, isControlStream bool) {
 	dbgACK.Printf("OnDataReceived seq=%d control=%v pending=%d buffered=%d maxPackets=%d",
 		seqNo, isControlStream, e.pending, e.recvWindow.BufferedCount(), e.policy.MaxPackets)
 
-	// Track loss in ring buffer
-	e.lossRing[e.ringHead] = true
-	e.ringHead++
-	e.received++
+	// Record a received-packet sample in the time-windowed loss ring.
+	// Eviction is lazy (done on read) but a hard cap protects against
+	// unbounded growth on extreme rates between evictions.
+	e.recordLossSampleLocked(false)
 
 	// Rule 1: Gap detected → immediate ACK
 	if e.policy.ImmOnGap && e.recvWindow.BufferedCount() > 0 {
@@ -262,22 +306,93 @@ func (e *ACKEngine) BuildCompositeACK() *aether.CompositeACK {
 	return e.buildLocked()
 }
 
-// LossRate returns the current loss rate over the last 256 packets (0-10000).
+// LossRate returns the current loss rate over the sliding lossWindow
+// (0-10000, where 10000 = 100%). Returns 0 before the engine has warmed
+// up; callers wanting the warmup signal directly should use HasWarmedUp.
 func (e *ACKEngine) LossRate() uint16 {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.received <= 0 {
+	if !e.hasWarmedUpLocked() {
 		return 0
 	}
-	// Count received in ring
-	recv := 0
-	for _, r := range e.lossRing {
-		if r {
-			recv++
+	return e.lossRateLocked()
+}
+
+// HasWarmedUp reports whether the loss-rate estimator has accumulated
+// enough samples (or enough wall-clock time) to produce a meaningful
+// rate. Callers should suppress LossDensity-flagged emissions until this
+// returns true to avoid the warmup-skew that the previous fixed-size
+// bool-ring exhibited during the first <256 packets after engine
+// creation.
+func (e *ACKEngine) HasWarmedUp() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.hasWarmedUpLocked()
+}
+
+// recordLossSampleLocked appends one (now, lost) sample and trims any
+// samples that fell out of the sliding window. Caller must hold e.mu.
+func (e *ACKEngine) recordLossSampleLocked(lost bool) {
+	now := time.Now()
+	e.lossSamples = append(e.lossSamples, lossSample{ts: now, lost: lost})
+	e.evictLossSamplesLocked(now)
+	// Hard cap: drop oldest if pathological growth slips past eviction
+	// (e.g. clock skew, extreme burst). Preserves the most recent window
+	// even if the timestamps lie about age.
+	if e.lossSampleCap > 0 && len(e.lossSamples) > e.lossSampleCap {
+		drop := len(e.lossSamples) - e.lossSampleCap
+		e.lossSamples = append(e.lossSamples[:0], e.lossSamples[drop:]...)
+	}
+}
+
+// evictLossSamplesLocked drops entries older than lossWindow relative to
+// the supplied "now". A linear scan from the head is fine because the
+// slice is time-ordered (append-only) and the cap keeps it small.
+func (e *ACKEngine) evictLossSamplesLocked(now time.Time) {
+	if e.lossWindow <= 0 || len(e.lossSamples) == 0 {
+		return
+	}
+	cutoff := now.Add(-e.lossWindow)
+	idx := 0
+	for idx < len(e.lossSamples) && e.lossSamples[idx].ts.Before(cutoff) {
+		idx++
+	}
+	if idx > 0 {
+		e.lossSamples = append(e.lossSamples[:0], e.lossSamples[idx:]...)
+	}
+}
+
+// hasWarmedUpLocked is the unlocked variant of HasWarmedUp. Caller must
+// hold e.mu. True once either sample count or elapsed wall-clock crosses
+// its threshold — whichever comes first — so short bursts at warmup AND
+// long-running idle streams both produce a usable signal.
+func (e *ACKEngine) hasWarmedUpLocked() bool {
+	if e.lossMinSamples > 0 && len(e.lossSamples) >= e.lossMinSamples {
+		return true
+	}
+	if e.lossMinDuration > 0 && !e.createdAt.IsZero() &&
+		time.Since(e.createdAt) >= e.lossMinDuration {
+		return true
+	}
+	return false
+}
+
+// lossRateLocked computes the current loss rate (0-10000) over the
+// in-window samples. Returns 0 if the window is empty so the caller's
+// warmup gate is the only suppression source. Caller must hold e.mu.
+func (e *ACKEngine) lossRateLocked() uint16 {
+	e.evictLossSamplesLocked(time.Now())
+	n := len(e.lossSamples)
+	if n == 0 {
+		return 0
+	}
+	lost := 0
+	for i := range e.lossSamples {
+		if e.lossSamples[i].lost {
+			lost++
 		}
 	}
-	missed := 256 - recv
-	return uint16(missed * 10000 / 256)
+	return uint16(lost * 10000 / n)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -385,17 +500,16 @@ func (e *ACKEngine) buildLocked() *aether.CompositeACK {
 		}
 	}
 
-	// Loss density (advisory) — compute inline to avoid deadlock (mu already held)
-	recv := 0
-	for _, r := range e.lossRing {
-		if r {
-			recv++
+	// Loss density (advisory) — gated on warmup so the early-stream
+	// undersample skew (the old fixed-256 bool ring inflated loss for the
+	// first <256 packets) cannot leak onto the wire. Computed inline to
+	// avoid re-entering LossRate() while e.mu is already held.
+	if e.hasWarmedUpLocked() {
+		lossRate := e.lossRateLocked()
+		if lossRate > 0 {
+			ack.LossRate = lossRate
+			ack.Flags |= aether.CACKHasLossDensity
 		}
-	}
-	lossRate := uint16((256 - recv) * 10000 / 256)
-	if lossRate > 0 {
-		ack.LossRate = lossRate
-		ack.Flags |= aether.CACKHasLossDensity
 	}
 
 	// Window-credit piggyback. If the stream window has granted new
