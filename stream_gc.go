@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package aether
 
@@ -10,12 +10,19 @@ import (
 )
 
 // DefaultStreamIdleTimeout is the duration after which an idle stream is auto-reset.
-// Control streams (0-3) are exempt from idle timeout.
+// Well-known streams (IDs < StreamGCExemptBelow, i.e. 0-9) are exempt from idle timeout.
 const DefaultStreamIdleTimeout = 5 * time.Minute
+
+// StreamGCExemptBelow is the exclusive upper bound of stream IDs exempt from idle GC.
+// AE-I-02: single source of truth for the sweep() exemption boundary so the code and
+// docs cannot drift. Streams with ID < StreamGCExemptBelow (0-9) are well-known protocol
+// streams (gossip, RPC, keepalive, control) and are never idle-reset; dynamic application
+// streams use higher IDs.
+const StreamGCExemptBelow = 10
 
 // StreamGC garbage-collects idle streams to prevent resource leaks.
 // Streams with no Send/Receive activity for StreamIdleTimeout are auto-RESET.
-// Well-known streams (0-3) are exempt.
+// Well-known streams (IDs < StreamGCExemptBelow, i.e. 0-9) are exempt.
 type StreamGC struct {
 	mu           sync.Mutex
 	lastActivity map[uint64]time.Time // streamID → last activity timestamp
@@ -89,10 +96,10 @@ func (g *StreamGC) sweep() {
 	now := time.Now()
 	var expired []uint64
 	for streamID, lastSeen := range g.lastActivity {
-		// Exempt low stream IDs (protocol-level streams assigned by consumer).
-		// Consumers typically use IDs 0-9 for core functions (gossip, RPC,
-		// keepalive, control). Dynamic application streams use higher IDs.
-		if streamID < 10 {
+		// AE-I-02: exempt well-known low stream IDs (gossip, RPC, keepalive,
+		// control). Boundary lives in StreamGCExemptBelow so sweep() and the
+		// type/const docs stay in sync. Dynamic application streams use higher IDs.
+		if streamID < StreamGCExemptBelow {
 			continue
 		}
 		if now.Sub(lastSeen) > g.idleTimeout {

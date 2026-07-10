@@ -1,10 +1,11 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package adapter
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -24,6 +25,12 @@ const (
 	fragMagic1     byte = 0x52 // 'R'
 	fragHeaderSize      = 4    // magic(2) + index(1) + total(1)
 	fragTimeout         = 10 * time.Second
+
+	// MaxFragments is the hard ceiling on fragments per message. The
+	// on-wire index/total header fields are single bytes, so a message
+	// can span at most 255 fragments; SplitPayload rejects anything
+	// larger rather than silently truncating it (AE-H-03).
+	MaxFragments = 255
 
 	// MaxGroupsPerStream caps the number of concurrent fragment groups
 	// being reassembled on a single stream. Without this, a peer sending
@@ -56,22 +63,36 @@ const (
 	DefaultFragGroupMaxAge = 30 * time.Second
 )
 
+// ErrPayloadTooLarge is returned by SplitPayload (and surfaced by
+// noiseStream.Send) when a payload cannot be represented within
+// MaxFragments fragments at the current MSS. Callers must chunk at the
+// application layer or fail loudly — the alternative (silent tail
+// truncation) corrupts the message with no error on either end (AE-H-03).
+var ErrPayloadTooLarge = errors.New("aether: payload exceeds maximum fragment count")
+
 // SplitPayload splits a large payload into MSS-sized fragments.
 // Each fragment carries a 4-byte header: [magic:2][index:1][total:1].
-// Returns nil if the payload fits in a single frame (no fragmentation needed).
-func SplitPayload(data []byte, maxPayload int) [][]byte {
+// Returns (nil, nil) if the payload fits in a single frame (no
+// fragmentation needed).
+//
+// AE-H-03: the on-wire total field is a single byte, so a message can span
+// at most MaxFragments (255) fragments. A payload that would need more
+// returns (nil, ErrPayloadTooLarge) rather than being silently truncated to
+// its first 255 fragments — the caller must chunk at the application layer
+// or fail loudly instead of shipping a corrupted (short) message.
+func SplitPayload(data []byte, maxPayload int) ([][]byte, error) {
 	if maxPayload <= fragHeaderSize {
 		maxPayload = 1200 // safe default
 	}
 	chunkSize := maxPayload - fragHeaderSize
 	if len(data) <= maxPayload {
-		return nil // no fragmentation needed
+		return nil, nil // no fragmentation needed
 	}
 
 	total := (len(data) + chunkSize - 1) / chunkSize
-	if total > 255 {
-		total = 255 // cap at 255 fragments (~306KB at 1200 byte chunks)
-		data = data[:255*chunkSize]
+	if total > MaxFragments {
+		return nil, fmt.Errorf("%w: %d bytes needs %d fragments at %d-byte chunks (max %d)",
+			ErrPayloadTooLarge, len(data), total, chunkSize, MaxFragments)
 	}
 
 	fragments := make([][]byte, total)
@@ -91,7 +112,7 @@ func SplitPayload(data []byte, maxPayload int) [][]byte {
 		copy(frag[fragHeaderSize:], chunk)
 		fragments[i] = frag
 	}
-	return fragments
+	return fragments, nil
 }
 
 // IsFragment returns true if the payload starts with the fragment magic.
@@ -224,6 +245,15 @@ func (fb *FragmentBuffer) Add(streamID uint64, seqNo uint32, data []byte) ([]byt
 			if ageCap > 0 && now.Sub(g.created) > ageCap {
 				fb.bufferedBytes -= g.bytes
 				delete(st.groups, k)
+				// AE-L-02: if the pruned group is the one currently being
+				// assembled, clear hasCurr/current too. Otherwise a delayed
+				// index>0 fragment takes the ss.current branch, finds no
+				// group, and instantiates a corrupt never-completing group
+				// under the stale key. Mirrors the completion-path cleanup.
+				if st.hasCurr && k == st.current {
+					st.hasCurr = false
+					st.current = 0
+				}
 			}
 		}
 		if len(st.groups) == 0 && sid != streamID {

@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package reliability
 
@@ -111,5 +111,106 @@ func TestSendWindow_GetEntry(t *testing.T) {
 	// Non-existent SeqNo
 	if w.GetEntry(99) != nil {
 		t.Error("GetEntry(99) should return nil")
+	}
+}
+
+// fillWindow adds n frames (seq 0..n-1) to a fresh window sized maxSize.
+func fillWindow(t *testing.T, maxSize, n int) *SendWindow {
+	t.Helper()
+	w := NewSendWindow(maxSize)
+	for i := 0; i < n; i++ {
+		w.Add(&aether.Frame{Type: aether.TypeDATA})
+	}
+	if got := w.InFlight(); got != n {
+		t.Fatalf("setup: InFlight()=%d, want %d", got, n)
+	}
+	return w
+}
+
+// bitmap4 returns a 4-byte bitmap with the given bit indices set. Bit i
+// corresponds to seq BaseACK+1+i (matching ProcessCompositeACK's scan).
+func bitmap4(bits ...int) []byte {
+	b := make([]byte, 4)
+	for _, i := range bits {
+		b[i/8] |= 1 << (uint(i) % 8)
+	}
+	return b
+}
+
+// TestProcessCompositeACK_NoSpuriousNACKAboveLargestAcked is the AE-H-09
+// regression: an in-flight seq ABOVE the highest SACKed seq must not be
+// implicitly NACKed. Pre-fix, int(largestAcked-seqNo) underflowed uint32
+// to ~4e9 and spuriously NACKed the whole in-flight tail on every gapped ACK.
+func TestProcessCompositeACK_NoSpuriousNACKAboveLargestAcked(t *testing.T) {
+	w := fillWindow(t, 64, 20) // seq 0..19 in flight, next=20
+
+	// BaseACK=10, bitmap marks seq12 (bit 1) and seq13 (bit 2) received.
+	// largestAcked becomes 13; seq14..19 are still legitimately in flight.
+	ack := &aether.CompositeACK{BaseACK: 10, Bitmap: bitmap4(1, 2)}
+	acked, nacks := w.ProcessCompositeACK(ack, ReorderThreshold)
+
+	if len(nacks) != 0 {
+		t.Fatalf("nacks=%v, want empty (seq14..19 above largestAcked must NOT be NACKed)", nacks)
+	}
+	if len(acked) == 0 {
+		t.Fatalf("acked is empty, want the cumulative + bitmap acks")
+	}
+
+	// seq12,13 acked and removed; seq11 still present (gap distance 2 < 3).
+	if w.GetEntry(12) != nil {
+		t.Errorf("seq12 should be acked+removed")
+	}
+	if w.GetEntry(13) != nil {
+		t.Errorf("seq13 should be acked+removed")
+	}
+	if w.GetEntry(11) == nil {
+		t.Errorf("seq11 should still be in flight (below reorder threshold)")
+	}
+	// Remaining in flight: seq 11,14,15,16,17,18,19 == 7.
+	if got := w.InFlight(); got != 7 {
+		t.Errorf("InFlight()=%d, want 7", got)
+	}
+	if got := w.Base(); got != 11 {
+		t.Errorf("Base()=%d, want 11", got)
+	}
+}
+
+// TestProcessCompositeACK_HighBitDoesNotInflateLargestAcked exercises the
+// first-pass bound: a peer setting a bit at/beyond largestSent must not push
+// largestAcked past w.next and thereby widen the NACK range.
+func TestProcessCompositeACK_HighBitDoesNotInflateLargestAcked(t *testing.T) {
+	w := fillWindow(t, 64, 20) // seq 0..19 in flight, next=20
+
+	// 32-byte bitmap with only bit 250 set (seqNo 261, far beyond next=20).
+	bm := make([]byte, 32)
+	bm[250/8] |= 1 << (uint(250) % 8)
+	ack := &aether.CompositeACK{BaseACK: 10, Bitmap: bm}
+
+	_, nacks := w.ProcessCompositeACK(ack, ReorderThreshold)
+	if len(nacks) != 0 {
+		t.Fatalf("nacks=%v, want empty (high bit must not inflate largestAcked)", nacks)
+	}
+}
+
+// TestProcessCompositeACK_GenuineReorderStillNACKs proves the guard narrows
+// only spurious wrap NACKs — a real gap below largestAcked still NACKs.
+func TestProcessCompositeACK_GenuineReorderStillNACKs(t *testing.T) {
+	w := fillWindow(t, 64, 20) // seq 0..19 in flight, next=20
+
+	// BaseACK=10, seq15 received (bit 4). largestAcked=15.
+	// seq11 (dist 4) and seq12 (dist 3) exceed ReorderThreshold(3) -> NACK.
+	// seq13 (dist 2), seq14 (dist 1) below threshold; seq16..19 above
+	// largestAcked -> not NACKed.
+	ack := &aether.CompositeACK{BaseACK: 10, Bitmap: bitmap4(4)}
+	_, nacks := w.ProcessCompositeACK(ack, ReorderThreshold)
+
+	want := []uint32{11, 12}
+	if len(nacks) != len(want) {
+		t.Fatalf("nacks=%v, want %v", nacks, want)
+	}
+	for i, seq := range want {
+		if nacks[i] != seq {
+			t.Fatalf("nacks=%v, want %v", nacks, want)
+		}
 	}
 }

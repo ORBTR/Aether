@@ -1,8 +1,8 @@
 //go:build !js
 
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 
 package noise
@@ -102,24 +102,60 @@ func TestSeenTicketCache_ReplayRejection(t *testing.T) {
 	cache := newSeenTicketCache(16)
 	nonce := []byte{0xAA, 0xBB, 0xCC, 0xDD}
 
-	if !cache.MarkOrReject(nonce) {
+	live := time.Now().Add(time.Hour)
+	if !cache.MarkOrReject(nonce, live) {
 		t.Errorf("first MarkOrReject should admit")
 	}
-	if cache.MarkOrReject(nonce) {
+	if cache.MarkOrReject(nonce, live) {
 		t.Errorf("second MarkOrReject of same nonce should reject")
 	}
 	// Different nonce admits.
 	other := []byte{0x11, 0x22, 0x33, 0x44}
-	if !cache.MarkOrReject(other) {
+	if !cache.MarkOrReject(other, live) {
 		t.Errorf("different nonce should admit")
 	}
 }
 
-// TestBuildInitiatorCipherStates verifies raw keys round-trip through
+// TestSeenTicketCache_LiveNonceNeverForgotten_AEM11 is the AE-M-11 regression:
+// a nonce whose ticket is still within TTL must never be evicted, regardless of
+// how many novel live nonces flood the cache afterwards. Under the old
+// unconditional-FIFO eviction the victim nonce would be dropped at c.max and its
+// replay re-admitted, letting an on-path attacker hijack the peer mapping.
+func TestSeenTicketCache_LiveNonceNeverForgotten_AEM11(t *testing.T) {
+	cache := newSeenTicketCache(4) // small cap to force the full branch
+	live := time.Now().Add(time.Hour)
+	victim := []byte{0x01, 0x02, 0x03, 0x04}
+	if !cache.MarkOrReject(victim, live) {
+		t.Fatalf("victim nonce should admit first time")
+	}
+	// Flood with many novel, still-live nonces. Under the old FIFO eviction the
+	// victim nonce would be evicted at c.max and its replay re-admitted.
+	for i := 0; i < 32; i++ {
+		cache.MarkOrReject([]byte{0xF0, byte(i)}, live)
+	}
+	// Victim ticket is still within TTL — its replay MUST be rejected.
+	if cache.MarkOrReject(victim, live) {
+		t.Errorf("AE-M-11: live victim nonce was forgotten; resume replay admitted")
+	}
+}
+
+// TestSeenTicketCache_EvictsExpiredToAdmitNovel proves expired nonces are still
+// reclaimed so a cache full of dead entries does not permanently wedge resumes.
+func TestSeenTicketCache_EvictsExpiredToAdmitNovel(t *testing.T) {
+	cache := newSeenTicketCache(2)
+	past := time.Now().Add(-time.Minute)
+	cache.MarkOrReject([]byte{1}, past)
+	cache.MarkOrReject([]byte{2}, past)
+	if !cache.MarkOrReject([]byte{3}, time.Now().Add(time.Hour)) {
+		t.Errorf("novel nonce should admit after expired entries are evicted")
+	}
+}
+
+// TestBuildResumeCipherStates verifies keys round-trip through
 // flynn/noise's UnsafeNewCipherState. The recovered CipherStates must
 // be able to Encrypt/Decrypt each other's output symmetrically — that's
 // the whole point of resumption.
-func TestBuildInitiatorCipherStates(t *testing.T) {
+func TestBuildResumeCipherStates(t *testing.T) {
 	var sendKey, recvKey [32]byte
 	for i := range sendKey {
 		sendKey[i] = byte(i + 1)
@@ -128,13 +164,13 @@ func TestBuildInitiatorCipherStates(t *testing.T) {
 
 	// Peer A uses (sendKey, recvKey). Peer B's perspective swaps them
 	// so A→B encrypted with A's send can be decrypted with B's recv.
-	aSend, aRecv, err := buildInitiatorCipherStates(sendKey, recvKey)
+	aSend, aRecv, err := buildResumeCipherStates(sendKey, recvKey)
 	if err != nil {
-		t.Fatalf("buildInitiatorCipherStates A: %v", err)
+		t.Fatalf("buildResumeCipherStates A: %v", err)
 	}
-	bSend, bRecv, err := buildInitiatorCipherStates(recvKey, sendKey)
+	bSend, bRecv, err := buildResumeCipherStates(recvKey, sendKey)
 	if err != nil {
-		t.Fatalf("buildInitiatorCipherStates B: %v", err)
+		t.Fatalf("buildResumeCipherStates B: %v", err)
 	}
 
 	// A encrypts with aSend; B decrypts with bRecv.

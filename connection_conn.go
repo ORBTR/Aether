@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package aether
 
@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -16,11 +17,15 @@ import (
 // Bridges the Send/Receive API to Read/Write for sessions that don't
 // natively expose a net.Conn (QUIC, gRPC).
 type ConnectionConn struct {
-	conn  Connection
-	buf      []byte
-	mu       sync.Mutex
-	closed   bool
-	deadline time.Time
+	conn   Connection
+	buf    []byte
+	mu     sync.Mutex // guards closed
+	readMu sync.Mutex // AE-L-15: serialises Read so concurrent readers cannot race on buf
+	closed bool
+	// AE-L-15: read by Read/Write while SetDeadline may write from another
+	// goroutine (net.Conn allows concurrent SetDeadline vs Read/Write); time.Time
+	// is multi-word, so store it atomically to avoid a torn read.
+	deadline atomic.Pointer[time.Time]
 }
 
 // NewConnectionConn wraps any Session into a net.Conn.
@@ -33,6 +38,9 @@ func NewConnectionConn(conn Connection) *ConnectionConn {
 func (c *ConnectionConn) NetConn() net.Conn { return c }
 
 func (c *ConnectionConn) Read(p []byte) (int, error) {
+	c.readMu.Lock() // AE-L-15: serialise readers to protect c.buf
+	defer c.readMu.Unlock()
+
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -49,9 +57,9 @@ func (c *ConnectionConn) Read(p []byte) (int, error) {
 
 	// Receive new message with optional deadline
 	ctx := context.Background()
-	if !c.deadline.IsZero() {
+	if dl := c.deadline.Load(); dl != nil && !dl.IsZero() { // AE-L-15: atomic deadline read
 		var cancel context.CancelFunc
-		timeout := time.Until(c.deadline)
+		timeout := time.Until(*dl)
 		if timeout <= 0 {
 			return 0, &net.OpError{Op: "read", Err: context.DeadlineExceeded}
 		}
@@ -80,9 +88,9 @@ func (c *ConnectionConn) Write(p []byte) (int, error) {
 	c.mu.Unlock()
 
 	ctx := context.Background()
-	if !c.deadline.IsZero() {
+	if dl := c.deadline.Load(); dl != nil && !dl.IsZero() { // AE-L-15: atomic deadline read
 		var cancel context.CancelFunc
-		timeout := time.Until(c.deadline)
+		timeout := time.Until(*dl)
 		if timeout <= 0 {
 			return 0, &net.OpError{Op: "write", Err: context.DeadlineExceeded}
 		}
@@ -106,16 +114,19 @@ func (c *ConnectionConn) Close() error {
 func (c *ConnectionConn) LocalAddr() net.Addr  { return &net.TCPAddr{} }
 func (c *ConnectionConn) RemoteAddr() net.Addr { return c.conn.RemoteAddr() }
 
+// SetDeadline stores the deadline atomically; net.Conn permits it to be called
+// concurrently with an in-flight Read/Write, and time.Time is multi-word, so a
+// plain field write would tear against the Read/Write reads (AE-L-15).
 func (c *ConnectionConn) SetDeadline(t time.Time) error {
-	c.deadline = t
+	c.deadline.Store(&t)
 	return nil
 }
 func (c *ConnectionConn) SetReadDeadline(t time.Time) error {
-	c.deadline = t
+	c.deadline.Store(&t) // AE-L-15: atomic deadline write
 	return nil
 }
 func (c *ConnectionConn) SetWriteDeadline(t time.Time) error {
-	c.deadline = t
+	c.deadline.Store(&t) // AE-L-15: atomic deadline write
 	return nil
 }
 

@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 
 // Package resume implements 0-RTT session resumption for Aether.
@@ -78,7 +78,14 @@ func DecodeToken(data []byte) (*Token, error) {
 	return t, nil
 }
 
-// Validate checks the token's HMAC and age.
+// Validate checks the token's HMAC and age ONLY.
+//
+// AE-P-29: Validate does NOT provide replay / single-use protection — a
+// captured, still-valid token passes Validate on every presentation for the
+// full MaxTokenAge window. Any 0-RTT path that wires this Store/Token
+// mechanism MUST call ValidateOnce with a shared SeenTokenSet instead, so a
+// replayed token is rejected (the production noise/session_resume.go path
+// already enforces this via seenTicketCache.MarkOrReject).
 func (t *Token) Validate(sessionKey []byte) error {
 	// Check age
 	created := time.Unix(int64(t.Timestamp), 0)
@@ -93,6 +100,89 @@ func (t *Token) Validate(sessionKey []byte) error {
 	}
 
 	return nil
+}
+
+// ValidateOnce verifies the token (age + HMAC, via Validate) and then enforces
+// single-use by consuming the token's SessionID against a bounded, TTL-evicting
+// seen-set. A token that verifies but whose SessionID has already been consumed
+// (a replay) is rejected. The SessionID is a fresh 8-byte random value per
+// GenerateToken, so it serves as the de-dup nonce without a wire-format change.
+//
+// AE-P-29: this is the replay-safe entry point wired 0-RTT resumption must use.
+// seen is retained/pruned by token expiry (created+MaxTokenAge), never by a
+// blind count, so the 24h capability is preserved and a full window of live
+// tokens cannot be silently forgotten (fail-closed when full).
+func (t *Token) ValidateOnce(sessionKey []byte, seen *SeenTokenSet) error {
+	if err := t.Validate(sessionKey); err != nil {
+		return err
+	}
+	if seen == nil {
+		return fmt.Errorf("resume: ValidateOnce requires a non-nil SeenTokenSet")
+	}
+	created := time.Unix(int64(t.Timestamp), 0)
+	if !seen.markOrReject(t.SessionID, created.Add(MaxTokenAge)) {
+		return fmt.Errorf("resume: token replay rejected (SessionID already consumed)")
+	}
+	return nil
+}
+
+// DefaultSeenTokenSetSize bounds the single-use resume-token seen-set.
+const DefaultSeenTokenSetSize = 16384
+
+// SeenTokenSet records consumed resume-token SessionIDs to enforce single-use.
+// It is bounded and evicts only entries whose tokens have already expired
+// (forgetting an expired token can never enable a replay — Validate rejects it
+// on age); when full of still-live entries it fails closed (rejects) rather
+// than forget a live one. Mirrors noise/session_resume.go's seenTicketCache.
+type SeenTokenSet struct {
+	mu    sync.Mutex
+	seen  map[[8]byte]time.Time
+	order [][8]byte
+	max   int
+}
+
+// NewSeenTokenSet creates a bounded single-use seen-set. max<=0 uses the default.
+func NewSeenTokenSet(max int) *SeenTokenSet {
+	if max <= 0 {
+		max = DefaultSeenTokenSetSize
+	}
+	return &SeenTokenSet{seen: make(map[[8]byte]time.Time), max: max}
+}
+
+// markOrReject records sessionID as consumed. Returns true if it was novel
+// (admit) and false if already consumed or the set is full of unexpired
+// entries (reject). expiresAt retains the entry until the token can no longer
+// pass the age check.
+func (s *SeenTokenSet) markOrReject(sessionID [8]byte, expiresAt time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.seen[sessionID]; ok {
+		return false
+	}
+	if len(s.order) >= s.max {
+		s.evictExpiredLocked()
+		if len(s.order) >= s.max {
+			return false // full of live entries — refuse rather than forget one
+		}
+	}
+	s.order = append(s.order, sessionID)
+	s.seen[sessionID] = expiresAt
+	return true
+}
+
+// evictExpiredLocked drops entries whose tokens have already expired. Caller
+// holds s.mu.
+func (s *SeenTokenSet) evictExpiredLocked() {
+	now := time.Now()
+	kept := s.order[:0]
+	for _, k := range s.order {
+		if exp, ok := s.seen[k]; ok && now.Before(exp) {
+			kept = append(kept, k)
+		} else {
+			delete(s.seen, k)
+		}
+	}
+	s.order = kept
 }
 
 // DeriveNewKey derives a new session key from the old key + fresh randomness.

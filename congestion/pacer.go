@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package congestion
 
@@ -90,8 +90,17 @@ func (p *Pacer) TimeUntilSend(n int) time.Duration {
 		return 0
 	}
 	deficit := float64(n) - p.tokens
+	// AE-H-04: rate <= 0 means the active controller has no pacing model —
+	// CUBIC.PacingRate() always returns 0, so the writeLoop's `pacingRate > 0`
+	// guard never calls SetRate for the default (CUBIC) session and this
+	// Pacer's rate stays 0 forever. Treat that as "pacing disabled" and send
+	// immediately, mirroring SendTimePacer.TimeUntilSend (which returns 0 for
+	// rate <= 0). Returning maxPacerWait here parked the burst-drained CUBIC
+	// writeLoop for an hour per frame — refill() never restores tokens while
+	// rate == 0. Congestion control is unaffected: the cwnd gate lives in
+	// CUBIC.CanSend, not the pacer.
 	if p.rate <= 0 {
-		return maxPacerWait // no rate set
+		return 0 // pacing disabled — no rate configured
 	}
 	waitNs := deficit / p.rate * float64(time.Second)
 	if waitNs >= float64(maxPacerWait) || waitNs < 0 {

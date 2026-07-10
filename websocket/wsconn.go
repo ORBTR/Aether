@@ -1,9 +1,10 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
  */
 package websocket
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -58,6 +59,17 @@ func (c *WSConn) Read(p []byte) (int, error) {
 		if err != nil {
 			log.Printf("[WS-DIAG] Read: ReadHeader err=%v remote=%s", err, c.peerID)
 			return 0, err
+		}
+
+		// AE-H-11: cap the peer-advertised frame length before allocating.
+		// header.Length is an int64 read straight off the wire (gobwas/ws does
+		// not bound it); an oversized value would OOM or panic 'makeslice: len
+		// out of range' in the single-goroutine gossip read loop. Reject at
+		// hijackMaxFrameSize (16 MB — the same mesh frame ceiling HijackConn.Read
+		// enforces) instead of allocating. gobwas rejects the 64-bit length MSB,
+		// so header.Length is already non-negative once ReadHeader returns nil.
+		if header.Length > hijackMaxFrameSize {
+			return 0, fmt.Errorf("ws: frame too large (%d bytes)", header.Length)
 		}
 
 		// Read frame payload

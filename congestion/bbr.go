@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 
 // BBRv2 congestion controller built around per-packet delivery-rate
@@ -60,6 +60,22 @@ const (
 	bbrStartupGrowthThreshold = 1.25 // BtlBw must grow ≥25% per round to stay in Startup
 	bbrStartupFullCntThreshold = 3   // 3 stalled rounds → exit Startup
 	bbrInflightHiHeadroom = 0.85     // CWND clamp = inflightHi * (1 - headroom)
+
+	// bbrMinSampleInterval is the shortest delivery-clock interval over which
+	// the degraded OnAck path will derive a bandwidth sample (AE-M-07). A
+	// composite ACK that acks many nil-sample entries makes the adapter call
+	// OnAck once per entry in a tight loop (adapter/noise_dispatch.go), and
+	// b.deliveredTime is advanced to now on every call — so the 2nd..Nth calls
+	// in one handler measure a sub-microsecond dt and would compute a delivery
+	// rate orders of magnitude above reality (~1400 B / 1e-7 s = ~1.4e10 B/s),
+	// pinning the max-filter and blasting cwnd/pacing to their clamps. Intervals
+	// below this floor are too short to measure meaningfully and are skipped.
+	// OnAckSampled is unaffected (it measures send->ack on the delivery clock,
+	// never an inter-loop gap). 1 ms sits far above any plausible intra-loop
+	// iteration gap yet below genuine inter-ACK spacing on real paths; erring
+	// toward over-rejection is safe here because skipping a rough degraded
+	// sample never causes a burst, whereas admitting a spurious one does.
+	bbrMinSampleInterval = 1 * time.Millisecond
 
 	// rtPropResetDefault is the rtProp seeded by ResetCWND when no
 	// previous measurement survives. 100 ms is the conventional "first
@@ -141,6 +157,10 @@ type BBRController struct {
 	fullBwCount   int
 	fullBwLastVal float64
 
+	// lastCEReduction rate-limits OnCE's CE-driven cwnd cut to one per
+	// rtProp window (AE-M-06). Zero value means no CE reduction yet.
+	lastCEReduction time.Time
+
 	// Outputs.
 	cwnd       int64
 	pacingRate float64
@@ -212,8 +232,16 @@ func (b *BBRController) OnAckSampled(ackedBytes int64, rtt time.Duration, sample
 	}
 
 	// MinRTT update: the lower of current rtt or the RTPropagation
-	// estimate, refreshed every 10 s of staleness.
-	if rtt > 0 && (rtt < b.rtProp || now.Sub(b.rtPropStamp) > bbrProbeRTTInterval) {
+	// estimate, refreshed every 10 s of staleness. AE-M-05: capture the
+	// staleness verdict BEFORE the refresh overwrites rtPropStamp, then
+	// hand it to runStateMachine. Otherwise the refresh resets the stamp
+	// and the ProbeBW→ProbeRTT trigger — which keys off the SAME staleness
+	// — sees now.Sub(rtPropStamp)≈0 and ProbeRTT is never entered. Mirrors
+	// canonical BBR, where UpdateRTprop computes rtprop_expired once and
+	// CheckProbeRTT reuses it (the staleness overwrite still tracks upward
+	// RTT shifts, so no capability is lost).
+	rtPropExpired := now.Sub(b.rtPropStamp) > bbrProbeRTTInterval
+	if rtt > 0 && (rtt < b.rtProp || rtPropExpired) {
 		b.rtProp = rtt
 		b.rtPropStamp = now
 	}
@@ -222,7 +250,7 @@ func (b *BBRController) OnAckSampled(ackedBytes int64, rtt time.Duration, sample
 	// sent in (or before) the new round.
 	b.rounds.OnAck(sample.DeliveredBytes, b.delivered)
 
-	b.runStateMachine(now)
+	b.runStateMachine(now, rtPropExpired)
 	b.recomputeOutputs()
 }
 
@@ -236,9 +264,18 @@ func (b *BBRController) OnAck(ackedBytes int64, rtt time.Duration) {
 	now := time.Now()
 	b.delivered += ackedBytes
 	if !b.deliveredTime.IsZero() {
-		dt := now.Sub(b.deliveredTime).Seconds()
-		if dt > 0 && ackedBytes > 0 {
-			dr := float64(ackedBytes) / dt
+		// AE-M-07: only derive a bandwidth sample over an interval at least
+		// bbrMinSampleInterval long. A composite ACK acking many nil-sample
+		// entries drives the adapter to call OnAck once per entry in a tight
+		// loop (adapter/noise_dispatch.go), and b.deliveredTime is advanced to
+		// now on every call — so the 2nd..Nth calls in one handler measure a
+		// sub-microsecond gap and would otherwise inject a delivery-rate sample
+		// orders of magnitude above reality, pinning btlBwFilter.max and
+		// blasting cwnd/pacing to their clamps. Sub-floor intervals are too
+		// short to measure, so skip them rather than poison the filter; the
+		// first ACK of each batch still spans a real inter-ACK interval.
+		if elapsed := now.Sub(b.deliveredTime); elapsed >= bbrMinSampleInterval && ackedBytes > 0 {
+			dr := float64(ackedBytes) / elapsed.Seconds()
 			b.btlBwFilter.update(dr)
 			b.btlBw = b.btlBwFilter.max()
 		}
@@ -248,11 +285,13 @@ func (b *BBRController) OnAck(ackedBytes int64, rtt time.Duration) {
 	if b.inflight < 0 {
 		b.inflight = 0
 	}
-	if rtt > 0 && (rtt < b.rtProp || now.Sub(b.rtPropStamp) > bbrProbeRTTInterval) {
+	// AE-M-05: capture staleness before the refresh resets rtPropStamp; see OnAckSampled.
+	rtPropExpired := now.Sub(b.rtPropStamp) > bbrProbeRTTInterval
+	if rtt > 0 && (rtt < b.rtProp || rtPropExpired) {
 		b.rtProp = rtt
 		b.rtPropStamp = now
 	}
-	b.runStateMachine(now)
+	b.runStateMachine(now, rtPropExpired)
 	b.recomputeOutputs()
 }
 
@@ -328,13 +367,30 @@ func (b *BBRController) OnCE(bytesMarked int64) {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	// AE-M-06: rate-limit CE-driven reductions to one per rtProp window.
+	// The adapter calls OnCE once per CE-bearing composite ACK, and a
+	// peer (or a compliant receiver reporting CE on multiple ACKs per
+	// RTT) can drive back-to-back calls while data is in flight; without
+	// this gate each one applies another 0.85× cut plus a forced ProbeRTT
+	// re-entry, collapsing throughput. The doc comment above already
+	// promises "One RTT-bounded reduction" but nothing enforced it. This
+	// mirrors CUBIC's recovery-epoch idempotence (OnLossWithPipe
+	// early-returns while already in fastRecovery), coalescing repeated CE
+	// marks within one RTT into a single reduction. The reaction magnitude
+	// is unchanged — the full 0.85× cut and ProbeRTT re-entry still fire on
+	// the first CE of each RTT; only the per-RTT frequency is bounded.
+	now := time.Now()
+	if !b.lastCEReduction.IsZero() && now.Sub(b.lastCEReduction) < b.rtProp {
+		return
+	}
+	b.lastCEReduction = now
 	b.cwnd = int64(float64(b.cwnd) * 0.85)
 	if b.cwnd < minCWND {
 		b.cwnd = minCWND
 	}
 	// Schedule earlier ProbeRTT entry so we re-measure rtProp once the
 	// queue drains.
-	b.rtPropStamp = time.Now().Add(-bbrProbeRTTInterval - time.Second)
+	b.rtPropStamp = now.Add(-bbrProbeRTTInterval - time.Second)
 }
 
 // CWND returns the current congestion window in bytes.
@@ -379,7 +435,7 @@ func (b *BBRController) State() string {
 }
 
 // runStateMachine advances state per the model. Caller holds b.mu.
-func (b *BBRController) runStateMachine(now time.Time) {
+func (b *BBRController) runStateMachine(now time.Time, rtPropExpired bool) {
 	switch b.state {
 	case bbrStartup:
 		// Stay in Startup while BtlBw is growing ≥25% per round; after
@@ -422,8 +478,11 @@ func (b *BBRController) runStateMachine(now time.Time) {
 			b.cycleIndex = (b.cycleIndex + 1) % len(bbrProbeBWGains)
 			b.cycleStamp = now
 		}
-		// Periodic ProbeRTT entry.
-		if now.Sub(b.rtPropStamp) > bbrProbeRTTInterval {
+		// Periodic ProbeRTT entry. AE-M-05: key off the pre-refresh
+		// staleness verdict rtPropExpired, NOT now.Sub(rtPropStamp) — the
+		// ack-path refresh already reset rtPropStamp to now, so re-reading
+		// it here is always ≈0 and ProbeRTT would never be entered.
+		if rtPropExpired {
 			b.state = bbrProbeRTT
 			b.probeRTTDone = now.Add(bbrProbeRTTDur)
 			b.probeRTTRound = b.rounds.Count

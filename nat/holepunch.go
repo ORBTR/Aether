@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 
 // Coordinated NAT hole-punching.
@@ -94,8 +94,34 @@ type PunchOffer struct {
 // fails Ed25519 verification.
 var ErrPunchSignature = errors.New("nat: punch signature invalid")
 
+// appendPunchAddrs folds a candidate-address slice into a signing buffer.
+// AE-P-03: the punch signature must cover every ReflexiveAddr/LocalAddr the
+// execution layer will send traffic to (execute.go PunchCandidates dials and
+// ProbeCandidates probes), otherwise a MITM on the consumer-owned signalling
+// channel — which, for the documented relay/gossip rendezvous, is an untrusted
+// intermediary — can rewrite the addresses while Verify still passes and
+// redirect the probes/dials at attacker-chosen targets. The slice length and
+// each address (a length-prefixed canonical 16-byte IP plus a big-endian port)
+// are encoded deterministically so Sign and Verify derive identical bytes from
+// the same struct fields. Empty/invalid IPs encode as a zero-length IP; ports
+// are inherently 16-bit so uint16 truncation is lossless for any dialable port.
+func appendPunchAddrs(out []byte, addrs []net.UDPAddr) []byte {
+	var count [4]byte
+	binary.BigEndian.PutUint32(count[:], uint32(len(addrs)))
+	out = append(out, count[:]...)
+	for i := range addrs {
+		ip := addrs[i].IP.To16() // canonical 16-byte form; nil (len 0) for an empty/invalid IP
+		out = append(out, byte(len(ip)))
+		out = append(out, ip...)
+		var port [2]byte
+		binary.BigEndian.PutUint16(port[:], uint16(addrs[i].Port))
+		out = append(out, port[:]...)
+	}
+	return out
+}
+
 // SignBytes returns the canonical byte sequence to sign for a request.
-// Stable across implementations: requester ‖ target ‖ behaviour ‖ ts.
+// Stable across implementations: requester ‖ target ‖ behaviour ‖ ts ‖ addrs.
 func (r *PunchRequest) SignBytes() []byte {
 	out := []byte{}
 	out = append(out, []byte(r.RequesterNodeID)...)
@@ -106,6 +132,9 @@ func (r *PunchRequest) SignBytes() []byte {
 	var ts [8]byte
 	binary.BigEndian.PutUint64(ts[:], uint64(r.Timestamp))
 	out = append(out, ts[:]...)
+	// AE-P-03: authenticate the candidate addresses the execution layer acts on.
+	out = appendPunchAddrs(out, r.ReflexiveAddrs)
+	out = appendPunchAddrs(out, r.LocalAddrs)
 	return out
 }
 
@@ -133,6 +162,9 @@ func (o *PunchOffer) SignBytes() []byte {
 	var ts [8]byte
 	binary.BigEndian.PutUint64(ts[:], uint64(o.Timestamp))
 	out = append(out, ts[:]...)
+	// AE-P-03: authenticate the candidate addresses the execution layer acts on.
+	out = appendPunchAddrs(out, o.ReflexiveAddrs)
+	out = appendPunchAddrs(out, o.LocalAddrs)
 	return out
 }
 

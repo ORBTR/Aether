@@ -1,8 +1,8 @@
 //go:build !js
 
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package adapter
 
@@ -121,7 +121,7 @@ func (s *NoiseSession) processIncomingFrame(frame *aether.Frame, indicator byte)
 	// NOTE: connection-level packetReplay check removed. It was using
 	// frame.SeqNo (per-stream sequence assigned by st.sendWindow.Add) as
 	// if it were a connection-level packet counter. With multiple streams
-	// open (5+ on HSTLES mesh sessions), each stream independently starts
+	// open (5+ on ORBTR mesh sessions), each stream independently starts
 	// at SeqNo=0; the second stream's first DATA frame collided with the
 	// first stream's bit-0 in the connection-level bitmap and was silently
 	// dropped as a "replay". As stream 0 (gossip) advanced past the
@@ -155,6 +155,16 @@ func (s *NoiseSession) processIncomingFrame(frame *aether.Frame, indicator byte)
 
 // dispatchFrame routes an incoming frame to the appropriate handler.
 func (s *NoiseSession) dispatchFrame(frame *aether.Frame) {
+	// AE-H-10: refresh stream-GC activity for ANY frame type on a
+	// non-control stream — ACK / WINDOW_UPDATE are liveness just like
+	// DATA. Recording only on inbound DATA (handleData) let StreamGC
+	// reset a live upload-only stream: an uploader sees only ACK/WINDOW
+	// returning on its app stream, so after the 5-min idle timeout the
+	// sweep RESET its own actively-transmitting stream mid-transfer.
+	// Mirrors adapter/tcp.go dispatchFrame.
+	if s.streamGC != nil && frame.StreamID != 0 {
+		s.streamGC.RecordActivity(frame.StreamID)
+	}
 	switch frame.Type {
 	case aether.TypeDATA:
 		s.handleData(frame)
@@ -253,9 +263,6 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 		return // unknown stream
 	}
 
-	// Record stream activity for GC
-	s.streamGC.RecordActivity(frame.StreamID)
-
 	// Anti-replay classification — distinguishes legitimate retransmits
 	// (drop silently, NO abuse) from genuine anomalies (drop AND feed
 	// abuse score). Conflating the two was the fleet-wide churn root
@@ -303,9 +310,50 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 			st.ackEngine.OnDuplicateReceived(frame.SeqNo)
 		}
 		return
-	case reliability.ResultAncient, reliability.ResultWrapAttack:
+	case reliability.ResultWrapAttack:
+		// Genuine forgery: SeqNo jumped past half the uint32 space, which
+		// no legitimate sender produces inside one rekey window. Drop +
+		// charge abuse (unchanged).
 		s.reportAbuse(abuse.ReasonReplayDetected)
 		return
+	case reliability.ResultAncient:
+		// AE-P-04: a SeqNo more than ReplayWindowSize(64) below topSeq is
+		// NOT necessarily an adversarial replay. In-flight frame count is
+		// bounded by CUBIC cwnd + byte-based flow-control credit (default
+		// 1 MiB, growable to 8 MiB, and frames <= MinGuaranteedWindow=1KiB
+		// bypass credit entirely -- flow/stream_window.go), NOT by the
+		// 64-frame replay window. On any stream that bursts >64 frames (a
+		// gossip convergence full-sync, an RPC/bulk pipeline) a single
+		// early loss lets topSeq advance far past the lost SeqNo; the
+		// sender's legitimate retransmit -- or a deep network reorder --
+		// then lands >64 behind and is misclassified Ancient. Dropping it
+		// here AND charging abuse re-opens the retransmit churn class the
+		// ResultDuplicate/ResultAncient split was built to eliminate.
+		//
+		// The reorder authority is the recvWindow's cumulative delivery
+		// floor (expected), not topSeq: any SeqNo at or above `expected`
+		// was never delivered and is still needed. Route it through the
+		// idempotent recvWindow (recv_window.go dedups < expected and
+		// already-buffered SeqNos harmlessly) instead of dropping it --
+		// preserving delivery (no stream stall) with no false abuse.
+		if frame.SeqNo < st.recvWindow.ExpectedSeqNo() {
+			// Genuinely below the delivery floor: already delivered. Almost
+			// always a retransmit whose cumulative ACK was lost and which
+			// arrived >64 behind an advanced topSeq. Force an eager ACK to
+			// clear the sender's retransmit timer (same rationale as
+			// ResultDuplicate at OnDuplicateReceived) so the storm stops in
+			// one round-trip, then charge abuse: a real replay FLOOD still
+			// trips the tracker, while the eager ACK keeps an occasional
+			// lost-ACK retransmit from accumulating to the threshold.
+			if st.ackEngine != nil {
+				st.ackEngine.OnDuplicateReceived(frame.SeqNo)
+			}
+			s.reportAbuse(abuse.ReasonReplayDetected)
+			return
+		}
+		// At/above the delivery floor -- still-needed late/reordered/
+		// retransmitted frame. Fall out of the switch to the idempotent
+		// recvWindow delivery path below.
 	default:
 		return
 	}
@@ -340,7 +388,13 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 			}
 		}()
 		for _, payload := range delivered {
-			ok := DeliverToRecvChWithSignals(st.recvCh, payload, st.window, st.streamID, s.sendWindowUpdateAgnostic, s.SendCongestion, &s.deliveryStats)
+			// AE-M-02: hand the payload to the stream's own deliverLoop
+			// goroutine (non-blocking enqueue) instead of blocking the shared
+			// readLoop up to stream1MaxBackpressure=1s on a full recvCh. A slow
+			// stream-1 consumer must not stall the readLoop, which would stop
+			// draining the noiseConn inbox and silently drop inbound ACKs for
+			// every other stream (noise/session.go:296-312).
+			ok := st.enqueueDelivery(payload)
 			// Conn-level flow control: successful delivery grants credit at
 			// application-read time via the session debouncer (Receive →
 			// connGrantDebouncer.Record). On drop, the debouncer will never
@@ -354,8 +408,16 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 		}
 	}()
 
-	// Congestion controller: record data received
-	s.congestion().OnAck(int64(frame.Length), st.rtt.SRTT())
+	// AE-M-03: Do NOT feed inbound DATA bytes into congestion().OnAck here.
+	// handleData processes DATA frames arriving FROM the peer; OnAck is the
+	// acknowledgement-of-OUR-sent-data hook and grows the send-side cwnd
+	// (CUBIC slow-start does cwnd += ackedBytes, cubic.go:115). Counting
+	// received bytes into it inflates our congestion window in proportion to
+	// how much the peer sends us — unrelated to our own in-flight/loss state
+	// — and lets a later send burst past the safe window (self-induced loss).
+	// Send-side cwnd advancement is driven solely by ACKs of locally-sent
+	// data in handleACK. Receive-side flow control is already accounted by
+	// the recvWindow/connWindow logic above; congestion state must not be.
 }
 
 func (s *NoiseSession) handleACK(frame *aether.Frame) {
@@ -380,7 +442,12 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	// cadence instead of over- or under-shooting. AckDelay is encoded
 	// in AckDelayGranularity (8us) units on the wire.
 	if st.tlp != nil {
-		peerAckDelay := time.Duration(ack.AckDelay) * aether.AckDelayGranularity
+		// AE-M-01: scale by time.Microsecond so the 8-unit (8µs) granularity
+		// lands in Duration (ns); matches the sibling RTT-sample decode below
+		// and the encoder (ack_engine.go: ackDelayUs / AckDelayGranularity).
+		// Without it the value is 1000x too small and TLP's max_ack_delay EWMA
+		// decays PTO below the peer's real ACK cadence, firing spurious probes.
+		peerAckDelay := time.Duration(ack.AckDelay) * aether.AckDelayGranularity * time.Microsecond
 		st.tlp.UpdateMaxAckDelay(peerAckDelay)
 	}
 
@@ -580,7 +647,18 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	// holding s.mu.
 	for {
 		prev := st.lastBaseACKSeen.Load()
-		if ack.BaseACK <= prev {
+		// AE-P-08: wrap-safe serial-number comparison (RFC 1982). A plain
+		// `ack.BaseACK <= prev` freezes progress tracking for a full ~4B-frame
+		// cycle after BaseACK wraps past 2^32 — the small post-wrap value
+		// compares <= the near-2^32 prev, so lastProgressAtUnixNano (and the
+		// session-wide lastAnyProgressAt) never advance while the stream is
+		// actually progressing, tripping the stall detector into needless
+		// probe-before-close / ResetCWND. int32(new-prev) > 0 is the
+		// forward-progress test used elsewhere in the reliability layer
+		// (send_window.go, antireplay.go); it also neutralises a peer that
+		// seeds prev near 2^32-1, since the next genuine BaseACK still reads
+		// as forward progress across the wrap.
+		if int32(ack.BaseACK-prev) <= 0 {
 			break
 		}
 		if st.lastBaseACKSeen.CompareAndSwap(prev, ack.BaseACK) {
@@ -679,7 +757,9 @@ func (s *NoiseSession) handleImplicitOpen(frame *aether.Frame) {
 			}
 		}()
 		for _, payload := range delivered {
-			ok := DeliverToRecvChWithSignals(st.recvCh, payload, st.window, st.streamID, s.sendWindowUpdateAgnostic, s.SendCongestion, &s.deliveryStats)
+			// AE-M-02: enqueue onto the per-stream deliverLoop (non-blocking)
+			// rather than block the readLoop on a full recvCh. See handleData.
+			ok := st.enqueueDelivery(payload)
 			// Drop-only conn-level credit: see handleData.
 			if !ok {
 				if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
@@ -937,7 +1017,11 @@ func (s *NoiseSession) deliverToStream(streamID uint64, payload []byte) {
 			dbgNoise.Printf("deliverToStream: send-on-closed for stream %d (race with teardown): %v", streamID, r)
 		}
 	}()
-	delivered := DeliverToRecvChWithSignals(st.recvCh, payload, st.window, streamID, s.sendWindowUpdateAgnostic, s.SendCongestion, &s.deliveryStats)
+	// AE-M-02: enqueue onto the per-stream deliverLoop (non-blocking) rather
+	// than block the readLoop on a full recvCh. See handleData. The enqueue
+	// send-on-closed race (teardown closes deliverCh) is caught by this
+	// function's deferred recover, same benign-drop semantics as before.
+	delivered := st.enqueueDelivery(payload)
 	// Drop-only conn-level credit: see handleData.
 	if !delivered {
 		if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {

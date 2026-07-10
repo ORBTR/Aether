@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package websocket
 
@@ -24,9 +24,9 @@ func TestWebsocketHeaderConstants(t *testing.T) {
 
 	// Verify they follow HTTP header naming convention
 	expectedHeaders := map[string]string{
-		"NodeIDHeader":    "X-HSTLES-NodeID",
-		"SignatureHeader": "X-HSTLES-Signature",
-		"NonceHeader":     "X-HSTLES-Nonce",
+		"NodeIDHeader":    "X-ORBTR-NodeID",
+		"SignatureHeader": "X-ORBTR-Signature",
+		"NonceHeader":     "X-ORBTR-Nonce",
 	}
 
 	if NodeIDHeader != expectedHeaders["NodeIDHeader"] {

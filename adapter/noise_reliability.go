@@ -1,8 +1,8 @@
 //go:build !js
 
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package adapter
 
@@ -849,6 +849,20 @@ type writeDeadlineConn interface {
 // peer's framing, so the session is unusable and must not be written to
 // again. CloseWithError is closeOnce-guarded and idempotent, so calling
 // it here is safe even if another path is closing concurrently.
+//
+// AE-H-02: the teardown is dispatched on its OWN goroutine, never called
+// inline. connWrite only ever runs while writeFrame holds s.writeMu, and
+// CloseWithError re-enters writeFrame on the same goroutine — via the
+// connGrantDebouncer flush (-> sendWindowUpdate) and the acceptor backlog
+// Reset (-> RESET frame). A synchronous call would re-acquire the
+// non-reentrant writeMu on the goroutine that already holds it and
+// self-deadlock, wedging every other writeFrame caller and leaking the fd
+// (s.conn.Close is never reached). Deferring to a goroutine lets this
+// writeFrame unwind and release writeMu before the teardown's re-entrant
+// writeFrame calls acquire it. SignalClose collapses duplicate closes, so
+// the spawned goroutine is a bounded no-op on all but the first, and the
+// graceful-close paths (idle/stall/application Close) are untouched — the
+// final grant + RESET frames still reach a live peer from those callers.
 func (s *NoiseSession) connWrite(b []byte) error {
 	// OBS-1 aether_write_syscall_us: time the actual syscall (or the
 	// transport adapter's effective send path) so operators can see
@@ -858,7 +872,7 @@ func (s *NoiseSession) connWrite(b []byte) error {
 	// the duration is meaningless (the session is being torn down).
 	start := time.Now()
 	if _, err := s.conn.Write(b); err != nil {
-		s.CloseWithError(fmt.Errorf("aether: frame write failed: %w", err))
+		go s.CloseWithError(fmt.Errorf("aether: frame write failed: %w", err))
 		return err
 	}
 	s.writeSyscallHist.Record(time.Since(start))

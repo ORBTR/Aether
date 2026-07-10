@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package flow
 
@@ -51,13 +51,20 @@ const DefaultMaxConnCredit int64 = 16 * 1024 * 1024
 type ConnWindow struct {
 	mu sync.Mutex
 
-	// Send-side semaphore, pre-sized to DefaultMaxConnCredit (16 MB).
-	// Effective window = DefaultMaxConnCredit - initialDeficit - dataOutstanding.
-	// ApplyUpdate growth of sendCredit is bounded by grantsReceived / dataOutstanding
-	// so we never Release past capacity.
+	// Send-side semaphore, pre-sized to maxSize (max(initialCredit,
+	// DefaultMaxConnCredit)). Effective window = maxSize - initialDeficit
+	// - dataOutstanding. ApplyUpdate growth of sendCredit is bounded by
+	// grantsReceived / dataOutstanding so we never Release past capacity.
 	sem             *semaphore.Weighted
 	initialDeficit  int64
 	dataOutstanding int64
+
+	// maxSize is the true semaphore capacity captured at construction —
+	// max(initialCredit, DefaultMaxConnCredit). grantLocked (recv cap) and
+	// Available (send report) use it instead of the DefaultMaxConnCredit
+	// constant so a window built with initialCredit > 16 MB still emits
+	// grants and reports an accurate Available. AE-P-14.
+	maxSize int64
 
 	// initialSize is the configured starting credit (e.g. 1 MB); used for
 	// the auto-grant threshold computation.
@@ -101,6 +108,7 @@ func NewConnWindow(initialCredit int64) *ConnWindow {
 	}
 	return &ConnWindow{
 		sem:            sem,
+		maxSize:        capacity,
 		initialDeficit: deficit,
 		initialSize:    initialCredit,
 		recvCredit:     initialCredit,
@@ -251,8 +259,11 @@ func (w *ConnWindow) ReceiverConsume(n int64) int64 {
 // (e.g. recvCredit already at the cap).
 func (w *ConnWindow) grantLocked(sinceLastGrant int64, trigger string) int64 {
 	grant := sinceLastGrant
-	if w.recvCredit+grant > DefaultMaxConnCredit {
-		grant = DefaultMaxConnCredit - w.recvCredit
+	// AE-P-14: cap against the true capacity (maxSize), not the
+	// DefaultMaxConnCredit constant, so a window constructed with
+	// initialCredit > 16 MB still emits grants instead of pinning at 0.
+	if w.recvCredit+grant > w.maxSize {
+		grant = w.maxSize - w.recvCredit
 	}
 	if grant <= 0 {
 		return 0
@@ -278,7 +289,7 @@ func (w *ConnWindow) grantLocked(sinceLastGrant int64, trigger string) int64 {
 func (w *ConnWindow) Available() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return DefaultMaxConnCredit - w.initialDeficit - w.dataOutstanding
+	return w.maxSize - w.initialDeficit - w.dataOutstanding
 }
 
 // ConnStats is a point-in-time snapshot of conn-window state for metrics.

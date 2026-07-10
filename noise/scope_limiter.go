@@ -1,8 +1,8 @@
 //go:build !js
 
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package noise
 
@@ -303,11 +303,14 @@ func (l *TenantRelayLimiter) CheckRelayPair(scopeID, pairKey string) error {
 		if busiest != "" && busiest != scopeID {
 			l.evictOldestLocked(busiest, l.state[busiest], true /* crossScope */)
 		} else if busiest == scopeID {
-			// The calling scope itself is the busiest — if step 2
-			// already ran, we've made room; otherwise self-evict now.
-			if l.config.MaxRelayPairs <= 0 {
-				l.evictOldestLocked(scopeID, s, false)
-			}
+			// AE-L-10: The calling scope itself is the busiest. We only reach
+			// here with total still >= MaxTotalPairs, so step 2 did NOT free a
+			// slot — it evicts only when the scope is already at its own
+			// MaxRelayPairs, which a below-cap dominant tenant never hits.
+			// Self-evict this scope's LRU pair unconditionally so the caller's
+			// subsequent TrackRelayPair cannot push the global count past the
+			// hard cap. Churn within the scope, not a stall — the WFQ intent.
+			l.evictOldestLocked(scopeID, s, false)
 		}
 	}
 

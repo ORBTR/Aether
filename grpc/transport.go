@@ -1,8 +1,8 @@
 //go:build !js
 
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package grpc
 
@@ -29,11 +29,11 @@ import (
 
 const (
 	// MetadataNodeID is the gRPC metadata key for NodeID
-	MetadataNodeID = "x-hstles-nodeid"
+	MetadataNodeID = "x-orbtr-nodeid"
 	// MetadataSignature is the gRPC metadata key for signature
-	MetadataSignature = "x-hstles-signature"
+	MetadataSignature = "x-orbtr-signature"
 	// MetadataPubKey is the gRPC metadata key for hex-encoded Ed25519 public key
-	MetadataPubKey = "x-hstles-pubkey"
+	MetadataPubKey = "x-orbtr-pubkey"
 )
 
 // GrpcTransportConfig configures the gRPC aether.
@@ -215,36 +215,42 @@ func (t *GrpcTransport) extractNodeID(ctx context.Context) (aether.NodeID, error
 
 	nodeID := aether.NodeID(nodeIDs[0])
 
-	// Verify signature if present
+	// NodeID ownership MUST be cryptographically proven — the signature is
+	// mandatory, never optional-on-presence. A caller that omits it would
+	// otherwise be accepted under any claimed NodeID (peer impersonation,
+	// AE-C-03). There is no client-cert backstop that binds TLS identity to the
+	// aether NodeID, so this signature is the sole ownership proof. Legitimate
+	// clients always send it (see Dial), so requiring it breaks nothing.
 	signatures := md.Get(MetadataSignature)
-	if len(signatures) > 0 {
-		sig, err := hex.DecodeString(signatures[0])
-		if err != nil {
-			return "", errors.New("grpc: invalid signature encoding")
-		}
+	if len(signatures) == 0 {
+		return "", errors.New("grpc: missing signature — NodeID ownership unproven")
+	}
+	sig, err := hex.DecodeString(signatures[0])
+	if err != nil {
+		return "", errors.New("grpc: invalid signature encoding")
+	}
 
-		// Get public key from dedicated header (NodeID is a base32 fingerprint, not a raw key)
-		pubKeys := md.Get(MetadataPubKey)
-		if len(pubKeys) == 0 {
-			return "", errors.New("grpc: missing public key metadata")
-		}
-		pubKeyBytes, err := hex.DecodeString(pubKeys[0])
-		if err != nil || len(pubKeyBytes) != ed25519.PublicKeySize {
-			return "", errors.New("grpc: invalid public key")
-		}
-		pubKey := ed25519.PublicKey(pubKeyBytes)
+	// Get public key from dedicated header (NodeID is a base32 fingerprint, not a raw key)
+	pubKeys := md.Get(MetadataPubKey)
+	if len(pubKeys) == 0 {
+		return "", errors.New("grpc: missing public key metadata")
+	}
+	pubKeyBytes, err := hex.DecodeString(pubKeys[0])
+	if err != nil || len(pubKeyBytes) != ed25519.PublicKeySize {
+		return "", errors.New("grpc: invalid public key")
+	}
+	pubKey := ed25519.PublicKey(pubKeyBytes)
 
-		// Verify the NodeID derives from this public key
-		derivedNodeID, err := aether.NewNodeID(pubKey)
-		if err != nil || derivedNodeID != nodeID {
-			return "", errors.New("grpc: public key does not match NodeID")
-		}
+	// Verify the NodeID derives from this public key
+	derivedNodeID, err := aether.NewNodeID(pubKey)
+	if err != nil || derivedNodeID != nodeID {
+		return "", errors.New("grpc: public key does not match NodeID")
+	}
 
-		// Verify signature
-		message := []byte(fmt.Sprintf("grpc-dial:%s:%s", nodeID, t.localNode))
-		if !ed25519.Verify(pubKey, message, sig) {
-			return "", errors.New("grpc: invalid signature")
-		}
+	// Verify signature
+	message := []byte(fmt.Sprintf("grpc-dial:%s:%s", nodeID, t.localNode))
+	if !ed25519.Verify(pubKey, message, sig) {
+		return "", errors.New("grpc: invalid signature")
 	}
 
 	return nodeID, nil

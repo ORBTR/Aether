@@ -174,7 +174,7 @@ func (m *Manager) Stop() {
 // gradeQualityForProto maps an aether.Protocol to the legacy integer
 // `Quality` used by setPrimary / promotebestStandby / computePathWeight.
 // Higher = better. Mirrors the Grade A/B/C hierarchy in
-// HSTLES/Library/mesh/grade so the legacy WDRR scheduler picks the
+// the consuming mesh grade layer so the legacy WDRR scheduler picks the
 // SAME path the grade-aware scaler would.
 //
 // Cascade A.2 fix (L4 #1): AddPathQA previously passed Quality=0 for
@@ -254,6 +254,7 @@ func (m *Manager) PickByQuality(op quality.DispatchOp) (aether.Session, bool) {
 	// the same call. Even without RunProbeLoop running, a path whose
 	// cooldown elapsed is back in the candidate pool here.
 	m.resurrectExpiredDeadPathsLocked()
+	m.resurrectExpiredFlappingPathsLocked()
 	if m.qstate == nil || m.qstate.cfg.Tracker == nil {
 		// No quality config; fall back to legacy primary selection.
 		if len(m.paths) == 0 || m.primary >= len(m.paths) {
@@ -266,6 +267,19 @@ func (m *Manager) PickByQuality(op quality.DispatchOp) (aether.Session, bool) {
 	bestRank := -1.0
 	for _, p := range m.paths {
 		if p.Session == nil || p.Session.IsClosed() {
+			continue
+		}
+		// AE-M-10: exclude PathDead / PathFlapping from quality-aware
+		// selection, mirroring PickPath and promotebestStandby
+		// (manager.go). A flapping path's session is still alive (its
+		// Ping succeeds — the RecordTLPReset premise) and a dead path
+		// within deadResurrectCooldown also has a live session, so both
+		// pass the nil/IsClosed guard above and would win on DispatchRank,
+		// silently defeating the flapping demote and primary-failure
+		// failover. The resurrection calls above return any path whose
+		// cooldown/demote window has elapsed to PathStandby, so this only
+		// shuns paths still inside their window — capability preserved.
+		if p.State == PathDead || p.State == PathFlapping {
 			continue
 		}
 		score := m.computeScoreLocked(p)

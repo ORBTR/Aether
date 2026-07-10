@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 
 // Package scheduler implements weighted fair queuing (WFQ) for Aether streams.
@@ -254,6 +254,24 @@ func (s *Scheduler) Enqueue(streamID uint64, frame *aether.Frame) {
 	s.mu.Lock()
 	queued := false
 	if ss, ok := s.streams[streamID]; ok {
+		// AE-M-08: seed an idle/newly-registered stream's WFQ deficit up to
+		// the current virtual start time of its class on the empty→backlogged
+		// edge. A stream registers (and re-registers on reopen) with
+		// deficit=0, and dequeueFromClass selects the minimum-finish stream,
+		// so a zero-deficit newcomer would win every Dequeue in its class
+		// until its deficit climbed to match — starving established same-class
+		// streams for that catch-up window (and giving a trivial
+		// re-registration griefing lever). Seeding to the class minimum
+		// equalises the newcomer with the current front-runner; the `>` guard
+		// only ever raises the deficit, so a stream already ahead (one whose
+		// queue briefly drained mid-send) keeps its earned virtual time and is
+		// never demoted. Mirrors the multipath WDRR seed at
+		// manager.go:addPathLocked.
+		if len(ss.queue) == 0 {
+			if vs := s.classVirtualStartLocked(ss.latencyClass); vs > ss.deficit {
+				ss.deficit = vs
+			}
+		}
 		ss.queue = append(ss.queue, frame)
 		queued = true
 		s.queueDepth.Add(1)
@@ -262,6 +280,27 @@ func (s *Scheduler) Enqueue(streamID uint64, frame *aether.Frame) {
 	if queued {
 		s.signalWake()
 	}
+}
+
+// classVirtualStartLocked returns the WFQ virtual start time for a latency
+// class: the minimum deficit among the streams of that class that are
+// currently backlogged (queue non-empty). Callers hold s.mu. Returns 0 when
+// no stream of the class is backlogged — Enqueue's `>` guard then leaves the
+// caller's own deficit untouched. Used to seed an idle/newly-registered
+// stream so it cannot monopolise its class from deficit=0 (AE-M-08).
+func (s *Scheduler) classVirtualStartLocked(class aether.LatencyClass) float64 {
+	found := false
+	var minDeficit float64
+	for _, ss := range s.streams {
+		if ss.latencyClass != class || len(ss.queue) == 0 {
+			continue
+		}
+		if !found || ss.deficit < minDeficit {
+			minDeficit = ss.deficit
+			found = true
+		}
+	}
+	return minDeficit
 }
 
 // EnqueueProbe queues a TLP loss probe for a stream. Per RFC 8985 §7.5
@@ -353,18 +392,29 @@ func (s *Scheduler) Dequeue() (*aether.Frame, bool) {
 		s.totalBytes /= 2
 	}
 
-	// 3. Try each latency class in priority order: REALTIME → INTERACTIVE → BULK
-	// If REALTIME is capped, skip it and let INTERACTIVE/BULK catch up
+	// 3. Try each latency class in priority order: REALTIME → INTERACTIVE → BULK.
+	// AE-H-05: a capped REALTIME class is DEMOTED into the INTERACTIVE round
+	// (its streams compete there via WFQ) rather than dropped from every round.
+	// Dropping it stalled a REALTIME-only connection forever: with no other
+	// class queued, Dequeue returned nil, totalBytes froze below the 1MB decay
+	// threshold, and the pinned >10% ratio never recovered. Demotion keeps the
+	// cap's purpose (REALTIME loses its absolute priority over other classes)
+	// while guaranteeing forward progress when nothing else competes.
 	for _, targetClass := range []aether.LatencyClass{aether.ClassREALTIME, aether.ClassINTERACTIVE, aether.ClassBULK} {
 		if targetClass == aether.ClassREALTIME && realtimeCapped {
-			continue // REALTIME over 10% cap — demote to INTERACTIVE round
+			continue // capped REALTIME is served in the INTERACTIVE round below
 		}
-		frame := s.dequeueFromClass(targetClass, order)
+		// Fold capped REALTIME streams into the INTERACTIVE round so their
+		// frames still make progress at INTERACTIVE priority (AE-H-05).
+		demoteRealtime := realtimeCapped && targetClass == aether.ClassINTERACTIVE
+		frame, isRealtime := s.dequeueFromClass(targetClass, order, demoteRealtime)
 		if frame != nil {
-			// Track bandwidth per class for REALTIME cap
+			// Track bandwidth per class for REALTIME cap. A demoted REALTIME
+			// frame served in the INTERACTIVE round still counts as REALTIME
+			// so the cap ratio stays accurate.
 			bytesOut := int64(aether.HeaderSize) + int64(frame.Length)
 			s.totalBytes += bytesOut
-			if targetClass == aether.ClassREALTIME {
+			if isRealtime {
 				s.realtimeBytes += bytesOut
 			}
 			return frame, false
@@ -378,13 +428,24 @@ func (s *Scheduler) Dequeue() (*aether.Frame, bool) {
 // order is the caller's snapshot of s.order (see Dequeue): iterating the snapshot
 // keeps this routine immune to concurrent Unregister reallocations even if a
 // future refactor unlocks s.mu mid-Dequeue.
-func (s *Scheduler) dequeueFromClass(targetClass aether.LatencyClass, order []uint64) *aether.Frame {
+//
+// includeRealtime folds REALTIME streams into this round in addition to
+// targetClass — used to serve a capped (demoted) REALTIME class in the
+// INTERACTIVE round (AE-H-05). The returned bool reports whether the chosen
+// frame belonged to a REALTIME stream so the caller charges the REALTIME
+// bandwidth counter correctly.
+func (s *Scheduler) dequeueFromClass(targetClass aether.LatencyClass, order []uint64, includeRealtime bool) (*aether.Frame, bool) {
 	var bestIdx int = -1
 	var bestFinish float64
 
 	for i, streamID := range order {
 		ss, ok := s.streams[streamID]
-		if !ok || len(ss.queue) == 0 || ss.latencyClass != targetClass {
+		if !ok || len(ss.queue) == 0 {
+			continue
+		}
+		// Serve the target class, plus REALTIME streams when a capped REALTIME
+		// class is being demoted into this round (AE-H-05).
+		if ss.latencyClass != targetClass && !(includeRealtime && ss.latencyClass == aether.ClassREALTIME) {
 			continue
 		}
 
@@ -409,7 +470,7 @@ func (s *Scheduler) dequeueFromClass(targetClass aether.LatencyClass, order []ui
 	}
 
 	if bestIdx == -1 {
-		return nil
+		return nil, false
 	}
 
 	streamID := order[bestIdx]
@@ -418,9 +479,24 @@ func (s *Scheduler) dequeueFromClass(targetClass aether.LatencyClass, order []ui
 	ss.queue = ss.queue[1:]
 	s.queueDepth.Add(-1)
 
-	// Advance virtual time
+	// Advance virtual time by the SAME cost used for selection (AE-L-07),
+	// not the raw frame size. Recompute the retransmit(2x)/FEC(0.5x) cost
+	// for the chosen frame — mirroring the selection metric above — so the
+	// penalty/bonus persists in the accumulated deficit instead of only
+	// tilting the one-shot tie-break. Without this a stream that keeps
+	// retransmitting accrues the same virtual time as a clean stream sending
+	// equal bytes, defeating the "discourage retransmit storms / encourage
+	// repair" intent. ss.isRetransmit is still set here (cleared below), so
+	// this block MUST stay above that clear.
 	frameSize := float64(aether.HeaderSize) + float64(frame.Length)
-	ss.deficit += frameSize / float64(ss.weight)
+	cost := frameSize
+	if ss.isRetransmit {
+		cost *= 2.0 // retransmit penalty (mirrors selection cost)
+	}
+	if frame.Type == aether.TypeFEC_REPAIR {
+		cost *= 0.5 // FEC bonus (mirrors selection cost)
+	}
+	ss.deficit += cost / float64(ss.weight)
 
 	// Clear the retransmit flag after consuming it. The flag is documented
 	// as single-shot ("next enqueue for a stream as a retransmit") but was
@@ -431,7 +507,7 @@ func (s *Scheduler) dequeueFromClass(targetClass aether.LatencyClass, order []ui
 	// inside the same s.mu critical section that owns ss.isRetransmit.
 	ss.isRetransmit = false
 
-	return frame
+	return frame, ss.latencyClass == aether.ClassREALTIME
 }
 
 // IsEmpty returns true if all stream queues — including pending TLP

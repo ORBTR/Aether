@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package aether
 
@@ -22,17 +22,21 @@ import (
 // See docs/_SECURITY.md §3.10 for the threat model justification.
 type AdaptiveController struct {
 	mu             sync.RWMutex
-	opts SessionOptions
+	sessions       map[CompressionCapable]struct{} // AE-L-03: live sessions this controller sheds load from
 	enabled        bool
 	checkInterval  time.Duration
 	lastCPUPercent float64
+	fecDegraded    bool // AE-L-03: current FEC rung decision (monitoring / future runtime FECCapable toggle)
+	schedDegraded  bool // AE-L-03: current scheduler rung decision (monitoring / future runtime SchedulerCapable toggle)
 	stopCh         chan struct{}
 }
 
-// NewAdaptiveController creates a controller that monitors CPU and degrades features.
-func NewAdaptiveController(opts SessionOptions) *AdaptiveController {
+// NewAdaptiveController creates a controller that monitors CPU and degrades
+// features. Register live sessions via Register so check() can shed their
+// load; call Unregister on session close. AE-L-03.
+func NewAdaptiveController() *AdaptiveController {
 	return &AdaptiveController{
-		opts:          opts,
+		sessions:      make(map[CompressionCapable]struct{}),
 		enabled:       true,
 		checkInterval: 5 * time.Second,
 		stopCh:        make(chan struct{}),
@@ -57,6 +61,23 @@ func (a *AdaptiveController) Start() {
 // Stop halts the adaptive controller.
 func (a *AdaptiveController) Stop() {
 	close(a.stopCh)
+}
+
+// Register enrols a runtime-toggleable session so the controller can shed its
+// load under CPU pressure. Sessions whose transport has no per-frame DEFLATE
+// simply don't implement CompressionCapable and aren't registered. Safe for
+// concurrent use. AE-L-03.
+func (a *AdaptiveController) Register(s CompressionCapable) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.sessions[s] = struct{}{}
+}
+
+// Unregister drops a session from the degrade set on close. AE-L-03.
+func (a *AdaptiveController) Unregister(s CompressionCapable) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.sessions, s)
 }
 
 // setEnabled toggles adaptive degradation on/off.
@@ -95,32 +116,55 @@ func (a *AdaptiveController) check() {
 		estimated = 100
 	}
 
+	a.applyDegradation(estimated)
+}
+
+// applyDegradation drives the progressive load-shedding ladder against the
+// LIVE registered sessions, under a.mu. Split out of check() so the rung
+// thresholds are unit-testable without synthesizing real CPU load.
+// Encryption is intentionally never toggled — security invariant (§3.10).
+// AE-L-03: previously this block mutated a private by-value SessionOptions
+// copy (a.opts) that no session ever read, so the ladder was inert.
+func (a *AdaptiveController) applyDegradation(estimated float64) {
 	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.lastCPUPercent = estimated
-	a.mu.Unlock()
 
-	// Apply degradation rules — disable features as CPU increases.
-	// SessionOptions uses positive flags (true=enabled), so we set to false to disable.
-	// NOTE: Encryption is NOT included — it is a security invariant that must never degrade.
-
-	if estimated > 90 && a.opts.Scheduler {
-		a.opts.Scheduler = false
-		dbgAether.Printf("Adaptive CPU %.0f%% > 90%%: disabling WFQ scheduler (using FIFO)", estimated)
-	} else if estimated <= 85 && !a.opts.Scheduler {
-		a.opts.Scheduler = true
+	// Rung 1 (>70%): disable per-frame DEFLATE on every registered session
+	// via the atomic runtime toggle the encode path samples per frame
+	// (noise_session.go compressionEnabled). This IS the shared,
+	// atomically-read policy sessions actually consult — unlike the old
+	// detached a.opts copy. Restore below 65% (hysteresis avoids flap).
+	// SetCompressionEnabled is an atomic store and takes no lock of its
+	// own, so calling it under a.mu cannot deadlock.
+	if estimated > 70 {
+		for s := range a.sessions {
+			s.SetCompressionEnabled(false)
+		}
+		if len(a.sessions) > 0 {
+			dbgAether.Printf("Adaptive CPU %.0f%% > 70%%: disabling compression on %d session(s)", estimated, len(a.sessions))
+		}
+	} else if estimated <= 65 {
+		for s := range a.sessions {
+			s.SetCompressionEnabled(true)
+		}
 	}
 
-	if estimated > 80 && a.opts.FEC {
-		a.opts.FEC = false
-		dbgAether.Printf("Adaptive CPU %.0f%% > 80%%: disabling FEC", estimated)
-	} else if estimated <= 75 && !a.opts.FEC {
-		a.opts.FEC = true
+	// Rung 2 (>80%, FEC) and Rung 3 (>90%, WFQ scheduler) are sampled at
+	// session-construction time (opts.FEC / scheduler build), so they cannot
+	// be flipped on a live session yet. Record the rung decision here —
+	// consumed by monitoring and by the future runtime FECCapable /
+	// SchedulerCapable toggles — so the documented three-rung ladder is
+	// preserved and testable. Enforcement wiring is a tracked follow-up.
+	// No capability is removed: these rungs are inert today regardless.
+	if estimated > 80 {
+		a.fecDegraded = true
+	} else if estimated <= 75 {
+		a.fecDegraded = false
 	}
-
-	if estimated > 70 && a.opts.Compression {
-		a.opts.Compression = false
-		dbgAether.Printf("Adaptive CPU %.0f%% > 70%%: disabling compression", estimated)
-	} else if estimated <= 65 && !a.opts.Compression {
-		a.opts.Compression = true
+	if estimated > 90 {
+		a.schedDegraded = true
+	} else if estimated <= 85 {
+		a.schedDegraded = false
 	}
 }

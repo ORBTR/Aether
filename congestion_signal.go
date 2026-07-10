@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 
 package aether
@@ -52,7 +52,15 @@ func (t *CongestionThrottle) Apply(p CongestionPayload) {
 	}
 
 	t.reason = p.Reason
-	t.severity = p.Severity
+	// AE-P-10: Severity is peer-controlled and physically 0-255, but the wire
+	// contract and RateFactor's documented [0,1] range require 0-100. Clamp an
+	// out-of-range hint UP to 100 (full congestion) rather than trusting it, so
+	// RateFactor never yields a negative multiplier and ShouldStall stays correct.
+	if p.Severity > 100 {
+		t.severity = 100
+	} else {
+		t.severity = p.Severity
+	}
 
 	// Default backoff if peer didn't specify one: scale from severity so higher
 	// severity yields longer windows (10 ms per percent of severity).

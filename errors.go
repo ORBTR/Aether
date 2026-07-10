@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package aether
 
@@ -60,6 +60,16 @@ var (
 	// immediately produces a busy-loop of OpenStream → refuse →
 	// retry.
 	ErrStreamCapExhausted = errors.New("transport: stream cap exhausted")
+
+	// ErrDuplicateStreamID signals that OpenStream was called with a
+	// StreamID already live in the session's stream table — e.g. a pool
+	// recycling a caller-assigned ID before the prior stream closed. The
+	// pre-existing stream is left intact; there is no new stream to
+	// return, so the caller must pick a fresh StreamID or close the prior
+	// stream first. A transient caller-side signal, not a transport
+	// failure — do NOT close the session in response.
+	// Use errors.Is(err, aether.ErrDuplicateStreamID) to detect.
+	ErrDuplicateStreamID = errors.New("transport: duplicate stream id")
 
 	// ErrSessionStuck signals that a session has persistently been unable
 	// to make forward progress (e.g. sustained Consume timeouts on the

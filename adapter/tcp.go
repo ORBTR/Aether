@@ -1,8 +1,8 @@
 //go:build !js
 
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package adapter
 
@@ -68,7 +68,15 @@ type TCPSession struct {
 	writeMu    sync.Mutex
 	sched      *scheduler.Scheduler
 	connWindow *flow.ConnWindow
-	compressor *aether.Compressor
+	// AE-P-05: separate compressor state for TX (encode) vs RX (decode) so
+	// cross-direction traffic never pollutes SessionCompState identity
+	// (lastSender/lastReceiver) or a stream's lastSeqNo/frameCount. A single
+	// shared instance flip-flopped the reconstructed identity with the
+	// direction of the most recent full header and cross-incremented the
+	// frameCount%64 resync cadence; splitting gives each directional flow
+	// dedicated state that tracks identically on both peers.
+	txCompressor *aether.Compressor
+	rxCompressor *aether.Compressor
 
 	// streamRefused counts peer-initiated OPEN requests rejected because
 	// MaxConcurrentStreams was reached. See _SECURITY.md §3.12.
@@ -202,7 +210,8 @@ func NewTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 		streams:       make(map[uint64]*tcpStream),
 		sched:         scheduler.NewScheduler(),
 		connWindow:    flow.NewConnWindow(0),
-		compressor:    aether.NewCompressor(),
+		txCompressor:  aether.NewCompressor(), // AE-P-05: encode-side state
+		rxCompressor:  aether.NewCompressor(), // AE-P-05: decode-side state
 		tickStop:      make(chan struct{}),
 	}
 	// Per-peer abuse tracker — per-session registry by default,
@@ -278,7 +287,7 @@ func (s *TCPSession) readLoop() {
 	var exitErr error
 	defer func() { s.CloseWithError(exitErr) }()
 	for {
-		frame, _, batch, err := aether.ReadNextFrame(s.conn, s.compressor)
+		frame, _, batch, err := aether.ReadNextFrame(s.conn, s.rxCompressor) // AE-P-05: RX state
 		if err != nil {
 			dbgTCP.Printf("readLoop: EXIT err=%v remote=%s", err, s.RemoteNodeID().Short())
 			if err != io.EOF {
@@ -289,6 +298,20 @@ func (s *TCPSession) readLoop() {
 		}
 		if batch != nil {
 			for _, f := range batch {
+				// AE-M-17: batched sub-frames are decoded by the
+				// short-header decoders (codec_short.go), which skip
+				// Frame.Validate() — the same gap the single-frame path
+				// guards below. Without a per-sub-frame gate a peer could
+				// smuggle unknown Type bytes, oversize Length, or
+				// payload/length mismatches into dispatchFrame inside a
+				// 0x85 batch AND evade the ReasonMalformedFrame abuse
+				// signal. Cross-adapter parity with the Noise adapter's
+				// processIncomingFrame batch loop.
+				if err := f.Validate(); err != nil {
+					dbgTCP.Printf("readLoop: batch sub-frame validate failed: %v", err)
+					s.reportAbuse(abuse.ReasonMalformedFrame)
+					continue
+				}
 				s.Health().RecordActivity()
 				s.dispatchFrame(f)
 			}
@@ -571,7 +594,8 @@ func (s *TCPSession) handleClose(frame *aether.Frame) {
 	st, ok := s.streams[frame.StreamID]
 	if !ok {
 		s.mu.Unlock()
-		s.compressor.RemoveStream(frame.StreamID)
+		s.txCompressor.RemoveStream(frame.StreamID) // AE-P-05
+		s.rxCompressor.RemoveStream(frame.StreamID) // AE-P-05
 		return
 	}
 	// Transition AND remove-from-map BEFORE releasing s.mu, so that any
@@ -591,7 +615,8 @@ func (s *TCPSession) handleClose(frame *aether.Frame) {
 		st.closeRecvOnce()
 		s.releaseStream(frame.StreamID)
 	}
-	s.compressor.RemoveStream(frame.StreamID)
+	s.txCompressor.RemoveStream(frame.StreamID) // AE-P-05
+	s.rxCompressor.RemoveStream(frame.StreamID) // AE-P-05
 }
 
 func (s *TCPSession) handleReset(frame *aether.Frame) {
@@ -601,7 +626,8 @@ func (s *TCPSession) handleReset(frame *aether.Frame) {
 		delete(s.streams, frame.StreamID)
 	}
 	s.mu.Unlock()
-	s.compressor.RemoveStream(frame.StreamID)
+	s.txCompressor.RemoveStream(frame.StreamID) // AE-P-05
+	s.rxCompressor.RemoveStream(frame.StreamID) // AE-P-05
 	if ok {
 		st.state.Transition(aether.EventRecvReset)
 		st.teardown()
@@ -758,7 +784,7 @@ func (s *TCPSession) writeLoop() {
 			}
 			if len(batch) > 1 {
 				s.writeMu.Lock()
-				_, err := s.compressor.EncodeBatch(s.conn, batch)
+				_, err := s.txCompressor.EncodeBatch(s.conn, batch) // AE-P-05: TX state
 				s.writeMu.Unlock()
 				if err != nil {
 					dbgTCP.Printf("writeLoop: batch err=%v count=%d", err, len(batch))
@@ -838,23 +864,24 @@ func (s *TCPSession) writeFrame(frame *aether.Frame) error {
 	defer s.writeMu.Unlock()
 
 	if s.opts.HeaderComp {
+		// AE-P-05: all encode goes through the TX-side compressor state.
 		// Control frames: PING/PONG/CLOSE/RESET → 4 bytes
-		if s.compressor.ShouldCompressControl(frame) {
-			_, err := s.compressor.EncodeControlShort(s.conn, frame)
+		if s.txCompressor.ShouldCompressControl(frame) {
+			_, err := s.txCompressor.EncodeControlShort(s.conn, frame)
 			return err
 		}
 		// ACK frames → 11 bytes (lite) or 3+N (full)
-		if s.compressor.ShouldCompressACK(frame) {
-			_, err := s.compressor.EncodeACKShort(s.conn, frame)
+		if s.txCompressor.ShouldCompressACK(frame) {
+			_, err := s.txCompressor.EncodeACKShort(s.conn, frame)
 			return err
 		}
 		// DATA frames → 6-9 bytes
-		if s.compressor.ShouldCompressData(frame) {
+		if s.txCompressor.ShouldCompressData(frame) {
 			if frame.Length <= 127 {
-				_, err := s.compressor.EncodeDataShortVar(s.conn, frame)
+				_, err := s.txCompressor.EncodeDataShortVar(s.conn, frame)
 				return err
 			}
-			_, err := s.compressor.EncodeDataShort(s.conn, frame)
+			_, err := s.txCompressor.EncodeDataShort(s.conn, frame)
 			return err
 		}
 	}
@@ -862,7 +889,7 @@ func (s *TCPSession) writeFrame(frame *aether.Frame) error {
 	// Full 50-byte header (fallback)
 	_, err := aether.EncodeFrame(s.conn, frame)
 	if err == nil {
-		s.compressor.RecordFullHeader(frame)
+		s.txCompressor.RecordFullHeader(frame) // AE-P-05: TX state
 	}
 	return err
 }
@@ -894,12 +921,29 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 	// the typed sentinel ErrStreamCapExhausted so pool/dispatch
 	// callers can detect cap-hit via errors.Is and back off rather
 	// than closing the session.
-	if s.registerStream(st, false) == nil {
+	// AE-L-01: registerStream has a tri-state return — nil on cap-hit, the
+	// PRE-EXISTING stream when cfg.StreamID is still live in s.streams
+	// (duplicate), or st on a fresh insert. Testing only `== nil` let a
+	// duplicate fall through and proceed with the detached, never-mapped
+	// st: the rollback defer below would delete the live map entry,
+	// RegisterWithClass would overwrite its scheduler slot, and inbound
+	// DATA would route to the original stream while the returned
+	// st.recvCh hangs forever. Compare identity and error out — matching
+	// handleOpen's `st != candidate` guard — BEFORE the rollback defer is
+	// armed so no cleanup touches the pre-existing stream.
+	registered := s.registerStream(st, false)
+	if registered == nil {
 		cap := s.opts.MaxConcurrentStreams
 		if cap <= 0 {
 			cap = DefaultTCPMaxConcurrentStreams
 		}
 		return nil, fmt.Errorf("OpenStream cap=%d: %w", cap, aether.ErrStreamCapExhausted)
+	}
+	if registered != st {
+		// Duplicate still-live StreamID (e.g. a pool recycling an ID
+		// before the prior stream closed). The pre-existing stream is
+		// untouched; never return a detached, dead stream.
+		return nil, fmt.Errorf("OpenStream stream=%d: %w", cfg.StreamID, aether.ErrDuplicateStreamID)
 	}
 
 	// committed flips to true after every post-registration step succeeds.
@@ -1015,11 +1059,11 @@ func (s *TCPSession) CloseWithError(err error) error {
 	// Capture the caller chain so the FIRST closer in a close
 	// cascade is identifiable. Frame 0 is this closure, 1 is
 	// CloseWithError; frames 2-5 are the actual callers — readLoop
-	// defer, stall detector, idle watchdog, the HSTLES dedup/multipath
+	// defer, stall detector, idle watchdog, the ORBTR dedup/multipath
 	// layer, or transport accept-full.
 	callerChain := aether.CaptureCallerChain(2, 4)
 	// Log EVERY close, including clean nil closes. Previously a
-	// nil-error Close() — exactly what the HSTLES dedup/multipath
+	// nil-error Close() — exactly what the ORBTR dedup/multipath
 	// layer calls on a losing session — was silent, so the real
 	// churn initiator never appeared in [SESSION-CLOSE] and a
 	// downstream readLoop-exit close masked it on the peer. The
@@ -1307,6 +1351,17 @@ func (st *tcpStream) Reset(reason aether.ResetReason) error {
 		delete(st.session.streams, st.streamID)
 	}
 	st.session.mu.Unlock()
+	// AE-P-07: free the per-stream compressor entry on local teardown. The
+	// compressor keeps per-stream SeqNo state in a separate unbounded sync.Map
+	// (codec_short.go Compressor.streams) that only the peer-driven handleClose
+	// / handleReset paths prune. Reset is the funnel for every LOCAL teardown —
+	// a direct Reset, the streamGC idle-reap callback, and the cancel path all
+	// route here — so without this the entry leaks for the session lifetime on
+	// locally-reset or GC-reaped streams. Ordering mirrors handleReset:
+	// delete-from-streams, then RemoveStream. Post AE-P-05 the compressor is
+	// split TX/RX, so free the stream from BOTH directional instances.
+	st.session.txCompressor.RemoveStream(st.streamID)
+	st.session.rxCompressor.RemoveStream(st.streamID)
 	st.closeRecvOnce()
 	return err
 }

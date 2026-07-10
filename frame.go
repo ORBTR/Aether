@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package aether
 
@@ -89,9 +89,26 @@ func (t FrameType) String() string {
 	}
 }
 
-// IsValid returns true if the frame type is a known type.
+// IsValid returns true if the frame type is a defined wire type.
+//
+// AE-L-14: this enumerates the defined types rather than range-checking
+// [TypeDATA..TypeCONGESTION]. The range check admitted the reserved hole
+// at 0x09 (between TypeACK=0x08 and TypePRIORITY=0x0A): a Type=0x09 frame
+// passed Validate (IsValid true, no minPayloadSizes entry) and was then
+// silently dropped at dispatch instead of being scored via
+// reportAbuse(ReasonMalformedFrame). Enumerating defined types makes 0x09
+// — and any future in-range gap — fail Validate and route to the
+// malformed-frame abuse path, exactly like out-of-range types >0x14.
 func (t FrameType) IsValid() bool {
-	return t >= TypeDATA && t <= TypeCONGESTION
+	switch t {
+	case TypeDATA, TypeOPEN, TypeCLOSE, TypeRESET, TypeWINDOW, TypePING,
+		TypePONG, TypeACK, TypePRIORITY, TypeGOAWAY, TypeFEC_REPAIR,
+		TypeWHOIS, TypeRENDEZVOUS, TypeNETWORK_CONFIG, TypeHANDSHAKE,
+		TypeSTATS, TypeTRACE, TypePATH_PROBE, TypeCONGESTION:
+		return true
+	default:
+		return false
+	}
 }
 
 // ────────────────────────────────────────────────────────────────────────────
