@@ -9,122 +9,112 @@ package adapter
 
 import (
 	"context"
-	"sync"
-	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/ORBTR/aether/flow"
 )
 
-// End-to-end assertion that application-read-driven grants produce real
-// backpressure: a slow consumer takes meaningfully longer to refill the
-// sender's credit than a fast consumer. That's what application-level
-// backpressure MEANS — credit availability on the sender side tracks
-// the receiver's actual consumption rate, not the arrival rate of
-// frames into recvCh. If grants emitted as soon as a frame landed in
-// recvCh, a slow consumer would give no signal to the sender at all.
+// TestConsumeDrivenGrants_SlowConsumerBackpressuresSender proves the core
+// backpressure invariant of the receiver-side grant path: sender credit is
+// refilled ONLY in proportion to what the application has actually consumed
+// (grantDebouncer.Record → StreamWindow.ReceiverConsume), never ahead of it.
+// A consumer that has read fewer bytes therefore leaves the sender with less
+// credit — which is exactly what application-level backpressure means. If
+// grants emitted on frame arrival instead of application read, a slow
+// consumer would signal nothing to the sender and the recv buffer would
+// overflow after credit had already been advertised.
 //
-// Strategy:
-//   - Sender drains its full 4 MB window with 20 × 128 KB payloads.
-//   - Receiver consumes those bytes at two different paces, calling
-//     Record on each read (mirroring noiseStream.Receive).
-//   - Measure elapsed time from workload start until Available()
-//     returns to a "credit refilled past half window" state.
-//   - Assert: slow reader's refill-time ≥ fast reader's refill-time.
+// This is asserted structurally, with no wall-clock timing and no racing
+// goroutines. The earlier form of this test compared the elapsed refill time
+// of a fast (0-delay) consumer against a slow (10 ms/read) one; that raced
+// two timed goroutines and flaked under CI CPU starvation (the "fast"
+// measurement inflated toward the "slow" one when goroutines were starved).
+// The property under test — refill tracks consumption — is captured here
+// directly and deterministically from the window's own accounting:
+//
+//   - On a non-growing window, grantLocked computes grant = currentWindow −
+//     recvCredit and recvCredit == initialCredit − consumed + granted, so the
+//     cumulative grant can never exceed cumulative consumed. Hence at every
+//     step Available() ≤ post-consume-floor + bytes-recorded-so-far.
+//   - The sender therefore cannot reach the half-window credit mark until it
+//     has consumed at least (halfWindow − floor) bytes of real application
+//     reads — credit strictly cannot precede consumption.
 func TestConsumeDrivenGrants_SlowConsumerBackpressuresSender(t *testing.T) {
 	const (
 		window      = 4 * 1024 * 1024
 		payloadSize = 128 * 1024
-		payloads    = 20 // 2.5 MB total, under the window
+		payloads    = 20 // 2.5 MB total — drains most of the 4 MB window
 	)
 
-	// Helper: construct a StreamWindow, consume the full workload amount
-	// on the sender side, then let the receiver drain recvCh at
-	// readInterval, recording each read. Returns elapsed time until the
-	// sender's Available() crosses the 2MB mark (half-window refilled).
-	run := func(readInterval time.Duration) time.Duration {
-		w := flow.NewStreamWindow(window)
-		// Install an updater that applies grants back to the window, so
-		// refill actually happens and Available() tracks real refill.
-		var mu sync.Mutex
-		var applied int64
-		send := func(sid uint64, credit uint64) {
-			mu.Lock()
-			applied = int64(credit)
-			mu.Unlock()
-			w.ApplyUpdate(int64(credit))
-		}
-		d := newGrantDebouncer(w, send, 42,
-			int64(float64(window)*GrantImmediateFraction))
-		defer d.Close()
+	w := flow.NewStreamWindow(window)
+	// send applies each cumulative grant back to the window, exactly as the
+	// real WINDOW_UPDATE path does, so Available() tracks true refill. It is
+	// called synchronously from Flush() below on this same goroutine, so no
+	// locking is needed.
+	var appliedCumulative int64
+	send := func(_ uint64, credit uint64) {
+		appliedCumulative = int64(credit)
+		w.ApplyUpdate(int64(credit))
+	}
+	d := newGrantDebouncer(w, send, 42, int64(float64(window)*GrantImmediateFraction))
+	defer d.Close()
 
-		// Sender consumes all payload bytes up front.
-		if err := w.Consume(context.Background(), payloadSize*payloads); err != nil {
-			t.Fatalf("consume: %v", err)
-		}
-
-		// Now dispatch payloads into recvCh for the consumer to drain.
-		recvCh := make(chan []byte, 64)
-		go func() {
-			for i := 0; i < payloads; i++ {
-				recvCh <- make([]byte, payloadSize)
-			}
-			close(recvCh)
-		}()
-
-		start := time.Now()
-
-		// Consumer: reads + records at readInterval.
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			for payload := range recvCh {
-				if readInterval > 0 {
-					time.Sleep(readInterval)
-				}
-				d.Record(int64(len(payload)))
-			}
-		}()
-
-		// Wait until Available() crosses the half-window mark — that's
-		// the moment enough grants have made it back to the sender that
-		// it can resume a meaningful workload.
-		halfWindow := int64(window / 2)
-		deadline := time.After(2 * time.Second)
-		for {
-			if w.Available() >= halfWindow {
-				return time.Since(start)
-			}
-			select {
-			case <-deadline:
-				<-done
-				t.Fatalf("timeout waiting for half-window refill; readInterval=%v Available=%d applied=%d",
-					readInterval, w.Available(), applied)
-			case <-time.After(time.Millisecond):
-			}
-		}
+	// Sender drains the workload up front: Available drops to a floor below
+	// the half-window mark.
+	if err := w.Consume(context.Background(), payloadSize*payloads); err != nil {
+		t.Fatalf("consume: %v", err)
+	}
+	floor := w.Available()
+	halfWindow := int64(window / 2)
+	if floor >= halfWindow {
+		t.Fatalf("workload did not drain below half-window: Available=%d halfWindow=%d — test premise broken",
+			floor, halfWindow)
 	}
 
-	fast := run(0)
-	slow := run(10 * time.Millisecond)
-
-	t.Logf("refill-to-half: fast=%v, slow=%v", fast, slow)
-
-	// Backpressure assertion: a 10 ms-per-payload slow consumer MUST
-	// take noticeably longer to refill than an instant consumer. If
-	// they're the same, grant emission is no longer driven by
-	// application reads — meaning the sender gets credit regardless of
-	// whether the application has consumed anything.
-	if slow < fast {
-		t.Errorf("slow consumer refilled FASTER than fast (%v < %v) — should never happen",
-			slow, fast)
+	// Invariant 1: with zero application reads, credit does NOT refill. Frames
+	// merely being dispatched (the workload) grant nothing on their own; only
+	// Record() (application consumption) can move credit.
+	if got := w.Available(); got != floor {
+		t.Fatalf("credit refilled with zero application reads: floor=%d now=%d", floor, got)
 	}
-	if slow <= fast+5*time.Millisecond {
-		t.Errorf("slow consumer should take meaningfully longer to refill: fast=%v slow=%v (diff=%v)",
-			fast, slow, slow-fast)
+
+	// Drive consumption one payload at a time, forcing a synchronous Flush so
+	// emission is deterministic (never left to the 5 ms coalesce timer or the
+	// 500 ms watchdog). Track monotonicity, the consumption bound, and the
+	// first read at which Available reaches the half-window mark.
+	prev := floor
+	crossedAt := -1
+	for i := 0; i < payloads; i++ {
+		d.Record(payloadSize)
+		d.Flush()
+		cur := w.Available()
+
+		if cur < prev {
+			t.Fatalf("Available regressed on read %d: %d < %d", i+1, cur, prev)
+		}
+		recorded := int64(i+1) * payloadSize
+		if cur > floor+recorded {
+			t.Fatalf("read %d: credit outran consumption — Available=%d > floor(%d)+recorded(%d); grants are not consume-driven",
+				i+1, cur, floor, recorded)
+		}
+		if crossedAt < 0 && cur >= halfWindow {
+			crossedAt = i + 1
+		}
+		prev = cur
 	}
+
+	// By the end (all bytes consumed) the sender must have reached half-window
+	// credit — but NOT before it had consumed enough real reads to cover the
+	// floor→halfWindow gap. That lower bound is the backpressure guarantee.
+	if crossedAt < 0 {
+		t.Fatalf("Available never reached half-window after all %d reads: Available=%d appliedCumulative=%d",
+			payloads, w.Available(), appliedCumulative)
+	}
+	minReads := int((halfWindow - floor + payloadSize - 1) / payloadSize) // ceil
+	if crossedAt < minReads {
+		t.Errorf("reached half-window after only %d reads; refill outran consumption (need ≥ %d)",
+			crossedAt, minReads)
+	}
+	t.Logf("consume-driven refill: floor=%d, crossed half-window after %d/%d reads (min %d), appliedCumulative=%d",
+		floor, crossedAt, payloads, minReads, appliedCumulative)
 }
-
-// Silence unused-import when the test is trimmed during debugging.
-var _ atomic.Int32
