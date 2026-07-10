@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 
 // Package abuse implements per-peer behavioural scoring with a circuit
@@ -161,7 +161,6 @@ func (s *Score[K]) Record(peer K, r Reason) (current float64, justExceeded bool)
 		p = &PeerScore{lastUpdate: now}
 		s.peers[peer] = p
 	}
-	wasOver := p.score >= s.cfg.Threshold
 	s.decayLocked(p, now)
 
 	p.score += DefaultWeight(r)
@@ -169,8 +168,24 @@ func (s *Score[K]) Record(peer K, r Reason) (current float64, justExceeded bool)
 	p.lastUpdate = now
 	p.hits++
 
+	// AE-P-09: re-arm the breaker on current state, not just the rising
+	// edge. The old guard blacklisted only on a below->over transition
+	// (!wasOver && nowOver) using a pre-decay wasOver snapshot. A peer
+	// whose score stayed >= threshold across a cool-off kept wasOver==true
+	// forever, so once IsBlacklisted auto-cleared the flag at TTL expiry
+	// (without resetting the score) the breaker never re-fired and the
+	// accept gate re-admitted a still-abusive peer permanently. Clear an
+	// expired cool-off here first (so re-arming does not depend on
+	// IsBlacklisted having been polled), then re-blacklist whenever the
+	// post-decay score is over threshold and the peer is not already
+	// serving a cool-off. This fires at most one GoAway per BlacklistTTL
+	// for a sustained abuser and never resets the accumulated score, so no
+	// misbehaviour evidence is lost (capability preserved).
+	if p.blacklisted && now.After(p.blacklistEnd) {
+		p.blacklisted = false
+	}
 	nowOver := p.score >= s.cfg.Threshold
-	if !wasOver && nowOver {
+	if nowOver && !p.blacklisted {
 		p.blacklisted = true
 		p.blacklistEnd = now.Add(s.cfg.BlacklistTTL)
 		justExceeded = true
@@ -192,6 +207,20 @@ func (s *Score[K]) Current(peer K) float64 {
 
 // IsBlacklisted reports whether the peer is currently in the cool-off
 // window. Auto-clears once the TTL expires.
+//
+// AE-M-04 caveat: this predicate is what the responder-side accept gate
+// (adapter.AcceptSessionOverConn) consults to refuse a peer for its
+// BlacklistTTL cool-off, rather than letting the peer reset its score to
+// 0 by reconnecting. That protection only holds when callers share ONE
+// node-scoped registry across sessions; a fresh per-session registry
+// carries no prior blacklist. Auto-clear here only ungates the accept
+// path once the TTL lapses; it deliberately does NOT reset the score
+// (a still-misbehaving peer keeps its accumulated evidence). AE-P-09:
+// re-arming no longer depends on a HalfLife≈BlacklistTTL decay
+// coincidence — Record re-arms the breaker on the peer's current
+// post-decay state regardless of peak, so a peer that stays >= threshold
+// across the cool-off is re-blacklisted on its next event instead of
+// staying latched open.
 func (s *Score[K]) IsBlacklisted(peer K) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()

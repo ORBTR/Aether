@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package reliability
 
@@ -245,6 +245,19 @@ func (d *FECDecoder) tryRecover(groupID uint32, g *fecGroup) []byte {
 
 	if len(g.received) < dataCount-1 {
 		return nil // more than one frame missing — can't recover with XOR
+	}
+
+	// AE-M-13: XOR reconstruction requires the exact (dataCount-1) surviving
+	// data frames to XOR against the repair. A group with zero received data
+	// frames — e.g. a Total==2 repair where dataCount==1, so `0 < dataCount-1`
+	// is `0 < 0` = false and the `>= dataCount` check above is also false —
+	// would otherwise fall through and return the repair payload verbatim as a
+	// fabricated DATA frame. Delivered via handleFECRepair -> deliverToStream,
+	// those bytes bypass the per-stream anti-replay window and reorder buffer,
+	// letting an authenticated peer inject or replay arbitrary SeqNo-less bytes
+	// into any stream. Require at least one real data frame before recovering.
+	if len(g.received) == 0 {
+		return nil
 	}
 
 	// Exactly one frame missing — recover it

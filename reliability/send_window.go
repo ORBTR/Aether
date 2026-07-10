@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package reliability
 
@@ -390,6 +390,11 @@ func (w *SendWindow) ProcessCompositeACK(ack *aether.CompositeACK, reorderThresh
 		// First pass: find largestAcked for reorder threshold
 		for i := 0; i < windowBits; i++ {
 			seqNo := ack.BaseACK + 1 + uint32(i)
+			// AE-H-09: bits at/beyond largestSent must not inflate largestAcked;
+			// a peer setting a high bit could otherwise widen the NACK range.
+			if seqNo >= w.next {
+				break
+			}
 			if ack.Bitmap[i/8]&(1<<(uint(i)%8)) != 0 {
 				if seqNo > largestAcked {
 					largestAcked = seqNo
@@ -413,9 +418,15 @@ func (w *SendWindow) ProcessCompositeACK(ack *aether.CompositeACK, reorderThresh
 					delete(w.entries, seqNo)
 				}
 			} else {
-				// bit=0: missing — implicit NACK if reorder threshold met
+				// bit=0: missing — implicit NACK if reorder threshold met.
+				// AE-H-09: require seqNo strictly below largestAcked. Without
+				// this guard an in-flight seq above the highest SACKed seq makes
+				// largestAcked-seqNo underflow uint32 to ~4e9, which widens to a
+				// large positive int (>= reorderThreshold) and spuriously NACKs
+				// the whole in-flight tail — a fast-retransmit storm plus a false
+				// congestion loss signal on every gapped ACK.
 				if _, ok := w.entries[seqNo]; ok {
-					if int(largestAcked-seqNo) >= reorderThreshold {
+					if seqNo < largestAcked && int(largestAcked-seqNo) >= reorderThreshold {
 						nacks = append(nacks, seqNo)
 					}
 				}
@@ -430,6 +441,17 @@ func (w *SendWindow) ProcessCompositeACK(ack *aether.CompositeACK, reorderThresh
 	for _, block := range ack.ExtRanges {
 		if block.Start <= bitmapEnd {
 			continue // overlaps bitmap window — ignore (spec violation by receiver)
+		}
+		if block.End >= w.next {
+			// End at/beyond largestSent is meaningless (we hold no entries
+			// there) and, critically, unbounded: End=0xFFFFFFFF makes the
+			// `seq <= block.End` loop below non-terminating because seq++
+			// wraps 0xFFFFFFFF→0 and stays <= End forever, spinning at 100%
+			// CPU while holding w.mu — one crafted frame wedges the session.
+			// This is the same upper-bound scope guard the DroppedRanges loop
+			// applies (block.End >= w.next). (§3.2 / S1 — AE-C-02)
+			atomic.AddUint64(&w.suspiciousACKs, 1)
+			continue
 		}
 		if block.End < block.Start {
 			atomic.AddUint64(&w.suspiciousACKs, 1)

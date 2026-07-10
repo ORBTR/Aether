@@ -273,3 +273,104 @@ func TestStop_TerminatesEnsureGoroutine(t *testing.T) {
 		t.Errorf("Stop didn't terminate goroutine: %d before, %d after", beforeStop, afterStop)
 	}
 }
+
+// TestPickByQuality_SkipsFlappingAndDeadPaths is the AE-M-10 regression.
+// PickByQuality must not hand back a session on a PathDead or PathFlapping
+// path (both keep a live session — a flapping path's Ping still succeeds,
+// a dead path within deadResurrectCooldown too), which would silently
+// defeat the flapping demote and primary-failure failover. It must also
+// resurrect flapping paths whose demote window has elapsed so a recovered
+// path is selectable again.
+func TestPickByQuality_SkipsFlappingAndDeadPaths(t *testing.T) {
+	tracker := quality.NewTracker()
+	m := NewManager()
+
+	// Higher-grade Noise path (grade A) vs a WS path (grade C) dragged
+	// lower with recorded failures — absent any demotion the Noise path
+	// is the unambiguous winner, so if a later assertion returns the WS
+	// session it can only be because the guard shunned the Noise path.
+	noiseSess := newFakeSession(aether.ProtoNoise, 5*time.Millisecond, time.Millisecond)
+	wsSess := newFakeSession(aether.ProtoWebSocket, 5*time.Millisecond, time.Millisecond)
+
+	if err := m.EnsureK(context.Background(), QualityConfig{
+		Tracker:     tracker,
+		LocalRegion: "syd",
+		PeerID:      "peer1",
+		Weights:     quality.DefaultWeights,
+	}, 0); err != nil {
+		t.Fatalf("EnsureK: %v", err)
+	}
+
+	m.AddPathQA(noiseSess, aether.ProtoNoise, "syd") // same-region, grade A
+	m.AddPathQA(wsSess, aether.ProtoWebSocket, "syd") // same-region, grade C
+
+	tracker.RecordClose(quality.Key("peer1", aether.ProtoWebSocket.String()), false)
+	tracker.RecordClose(quality.Key("peer1", aether.ProtoWebSocket.String()), false)
+	tracker.RecordClose(quality.Key("peer1", aether.ProtoWebSocket.String()), false)
+
+	// Age both past the AgeGrace ramp so their scores are clearly
+	// non-zero and the grade/health ordering is deterministic.
+	old := time.Now().Add(-2 * time.Minute)
+	for _, p := range m.paths {
+		p.LastSuccess = old
+		p.CreatedAt = old
+	}
+
+	pathByProto := func(proto aether.Protocol) *Path {
+		t.Helper()
+		for _, p := range m.paths {
+			if p.Protocol == proto {
+				return p
+			}
+		}
+		t.Fatalf("no path for protocol %s", proto)
+		return nil
+	}
+	noisePath := pathByProto(aether.ProtoNoise)
+
+	// Baseline: with no path demoted, the higher-grade Noise path wins.
+	if got, ok := m.PickByQuality(quality.OpDefault); !ok || got != noiseSess {
+		t.Fatalf("baseline: want Noise session ok=true, got=%v ok=%v", got, ok)
+	}
+
+	// Case A — flapping path (session still alive) must be shunned; the
+	// healthy WS path is selected instead of the higher-scoring flapper.
+	noisePath.State = PathFlapping
+	noisePath.flappingUntil = time.Now().Add(time.Minute)
+	if got, ok := m.PickByQuality(quality.OpDefault); !ok || got != wsSess {
+		t.Errorf("Case A (flapping): want WS session ok=true, got=%v ok=%v", got, ok)
+	}
+
+	// Case B — dead path within deadResurrectCooldown (session still
+	// alive) must be shunned.
+	noisePath.State = PathDead
+	noisePath.flappingUntil = time.Time{}
+	noisePath.LastFailure = time.Now()
+	if got, ok := m.PickByQuality(quality.OpDefault); !ok || got != wsSess {
+		t.Errorf("Case B (dead-in-cooldown): want WS session ok=true, got=%v ok=%v", got, ok)
+	}
+
+	// Case C — flapping demote window already elapsed: the added
+	// resurrectExpiredFlappingPathsLocked call restores the path to
+	// PathStandby so the highest-score Noise path is selectable again.
+	noisePath.State = PathFlapping
+	noisePath.LastFailure = time.Time{}
+	noisePath.flappingUntil = time.Now().Add(-time.Second)
+	if got, ok := m.PickByQuality(quality.OpDefault); !ok || got != noiseSess {
+		t.Errorf("Case C (recovered flapper): want Noise session ok=true, got=%v ok=%v", got, ok)
+	}
+	if noisePath.State != PathStandby {
+		t.Errorf("Case C: elapsed flapper should be resurrected to Standby, got %s", noisePath.State)
+	}
+
+	// Case D — every path demoted with a future window: no candidate
+	// survives the guard, so PickByQuality reports no session rather than
+	// handing back a shunned path.
+	for _, p := range m.paths {
+		p.State = PathFlapping
+		p.flappingUntil = time.Now().Add(time.Minute)
+	}
+	if got, ok := m.PickByQuality(quality.OpDefault); ok {
+		t.Errorf("Case D (all demoted): want ok=false, got=%v ok=%v", got, ok)
+	}
+}

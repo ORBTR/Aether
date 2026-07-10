@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 
 package congestion
@@ -154,6 +154,20 @@ func (r *RACK) UpdateRTT(rtt time.Duration) {
 func (r *RACK) Ack(seq uint32, xmitTime, ackTime time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// AE-L-05: a seq RACK previously declared lost that is now being
+	// acknowledged is DSACK evidence — the packet was reordered past reoWnd,
+	// not truly lost. Inflate the reorder window (RFC 8985 §7.2) BEFORE the
+	// delete below clears the markedLost entry, so genuinely-reordering paths
+	// widen their tolerance instead of re-declaring the same in-order-late
+	// packets lost every tick. This is the production wiring for OnDSACK:
+	// markedLost membership is the DSACK signal the adapter's ACK path already
+	// carries in via rack.Ack (noise_dispatch.go), so no adapter change or new
+	// RACK API is needed. inflateReoWndLocked sets dsackSeen, which makes the
+	// clean-shrink block below skip this Ack — matching the intended
+	// OnDSACK-then-Ack sequence.
+	if r.markedLost[seq] {
+		r.inflateReoWndLocked()
+	}
 	delete(r.markedLost, seq)
 	if xmitTime.After(r.fack) {
 		r.fack = xmitTime
@@ -186,6 +200,15 @@ func (r *RACK) Ack(seq uint32, xmitTime, ackTime time.Time) {
 func (r *RACK) OnDSACK() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.inflateReoWndLocked()
+}
+
+// inflateReoWndLocked widens reoWnd by one adaptive step in response to a
+// DSACK (a previously-marked-lost packet proven to have arrived). Caller
+// must hold mu. AE-L-05: shared by the exported OnDSACK and the in-Ack DSACK
+// detection so both reorder-evidence paths grow the window identically per
+// RFC 8985 §7.2, still capped at rackReoWndCap.
+func (r *RACK) inflateReoWndLocked() {
 	r.dsackSeen = true
 	r.reoWndPersist = 0
 	step := r.minRTT / rackReoWndStepDivisor

@@ -1,8 +1,8 @@
 //go:build !js
 
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package noise
 
@@ -191,9 +191,17 @@ type NoiseTransport struct {
 	initiatorTickets *initiatorTicketCache // initiator-side resume cache
 	seenTickets      *seenTicketCache      // responder-side replay guard
 
+	// AE-P-20: memoized signed NodeInfo handshake payload. Constant for the
+	// transport's lifetime (see encodeNodeInfo), so the per-handshake
+	// ed25519.Sign + json.Marshal that ran under the listener-wide l.mu on
+	// the read-loop goroutine is computed exactly once here.
+	nodeInfoOnce  sync.Once
+	nodeInfoBytes []byte
+	nodeInfoErr   error
+
 	// Cross-org anycast forwarder — intra-org noise-UDP hairpin per
 	// inner_relay.go + the design doc at
-	// HSTLES/Library/docs/superpowers/plans/2026-05-23-cross-org-anycast-forwarder.md.
+	// the consuming runtime cross-org anycast forwarder plan.
 	// Nil = transport runs in non-forwarder mode (legacy behaviour:
 	// preambled msg1 for non-local targets is dropped, op=1 / op=2
 	// frames are ignored). Set via SetForwarder before the listener

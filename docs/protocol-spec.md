@@ -16,7 +16,7 @@
 > **Module:** `github.com/ORBTR/aether`
 > **Status:** Specification (v6.1)
 > **Date:** 2026-04-18
-> **Authors:** HSTLES / ORBTR Pty Ltd
+> **Authors:** ORBTR Pty Ltd
 
 ## Terminology
 
@@ -148,7 +148,7 @@ All multi-byte fields are **big-endian** (network byte order).
 
 | Code | Name | Payload | Description |
 |------|------|---------|-------------|
-| 0x11 | STATS | `[RTT_us:4][Loss_ppm:4][CWND:4][Retransmits:4][FramesSent:8][BytesSent:8][ActiveStreams:2]` | Periodic session stats report (34 bytes). Sent every 30s on control stream. |
+| 0x11 | STATS | `[RTT_us:4][Loss_ppm:4][CWND:4][Retransmits:4][FramesSent:8][BytesSent:8][ActiveStreams:2][FramesRecv:8][BytesRecv:8][TotalReorders:4][DroppedFrames:4][RttP50_us:4][RttP99_us:4][TLPFires:4][RACKMarks:4]` | Periodic session stats report (74 bytes; receive-direction + RTT-distribution counters carry the asymmetric-loss/quality signal for the multipath scorer — see codec.go StatsPayloadSize). Sent every 5s on control stream. AE-P-22 |
 | 0x12 | TRACE | `[TraceID:8][HopIndex:1][NodeID:8][Timestamp:8][Latency_us:4]` | Distributed RPC trace. Each hop appends its entry (29 bytes). |
 | 0x13 | PATH_PROBE | `[ProbeID:4][PayloadSize:2][Padding:var]` | Active path measurement + PMTU discovery. Response echoes ProbeID. |
 
@@ -383,7 +383,7 @@ A 128-bit packet-level replay window operates per connection, BEFORE stream demu
 - **Scope:** Connection-level (all streams combined)
 - **DATA frames only:** Control frames (WINDOW, ACK, PING, PONG, GOAWAY, CLOSE, RESET, PRIORITY) have SeqNo=0 and are exempt from replay checking. Applying anti-replay to control frames caused WINDOW_UPDATE frames to be silently dropped after the first one (SeqNo=0 seen as duplicate), permanently draining flow control credit and stalling streams.
 
-Implementation: `reliability/packet_replay.go:PacketReplayWindow`
+AE-P-25: The standalone `reliability/packet_replay.go:PacketReplayWindow` was removed — it was an allocated-but-never-read layer that misused per-stream `frame.SeqNo` as a connection-level packet counter (silently dropping streams 1-4). Connection-level replay protection is provided pre-decryption by `noise/nonce_window.go` (each encrypted UDP packet carries an 8-byte explicit nonce; a sliding 64-bit bitmap rejects duplicates before decrypt), and per-stream reordering is caught by `reliability/antireplay.go:ReplayWindow` (checked via `reliability/engine.go` `Replay.Check`).
 
 ---
 
@@ -1318,7 +1318,7 @@ Consumers derive their own quality models from these capabilities.
 
 | Code | Type | Payload |
 |------|------|---------|
-| 0x11 | STATS | RTT, loss%, cwnd, retransmits, frames, bytes, streams (34B) |
+| 0x11 | STATS | RTT, loss%, cwnd, retransmits, frames, bytes, streams, recv-frames/bytes, reorders, drops, RTT p50/p99, TLP/RACK counts (74B) |
 | 0x12 | TRACE | TraceID + per-hop entries (nodeID, timestamp, latency) |
 | 0x13 | PATH_PROBE | ProbeID + variable padding for PMTU discovery |
 

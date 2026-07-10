@@ -1,13 +1,14 @@
 //go:build !js
 
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package quic
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 
@@ -53,8 +54,21 @@ func (s *QuicSession) Receive(ctx context.Context) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// No need to close read side of uni stream, but good practice to read until EOF
-	return io.ReadAll(stream)
+	// AE-M-15: cap the read at MaxPayloadSize so a peer cannot stream
+	// arbitrarily large data on a single uni-stream and OOM the process
+	// (QUIC per-stream flow control only bounds in-flight bytes, not the
+	// total io.ReadAll accumulates). Read one byte past the cap so an
+	// over-limit stream is rejected rather than silently truncated. Mirrors
+	// adapter/quic.go's length guard and adapter/noise_reliability.go's LimitReader.
+	limited := io.LimitReader(stream, int64(aether.MaxPayloadSize)+1)
+	payload, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if len(payload) > aether.MaxPayloadSize {
+		return nil, fmt.Errorf("aether: quic payload too large (max %d bytes)", aether.MaxPayloadSize)
+	}
+	return payload, nil
 }
 
 // Close terminates the session.

@@ -1,8 +1,8 @@
 //go:build !js
 
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package noise
 
@@ -39,9 +39,16 @@ func (t *NoiseTransport) handleRelayRequest(c *noiseConn, payload []byte) error 
 		return targetConn.sendRelayPacket(c.remoteNode, data)
 	}
 
-	// Fallback: try external session (WS/QUIC bridge) via RelayService
+	// Fallback: try external session (WS/QUIC bridge) via RelayService.
+	// AE-H-08: enforce scope isolation on the bridge path too — a Noise peer
+	// must not relay into an external session belonging to another scope.
+	// Empty scope on either side = dedicated mode (no restriction), matching
+	// resolveRelayTarget's Noise-path check.
 	if t.relayService != nil {
-		if extSess := t.relayService.LookupExternal(targetNodeID); extSess != nil {
+		if extSess, targetScope, ok := t.relayService.ExternalScope(targetNodeID); ok {
+			if !scopeAllowed(c.scopeID, targetScope) {
+				return relay.ErrTenantMismatch
+			}
 			// Build relay data frame for external session: [sourceNodeID][payload]
 			frame := make([]byte, relay.RelayHeaderSize+len(data))
 			copy(frame[:relay.RelayHeaderSize], c.remoteNode)
@@ -51,6 +58,13 @@ func (t *NoiseTransport) handleRelayRequest(c *noiseConn, payload []byte) error 
 	}
 
 	return relay.ErrTargetUnreachable
+}
+
+// scopeAllowed reports whether a relay between scopes a and b is permitted.
+// Both scopes must match; an empty scope on either side means dedicated mode
+// (no restriction), mirroring resolveRelayTarget's Noise-path check. AE-H-08.
+func scopeAllowed(a, b string) bool {
+	return a == "" || b == "" || a == b
 }
 
 // resolveRelayTarget finds the target connection for a relay request and validates
@@ -194,6 +208,7 @@ func (l *noiseListener) handleRelayedHandshake(relayConn *noiseConn, sourceNodeI
 			return err
 		}
 		hs = &listenerHandshake{state: state, created: time.Now()}
+		l.evictOldestHandshakeLocked() // AE-P-21: hard cap on incomplete-handshake map
 		l.handshakes[sourceNodeID] = hs
 
 		// Process the first message (stripped of fingerprint)
@@ -307,9 +322,9 @@ func (l *noiseListener) handleRelayedHandshake(relayConn *noiseConn, sourceNodeI
 // RegisterExternalSession adds a non-Noise session (e.g., WebSocket) to the
 // relay's session table via RelayService. This allows the relay to forward
 // frames between Noise peers and external transport sessions.
-func (t *NoiseTransport) RegisterExternalSession(nodeID aether.NodeID, sess aether.Connection) {
+func (t *NoiseTransport) RegisterExternalSession(nodeID aether.NodeID, sess aether.Connection, scopeID string) {
 	if t.relayService != nil {
-		t.relayService.RegisterExternal(nodeID, sess)
+		t.relayService.RegisterExternal(nodeID, sess, scopeID)
 	}
 }
 
@@ -337,14 +352,28 @@ func (t *NoiseTransport) HandleExternalRelayFrame(sourceNodeID aether.NodeID, da
 	targetNodeID := aether.NodeID(data[:relay.RelayHeaderSize])
 	payload := data[relay.RelayHeaderSize:]
 
+	// AE-H-08: resolve the source bridge session's scope so the same isolation
+	// invariant enforced on the Noise path also applies when a frame originates
+	// from an external (WS/QUIC/gRPC) bridge session.
+	var sourceScope string
+	if t.relayService != nil {
+		_, sourceScope, _ = t.relayService.ExternalScope(sourceNodeID)
+	}
+
 	// Try Noise target (external → Noise peer)
 	if targetConn := t.findNoiseSession(targetNodeID); targetConn != nil {
+		if !scopeAllowed(sourceScope, targetConn.scopeID) {
+			return relay.ErrTenantMismatch
+		}
 		return targetConn.sendRelayPacket(sourceNodeID, payload)
 	}
 
 	// Try external target (external → external, e.g., WS-to-WS relay) via RelayService
 	if t.relayService != nil {
-		if extSess := t.relayService.LookupExternal(targetNodeID); extSess != nil {
+		if extSess, targetScope, ok := t.relayService.ExternalScope(targetNodeID); ok {
+			if !scopeAllowed(sourceScope, targetScope) {
+				return relay.ErrTenantMismatch
+			}
 			frame := make([]byte, relay.RelayHeaderSize+len(payload))
 			copy(frame[:relay.RelayHeaderSize], sourceNodeID)
 			copy(frame[relay.RelayHeaderSize:], payload)

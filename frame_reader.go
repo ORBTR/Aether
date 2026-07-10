@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package aether
 
@@ -46,6 +46,8 @@ func ReadNextFrame(r io.Reader, c *Compressor) (frame *Frame, indicator byte, ba
 			frame, err = c.DecodeControlShort(r)
 		case ShortACKIndicator:
 			frame, err = c.DecodeACKShort(r)
+		case ShortACKFullIndicator:
+			frame, err = c.DecodeACKShortFull(r)
 		case ShortDataVarIndicator:
 			frame, err = c.DecodeDataShortVar(r)
 		case ShortEncryptedIndicator:

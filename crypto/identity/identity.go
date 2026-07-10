@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  *
  * CryptoIdentity encapsulates Ed25519 + Curve25519 key derivation and
  * node identity operations. Extracted from NoiseTransport to be reusable

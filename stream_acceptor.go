@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package aether
 
@@ -279,7 +279,32 @@ func (a *StreamAcceptor) AcceptByID(ctx context.Context, streamID uint64) (Strea
 			return nil, ctx.Err()
 		}
 	case <-a.closed:
-		return nil, a.errClosed
+		// AE-L-16: mirror the ctx.Done() drain above. Session teardown
+		// closes `closed` (via SignalClose) BEFORE calling the acceptor's
+		// Close() that sets isClosed, so a Notify racing teardown still
+		// takes the waiter fast-path, deletes our slot, and buffers the
+		// stream into ch. When this branch wins the select that stream
+		// would be orphaned — Notify reported it delivered, Close() cannot
+		// surface it (already removed from the waiters map), and no Reset
+		// is ever sent. Re-check the map: if we are still the registered
+		// waiter nothing is in flight; otherwise consume the buffered
+		// stream and hand it back so the caller can use or Reset it.
+		a.mu.Lock()
+		if cur, ok := a.waiters[streamID]; ok && cur == ch {
+			delete(a.waiters, streamID)
+			a.mu.Unlock()
+			return nil, a.errClosed
+		}
+		a.mu.Unlock()
+		select {
+		case st, ok := <-ch:
+			if !ok {
+				return nil, a.errClosed
+			}
+			return st, nil
+		default:
+			return nil, a.errClosed
+		}
 	}
 }
 

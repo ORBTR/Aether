@@ -1,8 +1,8 @@
 //go:build !js
 
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package discovery
 
@@ -20,7 +20,7 @@ import (
 // Queries _mesh._tcp.<domain> for seed node addresses and ports.
 // Results are cached for the configured TTL duration.
 type DNSSRVDiscoverer struct {
-	domain   string        // e.g., "hstles.com"
+	domain   string        // e.g., "orbtr.io"
 	resolver *net.Resolver // nil = use default
 	cacheTTL time.Duration // how long to cache results (default: 5m)
 

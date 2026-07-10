@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package aether
 
@@ -57,7 +57,7 @@ func CaptureCallerChain(skip, depth int) string {
 // DebugLogger provides conditional debug logging, enabled by the DEBUG
 // environment variable. All Aether namespaces are prefixed "aether.*"
 // (e.g. "aether", "aether.gossip", "aether.transport", "aether.flow")
-// so they coexist with the HSTLES Library debug system which uses the
+// so they coexist with the the consuming Library debug system which uses the
 // same DEBUG var.
 //
 // Matching is hierarchical with comma-separated entries:

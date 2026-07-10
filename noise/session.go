@@ -1,8 +1,8 @@
 //go:build !js
 
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package noise
 
@@ -76,8 +76,8 @@ type noiseConn struct {
 
 	// Explicit nonce mode (if both sides support capExplicitNonce)
 	explicitNonce bool
-	encryptor     *nonceEncryptor // non-nil when explicitNonce=true
-	window        *nonceWindow   // non-nil when explicitNonce=true
+	encryptor     atomic.Pointer[nonceEncryptor] // AE-M-12: atomic swap; Load() on concurrent sends, Store() on rekey. Load()!=nil when explicitNonce=true
+	window        *nonceWindow                   // non-nil when explicitNonce=true
 
 	// Health tracking
 	health *transportHealth.Monitor
@@ -210,9 +210,23 @@ func newNoiseConnListener(ptr *noiseListener, send, recv *noise.CipherState, rem
 func (c *noiseConn) enableExplicitNonce() {
 	sendCipher := c.send.Cipher() // marks CipherState as invalid
 	recvCipher := c.recv.Cipher()
-	c.encryptor = newNonceEncryptor(sendCipher)
-	c.window = newNonceWindow(recvCipher, 64)
+	c.encryptor.Store(newNonceEncryptor(sendCipher))
+	c.window = newNonceWindow(recvCipher, c.nonceWindowSize()) // AE-L-12: honour configured NonceWindowSize
 	c.explicitNonce = true
+}
+
+// nonceWindowSize resolves the explicit-nonce replay-window size from the
+// transport config (cfg.NonceWindowSize -> transport.nonceWindow). Falls back
+// to the safe default of 64 when the transport is unset - c.transport is nil on
+// test-constructed conns and on any path that builds a noiseConn without a
+// parent transport. newNonceWindow additionally clamps the result to 1..64.
+// AE-L-12: both enableExplicitNonce and rekeyRecvCipher previously passed a
+// hardcoded literal 64, silently ignoring the configured NonceWindowSize knob.
+func (c *noiseConn) nonceWindowSize() int {
+	if c.transport != nil && c.transport.nonceWindow > 0 {
+		return c.transport.nonceWindow
+	}
+	return 64
 }
 
 // PeerMaxAckDelay returns the peer's advertised max_ack_delay (RFC 9002
@@ -371,8 +385,12 @@ func (c *noiseConn) sendPacket(packetType byte, payload []byte) error {
 	data := append([]byte{packetType}, payload...)
 
 	if c.explicitNonce {
-		// Explicit nonce mode: atomic counter, no mutex needed
-		ct := c.encryptor.Encrypt(nil, nil, data)
+		// Explicit nonce mode: the nonceEncryptor's own atomic counter makes
+		// concurrent Encrypt calls safe with no mutex. AE-M-12: Load() the
+		// encryptor pointer atomically so a concurrent rekeySendCipher Store()
+		// can't race this read (Go-memory-model data race); the encryptor
+		// itself stays lock-free, so concurrent sends are unaffected.
+		ct := c.encryptor.Load().Encrypt(nil, nil, data)
 		c.rekey.AddBytesSent(uint64(len(ct)))
 		_, err := c.writeFunc(ct)
 		if err != nil {
@@ -433,7 +451,7 @@ func (c *noiseConn) maybeInitiateRekey() {
 	data := []byte{relay.PacketTypeRekey}
 	var ct []byte
 	if c.explicitNonce {
-		ct = c.encryptor.Encrypt(nil, nil, data)
+		ct = c.encryptor.Load().Encrypt(nil, nil, data) // AE-M-12: atomic load pairs with rekeySendCipher's Store
 	} else {
 		c.sendMu.Lock()
 		var err error
@@ -459,7 +477,9 @@ func (c *noiseConn) rekeySendCipher() {
 		// the underlying CipherState and re-extract
 		c.sendMu.Lock()
 		c.send.Rekey()
-		c.encryptor = newNonceEncryptor(c.send.Cipher())
+		// AE-M-12: atomic Store pairs with the atomic Load in sendPacket/
+		// maybeInitiateRekey. sendMu still serialises Rekey()+re-extract.
+		c.encryptor.Store(newNonceEncryptor(c.send.Cipher()))
 		c.sendMu.Unlock()
 	} else {
 		c.sendMu.Lock()
@@ -475,7 +495,7 @@ func (c *noiseConn) rekeyRecvCipher() {
 	if c.explicitNonce {
 		c.recvMu.Lock()
 		c.recv.Rekey()
-		c.window = newNonceWindow(c.recv.Cipher(), 64)
+		c.window = newNonceWindow(c.recv.Cipher(), c.nonceWindowSize()) // AE-L-12: honour configured NonceWindowSize
 		c.recvMu.Unlock()
 	} else {
 		c.recvMu.Lock()
@@ -879,6 +899,18 @@ func (l *noiseListener) runReader(ctx context.Context, conn *net.UDPConn) {
 		// replies with resumeAcceptPrefix + a tag proving our own key
 		// possession.
 		if n > 0 && buf[0] == resumePrefix {
+			// AE-L-11: Resume is a first-contact / unknown-source event, not
+			// established-session traffic - it MUST NOT skip the S6 throttles.
+			// Apply the same per-source + global handshake-flood limits the
+			// slow path below uses (session.go sourceLimit/rateLimiter), so
+			// 0xFA spray from spoofed sources can't bypass them and burn CPU
+			// on ticket GCM.Open + per-datagram copies with no rate limit.
+			if l.transport.sourceLimit != nil && !l.transport.sourceLimit.Allow(addr) {
+				continue
+			}
+			if !l.transport.rateLimiter.Allow(1) {
+				continue
+			}
 			l.handleResumePacket(ctx, conn, append([]byte(nil), buf[:n]...), addr)
 			continue
 		}
@@ -1080,6 +1112,42 @@ func (l *noiseListener) removeSessionForConn(nc *noiseConn) {
 	l.sessions.RemoveBy(func(sess aether.Connection) bool {
 		return connFromSession(sess) == nc
 	})
+}
+
+// maxIncompleteHandshakes is a hard ceiling on the number of in-flight
+// (incomplete) handshake states the listener holds at once. AE-P-21:
+// pruneStaleHandshakes bounds the map only by a 30s TTL, and the per-source +
+// global rate limiters bound only the arrival rate. When an operator sets
+// RequireRetryToken=false (transport.go, legacy-initiator interop) the
+// stateless-retry anti-amplification early-return (handshake.go) is skipped, so
+// spoofed first-contact msg1s each allocate a Noise HandshakeState. This cap
+// sits far above any realistic concurrent legitimate incomplete-handshake
+// working set yet well below the rate×TTL flood ceiling (~30k at the 1000/s
+// default), so it never fires in normal operation and backstops memory.
+const maxIncompleteHandshakes = 16384
+
+// evictOldestHandshakeLocked enforces maxIncompleteHandshakes by discarding the
+// oldest-created incomplete handshake when the map is at capacity. Caller MUST
+// hold l.mu. Evicting the oldest (rather than rejecting the new arrival)
+// preserves the ability to always accept a fresh handshake while bounding
+// memory — the oldest entry is closest to its TTL and the most likely to be
+// abandoned/stale. AE-P-21.
+func (l *noiseListener) evictOldestHandshakeLocked() {
+	if len(l.handshakes) < maxIncompleteHandshakes {
+		return
+	}
+	var oldestKey string
+	var oldestCreated time.Time
+	for k, hs := range l.handshakes {
+		if oldestKey == "" || hs.created.Before(oldestCreated) {
+			oldestKey = k
+			oldestCreated = hs.created
+		}
+	}
+	if oldestKey != "" {
+		dbgSession.Printf("AE-P-21: evicting oldest incomplete handshake %s (cap %d reached, age %v)", oldestKey, maxIncompleteHandshakes, time.Since(oldestCreated))
+		delete(l.handshakes, oldestKey)
+	}
 }
 
 // pruneStaleHandshakes removes incomplete handshakes and leaked pending dials

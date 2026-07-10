@@ -1,8 +1,8 @@
 //go:build !js
 
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package noise
 
@@ -20,7 +20,7 @@ import (
 
 // Intra-org noise-UDP forwarder — the production side of the cross-org
 // anycast hairpin documented in
-// HSTLES/Library/docs/superpowers/plans/2026-05-23-cross-org-anycast-forwarder.md.
+// the consuming runtime cross-org anycast forwarder plan.
 //
 // Problem: Fly's public anycast IPv4 is per-app. An initiator's Noise
 // msg1 lands on whichever of the app's N machines wins the 5-tuple
@@ -41,7 +41,7 @@ import (
 // tables, and the IntraOrgForwarder type. NoiseTransport integration
 // (listener branching + reply-write interception) is in transport.go
 // and session.go. Library wiring (LAD-backed lookup + per-dial
-// preamble emission) is in HSTLES/Library/mesh/node.
+// preamble emission) is in the consuming mesh runtime.
 
 // ── wire format ──────────────────────────────────────────────────────
 //

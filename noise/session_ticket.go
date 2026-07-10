@@ -1,8 +1,8 @@
 //go:build !js
 
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package noise
 
@@ -45,6 +45,7 @@ const capSessionTicket uint32 = 1 << 1
 //   [32-byte recv key]
 //   [8-byte recv nonce]
 //   [1-byte caps flags]
+//   [2-byte scope len][scope ID]
 type sessionTicket struct {
 	ExpiresAt time.Time
 	PeerID    aether.NodeID
@@ -53,10 +54,15 @@ type sessionTicket struct {
 	RecvKey   [32]byte
 	RecvNonce uint64
 	Caps      uint32
+	// ScopeID is the tenant scope the original session was bound to. Carried so
+	// a resumed session restores its relay isolation (AE-H-07); empty for
+	// dedicated (single-tenant) transports.
+	ScopeID string
 }
 
 const (
-	ticketPlaintextSize = 8 + 32 + 32 + 8 + 32 + 8 + 4 // 124 bytes
+	ticketPlaintextSize = 8 + 32 + 32 + 8 + 32 + 8 + 4 // 124-byte fixed prefix; AE-H-07 scope suffix follows
+	ticketScopeLenSize  = 2                             // AE-H-07: uint16 length prefix for the scope suffix
 	ticketNonceSize     = 12
 	ticketTagSize       = 16
 	ticketEncryptedSize = ticketNonceSize + ticketPlaintextSize + ticketTagSize // 152 bytes
@@ -78,6 +84,11 @@ type TicketStore struct {
 	ttl      time.Duration // Ticket validity duration
 	gcm      cipher.AEAD
 	prevGCM  cipher.AEAD
+
+	// AE-P-19: install time of prevGCM. Lets DecryptTicket retire the previous
+	// key one ticket TTL after rotation rather than only on the next RotateKey
+	// call, so a single rotation actually drops a compromised key.
+	prevInstalledAt time.Time
 
 	// Client-side ticket cache: peerNodeID → encrypted ticket bytes.
 	// Bounded by cacheMax with FIFO eviction (cacheOrder tracks insert order).
@@ -129,7 +140,8 @@ func NewTicketStoreWithKey(key []byte, ttl time.Duration) (*TicketStore, error) 
 }
 
 // RotateKey replaces the ticket encryption key. The previous key is kept for
-// one rotation period to decrypt tickets issued before the rotation.
+// one ticket TTL after rotation to decrypt tickets issued before the rotation
+// (AE-P-19: DecryptTicket retires it once that window elapses).
 func (ts *TicketStore) RotateKey(newKey []byte) error {
 	if len(newKey) != 32 {
 		return errors.New("vl1: ticket key must be 32 bytes")
@@ -145,6 +157,7 @@ func (ts *TicketStore) RotateKey(newKey []byte) error {
 	ts.mu.Lock()
 	ts.prevKey = ts.key
 	ts.prevGCM = ts.gcm
+	ts.prevInstalledAt = time.Now() // AE-P-19: bound the prev-key overlap to one TTL
 	ts.key = append([]byte(nil), newKey...)
 	ts.gcm = gcm
 	ts.mu.Unlock()
@@ -163,7 +176,7 @@ func (ts *TicketStore) RotateKey(newKey []byte) error {
 // Callers must only invoke IssueTicket BEFORE any messages have been sent
 // on the session — rekeying invalidates an earlier-issued ticket silently
 // at resumption time. The Nonce()==0 guard enforces this contract.
-func (ts *TicketStore) IssueTicket(peerID aether.NodeID, send, recv *fnoise.CipherState, caps uint32) ([]byte, error) {
+func (ts *TicketStore) IssueTicket(peerID aether.NodeID, send, recv *fnoise.CipherState, caps uint32, scopeID string) ([]byte, error) {
 	ts.mu.RLock()
 	gcm := ts.gcm
 	ts.mu.RUnlock()
@@ -183,6 +196,7 @@ func (ts *TicketStore) IssueTicket(peerID aether.NodeID, send, recv *fnoise.Ciph
 		SendNonce: send.Nonce(),
 		RecvNonce: recv.Nonce(),
 		Caps:      caps,
+		ScopeID:   scopeID,
 	}
 	// UnsafeKey() returns a [32]byte value (by value, not by reference),
 	// so assigning it here takes a full copy. The "Unsafe" in the name
@@ -191,7 +205,12 @@ func (ts *TicketStore) IssueTicket(peerID aether.NodeID, send, recv *fnoise.Ciph
 	ticket.SendKey = send.UnsafeKey()
 	ticket.RecvKey = recv.UnsafeKey()
 
-	plaintext := make([]byte, ticketPlaintextSize)
+	// AE-H-07: fixed 124B prefix + [2B scopeLen][scopeID]. Scope validated to
+	// MaxScopeIDLength (matches the preamble bound) so the uint16 never truncates.
+	if len(scopeID) > MaxScopeIDLength {
+		return nil, ErrTenantIDTooLong
+	}
+	plaintext := make([]byte, ticketPlaintextSize+ticketScopeLenSize+len(scopeID))
 	binary.BigEndian.PutUint64(plaintext[0:8], uint64(ticket.ExpiresAt.UnixNano()))
 	copy(plaintext[8:40], []byte(ticket.PeerID))
 	copy(plaintext[40:72], ticket.SendKey[:])
@@ -199,6 +218,8 @@ func (ts *TicketStore) IssueTicket(peerID aether.NodeID, send, recv *fnoise.Ciph
 	copy(plaintext[80:112], ticket.RecvKey[:])
 	binary.BigEndian.PutUint64(plaintext[112:120], ticket.RecvNonce)
 	binary.BigEndian.PutUint32(plaintext[120:124], ticket.Caps)
+	binary.BigEndian.PutUint16(plaintext[124:126], uint16(len(scopeID)))
+	copy(plaintext[126:], scopeID)
 
 	nonce := make([]byte, ticketNonceSize)
 	if _, err := rand.Read(nonce); err != nil {
@@ -219,10 +240,19 @@ func (ts *TicketStore) DecryptTicket(encrypted []byte) (*sessionTicket, error) {
 	nonce := encrypted[:ticketNonceSize]
 	ciphertext := encrypted[ticketNonceSize:]
 
-	// Try current key
+	// Try current key, then the previous key within the rotation overlap.
 	ts.mu.RLock()
 	gcm := ts.gcm
 	prevGCM := ts.prevGCM
+	// AE-P-19: only consult the previous key for one ticket TTL after rotation.
+	// Any ticket legitimately minted before the rotation self-expires within
+	// TTL (the ExpiresAt check below), so beyond this window prevGCM would only
+	// ever accept a FORGED ticket built with a stolen prev key and an
+	// attacker-chosen far-future ExpiresAt. Retiring it here makes a single
+	// RotateKey sufficient to drop a compromised key.
+	if prevGCM != nil && !ts.prevInstalledAt.IsZero() && time.Since(ts.prevInstalledAt) > ts.ttl {
+		prevGCM = nil
+	}
 	ts.mu.RUnlock()
 
 	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
@@ -234,7 +264,13 @@ func (ts *TicketStore) DecryptTicket(encrypted []byte) (*sessionTicket, error) {
 		return nil, ErrTicketDecrypt
 	}
 
-	if len(plaintext) != ticketPlaintextSize {
+	// AE-H-07: fixed 124B prefix + [2B scopeLen][scopeID] suffix. An old
+	// (scopeless, 124B) ticket fails this and is rejected → full-handshake fallback.
+	if len(plaintext) < ticketPlaintextSize+ticketScopeLenSize {
+		return nil, ErrTicketInvalid
+	}
+	scopeLen := int(binary.BigEndian.Uint16(plaintext[124:126]))
+	if scopeLen > MaxScopeIDLength || ticketPlaintextSize+ticketScopeLenSize+scopeLen != len(plaintext) {
 		return nil, ErrTicketInvalid
 	}
 
@@ -244,6 +280,7 @@ func (ts *TicketStore) DecryptTicket(encrypted []byte) (*sessionTicket, error) {
 		SendNonce: binary.BigEndian.Uint64(plaintext[72:80]),
 		RecvNonce: binary.BigEndian.Uint64(plaintext[112:120]),
 		Caps:      binary.BigEndian.Uint32(plaintext[120:124]),
+		ScopeID:   string(plaintext[126 : 126+scopeLen]),
 	}
 	copy(ticket.SendKey[:], plaintext[40:72])
 	copy(ticket.RecvKey[:], plaintext[80:112])
@@ -328,7 +365,7 @@ func (t *NoiseTransport) IssueTicket(sess aether.Connection) ([]byte, error) {
 		return nil, err
 	}
 	caps := capExplicitNonce
-	return t.ticketStore.IssueTicket(nc.remoteNode, nc.send, nc.recv, caps)
+	return t.ticketStore.IssueTicket(nc.remoteNode, nc.send, nc.recv, caps, nc.scopeID)
 }
 
 // ResumeSession attempts to resume a session from an encrypted ticket.

@@ -1,8 +1,8 @@
 //go:build !js
 
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package discovery
 
@@ -18,13 +18,21 @@ import (
 )
 
 // MDNSServiceType is the mDNS service type for mesh discovery.
-const MDNSServiceType = "_hstles-mesh._tcp.local."
+const MDNSServiceType = "_orbtr-mesh._tcp.local."
+
+// Bounds on the discovered-peer map. Without them an on-LAN attacker minting
+// fresh nodeIDs (each hitting the trust-on-first-use store branch in
+// processMDNSResponse) could grow d.discovered without bound. AE-M-09.
+const (
+	mdnsPeerTTL       = 10 * time.Minute // forget peers not re-announced within this window
+	mdnsMaxDiscovered = 4096             // hard cap on retained peers; oldest evicted first
+)
 
 // MDNSPeer represents a peer discovered via mDNS.
 type MDNSPeer struct {
 	NodeID       string
 	Addresses    []string
-	Signature    []byte    // ed25519 signature over NodeID+Addresses
+	Signature    []byte    // ed25519 signature over NodeID + signed (addr=) addresses; Addresses may also carry an unsigned transport-observed dial hint (AE-P-15)
 	DiscoveredAt time.Time
 }
 
@@ -249,17 +257,24 @@ func (d *MDNSDiscoverer) queryPeers(ctx context.Context) {
 		if addrStr != "" {
 			addresses = strings.Split(addrStr, ",")
 		}
-		// Add the discovered host:port as well
+		// AE-P-15: the transport-observed host:port is NOT covered by the
+		// announcer's ed25519 signature (SignMDNSAnnouncement signs only the
+		// addr= set), so it must stay OUT of the address list handed to
+		// verification. Appending it here made every genuinely-signed peer fail
+		// VerifyMDNSAnnouncement (augmented payload != signed payload) and let a
+		// TOFU peer's stored addresses carry an unsigned, attacker-settable
+		// endpoint. Pass it separately as an unsigned dial hint instead.
+		var observed string
 		if r.Host != "" && r.Port > 0 {
-			addresses = append(addresses, fmt.Sprintf("%s:%d", r.Host, r.Port))
+			observed = fmt.Sprintf("%s:%d", r.Host, r.Port)
 		}
 
-		d.processMDNSResponse(nodeID, addresses, sigHex)
+		d.processMDNSResponse(nodeID, addresses, observed, sigHex)
 	}
 }
 
 // processMDNSResponse validates and stores an mDNS announcement.
-func (d *MDNSDiscoverer) processMDNSResponse(nodeID string, addresses []string, sigHex string) {
+func (d *MDNSDiscoverer) processMDNSResponse(nodeID string, addresses []string, observed string, sigHex string) {
 	if nodeID == d.nodeID {
 		return // ignore our own announcements
 	}
@@ -287,12 +302,60 @@ func (d *MDNSDiscoverer) processMDNSResponse(nodeID string, addresses []string, 
 		}
 	}
 
+	// AE-P-15: verification above ran over the signed addr= set only. Add the
+	// transport-observed address (if any) as an ADDITIONAL, unsigned dial
+	// candidate, de-duplicated against the signed set. It never participated in
+	// the signature check, so it can neither break verification nor be laundered
+	// as a signed address; preserves the original host:port dial-hint capability.
+	stored := addresses
+	if observed != "" {
+		dup := false
+		for _, a := range stored {
+			if a == observed {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			stored = append(append([]string(nil), stored...), observed)
+		}
+	}
+
+	now := time.Now()
 	d.mu.Lock()
+	// AE-M-09: bound the discovered-peer map. An on-LAN attacker can mint
+	// unlimited distinct nodeIDs — each reaching the trust-on-first-use
+	// store-unverified branch above — so without pruning and a hard size cap
+	// d.discovered would grow without bound (LAN memory-exhaustion DoS), and
+	// every Discover() call allocates an O(len(discovered)) slice. Only enforce
+	// the bound when inserting a NEW nodeID; re-announcements of a known peer
+	// just refresh it in place.
+	if _, exists := d.discovered[nodeID]; !exists {
+		// Prune peers not re-announced within the TTL.
+		for id, p := range d.discovered {
+			if now.Sub(p.DiscoveredAt) > mdnsPeerTTL {
+				delete(d.discovered, id)
+			}
+		}
+		// If still at the cap, evict the least-recently-announced peer (FIFO).
+		if len(d.discovered) >= mdnsMaxDiscovered {
+			var oldestID string
+			var oldestAt time.Time
+			for id, p := range d.discovered {
+				if oldestID == "" || p.DiscoveredAt.Before(oldestAt) {
+					oldestID, oldestAt = id, p.DiscoveredAt
+				}
+			}
+			if oldestID != "" {
+				delete(d.discovered, oldestID)
+			}
+		}
+	}
 	d.discovered[nodeID] = MDNSPeer{
 		NodeID:       nodeID,
-		Addresses:    addresses,
+		Addresses:    stored,
 		Signature:    sig,
-		DiscoveredAt: time.Now(),
+		DiscoveredAt: now,
 	}
 	d.mu.Unlock()
 

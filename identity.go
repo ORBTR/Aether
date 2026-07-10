@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package aether
 
@@ -101,15 +101,26 @@ func (id NodeID) Short() string {
 	return value[:10] + "…" + value[len(value)-6:]
 }
 
-// ToPeerID returns the 8-byte PeerID derived from the textual NodeID.
-// The first eight bytes of the canonical string form are copied into the
-// fixed-size array — this is what every transport adapter stamps into
+// ToPeerID returns the 8-byte PeerID derived from the NodeID's decoded key
+// fingerprint. The first eight bytes of NodeID.Fingerprint are copied into
+// the fixed-size array — this is what every transport adapter stamps into
 // outbound Frame.SenderID / Frame.ReceiverID so the wire identity matches
 // what the peer sees on its end of the connection. Lives on NodeID (rather
 // than each adapter) so the Noise, TCP and QUIC sessions all derive the
 // same value from the same input.
+//
+// AE-L-04: derive from the decoded fingerprint (64 bits), not the textual
+// canonical string. The canonical form is nodeIDPrefix ("vl1_") + base32, so
+// its first eight bytes are the constant "vl1_" plus only four base32 chars
+// (~20 bits) — a near-total PeerID collision across the mesh (birthday
+// collisions at ~1000 nodes). A malformed NodeID (Fingerprint error) falls
+// back to the textual bytes, matching the prior behaviour for that edge.
 func (id NodeID) ToPeerID() PeerID {
 	var pid PeerID
+	if fp, err := id.Fingerprint(); err == nil {
+		copy(pid[:], fp) // AE-L-04: first 8 of the 16-byte SHA-256 fingerprint
+		return pid
+	}
 	copy(pid[:], []byte(string(id)))
 	return pid
 }

@@ -1,8 +1,8 @@
 //go:build !js
 
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package nat
 
@@ -139,6 +139,20 @@ func (c *STUNClient) querySTUNServer(ctx context.Context, localAddr *net.UDPAddr
 		return nil, fmt.Errorf("decode STUN response: %w", err)
 	}
 
+	// AE-L-08: verify the response before trusting the mapped address.
+	// XORMappedAddress.GetFrom de-XORs using whatever TransactionID the response
+	// carries, so a well-formed forged reply is otherwise self-consistent and
+	// would poison the reflexive-address cache (see DiscoverReflexiveAddr). The
+	// connected UDP socket only filters by source IP:port; the mandatory STUN
+	// transaction-ID match (RFC 5389 s7.3.1) and success-class check are the real
+	// defenses. `message` is the binding request built at the top of this function.
+	if msg.Type != stun.BindingSuccess {
+		return nil, fmt.Errorf("stun: unexpected response type %s (want binding success)", msg.Type)
+	}
+	if msg.TransactionID != message.TransactionID {
+		return nil, fmt.Errorf("stun: transaction ID mismatch (possible spoofed response)")
+	}
+
 	// Extract XOR-MAPPED-ADDRESS
 	var xorAddr stun.XORMappedAddress
 	if err := xorAddr.GetFrom(&msg); err != nil {
@@ -171,10 +185,19 @@ func (c *STUNClient) detectNATType(localAddr, publicAddr *net.UDPAddr) aether.NA
 		return aether.NATOpen
 	}
 
-	// For now, we classify as full-cone (most permissive NAT)
-	// Full NAT type detection requires multiple STUN servers and techniques
-	// This is a simplified implementation suitable for initial hole-punching
-	return aether.NATFullCone
+	// AE-P-18: a single STUN query reveals only this server's reflexive
+	// mapping — it cannot distinguish full-cone / restricted / port-restricted
+	// / symmetric behaviour. Asserting NATFullCone here fabricated a confident
+	// and frequently-wrong classification (e.g. a symmetric NAT reported as
+	// full-cone), which then leaks to external peers via ReflexiveAddress.NATType
+	// (NoiseTransport.DiscoverReflexiveAddr) and to DetectNATType's single-server
+	// branch. Return NATUnknown so callers fall through to the multi-server
+	// DetectNATType / RFC 5780 DetectNATBehaviour paths instead of trusting a
+	// guess. Routing is unchanged and no capability is lost — relay/fallback.go
+	// chooseStrategy maps both NATUnknown and NATFullCone to StrategyHolePunch
+	// (hole-punch then automatic relay fallback) — the fix only stops emitting a
+	// false full-cone signal for a NAT we could not actually classify.
+	return aether.NATUnknown
 }
 
 // DetectNATType performs comprehensive NAT type detection using multiple STUN servers

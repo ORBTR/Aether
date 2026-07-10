@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 
 // Engine composes all per-stream reliability components into a single
@@ -185,8 +185,22 @@ func (e *Engine) ProcessACK(ackNo uint32, sackBlocks []aether.SACKBlock) (rttSam
 	for _, block := range sackBlocks {
 		count := e.SendWin.AckRange(block.Start, block.End)
 		ackedBytes += int64(count) * int64(aether.HeaderSize)
-		for seq := block.Start; seq <= block.End; seq++ {
+		// AE-P-23: bound the retransmit-removal scan the same way
+		// SendWindow.AckRange does. block.End is peer-controlled; the naive
+		// `for seq := Start; seq <= End; seq++` never terminates when
+		// End=0xFFFFFFFF (seq wraps to 0 and stays <= End) and runs ~4B
+		// Remove() calls when End<Start — either wedges the send side under
+		// e.sendMu. Skip spans larger than a real ACK ever covers (matching
+		// AckRange, which returns 0 for the same input so nothing was acked
+		// there either), then iterate a fixed count with wrap-safe increment.
+		span := uint64(block.End - block.Start)
+		if span > maxAckRangeSpan {
+			continue
+		}
+		seq := block.Start
+		for i := uint64(0); i <= span; i++ {
 			e.RetransmitQ.Remove(seq)
+			seq++
 		}
 	}
 

@@ -1,8 +1,8 @@
 //go:build !js
 
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package adapter
 
@@ -105,8 +105,10 @@ type NoiseSession struct {
 	// Connection migration handler
 	migrator *migration.Migrator
 
-	// Packet-level anti-replay (connection-scoped, 128-bit window)
-	packetReplay *reliability.PacketReplayWindow
+	// AE-P-25: removed packetReplay *reliability.PacketReplayWindow — it was
+	// an allocated-but-never-read field for a redundant+incorrect third
+	// replay layer. Replay is enforced by noise/nonce_window.go (pre-decrypt)
+	// and per-stream reliability.ReplayWindow (engine.go Replay.Check).
 
 	// streamRefused counts every stream open rejected because the
 	// MaxConcurrentStreams cap is reached — both peer-initiated OPENs
@@ -493,7 +495,10 @@ func NewNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 	)
 
 	s.migrator = migration.NewMigrator()
-	s.packetReplay = reliability.NewPacketReplayWindow()
+	// AE-P-25: removed s.packetReplay allocation — PacketReplayWindow was a
+	// redundant+incorrect third replay layer (see noise_dispatch.go). Replay
+	// is enforced by noise/nonce_window.go (pre-decrypt) and per-stream
+	// reliability.ReplayWindow (engine.go Replay.Check).
 	// connID is owned by *BaseSession (initialised by NewBaseSession).
 	s.classDefaults = aether.DefaultsForClass(aether.ClassRAW)
 	s.streamGC = aether.NewStreamGC(aether.DefaultStreamIdleTimeout, func(streamID uint64) {
@@ -898,6 +903,14 @@ func (s *NoiseSession) MSS() int { return s.pmtuProber.MSS() }
 // The key should be derived from the Noise handshake shared secret.
 // When set, all outbound frames are encrypted and inbound frames are decrypted.
 func (s *NoiseSession) SetSessionKey(key [32]byte) error {
+	// AE-P-02: reject a second install so a key is never silently re-installed
+	// into a fresh FrameEncryptor whose ordered nonce counter restarts at 0.
+	// The encryptor's per-instance random nonce prefix already makes reinstall
+	// nonce-safe, but a re-key mid-session is a caller bug (both directions
+	// share the single s.encryptor); fail loud instead of masking it.
+	if s.encryptor != nil {
+		return fmt.Errorf("aether: session key already set")
+	}
 	enc, err := aethercrypto.NewFrameEncryptor(key, true)
 	if err != nil {
 		return err

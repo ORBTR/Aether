@@ -74,7 +74,7 @@ type Components struct {
 
 // Weights tunes how much each component contributes to the geometric
 // mean. Higher weight = bigger pull toward 0 if the component is low.
-// Defaults are calibrated for the HSTLES/ORBTR mesh's workload (gossip-
+// Defaults are calibrated for the ORBTR mesh's workload (gossip-
 // heavy, RPC-medium, bulk-transfer-light); applications that drive a
 // lot of bulk traffic should override Throughput up.
 type Weights struct {

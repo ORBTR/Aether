@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  *
  * Short Header v2 Compression System
  *
@@ -31,10 +31,14 @@ const (
 
 	ShortDataIndicator      byte = 0x82 // DATA frames, 9 bytes, uint32 Length
 	ShortControlIndicator   byte = 0x83 // PING/PONG/CLOSE/RESET, 8 bytes
-	ShortACKIndicator       byte = 0x84 // Composite ACK, 11 bytes (lite) or 3+N (full)
+	ShortACKIndicator       byte = 0x84 // Composite ACK-lite, 11 bytes
 	ShortBatchIndicator     byte = 0x85 // Batch of sub-frames, 2 + N×sub
 	ShortDataVarIndicator   byte = 0x86 // DATA frames, varint Length, 6-10 bytes
 	ShortEncryptedIndicator byte = 0x87 // Encrypted DATA, 9 bytes, Nonce-in-payload
+	// AE-H-13: ACK-full carries its own indicator so the decoder never has
+	// to infer lite-vs-full from payload bytes (a full ACK with AckDelay==0
+	// was mis-decoded as lite and desynced the stream).
+	ShortACKFullIndicator byte = 0x88 // Composite ACK-full, 5-byte hdr + payload
 
 	ShortDataSize    = 9  // [indicator:1][streamID:2][seqDelta:2][length:4]
 	ShortControlSize = 8  // [indicator:1][type:1][streamID:2][seqNo:4]
@@ -42,6 +46,12 @@ const (
 
 	// Full header sent every N frames per stream for state resync
 	ShortHeaderFullInterval = 64
+
+	// MaxShortHeaderStreamID is the largest StreamID representable in the uint16
+	// short-header StreamID field. Streams above it must use the full 50-byte
+	// header, else the ID truncates on the wire and the decoder misroutes the
+	// frame to the wrong stream (AE-H-14).
+	MaxShortHeaderStreamID = 0xFFFF
 )
 
 // IsShortHeader returns true if the first byte indicates any v2 short header.
@@ -127,6 +137,13 @@ func (c *Compressor) ShouldCompressData(f *Frame) bool {
 	if f.Flags.Has(FlagENCRYPTED) {
 		return false
 	}
+	// AE-H-14: the short-header StreamID field is uint16; a stream above
+	// MaxShortHeaderStreamID would truncate on the wire and misroute on decode.
+	// Fall back to the full 50-byte header (capability preserved) rather than
+	// compress and corrupt routing.
+	if f.StreamID > MaxShortHeaderStreamID {
+		return false
+	}
 	c.Session.mu.RLock()
 	if !c.Session.identitySet ||
 		f.SenderID != c.Session.lastSender ||
@@ -160,6 +177,10 @@ func (c *Compressor) ShouldCompressControl(f *Frame) bool {
 	if f.Length > 0 {
 		return false // has payload — use full header
 	}
+	// AE-H-14: uint16 short-header StreamID — oversized streams need the full header.
+	if f.StreamID > MaxShortHeaderStreamID {
+		return false
+	}
 	c.Session.mu.RLock()
 	defer c.Session.mu.RUnlock()
 	return c.Session.identitySet &&
@@ -170,6 +191,10 @@ func (c *Compressor) ShouldCompressControl(f *Frame) bool {
 // ShouldCompressACK returns true if an ACK frame can use 0x84.
 func (c *Compressor) ShouldCompressACK(f *Frame) bool {
 	if f.Type != TypeACK {
+		return false
+	}
+	// AE-H-14: uint16 short-header StreamID — oversized streams need the full header.
+	if f.StreamID > MaxShortHeaderStreamID {
 		return false
 	}
 	c.Session.mu.RLock()
@@ -215,6 +240,40 @@ func (c *Compressor) EncodeDataShort(w io.Writer, f *Frame) (int, error) {
 	return n, nil
 }
 
+// maxShortPayloadPrealloc bounds how many bytes a short-header DATA decoder
+// allocates from a peer's declared length before the peer proves it is actually
+// delivering the body. The declared length (up to MaxPayloadSize) is honoured in
+// full only after a first chunk of this size has been read, so a tiny header
+// claiming MaxPayloadSize that never sends a body cannot force a transient
+// full-size heap allocation (AE-P-31). Capability preserved: payloads up to
+// MaxPayloadSize still decode in full.
+const maxShortPayloadPrealloc = 64 * 1024
+
+// readShortPayload reads exactly length bytes from r. For a declared length above
+// maxShortPayloadPrealloc it first reads a bounded chunk into a small buffer as
+// proof of delivery before allocating the full declared size (AE-P-31), so a peer
+// that streams tiny headers declaring huge lengths cannot drive repeated 16 MB
+// allocations at negligible cost.
+func readShortPayload(r io.Reader, length uint32) ([]byte, error) {
+	if length <= maxShortPayloadPrealloc {
+		buf := make([]byte, length)
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return nil, err
+		}
+		return buf, nil
+	}
+	head := make([]byte, maxShortPayloadPrealloc)
+	if _, err := io.ReadFull(r, head); err != nil {
+		return nil, err
+	}
+	buf := make([]byte, length)
+	copy(buf, head)
+	if _, err := io.ReadFull(r, buf[maxShortPayloadPrealloc:]); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
 // DecodeDataShort reads a 9-byte data short header (indicator already consumed).
 func (c *Compressor) DecodeDataShort(r io.Reader) (*Frame, error) {
 	var hdr [ShortDataSize - 1]byte
@@ -245,10 +304,13 @@ func (c *Compressor) DecodeDataShort(r io.Reader) (*Frame, error) {
 		if length > MaxPayloadSize {
 			return nil, fmt.Errorf("aether: data short payload too large (%d)", length)
 		}
-		f.Payload = make([]byte, length)
-		if _, err := io.ReadFull(r, f.Payload); err != nil {
+		// AE-P-31: read incrementally so a 9-byte header declaring up to
+		// MaxPayloadSize cannot force a full-size allocation before the body exists.
+		p, err := readShortPayload(r, length)
+		if err != nil {
 			return nil, fmt.Errorf("aether: read data short payload: %w", err)
 		}
+		f.Payload = p
 	}
 
 	s.mu.Lock()
@@ -306,7 +368,11 @@ func (c *Compressor) DecodeEncryptedDataShort(r io.Reader) (*Frame, error) {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Control Short Header (0x83): 4 bytes
+// Control Short Header (0x83): 8 bytes — AE-L-13
+// Layout: [indicator:1][type:1][streamID:2][seqNo:4] (see ShortControlSize=8).
+// This banner previously claimed 4 bytes, diverging from the constant and the
+// encode/decode path. SeqNo is carried on the wire so PING<->PONG RTT
+// correlation works; do NOT drop it back to 4 bytes (freezes the RTO estimator).
 // ────────────────────────────────────────────────────────────────────────────
 
 // EncodeControlShort writes an 8-byte control short header (no payload).
@@ -367,9 +433,9 @@ func (c *Compressor) EncodeACKShort(w io.Writer, f *Frame) (int, error) {
 		return w.Write(hdr[:])
 	}
 
-	// ACK-full: header + payload
+	// ACK-full: distinct indicator (AE-H-13) + header + payload
 	var hdr [5]byte
-	hdr[0] = ShortACKIndicator
+	hdr[0] = ShortACKFullIndicator
 	binary.BigEndian.PutUint16(hdr[1:3], uint16(f.StreamID))
 	binary.BigEndian.PutUint16(hdr[3:5], uint16(f.Length))
 	n, err := w.Write(hdr[:])
@@ -381,10 +447,14 @@ func (c *Compressor) EncodeACKShort(w io.Writer, f *Frame) (int, error) {
 	return n, err
 }
 
-// DecodeACKShort reads an ACK short header (indicator already consumed).
+// DecodeACKShort reads an ACK-lite short header (0x84 indicator already
+// consumed). AE-H-13: lite and full ACKs now use distinct indicators
+// (0x84 vs ShortACKFullIndicator 0x88), so this path unconditionally
+// decodes the 11-byte lite form and never infers the layout from payload
+// bytes — a full ACK with AckDelay==0 previously matched the lite
+// discriminator here and desynced the byte stream.
 func (c *Compressor) DecodeACKShort(r io.Reader) (*Frame, error) {
-	// Read StreamID + first 8 bytes (enough for ACK-lite check)
-	var hdr [10]byte // streamID(2) + potential ACK-lite payload(8)
+	var hdr [ShortACKLiteSize - 1]byte // streamID(2) + payload(8)
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, fmt.Errorf("aether: read ACK short header: %w", err)
 	}
@@ -395,40 +465,42 @@ func (c *Compressor) DecodeACKShort(r io.Reader) (*Frame, error) {
 	c.Session.mu.RUnlock()
 
 	streamID := uint64(binary.BigEndian.Uint16(hdr[0:2]))
+	payload := make([]byte, CompositeACKMinSize)
+	copy(payload, hdr[2:2+CompositeACKMinSize])
+	return &Frame{
+		SenderID: sender, ReceiverID: receiver,
+		StreamID: streamID, Type: TypeACK,
+		Flags:   FlagCOMPOSITE_ACK,
+		AckNo:   binary.BigEndian.Uint32(hdr[2:6]),
+		Length:  CompositeACKMinSize,
+		Payload: payload,
+	}, nil
+}
 
-	// Check ACK-lite: BitmapLen=0 (byte 8) and Flags=0 (byte 9)
-	if hdr[8] == 0 && hdr[9] == 0 {
-		// ACK-lite — payload is the 8 bytes we already read
-		payload := make([]byte, 8)
-		copy(payload, hdr[2:10])
-		return &Frame{
-			SenderID: sender, ReceiverID: receiver,
-			StreamID: streamID, Type: TypeACK,
-			Flags:   FlagCOMPOSITE_ACK,
-			AckNo:   binary.BigEndian.Uint32(hdr[2:6]),
-			Length:   CompositeACKMinSize,
-			Payload: payload,
-		}, nil
+// DecodeACKShortFull reads an ACK-full short header (0x88 indicator already
+// consumed). Layout: [streamID:2][length:2][payload:length]. AE-H-13: the
+// dedicated indicator removes the lite/full ambiguity, so the decoder no
+// longer guesses the layout from AckDelay/BitmapLen/Flags byte values.
+func (c *Compressor) DecodeACKShortFull(r io.Reader) (*Frame, error) {
+	var hdr [4]byte // streamID(2) + length(2)
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return nil, fmt.Errorf("aether: read ACK full short header: %w", err)
 	}
 
-	// ACK-full — hdr[2:4] is the length, not ACK payload
+	c.Session.mu.RLock()
+	sender := c.Session.lastSender
+	receiver := c.Session.lastReceiver
+	c.Session.mu.RUnlock()
+
+	streamID := uint64(binary.BigEndian.Uint16(hdr[0:2]))
 	length := uint32(binary.BigEndian.Uint16(hdr[2:4]))
 	if length > MaxPayloadSize {
 		return nil, fmt.Errorf("aether: ACK short payload too large (%d)", length)
 	}
 
-	// We already read 8 bytes beyond streamID. The first 2 are Length.
-	// The remaining 6 are the start of the payload. Read the rest.
 	payload := make([]byte, length)
-	alreadyRead := 6 // hdr[4:10] = 6 bytes of payload already consumed
-	if alreadyRead > int(length) {
-		alreadyRead = int(length)
-	}
-	copy(payload, hdr[4:4+alreadyRead])
-	if int(length) > alreadyRead {
-		if _, err := io.ReadFull(r, payload[alreadyRead:]); err != nil {
-			return nil, fmt.Errorf("aether: read ACK short payload: %w", err)
-		}
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return nil, fmt.Errorf("aether: read ACK short payload: %w", err)
 	}
 
 	return &Frame{
@@ -570,10 +642,13 @@ func (c *Compressor) DecodeDataShortVar(r io.Reader) (*Frame, error) {
 		if length > MaxPayloadSize {
 			return nil, fmt.Errorf("aether: varint payload too large (%d)", length)
 		}
-		f.Payload = make([]byte, length)
-		if _, err := io.ReadFull(r, f.Payload); err != nil {
+		// AE-P-31: read incrementally so a tiny varint header declaring up to
+		// MaxPayloadSize cannot force a full-size allocation before the body exists.
+		p, err := readShortPayload(r, length)
+		if err != nil {
 			return nil, err
 		}
+		f.Payload = p
 	}
 
 	s.mu.Lock()
@@ -646,10 +721,23 @@ func (c *Compressor) DecodeBatch(r io.Reader) ([]*Frame, error) {
 			f, err = c.DecodeControlShort(r)
 		case ShortACKIndicator:
 			f, err = c.DecodeACKShort(r)
+		case ShortACKFullIndicator:
+			f, err = c.DecodeACKShortFull(r)
 		case ShortDataVarIndicator:
 			f, err = c.DecodeDataShortVar(r)
 		case ShortEncryptedIndicator:
-			f, err = c.DecodeEncryptedDataShort(r)
+			// AE-P-27: reject 0x87 encrypted-data-short sub-frames inside a
+			// batch. The honest encoder never batches encrypted frames —
+			// EncodeBatch routes DATA through ShouldCompressData, which
+			// excludes FlagENCRYPTED (see ShouldCompressData) — so a batched
+			// 0x87 can only come from a crafted or buggy peer. If decoded it
+			// yields a Type=DATA frame with no FlagENCRYPTED, while the outer
+			// batch indicator (0x85) is what reaches processIncomingFrame;
+			// neither decrypt gate (noise_dispatch.go indicator==0x87 /
+			// FlagENCRYPTED) fires, so the raw [Nonce||Ciphertext||Tag]
+			// payload would be delivered undecrypted. Fail closed rather than
+			// surface un-decrypted bytes to the app.
+			return frames, fmt.Errorf("aether: encrypted-data-short (0x87) sub-frame not allowed in batch")
 		default:
 			f, err = DecodeFrameWithFirstByte(r, peek[0])
 			if err == nil {

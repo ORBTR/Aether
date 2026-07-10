@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 
 // Package crypto implements per-frame AEAD encryption for Aether.
@@ -31,6 +31,13 @@ type FrameEncryptor struct {
 	aead    cipher.AEAD
 	counter uint64 // atomic counter for ordered nonces
 	random  bool   // true for unordered streams (use random nonces)
+
+	// AE-P-02: per-encryptor random 32-bit nonce prefix (nonce[0:4]) for
+	// ordered mode. The counter alone restarts at 0 for every encryptor,
+	// so two encryptors sharing a key — both directions of a session, or a
+	// re-installed/resumed key — would emit identical (key,nonce) pairs.
+	// A fresh random prefix per instance makes those nonce spaces disjoint.
+	noncePrefix [4]byte
 }
 
 // NewFrameEncryptor creates an encryptor with the given 256-bit key.
@@ -41,10 +48,16 @@ func NewFrameEncryptor(key [32]byte, ordered bool) (*FrameEncryptor, error) {
 	if err != nil {
 		return nil, fmt.Errorf("aether crypto: create AEAD: %w", err)
 	}
-	return &FrameEncryptor{
+	fe := &FrameEncryptor{
 		aead:   aead,
 		random: !ordered,
-	}, nil
+	}
+	// AE-P-02: seed the ordered-mode nonce prefix so encryptors sharing a key
+	// (both directions, or a re-installed/resumed key) never collide.
+	if _, err := rand.Read(fe.noncePrefix[:]); err != nil {
+		return nil, fmt.Errorf("aether crypto: seed nonce prefix: %w", err)
+	}
+	return fe, nil
 }
 
 // Encrypt encrypts the frame payload in-place.
@@ -113,7 +126,19 @@ func (e *FrameEncryptor) DecryptWithNonce(frame *aether.Frame, nonce []byte) err
 		return fmt.Errorf("aether crypto: invalid nonce size %d (need %d)", len(nonce), e.aead.NonceSize())
 	}
 
-	plaintext, err := e.aead.Open(nil, nonce, frame.Payload, nil)
+	// AE-P-11: authenticate the reconstructed frame header with the same
+	// header-AAD contract as Decrypt (aead.go Decrypt) instead of nil AAD, so
+	// the 0x87 short-encrypted path binds SenderID/ReceiverID/StreamID/SeqNo/
+	// Length to the Poly1305 tag exactly like the full-header path — a
+	// re-enabled send side then cannot leave those fields unauthenticated.
+	// NOTE: the 0x87 SEND path is currently dead (ShouldCompressData rejects
+	// FlagENCRYPTED, codec_short.go) and Encrypt() neither prepends the nonce
+	// nor carries FlagENCRYPTED into this decode. Before re-enabling
+	// EncodeEncryptedDataShort, reconcile nonce placement AND make the
+	// encrypt-side AAD (including the Flags byte / FlagENCRYPTED state) match
+	// what HeaderBytes() reconstructs here, or Seal(header-AAD) and this
+	// Open(header-AAD) will disagree on the Flags byte.
+	plaintext, err := e.aead.Open(nil, nonce, frame.Payload, frame.HeaderBytes())
 	if err != nil {
 		return fmt.Errorf("aether crypto: decrypt with nonce failed: %w", err)
 	}
@@ -138,6 +163,15 @@ func (e *FrameEncryptor) nextNonce() aether.Nonce {
 		rand.Read(nonce[:])
 		return nonce
 	}
+	// AE-P-02: nonce = per-encryptor random prefix (nonce[0:4]) || monotonic
+	// counter (nonce[4:12]). The prefix separates nonce spaces across every
+	// encryptor instance that shares a key — the single s.encryptor encrypts
+	// AND decrypts, so interop forces one key across both directions, and a
+	// re-installed/resumed key restarts the counter at 0 — while the counter
+	// still guarantees uniqueness within an instance for up to 2^64 frames.
+	// The prefix is carried on the wire in frame.Nonce, so decrypt is
+	// unaffected and no caller coordination is required.
+	copy(nonce[0:4], e.noncePrefix[:])
 	c := atomic.AddUint64(&e.counter, 1)
 	binary.BigEndian.PutUint64(nonce[4:12], c) // last 8 bytes = counter
 	return nonce

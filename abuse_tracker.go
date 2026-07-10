@@ -1,11 +1,12 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package aether
 
 import (
 	"fmt"
+	"sync/atomic"
 
 	"github.com/ORBTR/aether/abuse"
 )
@@ -29,7 +30,10 @@ import (
 // method on this type so the tracker stays uncoupled from the adapter's
 // GoAway implementation (which differs across Noise / TCP / QUIC).
 type AbuseTracker struct {
-	score    *abuse.Score[NodeID]
+	// AE-P-01: atomic.Pointer so SetRegistry can swap the registry
+	// concurrently with Report/PeerScore on the read/deliver hot path
+	// without a data race on the pointer field. Load once per call.
+	score    atomic.Pointer[abuse.Score[NodeID]]
 	remote   NodeID
 	goAway   func(reason GoAwayReason, message string) error
 	closeErr func(error) error
@@ -51,13 +55,14 @@ func NewAbuseTracker(
 	closeErr func(error) error,
 	dbgLog func(format string, args ...any),
 ) *AbuseTracker {
-	return &AbuseTracker{
-		score:    registry,
+	t := &AbuseTracker{
 		remote:   remote,
 		goAway:   goAway,
 		closeErr: closeErr,
 		dbgLog:   dbgLog,
 	}
+	t.score.Store(registry) // AE-P-01: publish registry via atomic store
+	return t
 }
 
 // Report records a misbehaviour event against the remote peer. When
@@ -70,10 +75,14 @@ func NewAbuseTracker(
 // Returns the current decayed score for adapter-side logging hooks
 // that want to track score growth without re-reading via PeerScore.
 func (t *AbuseTracker) Report(r abuse.Reason) float64 {
-	if t == nil || t.score == nil {
+	if t == nil {
 		return 0
 	}
-	current, exceeded := t.score.Record(t.remote, r)
+	score := t.score.Load() // AE-P-01: single atomic load per call
+	if score == nil {
+		return 0
+	}
+	current, exceeded := score.Record(t.remote, r)
 	if !exceeded {
 		return current
 	}
@@ -93,10 +102,14 @@ func (t *AbuseTracker) Report(r abuse.Reason) float64 {
 // is false when no registry is bound — adapters can use that as the
 // signal to return 0 from their public accessor.
 func (t *AbuseTracker) PeerScore() (float64, bool) {
-	if t == nil || t.score == nil {
+	if t == nil {
 		return 0, false
 	}
-	return t.score.Current(t.remote), true
+	score := t.score.Load() // AE-P-01: single atomic load per call
+	if score == nil {
+		return 0, false
+	}
+	return score.Current(t.remote), true
 }
 
 // SetRegistry swaps the per-session registry for a shared one — useful
@@ -109,7 +122,7 @@ func (t *AbuseTracker) SetRegistry(r interface{}) bool {
 	if !ok {
 		return false
 	}
-	t.score = registry
+	t.score.Store(registry) // AE-P-01: atomic swap, race-free vs Report/PeerScore
 	return true
 }
 

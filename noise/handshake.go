@@ -1,8 +1,8 @@
 //go:build !js
 
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package noise
 
@@ -545,12 +545,26 @@ const (
 	patternFlagXK byte = 0x01 // Noise XK (initiator has responder's static key)
 )
 
+// encodeNodeInfo returns the signed NodeInfo payload advertised in the
+// handshake. AE-P-20: the payload is constant for the transport's lifetime
+// (identity key, caps, and advertised max_ack_delay are all fixed after
+// construction — ticketStore is assigned once in NewNoiseTransport and never
+// mutated), yet the responder previously recomputed a fresh ed25519.Sign +
+// json.Marshal on EVERY inbound msg1 while holding the listener-wide l.mu on
+// the single read-loop goroutine. Memoize it once so first-contact
+// handshakes reuse the cached bytes instead of re-signing per handshake.
+// Callers MUST treat the returned slice as read-only — it is shared across
+// handshakes; every caller passes it as the read-only plaintext argument to
+// state.WriteMessage, which never mutates it.
 func (t *NoiseTransport) encodeNodeInfo() ([]byte, error) {
-	caps := capExplicitNonce
-	if t.ticketStore != nil {
-		caps |= capSessionTicket
-	}
-	return t.identity.EncodeNodeInfo(caps, t.initialMaxAckDelayUS())
+	t.nodeInfoOnce.Do(func() {
+		caps := capExplicitNonce
+		if t.ticketStore != nil {
+			caps |= capSessionTicket
+		}
+		t.nodeInfoBytes, t.nodeInfoErr = t.identity.EncodeNodeInfo(caps, t.initialMaxAckDelayUS())
+	})
+	return t.nodeInfoBytes, t.nodeInfoErr
 }
 
 // initialMaxAckDelayUS returns the sender's advertised max_ack_delay (RFC
@@ -682,6 +696,7 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 			return
 		}
 		hs = &listenerHandshake{state: state, created: time.Now(), scopeID: scopeID, dialNonce: dialNonce}
+		l.evictOldestHandshakeLocked() // AE-P-21: hard cap on incomplete-handshake map
 		l.handshakes[key] = hs
 
 		// Process the first message (stripped of preamble + fingerprint)
@@ -820,7 +835,7 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 	// wants to resume dialing A), B needs the material delivered over
 	// the wire — see TODO below for the 0xFA delivery packet.
 	if l.transport.ticketStore != nil {
-		if ticket, err := l.transport.ticketStore.IssueTicket(remoteNode, cs2, cs1, remoteCaps); err == nil {
+		if ticket, err := l.transport.ticketStore.IssueTicket(remoteNode, cs2, cs1, remoteCaps, scopeID); err == nil {
 			dbgHandshake.Printf("Issued session ticket for %s (%d bytes)", remoteNode.Short(), len(ticket))
 			// Build the resume material from the responder's perspective
 			// captured pre-session. Initiator needs swapped keys: their

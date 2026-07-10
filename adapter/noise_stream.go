@@ -1,8 +1,8 @@
 //go:build !js
 
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package adapter
 
@@ -39,7 +39,18 @@ type noiseStream struct {
 	state    *aether.StreamStateMachine
 	recvCh   chan []byte
 	recvOnce sync.Once
-	window   *flow.StreamWindow
+
+	// deliverCh feeds this stream's deliverLoop goroutine. AE-M-02: the
+	// readLoop enqueues in-order payloads here (non-blocking) instead of
+	// calling the up-to-1s-blocking DeliverToRecvChWithSignals itself, so one
+	// slow consumer cannot stall the shared readLoop (which drains the
+	// noiseConn inbox). Buffered at recvChCapacity(streamID): with recvCh this
+	// gives 2x buffering before any drop. Single producer / single consumer =>
+	// FIFO order into recvCh preserved.
+	deliverCh   chan []byte
+	deliverOnce sync.Once // closes deliverCh exactly once from teardown
+
+	window *flow.StreamWindow
 
 	// grantDebouncer coalesces stream-level WINDOW_UPDATE emissions driven
 	// by application reads on this stream. When Receive() successfully
@@ -156,6 +167,7 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 		session:     s,
 		state:       aether.NewStreamStateMachine(),
 		recvCh:      make(chan []byte, recvChCapacity(streamID)),
+		deliverCh:   make(chan []byte, recvChCapacity(streamID)),
 		window:      flow.NewStreamWindowWithCap(cfg.InitialCredit, cfg.MaxCredit),
 		engine:      eng,
 		fragBuf:     NewFragmentBuffer(),
@@ -311,6 +323,11 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 		class = aether.DefaultLatencyClass(streamID)
 	}
 	s.sched.RegisterWithClass(streamID, cfg.Priority, cfg.Dependency, class)
+	// AE-M-02: start the per-stream delivery goroutine. This is the only
+	// return path for a newly-created stream — the duplicate-open path
+	// returns `existing` (already has a worker) and cap-refused paths return
+	// nil, so no stream ever gets a second worker or is left without one.
+	go st.deliverLoop()
 	return st
 }
 
@@ -413,7 +430,15 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 	// fragments so each fragment is a single UDP packet (no IP fragmentation).
 	// Lost fragments are individually retransmitted by the reliability engine.
 	maxPayload := MSSToMaxPayload(st.session.pmtuProber.MSS())
-	fragments := SplitPayload(data, maxPayload)
+	fragments, err := SplitPayload(data, maxPayload)
+	if err != nil {
+		// AE-H-03: payload exceeds the 255-fragment ceiling. Fail loudly
+		// instead of transmitting a silently-truncated message. Returning
+		// here (before streamCredited/connCredited are cleared) lets the
+		// deferred ReleaseUnsent guards return ALL consumed credit, since
+		// nothing reached the wire.
+		return fmt.Errorf("stream %d: %w", st.streamID, err)
+	}
 
 	if fragments != nil {
 		// Large payload — send as multiple fragments
@@ -593,6 +618,52 @@ func (st *noiseStream) Close() error {
 	return st.session.writeFrame(frame)
 }
 
+// deliverLoop is the per-stream delivery goroutine. AE-M-02: it drains
+// deliverCh (fed in-order by the single readLoop) and performs the actual
+// send into recvCh — including the up-to-1s stream-1 backpressure — OFF the
+// readLoop, so a slow application consumer blocks only this goroutine, never
+// the shared readLoop / inbound-ACK path. Exits when teardown closes deliverCh.
+func (st *noiseStream) deliverLoop() {
+	s := st.session
+	defer func() {
+		// recvCh may be closed by closeRecvOnce (teardown race); recover so a
+		// send-on-closed is a benign drop, matching handleData's prior guard.
+		if r := recover(); r != nil {
+			dbgNoise.Printf("deliverLoop: send-on-closed for stream %d (race with teardown): %v", st.streamID, r)
+		}
+	}()
+	for payload := range st.deliverCh {
+		ok := DeliverToRecvChWithSignals(st.recvCh, payload, st.window, st.streamID, s.sendWindowUpdateAgnostic, s.SendCongestion, &s.deliveryStats)
+		if !ok {
+			if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
+				s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
+			}
+		}
+	}
+}
+
+// enqueueDelivery hands one in-order payload to deliverLoop. AE-M-02:
+// non-blocking — the readLoop must never block here. Returns false only when
+// deliverCh is full (deliverCh AND recvCh saturated == genuine sustained
+// overload); the payload is then dropped with the SAME accounting
+// DeliverToRecvChWithSignals' drop path uses (backpressure+dropped stats,
+// stream-window grant, CONGESTION signal) so the sender is throttled and never
+// stalls on lost credit. Caller grants conn-level credit on false.
+func (st *noiseStream) enqueueDelivery(payload []byte) bool {
+	select {
+	case st.deliverCh <- payload:
+		return true
+	default:
+	}
+	s := st.session
+	s.deliveryStats.recordBackpressure(st.streamID)
+	dropGrantCredit(st.window, payload, st.streamID, s.sendWindowUpdateAgnostic)
+	s.deliveryStats.recordDropped(st.streamID, len(payload))
+	// deliverCh full == sustained overload tier (matches deliver.go drop path).
+	_ = s.SendCongestion(aether.CongestionPayload{Reason: aether.CongestionDownstream, Severity: 80, BackoffMs: 500})
+	return false
+}
+
 // teardown releases per-stream resources that must not outlive the
 // stream itself — currently the grant debouncer's timer goroutine +
 // pending-flush. Idempotent; safe to call from every termination path
@@ -600,6 +671,13 @@ func (st *noiseStream) Close() error {
 func (st *noiseStream) teardown() {
 	if st.grantDebouncer != nil {
 		st.grantDebouncer.Close()
+	}
+	// AE-M-02: stop the delivery goroutine. Closing deliverCh ends deliverLoop's
+	// range; deliverOnce keeps concurrent teardown paths idempotent. The nil
+	// guard covers streams constructed outside createStream (unit tests /
+	// future direct construction) where deliverCh was never made.
+	if st.deliverCh != nil {
+		st.deliverOnce.Do(func() { close(st.deliverCh) })
 	}
 }
 

@@ -1,8 +1,8 @@
 //go:build !js
 
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package noise
 
@@ -19,7 +19,7 @@ import (
 // The forwarder logic (listener-side branching, inner relay protocol between
 // the anycast-receiving machine and the target machine over 6PN, per-flow
 // relay table) is documented in
-// HSTLES/Library/docs/superpowers/plans/2026-05-23-cross-org-anycast-forwarder.md
+// the consuming runtime cross-org anycast forwarder plan
 // and intentionally NOT shipped here — it requires sustained design + test
 // + staged rollout work that warrants its own focused session.
 //

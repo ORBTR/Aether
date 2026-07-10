@@ -1,11 +1,12 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package reliability
 
 import (
 	"testing"
+	"time"
 
 	"github.com/ORBTR/aether"
 )
@@ -159,5 +160,67 @@ func TestS2_PruneOlderThan(t *testing.T) {
 	}
 	if got := d.EvictedCount(); got != 1 {
 		t.Errorf("EvictedCount = %d, want 1", got)
+	}
+}
+
+// ─── AE-C-02 — ExtRanges uint32 wraparound infinite loop ───────────────
+// An ExtRange whose End is at/beyond w.next (e.g. 0xFFFFFFFF) must be
+// rejected. Without the `block.End >= w.next` guard the scan loop
+// `for seq := block.Start; seq <= block.End; seq++` never terminates
+// because seq++ wraps 0xFFFFFFFF→0 and stays <= End forever, spinning at
+// 100% CPU while holding w.mu — one crafted frame wedges the session.
+
+func TestAEC02_ExtRangeWraparoundRejected(t *testing.T) {
+	w := NewSendWindow(64)
+	for i := 0; i < 8; i++ {
+		w.Add(&aether.Frame{StreamID: 1})
+	}
+	// Start=End=0xFFFFFFFF: passes the Start>bitmapEnd, End>=Start and
+	// End-Start<=MaxACKRangeSize guards, so only the End>=w.next guard stops
+	// the wraparound loop.
+	ack := &aether.CompositeACK{
+		BaseACK: 0,
+		Flags:   aether.CACKHasExtRanges,
+		ExtRanges: []aether.SACKBlock{
+			{Start: ^uint32(0), End: ^uint32(0)},
+		},
+	}
+	// Run in a goroutine so a regression (infinite loop) fails via timeout
+	// instead of hanging the whole suite.
+	done := make(chan struct{})
+	go func() {
+		_, _ = w.ProcessCompositeACK(ack, 3)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ProcessCompositeACK did not return — ExtRange End=0xFFFFFFFF wraparound loop (AE-C-02)")
+	}
+	if got := w.SuspiciousACKsCount(); got != 1 {
+		t.Errorf("SuspiciousACKsCount = %d, want 1", got)
+	}
+}
+
+// A legitimate ExtRange fully within (bitmapEnd, w.next) must still be
+// processed — the new guard must not reject valid ranges.
+func TestAEC02_ValidExtRangeStillAcked(t *testing.T) {
+	w := NewSendWindow(64)
+	for i := 0; i < 8; i++ {
+		w.Add(&aether.Frame{StreamID: 1}) // seqs 0..7, next=8
+	}
+	ack := &aether.CompositeACK{
+		BaseACK: 0, // cumulative acks seq 0
+		Flags:   aether.CACKHasExtRanges,
+		ExtRanges: []aether.SACKBlock{
+			{Start: 3, End: 5}, // in-window, End < next
+		},
+	}
+	acked, _ := w.ProcessCompositeACK(ack, 3)
+	if len(acked) < 3 {
+		t.Fatalf("valid ExtRange {3,5} not acked: got %d acked entries", len(acked))
+	}
+	if got := w.SuspiciousACKsCount(); got != 0 {
+		t.Errorf("valid ExtRange flagged suspicious (count=%d)", got)
 	}
 }

@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package scheduler
 
@@ -238,4 +238,133 @@ func TestScheduler_DepthHistogram_NilSafe(t *testing.T) {
 	s.Wake()
 	_, _ = s.Dequeue()
 	// If we got here without panicking, nil-safety holds.
+}
+
+// AE-H-05 regression: a capped REALTIME class must be DEMOTED into the
+// INTERACTIVE round rather than dropped from every round. The two tests below
+// lock in (1) a REALTIME-only connection no longer stalls once it trips the
+// 10% cap, and (2) a capped REALTIME stream loses its absolute priority but
+// still makes forward progress under contention.
+
+// newDataFrameH05 builds a minimally-valid DATA frame of the given payload
+// length tagged with its owning stream ID so a drained frame can be classified
+// back to its stream. The scheduler only reads Length/Type, so Payload is nil.
+func newDataFrameH05(streamID uint64, length uint32) *aether.Frame {
+	return &aether.Frame{
+		StreamID: streamID,
+		Type:     aether.TypeDATA,
+		Length:   length,
+	}
+}
+
+// TestRealtimeCapDoesNotStallRealtimeOnly is the core AE-H-05 regression: with
+// only REALTIME work queued, the >10% bandwidth cap trips after the first frame
+// (bytesOut = HeaderSize + 1200 pins the ratio at 100%). Pre-fix the loop
+// dropped capped REALTIME from every round, so every Dequeue after the first
+// returned nil and the connection stalled forever. Post-fix the capped class is
+// demoted into the INTERACTIVE round and every frame drains.
+func TestRealtimeCapDoesNotStallRealtimeOnly(t *testing.T) {
+	s := NewScheduler()
+	const rtID = uint64(1)
+	s.RegisterWithClass(rtID, DefaultWeight, 0, aether.ClassREALTIME)
+
+	const n = 50
+	for i := 0; i < n; i++ {
+		// Length 1200 => bytesOut 1250; the very first frame consumes 100% of
+		// the window so the cap trips from the second Dequeue onward.
+		s.Enqueue(rtID, newDataFrameH05(rtID, 1200))
+	}
+
+	drained := 0
+	// Bound the loop so a regression (permanent nil) fails fast instead of
+	// hanging the test.
+	for i := 0; i < n*4; i++ {
+		frame, _ := s.Dequeue()
+		if frame == nil {
+			break
+		}
+		drained++
+	}
+
+	if drained != n {
+		t.Fatalf("REALTIME-only connection stalled under the 10%% cap: drained %d of %d frames (want all %d)", drained, n, n)
+	}
+	if !s.IsEmpty() {
+		t.Fatalf("scheduler still reports queued frames after draining; cap left work stranded")
+	}
+}
+
+// TestRealtimeCapDemotesRealtimePriority proves the cap still does its job: once
+// REALTIME exceeds its share it is folded into the INTERACTIVE round and
+// competes there via WFQ instead of retaining absolute priority. With a REALTIME
+// stream and an INTERACTIVE stream both loaded, (a) both classes fully drain
+// (REALTIME not stalled, INTERACTIVE not starved) and (b) REALTIME frames are
+// interleaved with INTERACTIVE frames during the capped period rather than the
+// REALTIME stream monopolising every round.
+//
+// NOTE (deviation from the original test plan, which paired REALTIME with a
+// BULK stream): the fix folds a capped REALTIME class into the *INTERACTIVE*
+// round, which still ranks above BULK — so a demoted REALTIME stream keeps its
+// priority over BULK and the two never interleave. INTERACTIVE is therefore the
+// class that genuinely contends with a demoted REALTIME stream, so this test
+// pairs REALTIME with INTERACTIVE to exercise the demotion faithfully.
+func TestRealtimeCapDemotesRealtimePriority(t *testing.T) {
+	s := NewScheduler()
+	const (
+		rtID = uint64(1)
+		inID = uint64(2)
+	)
+	s.RegisterWithClass(rtID, DefaultWeight, 0, aether.ClassREALTIME)
+	s.RegisterWithClass(inID, DefaultWeight, 0, aether.ClassINTERACTIVE)
+
+	const perStream = 20
+	for i := 0; i < perStream; i++ {
+		s.Enqueue(rtID, newDataFrameH05(rtID, 1200))
+		s.Enqueue(inID, newDataFrameH05(inID, 1200))
+	}
+
+	var rtSeen, inSeen int
+	lastInteractiveIdx := -1
+	// Record the drain order so we can prove interleaving. Bound the loop as a
+	// stall guard.
+	seq := make([]uint64, 0, perStream*2)
+	for i := 0; i < perStream*8; i++ {
+		frame, _ := s.Dequeue()
+		if frame == nil {
+			break
+		}
+		seq = append(seq, frame.StreamID)
+		switch frame.StreamID {
+		case rtID:
+			rtSeen++
+		case inID:
+			inSeen++
+			lastInteractiveIdx = len(seq) - 1
+		default:
+			t.Fatalf("dequeued frame with unexpected StreamID %d", frame.StreamID)
+		}
+	}
+
+	// (a) Both classes fully drain.
+	if rtSeen != perStream {
+		t.Fatalf("REALTIME stream did not fully drain under cap: served %d of %d", rtSeen, perStream)
+	}
+	if inSeen != perStream {
+		t.Fatalf("INTERACTIVE stream did not fully drain: served %d of %d", inSeen, perStream)
+	}
+
+	// (b) REALTIME lost its absolute priority: many REALTIME frames were served
+	// interleaved with INTERACTIVE frames (before the final INTERACTIVE frame),
+	// rather than the REALTIME stream monopolising every round. Pre-fix, capped
+	// REALTIME was dropped from every round, so no REALTIME frame could be
+	// served while INTERACTIVE work remained.
+	rtBeforeLastInteractive := 0
+	for i, id := range seq {
+		if id == rtID && i < lastInteractiveIdx {
+			rtBeforeLastInteractive++
+		}
+	}
+	if rtBeforeLastInteractive < 5 {
+		t.Fatalf("REALTIME frames were not interleaved with INTERACTIVE under the cap: only %d REALTIME frames served before the last INTERACTIVE frame (want >= 5); drain order=%v", rtBeforeLastInteractive, seq)
+	}
 }

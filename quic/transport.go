@@ -1,8 +1,8 @@
 //go:build !js
 
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package quic
 
@@ -293,6 +293,10 @@ func generateTLSConfig(key ed25519.PrivateKey) (*tls.Config, error) {
 		Certificates:       []tls.Certificate{tlsCert},
 		NextProtos:         []string{"vl1-quic"},
 		InsecureSkipVerify: true, // We verify manually in VerifyConnection
+		// AE-H-12: RequireAnyClientCert makes the QUIC server send a CertificateRequest so it
+		// obtains the client's cert and can bind the inbound peer NodeID (validated in VerifyConnection).
+		// Server-only field; ignored on the dial side that shares this config.
+		ClientAuth: tls.RequireAnyClientCert,
 		VerifyConnection: func(cs tls.ConnectionState) error {
 			if len(cs.PeerCertificates) == 0 {
 				return errors.New("vl1: no peer certificate")

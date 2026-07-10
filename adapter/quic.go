@@ -1,8 +1,8 @@
 //go:build !js
 
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package adapter
 
@@ -116,7 +116,22 @@ func (s *QUICSession) acceptLoop() {
 		}
 		st.state.Transition(aether.EventRecvOpen)
 
+		// AE-P-06: an aether StreamID must be unique per live session. A
+		// second QUIC stream presenting an already-registered StreamID is
+		// a protocol violation — refuse the DUPLICATE transport stream
+		// rather than silently overwriting the map entry. Overwriting
+		// corrupts Metrics().ActiveStreams and, via dropStream (AE-H-01),
+		// lets either stream's close evict the survivor's slot. The first
+		// stream keeps its mapping; quic-go's MaxIncomingStreams still
+		// bounds total concurrent streams, so no limit is lowered. Mirrors
+		// tcp.go registerStream's duplicate handling.
 		s.mu.Lock()
+		if _, dup := s.streams[streamID]; dup {
+			s.mu.Unlock()
+			qs.CancelRead(quic.StreamErrorCode(aether.ResetRefused))
+			qs.CancelWrite(quic.StreamErrorCode(aether.ResetRefused))
+			continue
+		}
 		s.streams[streamID] = st
 		s.mu.Unlock()
 
@@ -272,29 +287,49 @@ func (st *quicStream) Receive(ctx context.Context) ([]byte, error) {
 	// Read 4-byte length prefix
 	var lenBuf [4]byte
 	if _, err := io.ReadFull(st.quicStream, lenBuf[:]); err != nil {
+		st.dropStream() // AE-H-01: evict on stream EOF/error
 		return nil, err
 	}
 	length := binary.BigEndian.Uint32(lenBuf[:])
 	if length > aether.MaxPayloadSize {
+		st.dropStream() // AE-H-01: framing desynced, stream is dead
 		return nil, fmt.Errorf("message too large: %d", length)
 	}
 	data := make([]byte, length)
 	if _, err := io.ReadFull(st.quicStream, data); err != nil {
+		st.dropStream() // AE-H-01: evict on stream EOF/error
 		return nil, err
 	}
 	st.session.Health().RecordActivity()
 	return data, nil
 }
 
+// dropStream evicts st from the session's stream map. Idempotent — a
+// delete of an absent key is a no-op, so every quicStream termination
+// path (Close, Reset, Receive EOF/error) can call it safely. The QUIC
+// streams map is otherwise write-only (its sole reader is Metrics for
+// the ActiveStreams count), so without this eviction it grows by one
+// pinned *quicStream — and the quic.Stream handle each retains — for
+// every stream ever created on a long-lived connection: an unbounded
+// leak. Mirrors the tcp/noise adapters' teardown discipline. AE-H-01.
+func (st *quicStream) dropStream() {
+	st.session.mu.Lock()
+	delete(st.session.streams, st.streamID)
+	st.session.mu.Unlock()
+}
+
 func (st *quicStream) Close() error {
 	st.state.Transition(aether.EventSendFIN)
-	return st.quicStream.Close()
+	err := st.quicStream.Close()
+	st.dropStream()
+	return err
 }
 
 func (st *quicStream) Reset(reason aether.ResetReason) error {
 	st.state.Transition(aether.EventSendReset)
 	st.quicStream.CancelRead(quic.StreamErrorCode(reason))
 	st.quicStream.CancelWrite(quic.StreamErrorCode(reason))
+	st.dropStream()
 	return nil
 }
 

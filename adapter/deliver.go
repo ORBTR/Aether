@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package adapter
 
@@ -137,10 +137,13 @@ const (
 	// A silent drop here desynchronises caller and credit accounting
 	// and produces a 30s deadline-exceeded sample with no retry. Pay
 	// a per-call latency penalty of waiting up to 1s rather than
-	// burning the 30s deadline. The readLoop still services other
-	// streams — a 1s blip on stream-1 under transient load is far
-	// cheaper than the silent 30s RPC timeouts ws_same-origin p99
-	// has been pinned to. See workflow wd4zasivv synthesis.
+	// burning the 30s deadline. AE-M-02: on the noise adapter this 1s
+	// wait is now paid on the per-stream deliverLoop goroutine, NOT the
+	// shared readLoop — a slow stream-1 consumer blocks only its own
+	// delivery goroutine while the readLoop keeps draining the noiseConn
+	// inbox (inbound ACKs for every other stream). Far cheaper than the
+	// silent 30s RPC timeouts ws_same-origin p99 has been pinned to. See
+	// workflow wd4zasivv synthesis.
 	stream1MaxBackpressure = 1 * time.Second
 )
 

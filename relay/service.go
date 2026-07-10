@@ -1,8 +1,8 @@
 //go:build !js
 
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  *
  * RelayService provides protocol-agnostic relay forwarding. It looks up
  * target sessions via a SessionIndex interface (injected by the transport
@@ -29,13 +29,20 @@ type SessionIndex interface {
 	LookupExternal(id aether.NodeID) aether.Connection
 }
 
+// externalEntry pairs a bridge session with its scope so relay forwarding can
+// enforce tenant isolation on external paths. AE-H-08.
+type externalEntry struct {
+	conn    aether.Connection
+	scopeID string
+}
+
 // RelayService handles relay request/data forwarding across any transport sessions.
 // It uses a SessionIndex to find targets via primary session lookup, and manages
 // external (non-primary) sessions (WebSocket, QUIC, gRPC bridges) directly.
 type RelayService struct {
 	mu               sync.RWMutex
-	sessions         SessionIndex                          // primary session lookup (injected)
-	externalSessions map[aether.NodeID]aether.Connection // WS/QUIC/gRPC bridge sessions
+	sessions         SessionIndex                    // primary session lookup (injected)
+	externalSessions map[aether.NodeID]externalEntry // WS/QUIC/gRPC bridge sessions + scope
 	config           RelayConfig
 }
 
@@ -44,7 +51,7 @@ func NewRelayService(config RelayConfig, sessions SessionIndex) *RelayService {
 	return &RelayService{
 		config:           config,
 		sessions:         sessions,
-		externalSessions: make(map[aether.NodeID]aether.Connection),
+		externalSessions: make(map[aether.NodeID]externalEntry),
 	}
 }
 
@@ -81,11 +88,11 @@ func (rs *RelayService) HandleRelayRequest(sourceNodeID aether.NodeID, data []by
 
 	// Fallback: external session (WS/QUIC/gRPC bridge)
 	rs.mu.RLock()
-	extSess := rs.externalSessions[targetNodeID]
+	e := rs.externalSessions[targetNodeID]
 	rs.mu.RUnlock()
-	if extSess != nil {
+	if e.conn != nil {
 		frame := makeRelayFrame(sourceNodeID, payload)
-		return extSess.Send(context.Background(), frame)
+		return e.conn.Send(context.Background(), frame)
 	}
 
 	return ErrTargetUnreachable
@@ -118,9 +125,9 @@ func (rs *RelayService) Config() RelayConfig {
 // RegisterExternal adds a non-primary session (e.g., WebSocket bridge) to the
 // relay's external session table. This allows relay forwarding between primary
 // transport sessions and external bridge sessions.
-func (rs *RelayService) RegisterExternal(nodeID aether.NodeID, sess aether.Connection) {
+func (rs *RelayService) RegisterExternal(nodeID aether.NodeID, sess aether.Connection, scopeID string) {
 	rs.mu.Lock()
-	rs.externalSessions[nodeID] = sess
+	rs.externalSessions[nodeID] = externalEntry{conn: sess, scopeID: scopeID}
 	rs.mu.Unlock()
 }
 
@@ -135,7 +142,16 @@ func (rs *RelayService) UnregisterExternal(nodeID aether.NodeID) {
 func (rs *RelayService) LookupExternal(id aether.NodeID) aether.Connection {
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()
-	return rs.externalSessions[id]
+	return rs.externalSessions[id].conn
+}
+
+// ExternalScope returns the bridge session and its scope for id, with ok=false
+// when none is registered. Used to enforce relay scope isolation. AE-H-08.
+func (rs *RelayService) ExternalScope(id aether.NodeID) (conn aether.Connection, scopeID string, ok bool) {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	e, ok := rs.externalSessions[id]
+	return e.conn, e.scopeID, ok
 }
 
 // PruneExternal removes idle external sessions older than maxAge.
@@ -144,10 +160,10 @@ func (rs *RelayService) LookupExternal(id aether.NodeID) aether.Connection {
 func (rs *RelayService) PruneExternal(maxAge time.Duration) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
-	for nodeID, sess := range rs.externalSessions {
-		if hr, ok := sess.(aether.HealthReporter); ok {
+	for nodeID, e := range rs.externalSessions {
+		if hr, ok := e.conn.(aether.HealthReporter); ok {
 			if !hr.IsAlive(maxAge) {
-				_ = sess.Close()
+				_ = e.conn.Close()
 				delete(rs.externalSessions, nodeID)
 			}
 		}

@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package websocket
 
@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
@@ -18,6 +19,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,14 +30,19 @@ import (
 
 const (
 	// NodeIDHeader is the HTTP header used to transmit the client's NodeID
-	NodeIDHeader = "X-HSTLES-NodeID"
+	NodeIDHeader = "X-ORBTR-NodeID"
 	// PubKeyHeader contains hex-encoded Ed25519 public key for signature verification.
 	// Sent alongside NodeID because NodeID is base32-encoded fingerprint (not the raw key).
-	PubKeyHeader = "X-HSTLES-PubKey"
+	PubKeyHeader = "X-ORBTR-PubKey"
 	// SignatureHeader contains Ed25519 signature proving ownership of NodeID
-	SignatureHeader = "X-HSTLES-Signature"
-	// NonceHeader contains the challenge nonce for signature verification
-	NonceHeader = "X-HSTLES-Nonce"
+	SignatureHeader = "X-ORBTR-Signature"
+	// NonceHeader carries the client-chosen random nonce bound into the dial
+	// signature; with TimestampHeader it makes each handshake unique so a
+	// captured signature cannot be replayed (AE-M-16).
+	NonceHeader = "X-ORBTR-Nonce"
+	// TimestampHeader carries the unix-nanosecond dial time bound into the
+	// signature; the server rejects anything outside dialFreshnessWindow.
+	TimestampHeader = "X-ORBTR-Timestamp"
 
 	// pingInterval is how often to send WebSocket ping frames for proxy keepalive.
 	// Sized at 5s rather than the obvious 10s because some HTTP edge proxies
@@ -45,6 +52,12 @@ const (
 	// underlying TCP never goes more than ~1s idle initially, then ~5s
 	// thereafter, well under any observed proxy idle threshold.
 	pingInterval = 5 * time.Second
+
+	// dialFreshnessWindow bounds clock skew between a dial signature's
+	// timestamp and the server clock; the replay cache retains authenticated
+	// nonces for the same span (AE-M-16). Sized generously (not tightened) so
+	// NTP-synced Fly nodes never falsely reject a legitimate dial.
+	dialFreshnessWindow = 60 * time.Second
 )
 
 type WebsocketTransportConfig struct {
@@ -58,6 +71,7 @@ type WebsocketTransport struct {
 	privateKey ed25519.PrivateKey
 	listenAddr string
 	server     *http.Server
+	replay     *dialReplayGuard
 }
 
 func NewWebsocketTransport(cfg WebsocketTransportConfig) (*WebsocketTransport, error) {
@@ -65,7 +79,35 @@ func NewWebsocketTransport(cfg WebsocketTransportConfig) (*WebsocketTransport, e
 		localNode:  cfg.LocalNode,
 		privateKey: cfg.PrivateKey,
 		listenAddr: cfg.ListenAddr,
+		replay:     newDialReplayGuard(),
 	}, nil
+}
+
+// dialReplayGuard rejects reuse of an authenticated dial nonce within the
+// freshness window (AE-M-16). Only signature-valid nonces are recorded, so
+// an unauthenticated peer cannot poison it. Retention is bounded by expiry.
+type dialReplayGuard struct {
+	mu   sync.Mutex
+	seen map[string]time.Time // nonce -> expiry
+}
+
+func newDialReplayGuard() *dialReplayGuard { return &dialReplayGuard{seen: make(map[string]time.Time)} }
+
+// checkAndRecord returns false if nonce was already seen; otherwise records
+// it with expiry and prunes expired entries.
+func (g *dialReplayGuard) checkAndRecord(nonce string, now, expiry time.Time) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for k, exp := range g.seen {
+		if now.After(exp) {
+			delete(g.seen, k)
+		}
+	}
+	if _, dup := g.seen[nonce]; dup {
+		return false
+	}
+	g.seen[nonce] = expiry
+	return true
 }
 
 // NewWebsocketTransportFromConfig creates a WebSocket transport from the unified Config.
@@ -87,8 +129,19 @@ func (t *WebsocketTransport) Dial(ctx context.Context, target aether.Target) (ae
 	headers.Set(NodeIDHeader, string(t.localNode))
 	headers.Set(PubKeyHeader, hex.EncodeToString(t.privateKey.Public().(ed25519.PublicKey)))
 
-	// Sign the dial intent to prevent replay attacks
-	message := []byte(fmt.Sprintf("ws-dial:%s:%s", t.localNode, target.NodeID))
+	// AE-M-16: bind the dial intent to a fresh timestamp + random nonce so a
+	// captured (NodeID, PubKey, Signature) header set cannot be replayed to
+	// re-establish a session as us. The server rejects timestamps outside
+	// dialFreshnessWindow and any nonce it has already seen within that window.
+	nonce := make([]byte, 16)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, aether.WrapOp("dial", aether.ProtoWebSocket, target.NodeID, err)
+	}
+	nonceStr := base64.RawStdEncoding.EncodeToString(nonce)
+	tsStr := strconv.FormatInt(time.Now().UnixNano(), 10)
+	headers.Set(NonceHeader, nonceStr)
+	headers.Set(TimestampHeader, tsStr)
+	message := []byte(fmt.Sprintf("ws-dial:%s:%s:%s:%s", t.localNode, target.NodeID, tsStr, nonceStr))
 	signature := ed25519.Sign(t.privateKey, message)
 	headers.Set(SignatureHeader, base64.StdEncoding.EncodeToString(signature))
 
@@ -109,15 +162,73 @@ func (t *WebsocketTransport) Dial(ctx context.Context, target aether.Target) (ae
 	// Dial using gobwas/ws — returns the raw net.Conn post-handshake
 	// Measure dial RTT (TCP handshake + TLS + WS upgrade) for cross-region latency
 	dialStart := time.Now()
+	// AE-P-26: capture the server's signed identity headers from the 101
+	// response so we can verify the server owns target.NodeID before trusting
+	// it (matching the HTTPUpgrader emit in Listen). Header keys arrive as
+	// canonicalized wire bytes, so match case-insensitively.
+	var srvNodeIDHdr, srvPubHex, srvSigB64 string
 	dialer := ws.Dialer{
 		Header:    ws.HandshakeHeaderHTTP(headers),
 		TLSConfig: tlsConfig,
+		OnHeader: func(key, value []byte) error {
+			switch {
+			case strings.EqualFold(string(key), NodeIDHeader):
+				srvNodeIDHdr = string(value)
+			case strings.EqualFold(string(key), PubKeyHeader):
+				srvPubHex = string(value)
+			case strings.EqualFold(string(key), SignatureHeader):
+				srvSigB64 = string(value)
+			}
+			return nil
+		},
 	}
 	rawConn, _, _, err := dialer.Dial(ctx, target.Address)
 	if err != nil {
 		return nil, aether.WrapOp("dial", aether.ProtoWebSocket, target.NodeID, err)
 	}
 	dialRTT := time.Since(dialStart)
+
+	// AE-P-26: verify the server's mesh identity (fail closed) before stamping
+	// target.NodeID. Mirrors the hijack path: require a signed triple, check the
+	// pubkey derives the claimed NodeID, verify the signature over OUR fresh
+	// nonce+timestamp, and require the proven NodeID == the dialed target. TLS
+	// alone only proves the endpoint holds a cert for the hostname, not which
+	// NodeID answered on shared infra.
+	srvNodeID := aether.NodeID(srvNodeIDHdr)
+	if srvNodeID == "" || srvPubHex == "" || srvSigB64 == "" {
+		rawConn.Close()
+		return nil, aether.WrapOp("dial-serverauth", aether.ProtoWebSocket, target.NodeID,
+			errors.New("server did not present a signed identity"))
+	}
+	srvPub, err := hex.DecodeString(srvPubHex)
+	if err != nil || len(srvPub) != ed25519.PublicKeySize {
+		rawConn.Close()
+		return nil, aether.WrapOp("dial-serverauth", aether.ProtoWebSocket, target.NodeID,
+			errors.New("server public key invalid"))
+	}
+	derivedSrv, err := aether.NewNodeID(ed25519.PublicKey(srvPub))
+	if err != nil || derivedSrv != srvNodeID {
+		rawConn.Close()
+		return nil, aether.WrapOp("dial-serverauth", aether.ProtoWebSocket, target.NodeID,
+			errors.New("server public key does not match its NodeID"))
+	}
+	srvSig, err := base64.StdEncoding.DecodeString(srvSigB64)
+	if err != nil {
+		rawConn.Close()
+		return nil, aether.WrapOp("dial-serverauth", aether.ProtoWebSocket, target.NodeID,
+			errors.New("server signature encoding invalid"))
+	}
+	acceptMsg := []byte(fmt.Sprintf("ws-accept:%s:%s:%s", srvNodeID, nonceStr, tsStr))
+	if !ed25519.Verify(ed25519.PublicKey(srvPub), acceptMsg, srvSig) {
+		rawConn.Close()
+		return nil, aether.WrapOp("dial-serverauth", aether.ProtoWebSocket, target.NodeID,
+			errors.New("server identity signature invalid"))
+	}
+	if srvNodeID != target.NodeID {
+		rawConn.Close()
+		return nil, aether.WrapOp("dial-serverauth", aether.ProtoWebSocket, target.NodeID,
+			fmt.Errorf("server NodeID %s does not match dialed target %s", srvNodeID.Short(), target.NodeID.Short()))
+	}
 
 	// Wrap with WSConn adapter (client side: isServer=false, with ping keepalive)
 	wsConn := NewWSConn(rawConn, false, string(target.NodeID), pingInterval)
@@ -140,46 +251,94 @@ func (t *WebsocketTransport) Listen(ctx context.Context) (aether.Listener, error
 		}
 		remoteNodeID := aether.NodeID(remoteNodeIDStr)
 
-		// Verify signature if present
+		// NodeID ownership MUST be cryptographically proven — the signature is
+		// mandatory, never optional-on-presence. A client that omits it would
+		// otherwise be accepted under any claimed NodeID (peer impersonation,
+		// AE-C-04). Ordinary server TLS gives no client-identity guarantee, so
+		// this signature is the sole NodeID binding. Legitimate clients always
+		// send it (see Dial), so requiring it breaks nothing.
 		signatureStr := r.Header.Get(SignatureHeader)
-		if signatureStr != "" {
-			signature, err := base64.StdEncoding.DecodeString(signatureStr)
-			if err != nil {
-				http.Error(w, "invalid signature encoding", http.StatusBadRequest)
-				return
-			}
-
-			// The signature should be over "ws-dial:<clientNodeID>:<serverNodeID>"
-			message := []byte(fmt.Sprintf("ws-dial:%s:%s", remoteNodeID, t.localNode))
-
-			// Extract public key from PubKey header (NodeID is base32 fingerprint, not the raw key)
-			pubKeyHex := r.Header.Get(PubKeyHeader)
-			if pubKeyHex == "" {
-				http.Error(w, "missing public key header", http.StatusBadRequest)
-				return
-			}
-			pubKeyBytes, err := hex.DecodeString(pubKeyHex)
-			if err != nil || len(pubKeyBytes) != ed25519.PublicKeySize {
-				http.Error(w, "invalid public key", http.StatusBadRequest)
-				return
-			}
-			pubKey := ed25519.PublicKey(pubKeyBytes)
-
-			// Verify the NodeID derives from this public key
-			derivedNodeID, err := aether.NewNodeID(pubKey)
-			if err != nil || derivedNodeID != remoteNodeID {
-				http.Error(w, "public key does not match NodeID", http.StatusBadRequest)
-				return
-			}
-
-			if !ed25519.Verify(pubKey, message, signature) {
-				http.Error(w, "invalid signature", http.StatusUnauthorized)
-				return
-			}
+		if signatureStr == "" {
+			http.Error(w, "missing signature header", http.StatusUnauthorized)
+			return
+		}
+		signature, err := base64.StdEncoding.DecodeString(signatureStr)
+		if err != nil {
+			http.Error(w, "invalid signature encoding", http.StatusBadRequest)
+			return
 		}
 
-		// Upgrade to WebSocket using gobwas/ws — hijacks the HTTP connection
-		rawConn, _, _, err := ws.UpgradeHTTP(r, w)
+		// AE-M-16: reject stale dials before spending a signature verify.
+		tsStr := r.Header.Get(TimestampHeader)
+		nonceStr := r.Header.Get(NonceHeader)
+		if tsStr == "" || nonceStr == "" {
+			http.Error(w, "missing dial freshness headers", http.StatusUnauthorized)
+			return
+		}
+		tsNano, err := strconv.ParseInt(tsStr, 10, 64)
+		if err != nil {
+			http.Error(w, "invalid dial timestamp", http.StatusBadRequest)
+			return
+		}
+		now := time.Now()
+		if skew := now.Sub(time.Unix(0, tsNano)); skew > dialFreshnessWindow || skew < -dialFreshnessWindow {
+			http.Error(w, "stale dial signature", http.StatusUnauthorized)
+			return
+		}
+
+		// The signature should be over "ws-dial:<clientNodeID>:<serverNodeID>:<ts>:<nonce>"
+		message := []byte(fmt.Sprintf("ws-dial:%s:%s:%s:%s", remoteNodeID, t.localNode, tsStr, nonceStr))
+
+		// Extract public key from PubKey header (NodeID is base32 fingerprint, not the raw key)
+		pubKeyHex := r.Header.Get(PubKeyHeader)
+		if pubKeyHex == "" {
+			http.Error(w, "missing public key header", http.StatusBadRequest)
+			return
+		}
+		pubKeyBytes, err := hex.DecodeString(pubKeyHex)
+		if err != nil || len(pubKeyBytes) != ed25519.PublicKeySize {
+			http.Error(w, "invalid public key", http.StatusBadRequest)
+			return
+		}
+		pubKey := ed25519.PublicKey(pubKeyBytes)
+
+		// Verify the NodeID derives from this public key
+		derivedNodeID, err := aether.NewNodeID(pubKey)
+		if err != nil || derivedNodeID != remoteNodeID {
+			http.Error(w, "public key does not match NodeID", http.StatusBadRequest)
+			return
+		}
+
+		if !ed25519.Verify(pubKey, message, signature) {
+			http.Error(w, "invalid signature", http.StatusUnauthorized)
+			return
+		}
+
+		// AE-M-16: authentic signature — now reject a replay of it.
+		if !t.replay.checkAndRecord(nonceStr, now, time.Unix(0, tsNano).Add(dialFreshnessWindow)) {
+			http.Error(w, "replayed dial signature", http.StatusUnauthorized)
+			return
+		}
+
+		// AE-P-26: prove our mesh identity to the client on the plain WS path too.
+		// The server previously emitted NO identity header here, so a client had
+		// only TLS hostname validation backing target.NodeID. Sign the client's
+		// fresh dial nonce+timestamp with our own key and emit the signed triple
+		// in the 101 response; the client verifies it before trusting
+		// target.NodeID and fails closed on mismatch. Guard on key presence
+		// (ed25519.Sign panics on a nil key): a keyless transport emits only the
+		// NodeID header and the client — which requires the triple — fails closed.
+		respHdr := make(http.Header)
+		respHdr.Set(NodeIDHeader, string(t.localNode))
+		if len(t.privateKey) == ed25519.PrivateKeySize {
+			acceptMsg := []byte(fmt.Sprintf("ws-accept:%s:%s:%s", t.localNode, nonceStr, tsStr))
+			acceptSig := ed25519.Sign(t.privateKey, acceptMsg)
+			respHdr.Set(PubKeyHeader, hex.EncodeToString(t.privateKey.Public().(ed25519.PublicKey)))
+			respHdr.Set(SignatureHeader, base64.StdEncoding.EncodeToString(acceptSig))
+		}
+		// Upgrade to WebSocket using gobwas/ws — hijacks the HTTP connection and
+		// writes our signed identity headers into the 101 response (AE-P-26).
+		rawConn, _, _, err := ws.HTTPUpgrader{Header: respHdr}.Upgrade(r, w)
 		if err != nil {
 			return
 		}
@@ -267,7 +426,7 @@ const (
 // instead of the WebSocket protocol. This avoids proxy interference on Fly.io
 // and Cloudflare by producing a plain TCP stream after the HTTP upgrade.
 //
-// The target.Address should be a hostname (e.g., "node.hstles.com") — the
+// The target.Address should be a hostname (e.g., "node.orbtr.io") — the
 // method constructs the full URL internally.
 func (t *WebsocketTransport) DialHijack(ctx context.Context, target aether.Target) (aether.Connection, error) {
 	// Build the target URL — strip any existing scheme
@@ -326,7 +485,18 @@ func (t *WebsocketTransport) DialHijack(ctx context.Context, target aether.Targe
 	req.Header.Set("Upgrade", HijackUpgradeToken)
 	req.Header.Set(NodeIDHeader, string(t.localNode))
 	req.Header.Set(PubKeyHeader, hex.EncodeToString(t.privateKey.Public().(ed25519.PublicKey)))
-	message := []byte(fmt.Sprintf("hijack-dial:%s:%s", t.localNode, target.NodeID))
+	// AE-M-16: bind a fresh timestamp + random nonce into the hijack dial
+	// signature so a captured header set cannot be replayed.
+	nonce := make([]byte, 16)
+	if _, err := rand.Read(nonce); err != nil {
+		tlsConn.Close()
+		return nil, aether.WrapOp("dial-hijack", aether.ProtoWebSocket, target.NodeID, err)
+	}
+	nonceStr := base64.RawStdEncoding.EncodeToString(nonce)
+	tsStr := strconv.FormatInt(time.Now().UnixNano(), 10)
+	req.Header.Set(NonceHeader, nonceStr)
+	req.Header.Set(TimestampHeader, tsStr)
+	message := []byte(fmt.Sprintf("hijack-dial:%s:%s:%s:%s", t.localNode, target.NodeID, tsStr, nonceStr))
 	signature := ed25519.Sign(t.privateKey, message)
 	req.Header.Set(SignatureHeader, base64.StdEncoding.EncodeToString(signature))
 
@@ -348,6 +518,60 @@ func (t *WebsocketTransport) DialHijack(ctx context.Context, target aether.Targe
 		tlsConn.Close()
 		return nil, aether.WrapOp("dial-hijack-status", aether.ProtoWebSocket, target.NodeID,
 			fmt.Errorf("expected 101, got %d", resp.StatusCode))
+	}
+
+	// AE-P-26: verify the server's mesh identity before trusting target.NodeID.
+	// TLS only proves the endpoint holds a cert for the dialed hostname; on
+	// shared infra (Fly anycast, one cert across many machines) that does not
+	// prove WHICH NodeID answered. The client's dial signature already makes an
+	// HONEST wrong-identity server reject the dial, but a malicious cert-holder
+	// can accept while claiming the victim's NodeID. Require the server to prove
+	// ownership of target.NodeID by signing OUR fresh dial nonce+timestamp with
+	// its own key: the proof is bound to THIS dial (non-replayable) and cannot be
+	// forged by echoing headers, because forging it needs the victim's private
+	// key. Fail closed on any mismatch instead of stamping target.NodeID blind.
+	srvNodeID := aether.NodeID(resp.Header.Get(NodeIDHeader))
+	srvPubHex := resp.Header.Get(PubKeyHeader)
+	srvSigB64 := resp.Header.Get(SignatureHeader)
+	if srvNodeID == "" || srvPubHex == "" || srvSigB64 == "" {
+		resp.Body.Close()
+		tlsConn.Close()
+		return nil, aether.WrapOp("dial-hijack-serverauth", aether.ProtoWebSocket, target.NodeID,
+			errors.New("server did not present a signed identity"))
+	}
+	srvPub, err := hex.DecodeString(srvPubHex)
+	if err != nil || len(srvPub) != ed25519.PublicKeySize {
+		resp.Body.Close()
+		tlsConn.Close()
+		return nil, aether.WrapOp("dial-hijack-serverauth", aether.ProtoWebSocket, target.NodeID,
+			errors.New("server public key invalid"))
+	}
+	derivedSrv, err := aether.NewNodeID(ed25519.PublicKey(srvPub))
+	if err != nil || derivedSrv != srvNodeID {
+		resp.Body.Close()
+		tlsConn.Close()
+		return nil, aether.WrapOp("dial-hijack-serverauth", aether.ProtoWebSocket, target.NodeID,
+			errors.New("server public key does not match its NodeID"))
+	}
+	srvSig, err := base64.StdEncoding.DecodeString(srvSigB64)
+	if err != nil {
+		resp.Body.Close()
+		tlsConn.Close()
+		return nil, aether.WrapOp("dial-hijack-serverauth", aether.ProtoWebSocket, target.NodeID,
+			errors.New("server signature encoding invalid"))
+	}
+	acceptMsg := []byte(fmt.Sprintf("hijack-accept:%s:%s:%s", srvNodeID, nonceStr, tsStr))
+	if !ed25519.Verify(ed25519.PublicKey(srvPub), acceptMsg, srvSig) {
+		resp.Body.Close()
+		tlsConn.Close()
+		return nil, aether.WrapOp("dial-hijack-serverauth", aether.ProtoWebSocket, target.NodeID,
+			errors.New("server identity signature invalid"))
+	}
+	if srvNodeID != target.NodeID {
+		resp.Body.Close()
+		tlsConn.Close()
+		return nil, aether.WrapOp("dial-hijack-serverauth", aether.ProtoWebSocket, target.NodeID,
+			fmt.Errorf("server NodeID %s does not match dialed target %s", srvNodeID.Short(), target.NodeID.Short()))
 	}
 
 	dialRTT := time.Since(dialStart)
@@ -385,35 +609,63 @@ func (t *WebsocketTransport) HijackHandler() (http.HandlerFunc, <-chan HijackSes
 		}
 		remoteNodeID := aether.NodeID(remoteNodeIDStr)
 
-		// Verify signature if present
+		// NodeID ownership MUST be cryptographically proven — the signature is
+		// mandatory, never optional-on-presence (peer impersonation, AE-C-04).
+		// Legitimate clients always send it, so requiring it breaks nothing.
 		signatureStr := r.Header.Get(SignatureHeader)
-		if signatureStr != "" {
-			signature, err := base64.StdEncoding.DecodeString(signatureStr)
-			if err != nil {
-				http.Error(w, "invalid signature encoding", http.StatusBadRequest)
-				return
-			}
-			message := []byte(fmt.Sprintf("hijack-dial:%s:%s", remoteNodeID, t.localNode))
-			pubKeyHex := r.Header.Get(PubKeyHeader)
-			if pubKeyHex == "" {
-				http.Error(w, "missing public key header", http.StatusBadRequest)
-				return
-			}
-			pubKeyBytes, err := hex.DecodeString(pubKeyHex)
-			if err != nil || len(pubKeyBytes) != ed25519.PublicKeySize {
-				http.Error(w, "invalid public key", http.StatusBadRequest)
-				return
-			}
-			pubKey := ed25519.PublicKey(pubKeyBytes)
-			derivedNodeID, err := aether.NewNodeID(pubKey)
-			if err != nil || derivedNodeID != remoteNodeID {
-				http.Error(w, "public key does not match NodeID", http.StatusBadRequest)
-				return
-			}
-			if !ed25519.Verify(pubKey, message, signature) {
-				http.Error(w, "invalid signature", http.StatusUnauthorized)
-				return
-			}
+		if signatureStr == "" {
+			http.Error(w, "missing signature header", http.StatusUnauthorized)
+			return
+		}
+		signature, err := base64.StdEncoding.DecodeString(signatureStr)
+		if err != nil {
+			http.Error(w, "invalid signature encoding", http.StatusBadRequest)
+			return
+		}
+		// AE-M-16: reject stale hijack dials before spending a signature verify.
+		tsStr := r.Header.Get(TimestampHeader)
+		nonceStr := r.Header.Get(NonceHeader)
+		if tsStr == "" || nonceStr == "" {
+			http.Error(w, "missing dial freshness headers", http.StatusUnauthorized)
+			return
+		}
+		tsNano, err := strconv.ParseInt(tsStr, 10, 64)
+		if err != nil {
+			http.Error(w, "invalid dial timestamp", http.StatusBadRequest)
+			return
+		}
+		now := time.Now()
+		if skew := now.Sub(time.Unix(0, tsNano)); skew > dialFreshnessWindow || skew < -dialFreshnessWindow {
+			http.Error(w, "stale dial signature", http.StatusUnauthorized)
+			return
+		}
+		message := []byte(fmt.Sprintf("hijack-dial:%s:%s:%s:%s", remoteNodeID, t.localNode, tsStr, nonceStr))
+		pubKeyHex := r.Header.Get(PubKeyHeader)
+		if pubKeyHex == "" {
+			http.Error(w, "missing public key header", http.StatusBadRequest)
+			return
+		}
+		pubKeyBytes, err := hex.DecodeString(pubKeyHex)
+		if err != nil || len(pubKeyBytes) != ed25519.PublicKeySize {
+			http.Error(w, "invalid public key", http.StatusBadRequest)
+			return
+		}
+		pubKey := ed25519.PublicKey(pubKeyBytes)
+		derivedNodeID, err := aether.NewNodeID(pubKey)
+		if err != nil || derivedNodeID != remoteNodeID {
+			http.Error(w, "public key does not match NodeID", http.StatusBadRequest)
+			return
+		}
+		if !ed25519.Verify(pubKey, message, signature) {
+			http.Error(w, "invalid signature", http.StatusUnauthorized)
+			return
+		}
+
+		// AE-M-16: authentic signature — now reject a replay of it (shared guard
+		// with the WS Listen path; keyed on the 128-bit random nonce).
+		if !t.replay.checkAndRecord(nonceStr, now, time.Unix(0, tsNano).Add(dialFreshnessWindow)) {
+			http.Error(w, "replayed dial signature", http.StatusUnauthorized)
+			return
 		}
 
 		// Hijack the connection
@@ -428,11 +680,23 @@ func (t *WebsocketTransport) HijackHandler() (http.HandlerFunc, <-chan HijackSes
 			return
 		}
 
-		// Write 101 Switching Protocols
+		// Write 101 Switching Protocols. AE-P-26: prove our mesh identity to the
+		// client by signing its fresh dial nonce+timestamp with our own key, so an
+		// endpoint that merely holds a cert for the hostname (and does not own this
+		// NodeID's private key) cannot pass the client's identity check. Guard on
+		// key presence: ed25519.Sign panics on a nil key, so a transport built
+		// without a private key emits only the NodeID header and the client (which
+		// requires the signed triple) fails closed rather than the server panicking.
 		_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
 		_, _ = rw.WriteString("Upgrade: " + HijackUpgradeToken + "\r\n")
 		_, _ = rw.WriteString("Connection: Upgrade\r\n")
 		_, _ = rw.WriteString(NodeIDHeader + ": " + string(t.localNode) + "\r\n")
+		if len(t.privateKey) == ed25519.PrivateKeySize {
+			acceptMsg := []byte(fmt.Sprintf("hijack-accept:%s:%s:%s", t.localNode, nonceStr, tsStr))
+			acceptSig := ed25519.Sign(t.privateKey, acceptMsg)
+			_, _ = rw.WriteString(PubKeyHeader + ": " + hex.EncodeToString(t.privateKey.Public().(ed25519.PublicKey)) + "\r\n")
+			_, _ = rw.WriteString(SignatureHeader + ": " + base64.StdEncoding.EncodeToString(acceptSig) + "\r\n")
+		}
 		_, _ = rw.WriteString("\r\n")
 		if err := rw.Flush(); err != nil {
 			log.Printf("[WS-HIJACK] Flush failed for %s: %v", r.RemoteAddr, err)

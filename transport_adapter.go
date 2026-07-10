@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package aether
 
@@ -65,7 +65,7 @@ type HealthReporter interface {
 // Type-assert ProtocolAdapter to check support.
 type RelayCapable interface {
 	SupportsRelay() bool
-	RegisterExternalSession(NodeID, Connection)
+	RegisterExternalSession(NodeID, Connection, string)
 	UnregisterExternalSession(NodeID)
 	HandleExternalRelayFrame(sourceNodeID NodeID, data []byte) error
 }

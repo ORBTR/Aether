@@ -1,8 +1,8 @@
 //go:build !js
 
 /*
- * Copyright (c) 2026 HSTLES / ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@hstles.com
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
  */
 package grpc
 
@@ -46,7 +46,7 @@ func TestGrpcMetadataConstants(t *testing.T) {
 		t.Error("MetadataSignature should not be empty")
 	}
 	// Verify they follow gRPC metadata naming convention (lowercase)
-	if MetadataNodeID != "x-hstles-nodeid" {
+	if MetadataNodeID != "x-orbtr-nodeid" {
 		t.Errorf("MetadataNodeID should be lowercase, got %s", MetadataNodeID)
 	}
 }

@@ -113,7 +113,7 @@ func (r RouteClass) AcceptableRTT() time.Duration {
 // side's region tag. Region tags are Fly's three-letter region codes
 // (e.g. "syd", "iad", "fra"). Unknown or empty regions yield RouteUnknown.
 //
-// The continent map is intentionally narrow — only the regions HSTLES /
+// The continent map is intentionally narrow — only the regions the ORBTR
 // ORBTR currently deploy to. Adding a new region requires adding a row;
 // the safe-fallback (RouteInterContinental) means a missing entry won't
 // over-promote the path, only under-promote it.
