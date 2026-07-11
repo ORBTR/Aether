@@ -197,3 +197,60 @@ func TestAcceptOverConn_TicketBadSignatureRejected(t *testing.T) {
 		t.Error("AcceptOverConn succeeded with bad ticket signature")
 	}
 }
+
+// A configured TrustedTicketSigner must REJECT a zero-length ticket rather than
+// silently skip verification. Regression for the empty-ticket fail-open: an
+// initiator presenting ticketLen=0 previously bypassed the signature +
+// ValidateTicketFn checks and completed the XX handshake anonymously on a
+// self-minted static key — an auth bypass for ticket-only callers (relay
+// browser bridge) that do not pin ExpectedNodeID.
+func TestAcceptOverConn_EmptyTicketRejectedWhenSignerConfigured(t *testing.T) {
+	aPriv, aPub := newTestKeypair(t)
+	bPriv, bPub := newTestKeypair(t)
+
+	signerPub, _, err := generateTestEd25519(t)
+	if err != nil {
+		t.Fatalf("gen signer: %v", err)
+	}
+
+	clientConn, serverConn := net.Pipe()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	var (
+		wg        sync.WaitGroup
+		acceptErr error
+	)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, acceptErr = AcceptOverConn(ctx, AcceptConnConfig{
+			LocalNodeID:         "vl1_bob",
+			StaticPriv:          bPriv,
+			StaticPub:           bPub,
+			TrustedTicketSigner: signerPub,
+			ValidateTicketFn: func([]byte) error {
+				t.Error("ValidateTicketFn must not run for an empty ticket")
+				return nil
+			},
+			HandshakeTimeout: 2 * time.Second,
+		}, serverConn)
+	}()
+
+	// Initiator presents NO ticket (ticketLen=0). With a signer configured on
+	// the accept side this must fail closed before the handshake completes.
+	go func() {
+		_, _ = DialOverConn(ctx, DialConnConfig{
+			LocalNodeID:      "vl1_alice",
+			StaticPriv:       aPriv,
+			StaticPub:        aPub,
+			Ticket:           nil,
+			HandshakeTimeout: 2 * time.Second,
+		}, clientConn)
+	}()
+
+	wg.Wait()
+	if acceptErr == nil {
+		t.Fatal("AcceptOverConn accepted a zero-length ticket with a signer configured (auth bypass)")
+	}
+}
