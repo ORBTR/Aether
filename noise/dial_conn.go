@@ -201,9 +201,19 @@ func AcceptOverConn(ctx context.Context, cfg AcceptConnConfig, conn net.Conn) (a
 	if err != nil {
 		return nil, fmt.Errorf("noise: read msg1: %w", err)
 	}
-	if len(ticket) > 0 && cfg.TrustedTicketSigner != nil {
+	// A configured TrustedTicketSigner makes ticket auth MANDATORY: an absent,
+	// empty, or truncated ticket fails CLOSED here rather than silently skipping
+	// verification. The prior `len(ticket) > 0 && signer != nil` guard let an
+	// initiator present a zero-length ticket (ticketLen=0) to skip the signature
+	// + ValidateTicketFn checks entirely and complete the XX handshake on a
+	// self-minted static key — an anonymous-accept auth bypass for any caller
+	// (e.g. the browser relay bridge) that relies on the ticket as its sole
+	// authenticator and does not pin ExpectedNodeID. Callers that do not want
+	// ticket auth leave TrustedTicketSigner nil (block skipped, as before).
+	if cfg.TrustedTicketSigner != nil {
 		if len(ticket) < ed25519.SignatureSize {
-			return nil, fmt.Errorf("noise: ticket truncated (%d < %d)", len(ticket), ed25519.SignatureSize)
+			return nil, fmt.Errorf("noise: ticket required (got %d bytes, need >= %d)",
+				len(ticket), ed25519.SignatureSize)
 		}
 		body := ticket[:len(ticket)-ed25519.SignatureSize]
 		sig := ticket[len(ticket)-ed25519.SignatureSize:]
