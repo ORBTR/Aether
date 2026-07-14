@@ -31,8 +31,8 @@ func TestNewProber_InitialState(t *testing.T) {
 	rec := &recordingSender{}
 	p := NewProber(rec.send)
 
-	if got := p.MSS(); got != DefaultMSS {
-		t.Errorf("initial MSS: got %d, want %d", got, DefaultMSS)
+	if got := p.MSS(); got != SafeFloorMSS {
+		t.Errorf("initial MSS: got %d, want %d", got, SafeFloorMSS)
 	}
 	if p.IsProbing() {
 		t.Error("fresh prober should not be probing")
@@ -64,13 +64,13 @@ func TestStartProbe_SendsFirstProbe(t *testing.T) {
 	if rec.probeIDs[0] != 1 {
 		t.Errorf("first probeID: got %d, want 1", rec.probeIDs[0])
 	}
-	// First size is probeSizes[0] == 1400; padding = size - 50 header.
-	if rec.paddings[0] != 1400-50 {
-		t.Errorf("first padding: got %d, want %d", rec.paddings[0], 1400-50)
+	// First size is probeSizes[0] == 1200 (the safe floor); padding = size - 50 header.
+	if rec.paddings[0] != 1200-50 {
+		t.Errorf("first padding: got %d, want %d", rec.paddings[0], 1200-50)
 	}
 	// MSS is unchanged until a response confirms a size.
-	if p.MSS() != DefaultMSS {
-		t.Errorf("MSS before any response: got %d, want %d", p.MSS(), DefaultMSS)
+	if p.MSS() != SafeFloorMSS {
+		t.Errorf("MSS before any response: got %d, want %d", p.MSS(), SafeFloorMSS)
 	}
 }
 
@@ -92,7 +92,7 @@ func TestFullDiscoveryWalk(t *testing.T) {
 	rec := &recordingSender{}
 	p := NewProber(rec.send)
 
-	wantSizes := []int{1400, 1500, 2000, 4000, 8000}
+	wantSizes := []int{1200, 1280, 1400, 1500, 2000, 4000, 8000}
 
 	p.StartProbe()
 
@@ -138,8 +138,8 @@ func TestOnProbeResponse_StaleProbeIDIgnored(t *testing.T) {
 	p := NewProber(rec.send)
 
 	p.StartProbe()      // sends probe #1
-	p.OnProbeResponse(1) // → MSS 1400, sends probe #2
-	p.OnProbeResponse(2) // → MSS 1500, sends probe #3 (current probeID now 3)
+	p.OnProbeResponse(1) // → MSS 1200, sends probe #2
+	p.OnProbeResponse(2) // → MSS 1280, sends probe #3 (current probeID now 3)
 
 	beforeMSS := p.MSS()
 	beforeCount := rec.count()
@@ -165,8 +165,8 @@ func TestOnProbeResponse_IgnoredWhenIdle(t *testing.T) {
 	// Never started — a response must be a no-op.
 	p.OnProbeResponse(1)
 
-	if p.MSS() != DefaultMSS {
-		t.Errorf("idle response changed MSS: got %d, want %d", p.MSS(), DefaultMSS)
+	if p.MSS() != SafeFloorMSS {
+		t.Errorf("idle response changed MSS: got %d, want %d", p.MSS(), SafeFloorMSS)
 	}
 	if p.IsProbing() {
 		t.Error("idle response must not start probing")
@@ -182,13 +182,13 @@ func TestOnProbeTimeout_KeepsLastSuccessful(t *testing.T) {
 	rec := &recordingSender{}
 	p := NewProber(rec.send)
 
-	p.StartProbe()       // probe #1 (size 1400)
-	p.OnProbeResponse(1) // MSS 1400, probe #2 (size 1500)
-	p.OnProbeResponse(2) // MSS 1500, probe #3 (size 2000)
+	p.StartProbe()       // probe #1 (size 1200)
+	p.OnProbeResponse(1) // MSS 1200, probe #2 (size 1280)
+	p.OnProbeResponse(2) // MSS 1280, probe #3 (size 1400)
 
 	countBefore := rec.count()
 
-	// Probe #3 (size 2000) gets no response.
+	// Probe #3 (size 1400) gets no response.
 	p.OnProbeTimeout()
 
 	if p.IsProbing() {
@@ -197,8 +197,8 @@ func TestOnProbeTimeout_KeepsLastSuccessful(t *testing.T) {
 	if p.state != ProbeComplete {
 		t.Errorf("state after timeout: got %v, want ProbeComplete", p.state)
 	}
-	if got := p.MSS(); got != 1500 {
-		t.Errorf("MSS after timeout: got %d, want 1500 (last confirmed)", got)
+	if got := p.MSS(); got != 1280 {
+		t.Errorf("MSS after timeout: got %d, want 1280 (last confirmed)", got)
 	}
 	if rec.count() != countBefore {
 		t.Errorf("timeout must not send another probe: count %d, want %d", rec.count(), countBefore)
@@ -217,7 +217,7 @@ func TestOnProbeTimeout_NoOpWhenNotActive(t *testing.T) {
 
 	// Complete: also a no-op.
 	p.StartProbe()
-	for i := 1; i <= 5; i++ {
+	for i := 1; i <= 7; i++ {
 		p.OnProbeResponse(uint32(i))
 	}
 	if p.state != ProbeComplete {
@@ -237,15 +237,15 @@ func TestRestartAfterComplete(t *testing.T) {
 	p := NewProber(rec.send)
 
 	p.StartProbe()
-	for i := 1; i <= 5; i++ {
+	for i := 1; i <= 7; i++ {
 		p.OnProbeResponse(uint32(i))
 	}
 	if p.MSS() != 8000 || p.state != ProbeComplete {
 		t.Fatalf("setup: got MSS=%d state=%v, want 8000/Complete", p.MSS(), p.state)
 	}
-	countAfterFirst := rec.count() // 5
+	countAfterFirst := rec.count() // 7
 
-	// Restart. probeID keeps climbing (was 5 → 6); index resets to the smallest.
+	// Restart. probeID keeps climbing (was 7 → 8); index resets to the smallest.
 	p.StartProbe()
 	if !p.IsProbing() {
 		t.Error("StartProbe after Complete should re-enter probing")
@@ -253,17 +253,17 @@ func TestRestartAfterComplete(t *testing.T) {
 	if rec.count() != countAfterFirst+1 {
 		t.Fatalf("restart should emit one probe, got %d", rec.count()-countAfterFirst)
 	}
-	if rec.probeIDs[len(rec.probeIDs)-1] != 6 {
-		t.Errorf("restart probeID: got %d, want 6", rec.probeIDs[len(rec.probeIDs)-1])
+	if rec.probeIDs[len(rec.probeIDs)-1] != 8 {
+		t.Errorf("restart probeID: got %d, want 8", rec.probeIDs[len(rec.probeIDs)-1])
 	}
-	if int(rec.paddings[len(rec.paddings)-1]) != 1400-50 {
+	if int(rec.paddings[len(rec.paddings)-1]) != 1200-50 {
 		t.Errorf("restart padding: got %d, want %d (smallest size again)",
-			rec.paddings[len(rec.paddings)-1], 1400-50)
+			rec.paddings[len(rec.paddings)-1], 1200-50)
 	}
 	// Responding to the restarted first probe drops MSS back to the smallest.
-	p.OnProbeResponse(6)
-	if p.MSS() != 1400 {
-		t.Errorf("MSS after restart's first response: got %d, want 1400", p.MSS())
+	p.OnProbeResponse(8)
+	if p.MSS() != 1200 {
+		t.Errorf("MSS after restart's first response: got %d, want 1200", p.MSS())
 	}
 }
 
@@ -281,7 +281,7 @@ func TestSendProbe_ErrorDoesNotDerailStateMachine(t *testing.T) {
 	if rec.count() != 1 {
 		t.Errorf("send should still have been attempted once, got %d", rec.count())
 	}
-	if p.MSS() != DefaultMSS {
+	if p.MSS() != SafeFloorMSS {
 		t.Errorf("MSS should be untouched after a send error: got %d", p.MSS())
 	}
 }
@@ -296,8 +296,8 @@ func TestNilSendCallback_DoesNotPanic(t *testing.T) {
 	}
 	// A response still advances the state machine without a sender.
 	p.OnProbeResponse(1)
-	if p.MSS() != 1400 {
-		t.Errorf("MSS after first response with nil sender: got %d, want 1400", p.MSS())
+	if p.MSS() != 1200 {
+		t.Errorf("MSS after first response with nil sender: got %d, want 1200", p.MSS())
 	}
 }
 
@@ -346,7 +346,7 @@ func TestShouldReprobe_Deterministic(t *testing.T) {
 	}
 
 	// Complete the cycle → lastProbe = now, still within ProbeInterval.
-	for i := 1; i <= 5; i++ {
+	for i := 1; i <= 7; i++ {
 		p.OnProbeResponse(uint32(i))
 	}
 	if p.state != ProbeComplete {

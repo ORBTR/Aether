@@ -23,6 +23,18 @@ const (
 	// MinMSS is the minimum MSS we'll accept.
 	MinMSS = 576
 
+	// SafeFloorMSS is the conservative MSS used as the starting point before
+	// PMTU discovery completes, and the low end of the probe sweep. Sized to
+	// fit constrained private-network paths — notably Fly.io 6PN / WireGuard
+	// IPv6 at a 1280-byte MTU (minus IPv6+UDP+Noise overhead). Data flows at
+	// this floor from session start; the prober then probes UPWARD to the real
+	// path maximum, so no capacity is lost on paths that support more.
+	// Fixes the prior failure: mss started at DefaultMSS (1400) and, when the
+	// first 1400-byte probe was dropped on a sub-1400 path, stayed 1400
+	// (OnProbeTimeout keeps the last success — there was none) → every data
+	// frame dropped → noise-UDP silently unusable on same-org 6PN paths.
+	SafeFloorMSS = 1200
+
 	// MaxMSS is the maximum MSS to probe for.
 	MaxMSS = 9000 // jumbo frames
 
@@ -64,9 +76,11 @@ type Prober struct {
 // NewProber creates a PMTU prober with a callback for sending probes.
 func NewProber(sendProbe func(probeID uint32, paddingSize uint16) error) *Prober {
 	return &Prober{
-		mss:        DefaultMSS,
+		// Start at the safe floor so data flows immediately even on a sub-1400
+		// path (Fly 6PN = 1280); probeSizes then discover the real max upward.
+		mss:        SafeFloorMSS,
 		state:      ProbeIdle,
-		probeSizes: []int{1400, 1500, 2000, 4000, 8000},
+		probeSizes: []int{SafeFloorMSS, 1280, 1400, 1500, 2000, 4000, 8000},
 		sendProbe:  sendProbe,
 	}
 }
