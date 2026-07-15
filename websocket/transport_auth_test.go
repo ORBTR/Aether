@@ -20,7 +20,7 @@ import (
 
 // ─── AE-C-04 — WebSocket NodeID auth binding must be mandatory ─────────
 // Both Listen and HijackHandler used to gate signature verification behind
-// `if signatureStr != ""`, so omitting the X-ORBTR-Signature header skipped
+// `if signatureStr != ""`, so omitting the X-Signature header skipped
 // all verification and bound the session to any claimed NodeID (impersonation).
 // HijackHandler returns its handler, so it is directly exercisable; Listen
 // carries the identical guard.
