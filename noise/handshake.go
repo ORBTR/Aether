@@ -356,9 +356,24 @@ recvLoop:
 	for {
 		select {
 		case resp := <-responseCh:
-			if !retried && HasRetryPrefix(resp) {
-				// Validate basic shape (length only — server proves
-				// authenticity via HMAC binding when we echo it back).
+			if HasRetryPrefix(resp) && len(resp) <= retryHeaderSize {
+				// A bare RETRY token is exactly retryHeaderSize bytes and
+				// begins with retryPrefix. A real msg2 can also begin with
+				// retryPrefix by chance (Noise fingerprints span all bytes)
+				// but carries a signed NodeInfo (~360-420B), so the
+				// exact-length test separates them with no HMAC check here.
+				if retried {
+					// Duplicate/stale RETRY: the responder mints a fresh cookie
+					// per plain-msg1 retransmit, so on a lossy 6PN path two can
+					// be in flight. The first cookie stays valid for
+					// RetryTokenTTL and the cookie-bearing msg1 retransmit draws
+					// the real msg2, so a second cookie must be dropped, never
+					// read as msg2 (its 49 bytes fail the Noise s-token length
+					// check as message-too-short).
+					continue
+				}
+				// Truncated/garbage retry-shaped packet: keep waiting for a
+				// well-formed token (also guards the slice below).
 				if len(resp) < retryHeaderSize {
 					continue
 				}
