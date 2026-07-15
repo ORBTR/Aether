@@ -24,9 +24,9 @@ func TestWebsocketHeaderConstants(t *testing.T) {
 
 	// Verify they follow HTTP header naming convention
 	expectedHeaders := map[string]string{
-		"NodeIDHeader":    "X-ORBTR-NodeID",
-		"SignatureHeader": "X-ORBTR-Signature",
-		"NonceHeader":     "X-ORBTR-Nonce",
+		"NodeIDHeader":    "X-NodeID",
+		"SignatureHeader": "X-Signature",
+		"NonceHeader":     "X-Nonce",
 	}
 
 	if NodeIDHeader != expectedHeaders["NodeIDHeader"] {

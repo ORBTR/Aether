@@ -40,8 +40,8 @@ func TestDialReplayGuardRejectsReplayAndStale(t *testing.T) {
 // TestDialFreshnessHeaderConstant guards the new AE-M-16 timestamp header value
 // that is bound into the dial signature alongside the nonce.
 func TestDialFreshnessHeaderConstant(t *testing.T) {
-	if TimestampHeader != "X-ORBTR-Timestamp" {
-		t.Errorf("TimestampHeader should be X-ORBTR-Timestamp, got %s", TimestampHeader)
+	if TimestampHeader != "X-Timestamp" {
+		t.Errorf("TimestampHeader should be X-Timestamp, got %s", TimestampHeader)
 	}
 	if dialFreshnessWindow <= 0 {
 		t.Errorf("dialFreshnessWindow must be positive, got %v", dialFreshnessWindow)

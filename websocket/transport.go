@@ -30,19 +30,19 @@ import (
 
 const (
 	// NodeIDHeader is the HTTP header used to transmit the client's NodeID
-	NodeIDHeader = "X-ORBTR-NodeID"
+	NodeIDHeader = "X-NodeID"
 	// PubKeyHeader contains hex-encoded Ed25519 public key for signature verification.
 	// Sent alongside NodeID because NodeID is base32-encoded fingerprint (not the raw key).
-	PubKeyHeader = "X-ORBTR-PubKey"
+	PubKeyHeader = "X-PubKey"
 	// SignatureHeader contains Ed25519 signature proving ownership of NodeID
-	SignatureHeader = "X-ORBTR-Signature"
+	SignatureHeader = "X-Signature"
 	// NonceHeader carries the client-chosen random nonce bound into the dial
 	// signature; with TimestampHeader it makes each handshake unique so a
 	// captured signature cannot be replayed (AE-M-16).
-	NonceHeader = "X-ORBTR-Nonce"
+	NonceHeader = "X-Nonce"
 	// TimestampHeader carries the unix-nanosecond dial time bound into the
 	// signature; the server rejects anything outside dialFreshnessWindow.
-	TimestampHeader = "X-ORBTR-Timestamp"
+	TimestampHeader = "X-Timestamp"
 
 	// pingInterval is how often to send WebSocket ping frames for proxy keepalive.
 	// Sized at 5s rather than the obvious 10s because some HTTP edge proxies
