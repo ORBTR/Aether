@@ -434,7 +434,7 @@ recvLoop:
 		}
 		return nil, fmt.Errorf("%w: msg2 read: %v", aether.ErrHandshakeFailed, err)
 	}
-	remoteNode, _, remoteCaps, remoteMaxAckDelayUS, err := t.verifyNodeInfo(hs.PeerStatic(), payload, path.NodeID)
+	remoteNode, remoteIdentity, remoteCaps, remoteMaxAckDelayUS, err := t.verifyNodeInfo(hs.PeerStatic(), payload, path.NodeID)
 	if err != nil {
 		return nil, fmt.Errorf("%w: verify: %v", aether.ErrHandshakeFailed, err)
 	}
@@ -471,7 +471,7 @@ recvLoop:
 	dbgHandshake.Printf("Shared-socket handshake complete with %s (pattern: %s)", remoteNode.Short(), pattern.Name)
 
 	// Create session using the listener's shared socket (like listener-accepted sessions)
-	nc := newNoiseConnListener(listener, sendCS, recvCS, addr, remoteNode)
+	nc := newNoiseConnListener(listener, sendCS, recvCS, addr, remoteNode, remoteIdentity)
 	nc.scopeID = preambleTenantID
 	nc.peerMaxAckDelay = decodeMaxAckDelay(remoteMaxAckDelayUS)
 	// Cross-org: persist the preamble target on the noiseConn so the
@@ -775,7 +775,7 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 		l.mu.Unlock()
 		return
 	}
-	remoteNode, _, remoteCaps, remoteMaxAckDelayUS, err := l.transport.verifyNodeInfo(state.PeerStatic(), payload, "")
+	remoteNode, remoteIdentity, remoteCaps, remoteMaxAckDelayUS, err := l.transport.verifyNodeInfo(state.PeerStatic(), payload, "")
 	if err != nil {
 		delete(l.handshakes, key)
 		l.mu.Unlock()
@@ -788,7 +788,7 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 	// In Noise XX/XK, after handshake:
 	// - cs1 is for initiator→responder (responder uses for recv)
 	// - cs2 is for responder→initiator (responder uses for send)
-	nc := newNoiseConnListener(l, cs2, cs1, addr, remoteNode)
+	nc := newNoiseConnListener(l, cs2, cs1, addr, remoteNode, remoteIdentity)
 	nc.scopeID = scopeID
 	nc.peerMaxAckDelay = decodeMaxAckDelay(remoteMaxAckDelayUS)
 

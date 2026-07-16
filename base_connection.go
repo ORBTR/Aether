@@ -6,6 +6,7 @@ package aether
 
 import (
 	"context"
+	"crypto/ed25519"
 	"net"
 	"sync"
 	"time"
@@ -115,6 +116,22 @@ func (s *BaseConnection) RemoteAddr() net.Addr {
 // RemoteNodeID returns the ID of the connected peer.
 func (s *BaseConnection) RemoteNodeID() NodeID {
 	return s.remoteNode
+}
+
+// RemoteIdentity returns the peer's verified ed25519 identity public key when
+// the wrapped conn exposes one (e.g. the noise transport's noiseConn, which
+// captures it from the handshake NodeInfo verification). Returns nil when the
+// underlying conn does not carry a verified identity. Forwarded via an
+// interface assertion — deliberately NOT part of the exported Connection
+// interface — so consumers holding the aether.Connection can type-assert
+// interface{ RemoteIdentity() ed25519.PublicKey } and obtain the key.
+func (s *BaseConnection) RemoteIdentity() ed25519.PublicKey {
+	if ri, ok := s.Conn.(interface {
+		RemoteIdentity() ed25519.PublicKey
+	}); ok {
+		return ri.RemoteIdentity()
+	}
+	return nil
 }
 
 // SetInitialRTT records the dial/handshake RTT measured during connection establishment.
