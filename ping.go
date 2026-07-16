@@ -101,19 +101,41 @@ func WaitForActivityPing(
 			return 0, ErrSessionClosed
 		default:
 		}
-		// Wait for an inbound Pong specifically — not any inbound frame.
-		// LastActivity advances on gossip / RPC / control traffic too,
-		// which produces false-positive "ping succeeded" returns and
-		// hides the broken SeqNo correlation behind the noise of a
-		// chatty session. LastPongRecv is set inside RecordPongRecv
-		// only when the Pong actually decodes with a valid SeqNo
-		// match (post-codec-widen), so this check now means what it
-		// reads.
+		// A real Pong is the gold standard: it proves the round-trip AND
+		// feeds the SRTT estimator via RecordPongRecv. Prefer it — on a
+		// healthy path the Pong arrives well inside the deadline and we
+		// return the measured RTT, unchanged from prior behaviour.
+		// Requiring the Pong here (rather than any inbound frame) keeps the
+		// SeqNo/SRTT correlation honest for chatty sessions, which is why
+		// the earlier "any inbound counts" fast-path was removed.
 		if hm.LastPongReceived().After(before) {
 			_, avg := hm.RTT()
 			return avg, nil
 		}
 		if !time.Now().Before(deadline) {
+			// Deadline reached with no Pong. The noise-UDP keepalive stream
+			// is UnreliableSequenced (FEC-1), so a single dropped Pong
+			// datagram is expected on a lossy path and must NOT tear down a
+			// session that is otherwise alive and carrying gossip/RPC —
+			// that PONG-required teardown was the same-org noise-UDP
+			// persistence bug (healthy sessions killed by lost Pongs, then
+			// parked in the 30-min address dead-cooldown). Honour the
+			// documented liveness contract as a deadline fallback: if ANY
+			// inbound frame arrived since the ping was sent, the return
+			// path works and the peer is alive. No SRTT sample this round
+			// (SRTT is fed by RecordPongRecv, not this return, so a zero
+			// RTT here cannot corrupt the estimator). Only genuine silence
+			// — no Pong AND no other inbound activity within the deadline —
+			// counts as a ping failure toward the keepalive death budget.
+			if hm.LastActivity().After(before) {
+				// Alive via other inbound traffic. Reuse the cached SRTT
+				// rather than returning a bogus 0 ms so a future RTT
+				// consumer never mistakes the liveness signal for a
+				// measured zero (both current callers discard it; the
+				// estimator is untouched either way).
+				_, avg := hm.RTT()
+				return avg, nil
+			}
 			return 0, fmt.Errorf("aether: ping timeout (no inbound activity)")
 		}
 		select {
