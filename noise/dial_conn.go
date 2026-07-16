@@ -388,6 +388,10 @@ func buildAetherConnectionOverConn(
 	maxPacket int,
 ) aether.Connection {
 	cfg := aether.DefaultSessionConfig()
+	// remoteIdentity is intentionally left nil: this path exchanges a
+	// minimal NodeInfo (NodeID + Curve25519 static key) rather than the
+	// signed ed25519 NodeInfo that verifyNodeInfo validates, so no verified
+	// ed25519 identity key is available. RemoteIdentity() reports nil here.
 	nc := &noiseConn{
 		conn:       conn,
 		remoteNode: remote,

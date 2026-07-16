@@ -8,6 +8,7 @@ package noise
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
 	"io"
@@ -57,22 +58,31 @@ type noiseConn struct {
 	conn       net.Conn
 	remote     *net.UDPAddr
 	remoteNode aether.NodeID // Added for Relay
-	send       *noise.CipherState
-	recv       *noise.CipherState
-	sendMu     sync.Mutex
-	recvMu     sync.Mutex
-	inbox      chan []byte
-	closed     chan struct{}
-	closeOnce  sync.Once
-	buffer     []byte
-	maxPacket  int
-	writeFunc  func([]byte) (int, error)
-	localAddr  net.Addr
-	parentStop func()
-	errMu      sync.RWMutex
-	err        error
-	transport  *NoiseTransport // Added for Relay
-	scopeID    string          // Set during handshake (from preamble or config)
+	// remoteIdentity is the peer's verified ed25519 identity public key,
+	// captured from verifyNodeInfo (crypto/identity.VerifyNodeInfo's 2nd
+	// return) during the handshake that established this conn. Exposed via
+	// RemoteIdentity() and forwarded by aether.BaseConnection so a consumer
+	// holding the dialed aether.Connection can obtain the cryptographically
+	// proven identity key. Nil when the establishing path carries no signed
+	// NodeInfo (e.g. the 0.5-RTT resume path, which authenticates via the
+	// ticket PSK, and the minimal-NodeInfo DialOverConn path).
+	remoteIdentity ed25519.PublicKey
+	send           *noise.CipherState
+	recv           *noise.CipherState
+	sendMu         sync.Mutex
+	recvMu         sync.Mutex
+	inbox          chan []byte
+	closed         chan struct{}
+	closeOnce      sync.Once
+	buffer         []byte
+	maxPacket      int
+	writeFunc      func([]byte) (int, error)
+	localAddr      net.Addr
+	parentStop     func()
+	errMu          sync.RWMutex
+	err            error
+	transport      *NoiseTransport // Added for Relay
+	scopeID        string          // Set during handshake (from preamble or config)
 
 	// Explicit nonce mode (if both sides support capExplicitNonce)
 	explicitNonce bool
@@ -161,7 +171,7 @@ func newNoiseConnDial(conn *net.UDPConn, remote *net.UDPAddr, remoteNode aether.
 	return nc
 }
 
-func newNoiseConnListener(ptr *noiseListener, send, recv *noise.CipherState, remote *net.UDPAddr, remoteNode aether.NodeID) *noiseConn {
+func newNoiseConnListener(ptr *noiseListener, send, recv *noise.CipherState, remote *net.UDPAddr, remoteNode aether.NodeID, remoteIdentity ed25519.PublicKey) *noiseConn {
 	udpConn := ptr.connFor(remote)
 	cfg := vl1.DefaultSessionConfig()
 	inboxSize := cfg.InboxSize
@@ -172,18 +182,19 @@ func newNoiseConnListener(ptr *noiseListener, send, recv *noise.CipherState, rem
 		inboxSize = vl1.DefaultInboxSize
 	}
 	nc := &noiseConn{
-		conn:       udpConn,
-		remote:     remote,
-		remoteNode: remoteNode,
-		send:       send,
-		recv:       recv,
-		inbox:      make(chan []byte, inboxSize),
-		closed:     make(chan struct{}),
-		maxPacket:  ptr.transport.maxPacket,
-		localAddr:  udpConn.LocalAddr(),
-		transport:  ptr.transport,
-		health:     transportHealth.NewMonitor(0.2), // EMA alpha default, overridden by aether.healthAlpha
-		rekey:      NewRekeyTracker(cfg.RekeyAfterBytes, cfg.RekeyAfterDuration),
+		conn:           udpConn,
+		remote:         remote,
+		remoteNode:     remoteNode,
+		remoteIdentity: remoteIdentity,
+		send:           send,
+		recv:           recv,
+		inbox:          make(chan []byte, inboxSize),
+		closed:         make(chan struct{}),
+		maxPacket:      ptr.transport.maxPacket,
+		localAddr:      udpConn.LocalAddr(),
+		transport:      ptr.transport,
+		health:         transportHealth.NewMonitor(0.2), // EMA alpha default, overridden by aether.healthAlpha
+		rekey:          NewRekeyTracker(cfg.RekeyAfterBytes, cfg.RekeyAfterDuration),
 	}
 	// writeFunc closes over nc so it can read crossOrgPreambleTarget on
 	// every send — letting the dial path set it post-construction
@@ -726,6 +737,14 @@ func (c *noiseConn) DecryptLatencySnapshot() (p50Us, p99Us uint64) {
 func (c *noiseConn) LocalAddr() net.Addr  { return c.localAddr }
 func (c *noiseConn) RemoteAddr() net.Addr { return c.remote }
 
+// RemoteIdentity returns the peer's verified ed25519 identity public key as
+// proven during the handshake (crypto/identity.VerifyNodeInfo). Returns nil
+// when the establishing path carries no signed NodeInfo (0.5-RTT resume,
+// minimal-NodeInfo DialOverConn). aether.BaseConnection forwards this via an
+// interface assertion so consumers holding the dialed aether.Connection can
+// obtain the key.
+func (c *noiseConn) RemoteIdentity() ed25519.PublicKey { return c.remoteIdentity }
+
 // ScopeID returns the scope associated with this connection.
 // Set during handshake from preamble (shared transport) or transport config (dedicated).
 func (c *noiseConn) ScopeID() string { return c.scopeID }
@@ -770,12 +789,12 @@ func (s *noiseConnSession) Send(ctx context.Context, payload []byte) error {
 func (s *noiseConnSession) Receive(ctx context.Context) ([]byte, error) {
 	return s.conn.receive(ctx)
 }
-func (s *noiseConnSession) Close() error                  { return s.conn.Close() }
-func (s *noiseConnSession) RemoteAddr() net.Addr           { return s.conn.RemoteAddr() }
-func (s *noiseConnSession) RemoteNodeID() aether.NodeID    { return s.nodeID }
-func (s *noiseConnSession) NetConn() net.Conn              { return s.conn.conn }
-func (s *noiseConnSession) Protocol() aether.Protocol      { return aether.ProtoNoise }
-func (s *noiseConnSession) OnClose(fn func())              { /* noise lifecycle managed by transport */ }
+func (s *noiseConnSession) Close() error                { return s.conn.Close() }
+func (s *noiseConnSession) RemoteAddr() net.Addr        { return s.conn.RemoteAddr() }
+func (s *noiseConnSession) RemoteNodeID() aether.NodeID { return s.nodeID }
+func (s *noiseConnSession) NetConn() net.Conn           { return s.conn.conn }
+func (s *noiseConnSession) Protocol() aether.Protocol   { return aether.ProtoNoise }
+func (s *noiseConnSession) OnClose(fn func())           { /* noise lifecycle managed by transport */ }
 
 // IsAlive implements aether.HealthReporter so ConnectionMap.Prune can evict idle sessions.
 func (s *noiseConnSession) IsAlive(timeout time.Duration) bool {
@@ -793,14 +812,14 @@ func connFromSession(sess aether.Connection) *noiseConn {
 
 type noiseListener struct {
 	transport    *NoiseTransport
-	conn         *net.UDPConn            // primary UDP socket (IPv4 on Fly, dual-stack elsewhere)
-	ipv6Conn     *net.UDPConn            // optional IPv6 socket for same-origin private traffic
+	conn         *net.UDPConn // primary UDP socket (IPv4 on Fly, dual-stack elsewhere)
+	ipv6Conn     *net.UDPConn // optional IPv6 socket for same-origin private traffic
 	mu           sync.Mutex
 	handshakes   map[string]*listenerHandshake
-	sessions     *aether.ConnectionMap   // addr/NodeID/scope → noiseConnSession
+	sessions     *aether.ConnectionMap // addr/NodeID/scope → noiseConnSession
 	incoming     chan aether.IncomingSession
-	pendingDials map[string]chan []byte   // nonce hex → channel for outgoing handshake responses
-	quicDemux    *DemuxPacketConn        // routes QUIC packets to quic-go
+	pendingDials map[string]chan []byte // nonce hex → channel for outgoing handshake responses
+	quicDemux    *DemuxPacketConn       // routes QUIC packets to quic-go
 }
 
 // connFor returns the correct UDP socket for the target address.

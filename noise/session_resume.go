@@ -554,7 +554,10 @@ func (l *noiseListener) handleResumePacket(ctx context.Context, conn *net.UDPCon
 
 	// Instantiate the resumed noiseConn and register it in the listener's
 	// session table so subsequent packets route correctly.
-	nc := newNoiseConnListener(l, send, recv, addr, ticket.PeerID)
+	// remoteIdentity is nil here: the 0.5-RTT resume path authenticates the
+	// peer via the ticket PSK + confirm-tag, not a signed NodeInfo, so no
+	// verified ed25519 identity key is available to thread through.
+	nc := newNoiseConnListener(l, send, recv, addr, ticket.PeerID, nil)
 	// AE-H-07: restore the original session's tenant scope from the ticket so
 	// the resumed conn keeps its relay isolation. Without this the conn would
 	// register scopeless (""), and resolveRelayTarget's cross-tenant guard
