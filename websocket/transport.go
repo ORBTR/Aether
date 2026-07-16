@@ -239,86 +239,134 @@ func (t *WebsocketTransport) Dial(ctx context.Context, target aether.Target) (ae
 	return session, nil
 }
 
+// VerifyMeshDialError carries the HTTP status a mesh-dial verification failure
+// should surface. VerifyMeshDial returns it (as the error interface) so a
+// caller mounting its own /mesh/ws handler can map the failure to the exact
+// status + message the built-in Listen handler uses: 400 for a malformed
+// request, 401 for a failed authentication (AE-C-04 mandatory signature /
+// AE-M-16 freshness+replay).
+type VerifyMeshDialError struct {
+	Status int
+	Msg    string
+}
+
+func (e *VerifyMeshDialError) Error() string { return e.Msg }
+
+// VerifyMeshDial runs the AE-C-04 dial verification on an inbound mesh WS
+// upgrade request and returns the cryptographically-proven remote NodeID and
+// its ed25519 public key. Callers that mount their own /mesh/ws handler call
+// this before upgrading, replacing a presence-only signature check. The
+// returned error carries the correct HTTP status via VerifyMeshDialError.
+func (t *WebsocketTransport) VerifyMeshDial(r *http.Request) (aether.NodeID, ed25519.PublicKey, error) {
+	return t.verifyMeshDial(r, "ws-dial")
+}
+
+// verifyMeshDial is the single source of truth for inbound mesh-dial
+// verification, shared by VerifyMeshDial/Listen (dialPrefix "ws-dial") and
+// HijackHandler (dialPrefix "hijack-dial"). Both inbound paths sign a byte-
+// identical structure that differs ONLY in this prefix, so threading it keeps
+// one implementation of the mandatory-signature (AE-C-04) and freshness+replay
+// (AE-M-16) checks while each path preserves its exact signed message. On
+// success it has already recorded the dial nonce in the shared replay guard.
+func (t *WebsocketTransport) verifyMeshDial(r *http.Request, dialPrefix string) (aether.NodeID, ed25519.PublicKey, error) {
+	// Extract and validate NodeID from headers
+	remoteNodeIDStr := r.Header.Get(NodeIDHeader)
+	if remoteNodeIDStr == "" {
+		return "", nil, &VerifyMeshDialError{Status: http.StatusBadRequest, Msg: "missing NodeID header"}
+	}
+	remoteNodeID := aether.NodeID(remoteNodeIDStr)
+
+	// NodeID ownership MUST be cryptographically proven — the signature is
+	// mandatory, never optional-on-presence. A client that omits it would
+	// otherwise be accepted under any claimed NodeID (peer impersonation,
+	// AE-C-04). Ordinary server TLS gives no client-identity guarantee, so
+	// this signature is the sole NodeID binding. Legitimate clients always
+	// send it (see Dial), so requiring it breaks nothing.
+	signatureStr := r.Header.Get(SignatureHeader)
+	if signatureStr == "" {
+		return "", nil, &VerifyMeshDialError{Status: http.StatusUnauthorized, Msg: "missing signature header"}
+	}
+	signature, err := base64.StdEncoding.DecodeString(signatureStr)
+	if err != nil {
+		return "", nil, &VerifyMeshDialError{Status: http.StatusBadRequest, Msg: "invalid signature encoding"}
+	}
+
+	// AE-M-16: reject stale dials before spending a signature verify.
+	tsStr := r.Header.Get(TimestampHeader)
+	nonceStr := r.Header.Get(NonceHeader)
+	if tsStr == "" || nonceStr == "" {
+		return "", nil, &VerifyMeshDialError{Status: http.StatusUnauthorized, Msg: "missing dial freshness headers"}
+	}
+	tsNano, err := strconv.ParseInt(tsStr, 10, 64)
+	if err != nil {
+		return "", nil, &VerifyMeshDialError{Status: http.StatusBadRequest, Msg: "invalid dial timestamp"}
+	}
+	now := time.Now()
+	if skew := now.Sub(time.Unix(0, tsNano)); skew > dialFreshnessWindow || skew < -dialFreshnessWindow {
+		return "", nil, &VerifyMeshDialError{Status: http.StatusUnauthorized, Msg: "stale dial signature"}
+	}
+
+	// The signature should be over "<dialPrefix>:<clientNodeID>:<serverNodeID>:<ts>:<nonce>"
+	message := []byte(fmt.Sprintf("%s:%s:%s:%s:%s", dialPrefix, remoteNodeID, t.localNode, tsStr, nonceStr))
+
+	// Extract public key from PubKey header (NodeID is base32 fingerprint, not the raw key)
+	pubKeyHex := r.Header.Get(PubKeyHeader)
+	if pubKeyHex == "" {
+		return "", nil, &VerifyMeshDialError{Status: http.StatusBadRequest, Msg: "missing public key header"}
+	}
+	pubKeyBytes, err := hex.DecodeString(pubKeyHex)
+	if err != nil || len(pubKeyBytes) != ed25519.PublicKeySize {
+		return "", nil, &VerifyMeshDialError{Status: http.StatusBadRequest, Msg: "invalid public key"}
+	}
+	pubKey := ed25519.PublicKey(pubKeyBytes)
+
+	// Verify the NodeID derives from this public key
+	derivedNodeID, err := aether.NewNodeID(pubKey)
+	if err != nil || derivedNodeID != remoteNodeID {
+		return "", nil, &VerifyMeshDialError{Status: http.StatusBadRequest, Msg: "public key does not match NodeID"}
+	}
+
+	if !ed25519.Verify(pubKey, message, signature) {
+		return "", nil, &VerifyMeshDialError{Status: http.StatusUnauthorized, Msg: "invalid signature"}
+	}
+
+	// AE-M-16: authentic signature — now reject a replay of it.
+	if !t.replay.checkAndRecord(nonceStr, now, time.Unix(0, tsNano).Add(dialFreshnessWindow)) {
+		return "", nil, &VerifyMeshDialError{Status: http.StatusUnauthorized, Msg: "replayed dial signature"}
+	}
+
+	return remoteNodeID, pubKey, nil
+}
+
+// writeVerifyMeshDialError maps a verifyMeshDial failure to the HTTP status +
+// message the inline handlers wrote before extraction. Non-VerifyMeshDialError
+// values (never produced by verifyMeshDial today) default to 400.
+func writeVerifyMeshDialError(w http.ResponseWriter, err error) {
+	var ve *VerifyMeshDialError
+	if errors.As(err, &ve) {
+		http.Error(w, ve.Msg, ve.Status)
+		return
+	}
+	http.Error(w, err.Error(), http.StatusBadRequest)
+}
+
 func (t *WebsocketTransport) Listen(ctx context.Context) (aether.Listener, error) {
 	ch := make(chan aether.IncomingSession, 32)
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Extract and validate NodeID from headers
-		remoteNodeIDStr := r.Header.Get(NodeIDHeader)
-		if remoteNodeIDStr == "" {
-			http.Error(w, "missing NodeID header", http.StatusBadRequest)
-			return
-		}
-		remoteNodeID := aether.NodeID(remoteNodeIDStr)
-
-		// NodeID ownership MUST be cryptographically proven — the signature is
-		// mandatory, never optional-on-presence. A client that omits it would
-		// otherwise be accepted under any claimed NodeID (peer impersonation,
-		// AE-C-04). Ordinary server TLS gives no client-identity guarantee, so
-		// this signature is the sole NodeID binding. Legitimate clients always
-		// send it (see Dial), so requiring it breaks nothing.
-		signatureStr := r.Header.Get(SignatureHeader)
-		if signatureStr == "" {
-			http.Error(w, "missing signature header", http.StatusUnauthorized)
-			return
-		}
-		signature, err := base64.StdEncoding.DecodeString(signatureStr)
+		// AE-C-04 / AE-M-16 dial verification — single source of truth shared
+		// with HijackHandler and exported as VerifyMeshDial for callers that
+		// mount their own /mesh/ws handler.
+		remoteNodeID, _, err := t.VerifyMeshDial(r)
 		if err != nil {
-			http.Error(w, "invalid signature encoding", http.StatusBadRequest)
+			writeVerifyMeshDialError(w, err)
 			return
 		}
 
-		// AE-M-16: reject stale dials before spending a signature verify.
+		// Re-read the freshness headers VerifyMeshDial already validated —
+		// they seed the AE-P-26 accept signature below.
 		tsStr := r.Header.Get(TimestampHeader)
 		nonceStr := r.Header.Get(NonceHeader)
-		if tsStr == "" || nonceStr == "" {
-			http.Error(w, "missing dial freshness headers", http.StatusUnauthorized)
-			return
-		}
-		tsNano, err := strconv.ParseInt(tsStr, 10, 64)
-		if err != nil {
-			http.Error(w, "invalid dial timestamp", http.StatusBadRequest)
-			return
-		}
-		now := time.Now()
-		if skew := now.Sub(time.Unix(0, tsNano)); skew > dialFreshnessWindow || skew < -dialFreshnessWindow {
-			http.Error(w, "stale dial signature", http.StatusUnauthorized)
-			return
-		}
-
-		// The signature should be over "ws-dial:<clientNodeID>:<serverNodeID>:<ts>:<nonce>"
-		message := []byte(fmt.Sprintf("ws-dial:%s:%s:%s:%s", remoteNodeID, t.localNode, tsStr, nonceStr))
-
-		// Extract public key from PubKey header (NodeID is base32 fingerprint, not the raw key)
-		pubKeyHex := r.Header.Get(PubKeyHeader)
-		if pubKeyHex == "" {
-			http.Error(w, "missing public key header", http.StatusBadRequest)
-			return
-		}
-		pubKeyBytes, err := hex.DecodeString(pubKeyHex)
-		if err != nil || len(pubKeyBytes) != ed25519.PublicKeySize {
-			http.Error(w, "invalid public key", http.StatusBadRequest)
-			return
-		}
-		pubKey := ed25519.PublicKey(pubKeyBytes)
-
-		// Verify the NodeID derives from this public key
-		derivedNodeID, err := aether.NewNodeID(pubKey)
-		if err != nil || derivedNodeID != remoteNodeID {
-			http.Error(w, "public key does not match NodeID", http.StatusBadRequest)
-			return
-		}
-
-		if !ed25519.Verify(pubKey, message, signature) {
-			http.Error(w, "invalid signature", http.StatusUnauthorized)
-			return
-		}
-
-		// AE-M-16: authentic signature — now reject a replay of it.
-		if !t.replay.checkAndRecord(nonceStr, now, time.Unix(0, tsNano).Add(dialFreshnessWindow)) {
-			http.Error(w, "replayed dial signature", http.StatusUnauthorized)
-			return
-		}
 
 		// AE-P-26: prove our mesh identity to the client on the plain WS path too.
 		// The server previously emitted NO identity header here, so a client had
@@ -602,71 +650,21 @@ func (t *WebsocketTransport) HijackHandler() (http.HandlerFunc, <-chan HijackSes
 			return
 		}
 
-		remoteNodeIDStr := r.Header.Get(NodeIDHeader)
-		if remoteNodeIDStr == "" {
-			http.Error(w, "missing NodeID header", http.StatusBadRequest)
-			return
-		}
-		remoteNodeID := aether.NodeID(remoteNodeIDStr)
-
-		// NodeID ownership MUST be cryptographically proven — the signature is
-		// mandatory, never optional-on-presence (peer impersonation, AE-C-04).
-		// Legitimate clients always send it, so requiring it breaks nothing.
-		signatureStr := r.Header.Get(SignatureHeader)
-		if signatureStr == "" {
-			http.Error(w, "missing signature header", http.StatusUnauthorized)
-			return
-		}
-		signature, err := base64.StdEncoding.DecodeString(signatureStr)
+		// AE-C-04 / AE-M-16 dial verification — single source of truth shared
+		// with the WS Listen path. The hijack path signs a "hijack-dial:"
+		// prefix rather than "ws-dial:", so it calls the internal verifier with
+		// that prefix; the replay guard is the same t.replay instance the WS
+		// path uses (nonce keyed on the 128-bit random value).
+		remoteNodeID, _, err := t.verifyMeshDial(r, "hijack-dial")
 		if err != nil {
-			http.Error(w, "invalid signature encoding", http.StatusBadRequest)
+			writeVerifyMeshDialError(w, err)
 			return
 		}
-		// AE-M-16: reject stale hijack dials before spending a signature verify.
+
+		// Re-read the freshness headers verifyMeshDial already validated —
+		// they seed the AE-P-26 accept signature written into the 101 below.
 		tsStr := r.Header.Get(TimestampHeader)
 		nonceStr := r.Header.Get(NonceHeader)
-		if tsStr == "" || nonceStr == "" {
-			http.Error(w, "missing dial freshness headers", http.StatusUnauthorized)
-			return
-		}
-		tsNano, err := strconv.ParseInt(tsStr, 10, 64)
-		if err != nil {
-			http.Error(w, "invalid dial timestamp", http.StatusBadRequest)
-			return
-		}
-		now := time.Now()
-		if skew := now.Sub(time.Unix(0, tsNano)); skew > dialFreshnessWindow || skew < -dialFreshnessWindow {
-			http.Error(w, "stale dial signature", http.StatusUnauthorized)
-			return
-		}
-		message := []byte(fmt.Sprintf("hijack-dial:%s:%s:%s:%s", remoteNodeID, t.localNode, tsStr, nonceStr))
-		pubKeyHex := r.Header.Get(PubKeyHeader)
-		if pubKeyHex == "" {
-			http.Error(w, "missing public key header", http.StatusBadRequest)
-			return
-		}
-		pubKeyBytes, err := hex.DecodeString(pubKeyHex)
-		if err != nil || len(pubKeyBytes) != ed25519.PublicKeySize {
-			http.Error(w, "invalid public key", http.StatusBadRequest)
-			return
-		}
-		pubKey := ed25519.PublicKey(pubKeyBytes)
-		derivedNodeID, err := aether.NewNodeID(pubKey)
-		if err != nil || derivedNodeID != remoteNodeID {
-			http.Error(w, "public key does not match NodeID", http.StatusBadRequest)
-			return
-		}
-		if !ed25519.Verify(pubKey, message, signature) {
-			http.Error(w, "invalid signature", http.StatusUnauthorized)
-			return
-		}
-
-		// AE-M-16: authentic signature — now reject a replay of it (shared guard
-		// with the WS Listen path; keyed on the 128-bit random nonce).
-		if !t.replay.checkAndRecord(nonceStr, now, time.Unix(0, tsNano).Add(dialFreshnessWindow)) {
-			http.Error(w, "replayed dial signature", http.StatusUnauthorized)
-			return
-		}
 
 		// Hijack the connection
 		hj, ok := w.(http.Hijacker)
@@ -709,7 +707,7 @@ func (t *WebsocketTransport) HijackHandler() (http.HandlerFunc, <-chan HijackSes
 		select {
 		case ch <- HijackSession{Conn: hjConn, RemoteNodeID: remoteNodeID}:
 		default:
-			log.Printf("[WS-HIJACK] Session channel full, dropping connection from %s", remoteNodeIDStr)
+			log.Printf("[WS-HIJACK] Session channel full, dropping connection from %s", remoteNodeID)
 			hjConn.Close()
 		}
 	}
