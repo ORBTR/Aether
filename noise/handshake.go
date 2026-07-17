@@ -406,6 +406,15 @@ recvLoop:
 				retried = true
 				continue
 			}
+			// Observability: identify anything mistaken for msg2. A real XX msg2
+			// carries the signed NodeInfo (~360-420B); anything materially
+			// shorter reaching ReadMessage yields flynn/noise's opaque
+			// "message is too short" with no clue what the packet WAS. The
+			// retry-shaped filter above only catches retryPrefix+<=49, so this
+			// records first-byte+length for any other short arrival.
+			if len(resp) > 0 && len(resp) < 96 {
+				dbgHandshake.Printf("shared-socket: SHORT %dB packet (first=0x%02X) accepted as msg2 from %s — ReadMessage will likely fail", len(resp), resp[0], addr)
+			}
 			msg2 = resp
 			break recvLoop
 		case <-rxmit.C:
@@ -664,12 +673,19 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 		if HasRetryPrefix(innerMsg) {
 			validated, ok := l.transport.retryGuard.ValidateAndStrip(innerMsg, addr, time.Now())
 			if !ok {
+				// Observability: this drop is otherwise SILENT and it strands
+				// the initiator until its msg2 deadline — the cookie is bound
+				// to this process's retryGuard secret and the source IP, so a
+				// responder restart or a source-IP change turns every dial from
+				// that peer into a timeout with no signal anywhere.
+				dbgHandshake.Printf("RETRY cookie REJECTED from %s (inner=%dB) — dropping msg1; initiator stalls to msg2 timeout", addr, len(innerMsg))
 				l.mu.Unlock()
 				return
 			}
 			innerMsg = validated
 		} else if l.transport.requireRetryToken {
 			token := l.transport.retryGuard.IssueToken(addr, time.Now())
+			dbgHandshake.Printf("RETRY token issued to %s (dialNonceWrapped=%t)", addr, dialNonce != nil)
 			out := token
 			if dialNonce != nil {
 				out = make([]byte, 0, 1+dialNonceLen+len(token))
