@@ -465,7 +465,30 @@ recvLoop:
 	// Post-handshake data packets rely on Fly's edge flow stickiness —
 	// if that proves insufficient in production we revisit and add a
 	// persistent preamble-on-every-write path.
-	msg3Wire := msg3
+	// Wrap msg3 in the dial-nonce envelope, exactly as msg1 already is.
+	//
+	// msg3 was the ONLY handshake message sent as raw Noise ciphertext, and a
+	// ciphertext's first byte is uniformly random. The responder classifies
+	// inbound packets by that first byte (ClassifyPacket), and the QUIC range
+	// 0x40-0xBF is 128 of 256 values — so ~50% of raw msg3s were classified as
+	// QUIC and handed to DeliverQUICPacket, which enqueues them for quic-go
+	// with no validation whatsoever. quic-go discards them and the msg3 is
+	// gone. Not packet loss: a systematic 50% misroute at the receiver.
+	//
+	// The consequence was the fleet-wide noise-UDP sawtooth. A swallowed msg3
+	// leaves the session HALF-OPEN — the initiator holds cipher states and
+	// believes it is connected while the responder never completes and prunes
+	// at 30s — so nothing ever comes back and STALL-DETECT reaps the session
+	// at 120s with "no forward progress". Links established, won the path,
+	// died ~2m later, and reformed, forever.
+	//
+	// Byte-range classification cannot separate ciphertext from QUIC — the
+	// ranges overlap by construction and no amount of tightening fixes a
+	// uniformly random byte. The envelope removes the ambiguity instead of
+	// narrowing it: dialNoncePrefix is checked BEFORE the QUIC range, so an
+	// enveloped msg3 routes as PacketDial 100% of the time. This is the same
+	// reason msg1 and msg2 were never affected — both already carry it.
+	msg3Wire := wrapDialResponse(nonce, msg3)
 	if crossOrgPreamble {
 		preamble := EncodeRoutingPreamble(path.NodeID)
 		msg3Wire = make([]byte, 0, len(preamble)+len(msg3))
@@ -494,6 +517,24 @@ recvLoop:
 	if remoteCaps&capExplicitNonce != 0 {
 		nc.enableExplicitNonce()
 	}
+
+	// msg3 is the only message in this 3-message handshake with no loss
+	// protection, and it runs over lossy UDP: msg1 has a retransmit ticker
+	// (handshakeRetransmitInterval) and msg2 is re-sent from hs.response on any
+	// duplicate msg1 — msg3 was written once and never confirmed. A single
+	// dropped msg3 leaves the session HALF-OPEN: we hold cipher states and
+	// believe we are connected, while the responder never completes and prunes
+	// its listenerHandshake at the 30s TTL. Everything we send then lands on a
+	// responder with no session for this addr and is discarded, nothing ever
+	// comes back, and STALL-DETECT reaps us at the 120s threshold with
+	// "session stuck (no forward progress)" / "ping timeout (no inbound
+	// activity)". Fleet-wide that is the noise-UDP sawtooth: links establish,
+	// win the path, die ~2m later, reform, forever.
+	//
+	// Retransmit until the peer proves it completed by sending us anything.
+	// Safe and idempotent: the responder ignores a duplicate msg3 once its
+	// handshake is complete, and any inbound packet at all stops the loop.
+	go retransmitMsg3UntilActive(listener, addr, msg3Wire, nc)
 
 	// Simultaneous-dial deterministic tiebreak (initiator side). See the
 	// responder-side comment in handleHandshake for the full rationale —
@@ -547,6 +588,52 @@ recvLoop:
 // mesh use). This is the same loss-recovery scheme WireGuard, QUIC and
 // DTLS use for their handshakes.
 const handshakeRetransmitInterval = 700 * time.Millisecond
+
+// msg3RetransmitWindow bounds how long the initiator keeps re-sending msg3
+// while waiting for the peer's first inbound packet. It must comfortably exceed
+// a few RTTs plus the responder's own msg2 retransmit handling, yet stay well
+// under the 120s STALL-DETECT threshold so a genuinely unreachable peer fails
+// fast rather than holding a doomed session open. Bounded by design: the loop
+// also exits the instant any inbound activity arrives, and on session close.
+const msg3RetransmitWindow = 10 * time.Second
+
+// retransmitMsg3UntilActive re-sends msg3 on handshakeRetransmitInterval until
+// the peer sends us anything (proving it completed the handshake), the session
+// closes, or msg3RetransmitWindow expires.
+//
+// Without this, one dropped msg3 is unrecoverable: the initiator has cipher
+// states and a live session, the responder has neither and prunes its pending
+// handshake at 30s. The session then makes no forward progress in either
+// direction and STALL-DETECT closes it at 120s — see
+// handshake_msg3_retransmit_test.go.
+//
+// Any inbound packet is sufficient proof: the peer cannot decrypt or ACK
+// anything on this session without having processed msg3.
+func retransmitMsg3UntilActive(l *noiseListener, addr *net.UDPAddr, msg3Wire []byte, nc *noiseConn) {
+	start := time.Now()
+	deadline := start.Add(msg3RetransmitWindow)
+	ticker := time.NewTicker(handshakeRetransmitInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-nc.closed:
+			return
+		case <-ticker.C:
+			if nc.health.LastActivity().After(start) {
+				return // peer answered — handshake demonstrably completed
+			}
+			if time.Now().After(deadline) {
+				dbgHandshake.Printf("msg3 retransmit window expired for %s — peer never answered; "+
+					"session will be reaped by STALL-DETECT", addr)
+				return
+			}
+			if _, err := l.connFor(addr).WriteToUDP(msg3Wire, addr); err != nil {
+				return // socket gone; nothing useful left to do
+			}
+			dbgHandshake.Printf("Retransmitting msg3 to %s (no inbound yet)", addr)
+		}
+	}
+}
 
 func (t *NoiseTransport) handshakeDeadline(ctx context.Context) time.Time {
 	deadline := time.Now().Add(t.handshake)
@@ -800,9 +887,20 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 	state := hs.state
 	scopeID := hs.scopeID
 
+	// Strip the dial-nonce envelope if present. msg3 now carries it (as msg1
+	// always has) so the classifier routes it as PacketDial instead of
+	// coin-flipping it into the QUIC demux — see the wrapDialResponse call on
+	// the initiator side. Tolerates a bare msg3 so a peer on an older build,
+	// which still sends it raw, keeps interoperating (its msg3 simply retains
+	// the ~50% misroute until it upgrades).
+	msg3 := msg
+	if n := currentDialNonce(msg); n != nil {
+		msg3 = msg[1+dialNonceLen:]
+	}
+
 	// Process the third message (Initiator -> Responder)
 	// This message completes the handshake and establishes the session.
-	payload, cs1, cs2, err := state.ReadMessage(nil, msg)
+	payload, cs1, cs2, err := state.ReadMessage(nil, msg3)
 	if err != nil {
 		// Not a valid msg3. If we have already sent msg2, this is almost
 		// certainly a retransmitted msg1 — the initiator re-sending
