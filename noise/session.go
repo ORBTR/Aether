@@ -18,10 +18,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/flynn/noise"
 	aether "github.com/ORBTR/aether"
-	transportHealth "github.com/ORBTR/aether/health"
 	vl1 "github.com/ORBTR/aether"
+	"github.com/flynn/noise"
+	transportHealth "github.com/ORBTR/aether/health"
 	"github.com/ORBTR/aether/metrics"
 	"github.com/ORBTR/aether/relay"
 	"github.com/pion/stun"
@@ -910,9 +910,11 @@ func (l *noiseListener) runReader(ctx context.Context, conn *net.UDPConn) {
 			return
 		}
 
-		// Resume (0.5-RTT): 0xFD prefix means the initiator is presenting
-		// an encrypted ticket + AEAD proof tag. Handle before classify so
-		// we never mistakenly route it to QUIC/STUN. Full path:
+		// Resume (0.5-RTT): resumePrefix (0xFA) means the initiator is
+		// presenting an encrypted ticket + AEAD proof tag. Handle before
+		// classify so we never mistakenly route it to QUIC/STUN. Note this
+		// is 0xFA, NOT the 0xFD dialNoncePrefix — the two are distinct
+		// wire prefixes and must not be conflated. Full path:
 		// handleResumePacket decrypts the ticket, verifies the tag,
 		// instantiates a noiseConn from the ticket's CipherState, and
 		// replies with resumeAcceptPrefix + a tag proving our own key
@@ -1005,6 +1007,36 @@ func (l *noiseListener) runReader(ctx context.Context, conn *net.UDPConn) {
 		// rate-limited packets that would otherwise dispatch.
 		key := addr.String()
 		msg := append([]byte(nil), buf[:n]...)
+
+		// SOLICITED-DIAL PATH — a response to a dial THIS node initiated.
+		// It must be routed before BOTH the session fast-path below and the
+		// handshake-flood limiters, because each of them silently eats it:
+		//
+		//   - dispatchToSession claims EVERY packet arriving from an addr
+		//     that has a session entry: it discards decryptAndDeliver's
+		//     error and returns true regardless. A session still mapped at
+		//     the peer's addr therefore swallows this dial's RETRY token and
+		//     msg2 (they are handshake frames, so the AEAD open always
+		//     fails). The dial then times out, AddressTracker marks the udp
+		//     endpoint dead, the upgrade walker's bestAddress() returns ""
+		//     and skips the candidate forever — noise-UDP is locked out for
+		//     that peer permanently and the mesh silently rides WebSocket.
+		//   - the per-source limiter is a FIRST-CONTACT flood defence (10
+		//     burst, 1/sec refill, keyed by IP only, so both directions to a
+		//     peer machine share one bucket). The 700ms msg1 retransmit
+		//     emits ~1.43/sec, outpacing refill, so a dial that begins while
+		//     the bucket is low cannot self-recover.
+		//
+		// Running it first does not widen the flood surface: it is
+		// self-gating, returning false unless the packet carries
+		// dialNoncePrefix AND an 8-byte nonce matching a dial registered by
+		// this node — unforgeable without guessing 64 random bits. Every
+		// non-matching packet still falls through to the session path and
+		// both limiters exactly as before.
+		if l.dispatchToPendingDial(msg) {
+			continue
+		}
+
 		if l.dispatchToSession(key, msg) {
 			if isCEMarked(tos) {
 				if nc := connFromSession(l.sessions.GetByAddr(key)); nc != nil {
@@ -1021,10 +1053,6 @@ func (l *noiseListener) runReader(ctx context.Context, conn *net.UDPConn) {
 			continue
 		}
 		if !l.transport.rateLimiter.Allow(1) {
-			continue
-		}
-		// Check if this is a response to an outgoing dial handshake
-		if l.dispatchToPendingDial(msg) {
 			continue
 		}
 		// Debug: log when packets fall through with pending dials registered
