@@ -15,11 +15,10 @@ import (
 	"net"
 	"time"
 
-	"github.com/flynn/noise"
 	aether "github.com/ORBTR/aether"
 	transportCrypto "github.com/ORBTR/aether/crypto/identity"
+	"github.com/flynn/noise"
 )
-
 
 func (t *NoiseTransport) performInitiatorHandshake(ctx context.Context, udpConn *net.UDPConn, path aether.Path) (aether.Connection, error) {
 	return t.performInitiatorHandshakeAttempt(ctx, udpConn, path, false)
@@ -642,9 +641,41 @@ type listenerHandshake struct {
 	state     *noise.HandshakeState
 	created   time.Time
 	responded bool
-	response  []byte // exact msg2 bytes sent; re-sent verbatim on a retransmitted msg1
+	// response is the RAW msg2 — never the nonce-wrapped bytes. This entry is
+	// keyed by ADDRESS and lives for the prune TTL, so a later msg1 from the
+	// same peer may belong to a different dial with a different nonce; the
+	// nonce is therefore applied per-send by wrapDialResponse, not cached.
+	response []byte
 	scopeID  string // Extracted from preamble (empty for dedicated transports)
-	dialNonce []byte // If non-nil, echo this nonce prefix in msg2/msg3 responses
+	// dialNonce is the nonce of the dial that CREATED this entry. Kept for
+	// diagnostics only — never use it to answer a later msg1, which may carry
+	// a newer nonce (see currentDialNonce).
+	dialNonce []byte
+}
+
+// currentDialNonce returns the dial nonce carried by an inbound handshake
+// packet, or nil when it is not nonce-tagged. Always read fresh from the packet
+// being answered: the nonce identifies the DIAL, while listenerHandshake is
+// keyed by ADDRESS and outlives any single dial.
+func currentDialNonce(msg []byte) []byte {
+	if len(msg) > 1+dialNonceLen && msg[0] == dialNoncePrefix {
+		return msg[1 : 1+dialNonceLen]
+	}
+	return nil
+}
+
+// wrapDialResponse tags a responder reply with the initiator's dial nonce so
+// dispatchToPendingDial can route it to the waiting dial. A nil nonce means the
+// initiator did not tag its msg1, so the reply goes back bare.
+func wrapDialResponse(dialNonce, response []byte) []byte {
+	if dialNonce == nil {
+		return response
+	}
+	out := make([]byte, 0, 1+dialNonceLen+len(response))
+	out = append(out, dialNoncePrefix)
+	out = append(out, dialNonce...)
+	out = append(out, response...)
+	return out
 }
 
 func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *net.UDPAddr, msg []byte) {
@@ -748,23 +779,20 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 			l.mu.Unlock()
 			return
 		}
-		// Echo dial nonce prefix so initiator can route the response.
-		// Cache the exact bytes sent so a retransmitted msg1 (initiator
-		// hasn't seen this msg2) can be answered by re-sending verbatim.
-		var sent []byte
-		if dialNonce != nil {
-			nonceResp := make([]byte, 0, 1+dialNonceLen+len(response))
-			nonceResp = append(nonceResp, dialNoncePrefix)
-			nonceResp = append(nonceResp, dialNonce...)
-			nonceResp = append(nonceResp, response...)
-			sent = nonceResp
-		} else {
-			sent = response
-		}
-		_, _ = l.writeRelayAware(addr, sent)
+		// Cache the RAW msg2 and echo the dial nonce at SEND time, never
+		// bake the nonce into the cache. listenerHandshake is keyed by
+		// ADDRESS and lives for the 30s prune TTL, so a later msg1 from
+		// this peer can legitimately belong to a DIFFERENT dial with a
+		// FRESH nonce (the initiator unregisters its nonce the moment a
+		// dial times out — one lost msg2 is enough). Caching the wrapped
+		// bytes made the retransmit path answer that new dial with the
+		// dead nonce; dispatchToPendingDial has no channel for it, drops
+		// it, and the new dial times out too — re-dialing inside the same
+		// window, forever. See handshake_redial_nonce_test.go.
 		hs.responded = true
-		hs.response = sent
+		hs.response = response
 		l.mu.Unlock()
+		_, _ = l.writeRelayAware(addr, wrapDialResponse(dialNonce, response))
 		return
 	}
 
@@ -782,7 +810,12 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 		// the handshake state; the old behaviour (delete) turned a
 		// single dropped msg2 into a failed handshake.
 		if hs.responded && hs.response != nil {
-			resp := hs.response
+			// Re-wrap with THIS msg1's dial nonce, not the one the cached
+			// msg2 was first sent under. The initiator drops its nonce when
+			// a dial times out and re-dials with a fresh one, so answering
+			// with the stale nonce is unroutable at dispatchToPendingDial
+			// and strands every subsequent dial from this peer.
+			resp := wrapDialResponse(currentDialNonce(msg), hs.response)
 			l.mu.Unlock()
 			_, _ = l.writeRelayAware(addr, resp)
 			return
