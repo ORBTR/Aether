@@ -791,6 +791,7 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 		if HasRetryPrefix(innerMsg) {
 			validated, ok := l.transport.retryGuard.ValidateAndStrip(innerMsg, addr, time.Now())
 			if !ok {
+				l.drops.count(DropRetryCookieInvalid)
 				// Observability: this drop is otherwise SILENT and it strands
 				// the initiator until its msg2 deadline — the cookie is bound
 				// to this process's retryGuard secret and the source IP, so a
@@ -803,6 +804,7 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 			innerMsg = validated
 		} else if l.transport.requireRetryToken {
 			token := l.transport.retryGuard.IssueToken(addr, time.Now())
+			l.drops.count(DropRetryTokenIssued)
 			dbgHandshake.Printf("RETRY token issued to %s (dialNonceWrapped=%t)", addr, dialNonce != nil)
 			out := token
 			if dialNonce != nil {
@@ -818,6 +820,7 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 
 		prologue, scopeID, patFlag, noiseMsg, ok := l.resolveHandshakeKey(innerMsg)
 		if !ok {
+			l.drops.count(DropHandshakeKeyUnresolved)
 			l.mu.Unlock()
 			return
 		}

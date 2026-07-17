@@ -20,10 +20,10 @@ import (
 
 	aether "github.com/ORBTR/aether"
 	vl1 "github.com/ORBTR/aether"
-	"github.com/flynn/noise"
 	transportHealth "github.com/ORBTR/aether/health"
 	"github.com/ORBTR/aether/metrics"
 	"github.com/ORBTR/aether/relay"
+	"github.com/flynn/noise"
 	"github.com/pion/stun"
 )
 
@@ -820,6 +820,12 @@ type noiseListener struct {
 	incoming     chan aether.IncomingSession
 	pendingDials map[string]chan []byte // nonce hex → channel for outgoing handshake responses
 	quicDemux    *DemuxPacketConn       // routes QUIC packets to quic-go
+	// drops tallies every datagram this listener discards or diverts, by
+	// reason. The receive path used to drop packets with a bare `continue`, so
+	// a fleet-wide outage (msg3 misrouted into quic-go ~50% of the time) was
+	// invisible: the packets just stopped existing and nothing counted them.
+	// Read via DropSnapshot(). See drops.go.
+	drops dropCounters
 }
 
 // connFor returns the correct UDP socket for the target address.
@@ -927,9 +933,11 @@ func (l *noiseListener) runReader(ctx context.Context, conn *net.UDPConn) {
 			// 0xFA spray from spoofed sources can't bypass them and burn CPU
 			// on ticket GCM.Open + per-datagram copies with no rate limit.
 			if l.transport.sourceLimit != nil && !l.transport.sourceLimit.Allow(addr) {
+				l.drops.count(DropResumeSourceLimit)
 				continue
 			}
 			if !l.transport.rateLimiter.Allow(1) {
+				l.drops.count(DropResumeGlobalLimit)
 				continue
 			}
 			l.handleResumePacket(ctx, conn, append([]byte(nil), buf[:n]...), addr)
@@ -939,14 +947,27 @@ func (l *noiseListener) runReader(ctx context.Context, conn *net.UDPConn) {
 		// Demux: route packets by protocol type
 		pktType := ClassifyPacket(buf[:n])
 
-		// QUIC packets → route to quic-go via demux
+		// QUIC packets → route to quic-go via demux.
+		//
+		// ⚠ This branch is classified by FIRST BYTE ONLY and DeliverQUICPacket
+		// validates nothing — anything in 0x40-0xBF (128 of 256 values) is
+		// enqueued for quic-go, which discards it if it is not really QUIC.
+		// Raw Noise ciphertext has a uniformly random first byte, so this
+		// branch silently destroyed ~50% of msg3 until msg3 was moved inside
+		// the dial-nonce envelope. Note the STUN branch below IS guarded by
+		// stun.IsMessage (magic-cookie validated); this one has no equivalent.
+		// The counter exists so the next occurrence is a lookup, not a
+		// nine-hour investigation: quic_demux climbing while noise-UDP fails
+		// is the signature.
 		if pktType == PacketQUIC && l.quicDemux != nil {
+			l.drops.count(DropQUICDemux)
 			l.quicDemux.DeliverQUICPacket(append([]byte(nil), buf[:n]...), addr)
 			continue
 		}
 
 		// STUN packets
 		if pktType == PacketSTUN && stun.IsMessage(buf[:n]) {
+			l.drops.count(DropSTUN)
 			l.transport.handleSTUNPacket(buf[:n])
 			continue
 		}
@@ -1034,6 +1055,7 @@ func (l *noiseListener) runReader(ctx context.Context, conn *net.UDPConn) {
 		// non-matching packet still falls through to the session path and
 		// both limiters exactly as before.
 		if l.dispatchToPendingDial(msg) {
+			l.drops.count(DropPendingDial)
 			continue
 		}
 
@@ -1050,9 +1072,11 @@ func (l *noiseListener) runReader(ctx context.Context, conn *net.UDPConn) {
 		// Treat as handshake-candidate from unknown / first-contact
 		// source and apply the rate limits intended for that path.
 		if l.transport.sourceLimit != nil && !l.transport.sourceLimit.Allow(addr) {
+			l.drops.count(DropSourceLimit)
 			continue
 		}
 		if !l.transport.rateLimiter.Allow(1) {
+			l.drops.count(DropGlobalLimit)
 			continue
 		}
 		// Debug: log when packets fall through with pending dials registered
@@ -1085,6 +1109,9 @@ func (l *noiseListener) dispatchToSession(key string, msg []byte) bool {
 	_ = nc.decryptAndDeliver(msg)
 	return true
 }
+
+// dropCount exposes the listener's per-reason drop tally. See drops.go.
+func (l *noiseListener) dropCount(r DropReason) uint64 { return l.drops[r].Load() }
 
 // dialNoncePrefix marks a packet as part of a nonce-tagged dial handshake.
 // This byte won't conflict with STUN (0x00-0x3F), preamble, or fingerprint packets.
