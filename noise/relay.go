@@ -23,6 +23,10 @@ import (
 // a wedged/backpressured target can't pin the relaying goroutine (AER-041).
 const relayForwardTimeout = 5 * time.Second
 
+// relayDedicatedScopeKey is the rate-limiter bucket used for dedicated /
+// empty-scope relay traffic so it is still metered (AER-040).
+const relayDedicatedScopeKey = "__aether_dedicated__"
+
 // handleRelayRequest processes an incoming relay request from a Noise session.
 // Checks Noise sessions first, then external (WS/QUIC) sessions as fallback.
 // Enforces scope isolation: source and target must belong to the same scope.
@@ -119,20 +123,28 @@ func (t *NoiseTransport) resolveRelayTarget(source *noiseConn, payload []byte) (
 		return nil, relay.ErrTenantMismatch
 	}
 
-	// Per-scope relay rate limiting
+	// Per-scope relay rate limiting. AER-040: also rate-limit dedicated /
+	// empty-scope traffic. The old `activeTenant != ""` guard skipped limiting
+	// entirely when both scopes were empty, so a dedicated relay was an
+	// unmetered forwarder. Bucket empty-scope traffic under a sentinel key so
+	// per-peer limits still apply.
 	activeTenant := sourceTenant
 	if activeTenant == "" {
 		activeTenant = targetTenant
 	}
-	if t.scopeLimiter != nil && activeTenant != "" {
-		if err := t.scopeLimiter.AllowRelay(activeTenant); err != nil {
+	limiterKey := activeTenant
+	if limiterKey == "" {
+		limiterKey = relayDedicatedScopeKey
+	}
+	if t.scopeLimiter != nil {
+		if err := t.scopeLimiter.AllowRelay(limiterKey); err != nil {
 			return nil, err
 		}
 		pairKey := string(source.remoteNode) + "→" + targetNodeID
-		if err := t.scopeLimiter.CheckRelayPair(activeTenant, pairKey); err != nil {
+		if err := t.scopeLimiter.CheckRelayPair(limiterKey, pairKey); err != nil {
 			return nil, err
 		}
-		t.scopeLimiter.TrackRelayPair(activeTenant, pairKey)
+		t.scopeLimiter.TrackRelayPair(limiterKey, pairKey)
 	}
 
 	return targetConn, nil
