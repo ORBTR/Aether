@@ -141,82 +141,120 @@ func (r CheckResult) IsAbuse() bool {
 	return r == ResultAncient || r == ResultWrapAttack
 }
 
-// CheckV2 classifies a SeqNo for delivery + abuse decisions. Marks the
-// SeqNo as seen on ResultNew (advancing the window). On all other
-// results the window state is unchanged. Thread-safe.
-//
-// Replaces Check() — old callers that only need a bool can use
-// `Check(seq)` which is preserved as a thin wrapper that conflates
-// reject reasons (kept for back-compat in tests; production hot path
-// should switch to CheckV2 so abuse scoring stays accurate under
-// normal retransmission).
+// classifyLocked returns the CheckResult for seqNo WITHOUT mutating window
+// state. Caller must hold w.mu.
 //
 // Rules:
 //   - SeqNo > top by more than SeqNoWrapThreshold → ResultWrapAttack
-//   - SeqNo > top, within wrap threshold → advance, ResultNew
-//   - top - 63 <= SeqNo <= top, bitmap-bit clear → mark seen, ResultNew
+//   - SeqNo > top, within wrap threshold → ResultNew
+//   - top - 63 <= SeqNo <= top, bitmap-bit clear → ResultNew
 //   - top - 63 <= SeqNo <= top, bitmap-bit set → ResultDuplicate
 //   - SeqNo < top - 63 → ResultAncient
-func (w *ReplayWindow) CheckV2(seqNo uint32) CheckResult {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
+func (w *ReplayWindow) classifyLocked(seqNo uint32) CheckResult {
 	if !w.inited {
-		w.topSeq = seqNo
-		w.bitmap = 1 // mark seqNo as seen (bit 0)
-		w.inited = true
 		return ResultNew
 	}
-
 	if seqNo > w.topSeq {
-		// Advance window
 		diff := seqNo - w.topSeq
 		// Reject jumps past half the SeqNo space — likely a uint32
 		// wraparound attack rather than a legitimate forward step.
 		// (S8 — see _SECURITY.md §3.3.)
 		if diff > SeqNoWrapThreshold {
-			atomic.AddUint64(&w.wrapsDetected, 1)
 			return ResultWrapAttack
 		}
+		return ResultNew
+	}
+	diff := w.topSeq - seqNo
+	if diff >= ReplayWindowSize {
+		return ResultAncient // too old — outside window, cannot be a legitimate retransmit
+	}
+	bit := uint64(1) << diff
+	if w.bitmap&bit != 0 {
+		return ResultDuplicate // already seen — almost always a legitimate retransmit
+	}
+	return ResultNew
+}
+
+// commitLocked marks seqNo as seen (advancing the window / setting the
+// bitmap bit). Idempotent. Caller must hold w.mu. A wrap-attack seqNo is
+// never committed.
+func (w *ReplayWindow) commitLocked(seqNo uint32) {
+	if !w.inited {
+		w.topSeq = seqNo
+		w.bitmap = 1 // mark seqNo as seen (bit 0)
+		w.inited = true
+		return
+	}
+	if seqNo > w.topSeq {
+		diff := seqNo - w.topSeq
+		if diff > SeqNoWrapThreshold {
+			return // wrap-attack seq — do not advance the window
+		}
 		if diff >= ReplayWindowSize {
-			// Jump beyond window — reset bitmap
-			w.bitmap = 1
+			w.bitmap = 1 // jump beyond window — reset bitmap
 		} else {
-			// Shift bitmap left by diff, set bit 0 for new seqNo
 			w.bitmap <<= diff
 			w.bitmap |= 1
 		}
 		w.topSeq = seqNo
-		return ResultNew
+		return
 	}
-
-	// seqNo <= top — check if within window
 	diff := w.topSeq - seqNo
 	if diff >= ReplayWindowSize {
-		atomic.AddUint64(&w.ancientDrops, 1)
-		return ResultAncient // too old — outside window, cannot be a legitimate retransmit
+		return // ancient — nothing to mark
 	}
-
-	// Check if already seen
-	bit := uint64(1) << diff
-	if w.bitmap&bit != 0 {
-		atomic.AddUint64(&w.duplicates, 1)
-		return ResultDuplicate // already seen — almost always a legitimate retransmit
-	}
-
-	// Mark as seen
-	w.bitmap |= bit
-	return ResultNew
+	w.bitmap |= (uint64(1) << diff)
 }
 
-// Check returns true if the SeqNo is acceptable (not a replay).
-// Thin wrapper around CheckV2 that conflates ResultDuplicate /
-// ResultAncient / ResultWrapAttack into a single false. Kept for
-// callers that don't need the result classification. Production code
-// that drives abuse scoring should call CheckV2 directly so legitimate
-// retransmits don't get charged as adversarial replays.
+// Classify returns the CheckResult for a SeqNo WITHOUT marking it seen.
+// Bumps the observational counters for the observed condition. The caller
+// commits acceptance via Commit only after the frame is durably buffered,
+// so a frame dropped by a full reorder buffer is not marked seen — which
+// would make every retransmit of it classify ResultDuplicate and be
+// discarded forever (AER-061). Thread-safe.
+func (w *ReplayWindow) Classify(seqNo uint32) CheckResult {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	res := w.classifyLocked(seqNo)
+	switch res {
+	case ResultWrapAttack:
+		atomic.AddUint64(&w.wrapsDetected, 1)
+	case ResultAncient:
+		atomic.AddUint64(&w.ancientDrops, 1)
+	case ResultDuplicate:
+		atomic.AddUint64(&w.duplicates, 1)
+	}
+	return res
+}
+
+// Commit marks seqNo as seen (advancing the window). Idempotent — a seq
+// already inside the window and set is left unchanged. Thread-safe.
+func (w *ReplayWindow) Commit(seqNo uint32) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.commitLocked(seqNo)
+}
+
+// Check returns true if the SeqNo is acceptable (not a replay), marking it
+// seen when it is. Convenience for callers that always accept a new SeqNo
+// and don't need to gate the mark on a downstream buffer insert. Production
+// hot paths that can drop a frame after acceptance should Classify then
+// Commit-on-success instead (AER-061).
 func (w *ReplayWindow) Check(seqNo uint32) bool {
-	return w.CheckV2(seqNo) == ResultNew
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	res := w.classifyLocked(seqNo)
+	switch res {
+	case ResultWrapAttack:
+		atomic.AddUint64(&w.wrapsDetected, 1)
+	case ResultAncient:
+		atomic.AddUint64(&w.ancientDrops, 1)
+	case ResultDuplicate:
+		atomic.AddUint64(&w.duplicates, 1)
+	case ResultNew:
+		w.commitLocked(seqNo)
+	}
+	return res == ResultNew
 }
 
 // top returns the highest accepted SeqNo.

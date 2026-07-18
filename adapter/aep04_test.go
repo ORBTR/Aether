@@ -55,7 +55,7 @@ func TestAEP04_AncientAboveFloor_DeliveredNoAbuse(t *testing.T) {
 
 	// Push the replay window's topSeq far ahead so a low SeqNo lands
 	// >= ReplayWindowSize(64) behind it and classifies ResultAncient.
-	st.replay.CheckV2(100)
+	st.replay.Check(100)
 
 	// recvWindow.expected is still 0, so SeqNo 1 is AT/ABOVE the cumulative
 	// delivery floor — never delivered, still needed.
@@ -76,9 +76,12 @@ func TestAEP04_AncientAboveFloor_DeliveredNoAbuse(t *testing.T) {
 	}
 }
 
-// Ancient AND below the delivery floor (already delivered): still charged, so a
-// real replay flood keeps tripping the abuse tracker.
-func TestAEP04_AncientBelowFloor_Charged(t *testing.T) {
+// AER-023: Ancient AND below the delivery floor (already delivered) is a
+// legitimate lost-ACK retransmit, NOT abuse. It is eager-ACKed and must NOT
+// be charged — a >64-frame burst with a lost cumulative ACK produced ~13 of
+// these inside one RTT and tripped the abuse tracker, killing a healthy
+// session. Genuine forgeries are still caught by the WrapAttack path.
+func TestAEP04_AncientBelowFloor_NotCharged(t *testing.T) {
 	s, st := aep04Setup()
 
 	// Advance the recvWindow delivery floor past SeqNo 2 by delivering
@@ -91,15 +94,15 @@ func TestAEP04_AncientBelowFloor_Charged(t *testing.T) {
 	}
 
 	// Push topSeq far ahead so SeqNo 2 classifies ResultAncient.
-	st.replay.CheckV2(100)
+	st.replay.Check(100)
 
 	before := s.PeerAbuseScore()
 	frame := &aether.Frame{StreamID: 1, SeqNo: 2, Payload: []byte("two")}
 	s.handleData(frame) // 2 < expected(5): below floor
 
-	if after := s.PeerAbuseScore(); after <= before {
-		t.Fatalf("AE-P-04: below-floor Ancient replay was NOT charged abuse "+
-			"(before=%v after=%v) — replay-flood defense lost", before, after)
+	if after := s.PeerAbuseScore(); after != before {
+		t.Fatalf("AER-023: below-floor lost-ACK retransmit charged abuse "+
+			"(before=%v after=%v) — must be eager-ACKed, not charged", before, after)
 	}
 }
 
@@ -107,7 +110,7 @@ func TestAEP04_AncientBelowFloor_Charged(t *testing.T) {
 func TestAEP04_WrapAttackStillCharged(t *testing.T) {
 	s, st := aep04Setup()
 
-	st.replay.CheckV2(100) // init topSeq
+	st.replay.Check(100) // init topSeq
 
 	// SeqNo jumping forward past half the uint32 space -> ResultWrapAttack.
 	frame := &aether.Frame{StreamID: 1, SeqNo: 100 + (1 << 31) + 1, Payload: []byte("forge")}
