@@ -431,31 +431,45 @@ func (c *noiseConn) sendPacket(packetType byte, payload []byte) error {
 	return err
 }
 
-// rekeySignalRetries is the number of times maybeInitiateRekey transmits
-// the PacketTypeRekey datagram before ratcheting the send cipher. UDP can
-// drop a single datagram silently — the previous fire-once design left
-// the sender ratcheted while the receiver wasn't, then every subsequent
-// frame failed AEAD silently until the session timed out (was the
-// H-Rekey-1 / C2 finding). 3 retries match what BIND's similar
-// UDP-signal designs use; on a lossless network all 3 arrive harmlessly
-// (the receiver ratchets idempotently on first observation).
-const rekeySignalRetries = 3
+// rekeySignalSpacing is the schedule of DELAYS between successive rekey-signal
+// copies, AFTER the first (immediate) copy. AER-014: the previous design fired
+// all copies back-to-back in the same instant, so a single correlated UDP loss
+// burst (the ~200ms blackouts documented for this path) took every copy at
+// once — the receiver then never ratcheted its recv cipher, and that direction
+// blackholed under the sender's new send key until the idle timeout, with only
+// a confusing decryptErrors climb to show for it.
+//
+// De-correlating the copies across a window WIDER than a typical burst means
+// no single blackout can swallow all of them: copies land at t=0 (immediate),
+// +50ms, +150ms, +350ms. The copies are ciphertext already sealed under the
+// OLD send key, so spacing them is independent of when the send cipher
+// ratchets (which still happens promptly, below); a copy that arrives after
+// the receiver has already ratcheted on an earlier copy fails AEAD and is
+// dropped harmlessly (AER-029). Total extra cost: three datagrams dribbled out
+// over 350ms every rekeyByteThreshold (~64 MiB) — negligible.
+var rekeySignalSpacing = []time.Duration{
+	50 * time.Millisecond,
+	100 * time.Millisecond, // → +150ms absolute
+	200 * time.Millisecond, // → +350ms absolute
+}
 
 // maybeInitiateRekey checks byte and time thresholds and sends a rekey signal
 // if either is exceeded. The rekey signal tells the peer to ratchet its receive
 // cipher, then we ratchet our send cipher. Thread-safe via sendMu.
 //
-// Reliability against UDP drop: PacketTypeRekey is sent N times
-// (rekeySignalRetries) back-to-back before we ratchet our send cipher.
-// On the receive side the FIRST signal observed ratchets the recv cipher.
-// AER-029: the duplicate copies (2 and 3) do NOT decrypt successfully after
-// that — they were encrypted under the OLD key, and once the receiver has
-// ratcheted to the new recv key its AEAD open of those copies fails and they
-// are dropped as ordinary undecryptable datagrams. The net effect (idempotent
-// rekey, extra copies discarded) is the same, but via AEAD failure, not a
-// successful decrypt. NOTE: if a correlated loss burst drops all N copies the
-// receiver never ratchets and that direction blackholes until idle timeout
-// (AER-014) — a receiver-side trial-rekey recovery is the robust fix.
+// Reliability against UDP drop: PacketTypeRekey is sent once immediately and
+// then re-sent on the rekeySignalSpacing schedule (t=0/+50/+150/+350ms) before
+// and after we ratchet our send cipher. On the receive side the FIRST signal
+// observed ratchets the recv cipher.
+// AER-029: the duplicate copies do NOT decrypt successfully after that — they
+// were encrypted under the OLD key, and once the receiver has ratcheted to the
+// new recv key its AEAD open of those copies fails and they are dropped as
+// ordinary undecryptable datagrams. The net effect (idempotent rekey, extra
+// copies discarded) is the same, but via AEAD failure, not a successful
+// decrypt.
+// AER-014: spreading the copies over a >200ms window de-correlates them from
+// the ~200ms loss bursts documented for this path, so a single blackout can no
+// longer drop every copy and blackhole the direction until idle timeout.
 // Costs three extra datagrams every rekeyByteThreshold (~64 MiB by
 // default) — negligible amortized overhead in exchange for closing
 // the C2 silent-decryption-failure window.
@@ -498,12 +512,35 @@ func (c *noiseConn) maybeInitiateRekey() {
 			return
 		}
 	}
-	for i := 0; i < rekeySignalRetries; i++ {
-		_, _ = c.writeFunc(ct)
-	}
+	// Copy 1 goes out immediately, before the send-cipher ratchet, so in the
+	// common (lossless) case the receiver ratchets its recv cipher before it
+	// sees any new-key data frame. The remaining copies are dribbled out on a
+	// widening schedule from a background goroutine to escape correlated loss
+	// bursts (AER-014); they carry the same old-key ciphertext.
+	_, _ = c.writeFunc(ct)
+	go c.spaceRekeySignals(ct)
 
 	// Ratchet our send cipher — all subsequent sends use the new key
 	c.rekeySendCipher()
+}
+
+// spaceRekeySignals retransmits the pre-encrypted rekey-signal ciphertext on
+// the rekeySignalSpacing schedule, exiting early if the connection closes or a
+// write fails. AER-014: this is the loss-de-correlation half of the rekey
+// signal — see rekeySignalSpacing. The ciphertext was sealed under the old
+// send key at rekey time; the receiver ratchets on the first copy it sees and
+// silently drops the rest via AEAD failure (AER-029).
+func (c *noiseConn) spaceRekeySignals(ct []byte) {
+	for _, d := range rekeySignalSpacing {
+		select {
+		case <-c.closed:
+			return
+		case <-time.After(d):
+		}
+		if _, err := c.writeFunc(ct); err != nil {
+			return
+		}
+	}
 }
 
 // rekeySendCipher ratchets the send cipher state. Called after sending a rekey signal.
