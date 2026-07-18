@@ -136,7 +136,7 @@ type SessionMetrics struct {
 	DecryptErrors    uint64 //       — decryption failures on incoming packets
 	InboxDrops       uint64 //       — packets dropped because the session inbox was full
 
-	// Anti-replay classification counters (post-CheckV2 split). Total
+	// Anti-replay classification counters (Classify/Commit split). Total
 	// ReplayRejects is the sum of these — surfaced separately because
 	// the operational meaning is different:
 	//
