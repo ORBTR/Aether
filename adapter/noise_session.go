@@ -745,7 +745,25 @@ func (s *NoiseSession) GoAway(ctx context.Context, reason aether.GoAwayReason, m
 // All operations are idempotent: calling for a streamID that was
 // already unregistered is a no-op on both the scheduler and the GC.
 func (s *NoiseSession) releaseStream(streamID uint64) {
-	s.sched.Unregister(streamID)
+	dropped, probe := s.sched.Unregister(streamID)
+	// AER-078: release the connection-window credit reserved by frames that
+	// were queued in the scheduler but never reached the wire (the stream was
+	// torn down with frames still queued). Scheduler.Unregister already returns
+	// them; ignoring the return stranded HeaderSize+Length conn credit per
+	// frame, draining the 4MB window under stream churn until Send failed with
+	// "insufficient connection credit". Only metered bytes were reserved (small
+	// frames bypass Consume). The per-stream window is discarded with the
+	// stream, and the conn window has its own lock, so this is safe from the GC
+	// sweep path that must not re-acquire s.mu.
+	relConn := func(f *aether.Frame) {
+		if f != nil && int64(f.Length) > flow.MinGuaranteedWindow {
+			s.connWindow.ReleaseUnsent(int64(f.Length))
+		}
+	}
+	for _, f := range dropped {
+		relConn(f)
+	}
+	relConn(probe)
 	if s.streamGC != nil {
 		s.streamGC.Unregister(streamID)
 	}
