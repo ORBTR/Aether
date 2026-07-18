@@ -62,5 +62,15 @@ func HandleGoAwayFrame(closeWithErr func(error) error, remoteShort, proto string
 	// via embedded newlines / ANSI escapes that would otherwise forge
 	// fake log lines in aggregators.
 	log.Printf("[AETHER-%s] GOAWAY from %s: reason=%d msg=%q", proto, remoteShort, reason, message)
-	_ = closeWithErr(fmt.Errorf("peer sent GOAWAY (reason=%d): %s", reason, message))
+	// AER-049: only GoAwayError is a genuine failure. Normal (graceful
+	// shutdown), Migration (moving to a better transport), and Overload (load
+	// shedding) are intentional peer actions — closing them with a non-nil
+	// cause made the upper-layer churn/fallback logic misread a graceful
+	// shutdown as a session failure and thrash. Close cleanly for those so no
+	// new streams open but the teardown is not scored as a failure.
+	if reason == GoAwayError {
+		_ = closeWithErr(fmt.Errorf("peer sent GOAWAY (reason=%d): %s", reason, message))
+		return
+	}
+	_ = closeWithErr(nil)
 }

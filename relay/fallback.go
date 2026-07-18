@@ -54,6 +54,10 @@ type FallbackDialer struct {
 	cachedNATType aether.NATType
 	natDetectedAt time.Time
 	natCacheTTL   time.Duration
+	// natDetectFailedAt negative-caches a failed STUN detection so a
+	// blocked/down STUN server doesn't make every dial burn the full
+	// detection timeout before falling through to strategy selection (AER-016).
+	natDetectFailedAt time.Time
 
 	// Relay discovery function (injected from LAD)
 	discoverRelays func(ctx context.Context, preferRegion string) ([]RelayInfo, error)
@@ -150,6 +154,15 @@ func (d *FallbackDialer) detectNATType(ctx context.Context) (aether.NATType, err
 		d.mu.RUnlock()
 		return cachedType, nil
 	}
+	// AER-016: if detection failed recently, don't re-probe — proceed
+	// immediately with NATUnknown (the caller falls through to a direct+relay
+	// strategy) instead of burning another full 10s STUN timeout on every
+	// dial while STUN is unreachable, which is exactly when relay fallback
+	// matters most. Negative-cache window is 1/10 of the positive TTL.
+	if !d.natDetectFailedAt.IsZero() && time.Since(d.natDetectFailedAt) < d.natCacheTTL/10 {
+		d.mu.RUnlock()
+		return aether.NATUnknown, nil
+	}
 	d.mu.RUnlock()
 
 	// Create a temporary UDP connection for NAT detection
@@ -163,6 +176,9 @@ func (d *FallbackDialer) detectNATType(ctx context.Context) (aether.NATType, err
 
 	natType, err := d.stunClient.DetectNATType(detectCtx, localAddr)
 	if err != nil {
+		d.mu.Lock()
+		d.natDetectFailedAt = time.Now()
+		d.mu.Unlock()
 		return aether.NATUnknown, err
 	}
 
@@ -360,7 +376,15 @@ func (s *RelayedSession) RemoteAddr() net.Addr {
 
 // RemoteNodeID returns the actual target node ID (not the relay).
 func (s *RelayedSession) RemoteNodeID() aether.NodeID {
-	return aether.NodeID(s.targetID[:])
+	// AER-015: derive the canonical NodeID (vl1_ + base32(sha256(pub)[:16]))
+	// from the target's public key. A raw cast of the 32 key bytes produced a
+	// value that never equalled any real NodeID, so relayed sessions were
+	// invisible to dedup/lookup and triggered duplicate dials.
+	id, err := aether.NewNodeID(ed25519.PublicKey(s.targetID[:]))
+	if err != nil {
+		return ""
+	}
+	return id
 }
 
 // IsRelayed returns true if this is a relayed session.

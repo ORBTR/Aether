@@ -16,6 +16,7 @@
 package abuse
 
 import (
+	"math"
 	"sync"
 	"time"
 )
@@ -254,8 +255,12 @@ func (s *Score[K]) Prune(maxIdle time.Duration) {
 	defer s.mu.Unlock()
 	now := time.Now()
 	for k, p := range s.peers {
+		// AER-052: capture the idle duration BEFORE decayLocked resets
+		// p.lastUpdate to now — otherwise now.Sub(p.lastUpdate) was always 0
+		// and nothing was ever pruned, so a shared registry grew without bound.
+		idle := now.Sub(p.lastUpdate)
 		s.decayLocked(p, now)
-		if !p.blacklisted && p.score < 1 && now.Sub(p.lastUpdate) > maxIdle {
+		if !p.blacklisted && p.score < 1 && idle > maxIdle {
 			delete(s.peers, k)
 		}
 	}
@@ -281,21 +286,15 @@ func (s *Score[K]) decayLocked(p *PeerScore, now time.Time) {
 	p.lastUpdate = now
 }
 
-// pow2neg returns 2^-n for n ≥ 0. Implemented inline to avoid pulling
-// in math just for this call.
+// pow2neg returns 2^-n for n ≥ 0.
+//
+// AER-092: use the exact math.Exp2 rather than a linear interpolation of the
+// fractional part. The convex 2^-frac was over-estimated by `1 - 0.5*frac`
+// (~6% high at frac=0.5), so misbehaviour scores decayed measurably slower
+// than the configured half-life.
 func pow2neg(n float64) float64 {
-	// 2^-n = e^(-n * ln2). Series isn't worth it — use a loop of halving
-	// for the integer part and one fast linear interp for the fraction.
 	if n <= 0 {
 		return 1
 	}
-	whole := int(n)
-	frac := n - float64(whole)
-	out := 1.0
-	for i := 0; i < whole; i++ {
-		out *= 0.5
-	}
-	// linear interp between 1 and 0.5 over the fractional part
-	out *= 1 - 0.5*frac
-	return out
+	return math.Exp2(-n)
 }
