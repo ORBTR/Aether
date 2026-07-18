@@ -91,3 +91,39 @@ func TestSplitPayloadRejectsOversizedPayload(t *testing.T) {
 		t.Fatalf("small payload: expected nil fragments, got %d", len(frags))
 	}
 }
+
+// TestSplitPayload_EscapesMagicPrefix is the AER-068 regression: a small
+// unfragmented payload that starts with the fragment magic must be escaped as
+// a single (0,1) fragment so the receiver's IsFragment gate stays authoritative
+// and the payload round-trips instead of being misread as a fragment header.
+func TestSplitPayload_EscapesMagicPrefix(t *testing.T) {
+	// A payload beginning with the fragment magic bytes ("FR"), short enough
+	// that it would normally be sent unfragmented.
+	msg := append([]byte{fragMagic0, fragMagic1}, []byte("hello world payload")...)
+
+	frags, err := SplitPayload(msg, 1200)
+	if err != nil {
+		t.Fatalf("SplitPayload: %v", err)
+	}
+	if len(frags) != 1 {
+		t.Fatalf("expected 1 escaped fragment, got %d", len(frags))
+	}
+	if !IsFragment(frags[0]) {
+		t.Fatal("escaped payload must be recognised as a fragment")
+	}
+
+	fb := NewFragmentBuffer()
+	assembled, err := fb.Add(1, 1, frags[0])
+	if err != nil {
+		t.Fatalf("FragmentBuffer.Add: %v", err)
+	}
+	if string(assembled) != string(msg) {
+		t.Fatalf("round-trip mismatch: got %q, want %q", assembled, msg)
+	}
+
+	// A normal small payload that does NOT start with the magic is still sent
+	// unfragmented (SplitPayload returns nil).
+	if frags, err := SplitPayload([]byte("plain small payload"), 1200); err != nil || frags != nil {
+		t.Fatalf("non-magic small payload: got frags=%v err=%v, want nil,nil", frags, err)
+	}
+}

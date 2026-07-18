@@ -86,6 +86,25 @@ func SplitPayload(data []byte, maxPayload int) ([][]byte, error) {
 	}
 	chunkSize := maxPayload - fragHeaderSize
 	if len(data) <= maxPayload {
+		// AER-068: the receiver distinguishes fragments purely by a payload-
+		// prefix magic (IsFragment) — the short-header DATA path carries no
+		// spare flag to mark them out-of-band. A small unfragmented payload
+		// that happens to START with that magic (deterministic for a text
+		// protocol beginning "FR", ~2^-16 for random binary) would be misread
+		// as a fragment header and silently lost or corrupt the next real
+		// message. Escape it by shipping it as a single (index=0, total=1)
+		// fragment so IsFragment is always authoritative; the receiver
+		// reassembles a total=1 group immediately. Costs the 4-byte header only
+		// for the rare colliding payload.
+		if len(data) >= 2 && data[0] == fragMagic0 && data[1] == fragMagic1 {
+			frag := make([]byte, fragHeaderSize+len(data))
+			frag[0] = fragMagic0
+			frag[1] = fragMagic1
+			frag[2] = 0 // index
+			frag[3] = 1 // total — single fragment, completes on arrival
+			copy(frag[fragHeaderSize:], data)
+			return [][]byte{frag}, nil
+		}
 		return nil, nil // no fragmentation needed
 	}
 
