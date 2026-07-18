@@ -56,6 +56,11 @@ type Engine struct {
 
 	// Configuration
 	maxAge time.Duration // 0 = no deadline (reliable forever)
+
+	// closed guards post-Close use. AER-069: Close no longer nils the
+	// component pointers (which panicked on any later call); it flips this
+	// flag under both locks instead. Guarded by sendMu (Close takes both).
+	closed bool
 }
 
 // EngineConfig holds configuration for creating a reliability engine.
@@ -170,15 +175,39 @@ func (e *Engine) ProcessACK(ackNo uint32, sackBlocks []aether.SACKBlock) (rttSam
 	e.sendMu.Lock()
 	defer e.sendMu.Unlock()
 
-	// Cumulative ACK
-	entry := e.SendWin.Ack(ackNo)
-	if entry != nil {
-		if entry.Retries == 0 {
-			rttSample = time.Since(entry.SentAt)
+	// Cumulative ACK: ackNo acknowledges EVERY outstanding seq in
+	// [base, ackNo], not just ackNo itself. AER-069: the old code acked and
+	// removed only `ackNo`, stranding every lower unacked seq in both the
+	// send window and the retransmit queue forever — they never left the
+	// retransmit heap, so they fired spurious duplicate retransmits and the
+	// send window never advanced past them. Walk base..ackNo, acking each.
+	//
+	// Bound the walk by maxAckRangeSpan exactly as the SACK path below and
+	// SendWindow.AckRange do: ackNo is peer-controlled, so base..ackNo can be
+	// a ~4B span for a stale or malicious value (ackNo < base underflows to a
+	// huge span). An oversize span is skipped entirely — a real cumulative
+	// ACK never covers that many seqs at once.
+	base := e.SendWin.Base()
+	if span := uint64(ackNo - base); span <= maxAckRangeSpan {
+		var sample *SendEntry
+		seq := base
+		for i := uint64(0); i <= span; i++ {
+			if entry := e.SendWin.Ack(seq); entry != nil {
+				ackedBytes += int64(entry.Frame.Length)
+				e.RetransmitQ.Remove(seq)
+				// AER-064: sample RTT from the largest-acked non-retransmitted
+				// entry (RFC 9002 §5.1), consistent with the noise dispatch
+				// path — sampling the oldest instead inflates SRTT/RTO.
+				if entry.Retries == 0 && (sample == nil || entry.SentAt.After(sample.SentAt)) {
+					sample = entry
+				}
+			}
+			seq++
+		}
+		if sample != nil {
+			rttSample = time.Since(sample.SentAt)
 			e.RTT.Update(rttSample)
 		}
-		ackedBytes += int64(entry.Frame.Length)
-		e.RetransmitQ.Remove(ackNo)
 	}
 
 	// SACK blocks
@@ -207,26 +236,54 @@ func (e *Engine) ProcessACK(ackNo uint32, sackBlocks []aether.SACKBlock) (rttSam
 	return rttSample, ackedBytes
 }
 
-// Tick checks for retransmission timeouts. Returns a frame to retransmit (or nil).
-// Should be called periodically (e.g., every 10ms). Send-path → sendMu.
-func (e *Engine) Tick() *aether.Frame {
+// Tick checks for retransmission timeouts and returns every frame that is due
+// this tick. Should be called periodically (e.g., every 10ms). Send-path →
+// sendMu.
+//
+// AER-069: the old signature returned a single frame and called BackoffRTO
+// once per returned frame. A caller draining all due frames (the only correct
+// use) therefore looped Tick and backed the RTO estimator off once *per due
+// frame* — an N-frame timeout burst multiplied the RTO by 2^N, freezing the
+// send side. Drain the whole due set here and back the estimator off at most
+// once, since a single detection instant is one loss signal regardless of how
+// many frames it covers.
+func (e *Engine) Tick() []*aether.Frame {
 	e.sendMu.Lock()
 	defer e.sendMu.Unlock()
 
-	frame := e.RetransmitQ.Dequeue()
-	if frame != nil {
+	var due []*aether.Frame
+	for {
+		frame := e.RetransmitQ.Dequeue()
+		if frame == nil {
+			break
+		}
+		due = append(due, frame)
+	}
+	if len(due) > 0 {
 		e.RTT.BackoffRTO()
 	}
-	return frame
+	return due
 }
 
 // GenerateSACKInfo returns the cumulative ACK point and SACK blocks for
 // sending an ACK frame back to the sender. Recv-path → recvMu.
-func (e *Engine) GenerateSACKInfo() (expectedSeqNo uint32, blocks []aether.SACKBlock) {
+//
+// AER-069: the cumulative ACK point is the highest CONTIGUOUSLY received seq,
+// which is `ExpectedSeqNo() - 1` — NOT ExpectedSeqNo() itself. The old code
+// returned the next-expected seq, i.e. one MORE than was actually received in
+// order; a peer decoding it as the cumulative point (the field's meaning, per
+// the ACKEngine's `BaseACK: expected-1`) would believe an extra frame was
+// delivered and stop retransmitting a frame the receiver never got.
+//
+// When nothing has been received in order yet (expected==0), the point wraps
+// to 0xFFFFFFFF, which is the same "no cumulative coverage" sentinel the
+// ACKEngine flags with CACKNoCumulative (AER-060). This facade has no flag
+// field, so callers must treat 0xFFFFFFFF as "no cumulative ACK yet".
+func (e *Engine) GenerateSACKInfo() (cumulativeAck uint32, blocks []aether.SACKBlock) {
 	e.recvMu.Lock()
 	defer e.recvMu.Unlock()
 
-	return e.RecvWin.ExpectedSeqNo(), e.RecvWin.MissingRanges()
+	return e.RecvWin.ExpectedSeqNo() - 1, e.RecvWin.MissingRanges()
 }
 
 // SRTT returns the current smoothed RTT estimate.
@@ -239,15 +296,25 @@ func (e *Engine) RTO() time.Duration {
 	return e.RTT.RTO()
 }
 
-// Close releases all resources held by the engine. Acquire both locks
-// to make sure no Send/Receive is in flight when we drop the references.
+// Close marks the engine closed. Acquire both locks so no Send/Receive is in
+// flight when it runs. It is idempotent and safe to call concurrently.
+//
+// AER-069: the old Close nil'd SendWin/RecvWin/RetransmitQ. The sub-components
+// have no resources to release (no goroutines, no fds), so nil-ing bought
+// nothing and turned any post-Close call — including a second Close, or a
+// racing Tick/ProcessACK/Receive — into a nil-pointer panic. Flip a closed
+// flag instead and leave the components intact; Closed() lets callers gate.
 func (e *Engine) Close() {
 	e.sendMu.Lock()
 	defer e.sendMu.Unlock()
 	e.recvMu.Lock()
 	defer e.recvMu.Unlock()
-	// Components don't have explicit Close methods, but clear references
-	e.SendWin = nil
-	e.RecvWin = nil
-	e.RetransmitQ = nil
+	e.closed = true
+}
+
+// Closed reports whether Close has been called.
+func (e *Engine) Closed() bool {
+	e.sendMu.Lock()
+	defer e.sendMu.Unlock()
+	return e.closed
 }

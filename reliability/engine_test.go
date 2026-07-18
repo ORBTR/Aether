@@ -99,9 +99,12 @@ func TestEngine_GenerateSACKInfo(t *testing.T) {
 	eng.Receive(0, []byte("a"), false)
 	eng.Receive(2, []byte("c"), false)
 
-	expected, blocks := eng.GenerateSACKInfo()
-	if expected != 1 {
-		t.Errorf("expected SeqNo: got %d, want 1", expected)
+	// AER-069: GenerateSACKInfo returns the cumulative ACK point = highest
+	// contiguously received seq = ExpectedSeqNo()-1. Received 0, skipped 1,
+	// so the cumulative point is 0 (not the next-expected 1).
+	cumulativeAck, blocks := eng.GenerateSACKInfo()
+	if cumulativeAck != 0 {
+		t.Errorf("cumulative ACK point: got %d, want 0", cumulativeAck)
 	}
 	if len(blocks) != 1 {
 		t.Fatalf("expected 1 SACK block, got %d", len(blocks))
