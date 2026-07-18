@@ -122,7 +122,13 @@ type tcpStream struct {
 	deliverCh        chan []byte
 	deliverOnce      sync.Once // closes deliverCh exactly once from teardown
 	deliverStartOnce sync.Once // starts deliverLoop exactly once
-	window           *flow.StreamWindow
+	// fragBuf reassembles fragmented messages. AER-099: Send fragments a
+	// message larger than MaxFrameSize into fragment-headed DATA frames (with
+	// [magic|index|total] metadata) so the original message boundary is
+	// restored here instead of surfacing each chunk as its own Receive().
+	// Touched only by Receive (single-consumer per stream).
+	fragBuf *FragmentBuffer
+	window  *flow.StreamWindow
 	// grantDebouncer coalesces stream-level WINDOW_UPDATE emissions driven
 	// by application reads. Lazily attached by attachGrantDebouncer after
 	// struct construction because the session method references must reach
@@ -584,6 +590,7 @@ func (s *TCPSession) handleOpen(frame *aether.Frame) {
 		state:     aether.NewStreamStateMachine(),
 		recvCh:    make(chan []byte, recvChCapacity(frame.StreamID)),
 		deliverCh: make(chan []byte, recvChCapacity(frame.StreamID)),
+		fragBuf:   NewFragmentBuffer(),
 		window:    flow.NewStreamWindowWithCap(0, 0),
 		observe:   reliability.NewObserveEngine(),
 	}
@@ -639,6 +646,7 @@ func (s *TCPSession) handleImplicitOpen(frame *aether.Frame) {
 		state:     aether.NewStreamStateMachine(),
 		recvCh:    make(chan []byte, recvChCapacity(frame.StreamID)),
 		deliverCh: make(chan []byte, recvChCapacity(frame.StreamID)),
+		fragBuf:   NewFragmentBuffer(),
 		window:    flow.NewStreamWindowWithCap(cfg.InitialCredit, cfg.MaxCredit),
 		observe:   reliability.NewObserveEngine(),
 	}
@@ -988,6 +996,7 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 		state:     aether.NewStreamStateMachine(),
 		recvCh:    make(chan []byte, recvChCapacity(cfg.StreamID)),
 		deliverCh: make(chan []byte, recvChCapacity(cfg.StreamID)),
+		fragBuf:   NewFragmentBuffer(),
 		window:    flow.NewStreamWindowWithCap(cfg.InitialCredit, cfg.MaxCredit),
 		observe:   reliability.NewObserveEngine(),
 	}
@@ -1355,13 +1364,28 @@ func (st *tcpStream) Send(ctx context.Context, data []byte) error {
 	}
 
 	totalLen := len(data)
-	for len(data) > 0 {
-		chunk := data
-		if len(chunk) > maxFrame {
-			chunk = data[:maxFrame]
-		}
-		data = data[len(chunk):]
 
+	// AER-099: fragment WITH explicit header/reassembly metadata rather than
+	// chopping the message into unrelated DATA frames. The old loop split a
+	// payload > maxFrame into headerless chunks with no grouping, so a
+	// message-oriented peer saw the boundary silently change (its Receive()
+	// returned a truncated head followed by extra messages). SplitPayload tags
+	// each chunk [magic|index|total] so the receiver's FragmentBuffer restores
+	// the original message; the chunks are still separate DATA frames, so the
+	// scheduler interleaving that motivated chunking is preserved. It returns
+	// nil for a payload that fits one frame (fast path, no header overhead)
+	// except when the payload starts with the fragment magic, which it escapes
+	// as a single fragment so IsFragment stays authoritative (AER-068).
+	fragments, err := SplitPayload(data, maxFrame)
+	if err != nil {
+		// Payload exceeds the 255-fragment ceiling at this frame size — fail
+		// loudly rather than ship a silently-truncated message (AE-H-03).
+		return fmt.Errorf("stream %d: %w", st.streamID, err)
+	}
+	if fragments == nil {
+		fragments = [][]byte{data} // fits one frame — send verbatim
+	}
+	for _, chunk := range fragments {
 		frame := &aether.Frame{
 			SenderID:   st.session.LocalPeerID(),
 			ReceiverID: st.session.RemotePeerID(),
@@ -1380,22 +1404,48 @@ func (st *tcpStream) Send(ctx context.Context, data []byte) error {
 }
 
 func (st *tcpStream) Receive(ctx context.Context) ([]byte, error) {
-	select {
-	case data, ok := <-st.recvCh:
-		if !ok {
-			return nil, io.EOF
+	for {
+		select {
+		case data, ok := <-st.recvCh:
+			if !ok {
+				return nil, io.EOF
+			}
+			// Consume-driven grant: record the app-consumed bytes in the
+			// stream-level debouncer so WINDOW_UPDATE emission advances with
+			// application progress, not frame-receipt. Recorded on the raw
+			// bytes pulled off recvCh (including any fragment header) so the
+			// sender's window advances per fragment, not only on the final
+			// reassembly — otherwise a multi-fragment message would stall the
+			// sender for the whole reassembly span.
+			if st.grantDebouncer != nil {
+				st.grantDebouncer.Record(int64(len(data)))
+			}
+			// AER-099: reassemble fragmented messages so the original message
+			// boundary the Send side split is restored, instead of returning
+			// each chunk as its own Receive() result.
+			if IsFragment(data) {
+				if st.fragBuf == nil {
+					st.fragBuf = NewFragmentBuffer() // direct-construction fallback
+				}
+				// recvCh doesn't carry the frame SeqNo, so pass 0 — the
+				// per-stream FragmentBuffer uses its own monotonic counter for
+				// group keys, and TCP's in-order delivery keeps fragments
+				// contiguous within their group.
+				assembled, err := st.fragBuf.Add(st.streamID, 0, data)
+				if err != nil {
+					continue // corrupted/over-cap fragment — skip
+				}
+				if assembled == nil {
+					continue // more fragments needed — loop back to recvCh
+				}
+				return assembled, nil
+			}
+			return data, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-st.session.CloseSignal():
+			return nil, fmt.Errorf("session closed")
 		}
-		// Consume-driven grant: record the app-consumed bytes in the
-		// stream-level debouncer so WINDOW_UPDATE emission advances with
-		// application progress, not frame-receipt.
-		if st.grantDebouncer != nil {
-			st.grantDebouncer.Record(int64(len(data)))
-		}
-		return data, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-st.session.CloseSignal():
-		return nil, fmt.Errorf("session closed")
 	}
 }
 
