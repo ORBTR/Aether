@@ -236,7 +236,13 @@ func (l *noiseListener) onInnerRelay(fwd *IntraOrgForwarder, buf []byte, addr *n
 		// reverse mapping so when the noise transport replies to
 		// dec.SrcAddr, the write path wraps in OpReply and sends to
 		// addr (M_r) instead.
-		if dec.SrcAddr == nil {
+		// AER-044: DecodeInnerRelay always returns a non-nil SrcAddr, so the
+		// original nil-only guard never fired for the "undefined originator"
+		// zero-IP encoding the sender uses. Drop frames whose decoded source
+		// IP is nil or unspecified (0.0.0.0 / ::) — registering/injecting
+		// against 0.0.0.0:port contradicts the drop contract and is another
+		// attacker-shaped key (compounds AER-038).
+		if dec.SrcAddr == nil || dec.SrcAddr.IP == nil || dec.SrcAddr.IP.IsUnspecified() {
 			fwd.recordDrop(dropOpForwardNoSrc)
 			return nil, nil, true
 		}
