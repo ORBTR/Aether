@@ -19,6 +19,10 @@ import (
 	"github.com/ORBTR/aether/relay"
 )
 
+// relayForwardTimeout bounds a single relay forward to an external session so
+// a wedged/backpressured target can't pin the relaying goroutine (AER-041).
+const relayForwardTimeout = 5 * time.Second
+
 // handleRelayRequest processes an incoming relay request from a Noise session.
 // Checks Noise sessions first, then external (WS/QUIC) sessions as fallback.
 // Enforces scope isolation: source and target must belong to the same scope.
@@ -53,7 +57,13 @@ func (t *NoiseTransport) handleRelayRequest(c *noiseConn, payload []byte) error 
 			frame := make([]byte, relay.RelayHeaderSize+len(data))
 			copy(frame[:relay.RelayHeaderSize], c.remoteNode)
 			copy(frame[relay.RelayHeaderSize:], data)
-			return extSess.Send(context.Background(), frame)
+			// AER-041: bound the forward with a deadline. context.Background()
+			// let a wedged/backpressured target session pin this relaying
+			// goroutine indefinitely, so a slow or malicious target could
+			// slowloris-pin relay goroutines.
+			ctx, cancel := context.WithTimeout(context.Background(), relayForwardTimeout)
+			defer cancel()
+			return extSess.Send(ctx, frame)
 		}
 	}
 

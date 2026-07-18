@@ -10,6 +10,12 @@ import (
 	"time"
 )
 
+// adaptiveGoroutineFloor is the goroutine count below which the (poor)
+// goroutine-based CPU heuristic reports zero load. Sized well above a normal
+// mesh node's per-session goroutine footprint so ordinary operation never
+// false-triggers load-shedding (AER-025).
+const adaptiveGoroutineFloor = 2000
+
 // AdaptiveController monitors system load and dynamically disables
 // expensive Aether features when CPU is saturated.
 //
@@ -105,15 +111,21 @@ func (a *AdaptiveController) check() {
 	}
 	a.mu.Unlock()
 
-	// Estimate CPU utilization from goroutine count and GOMAXPROCS.
-	// This is a rough heuristic — production should use runtime/pprof or cgroup stats.
+	// AER-025: goroutine count is a POOR proxy for CPU. Each Noise/TCP session
+	// spawns several goroutines, so the old goroutines/(maxProcs*10) formula
+	// read as permanently "saturated" on any node with more than ~2×maxProcs
+	// sessions and disabled compression fleet-wide — a bandwidth cost, not a
+	// real load response. Until a real CPU source (cgroup/pprof) is wired,
+	// only a genuine goroutine EXPLOSION (far beyond normal per-session
+	// counts) is treated as pressure, scaling from a high floor so ordinary
+	// operation reads as unloaded and the safe default (compression on) holds.
 	goroutines := runtime.NumGoroutine()
-	maxProcs := runtime.GOMAXPROCS(0)
-	// Rough estimate: if goroutines >> maxProcs, CPU is likely saturated.
-	// This is imprecise but works as a fast check without OS-specific APIs.
-	estimated := float64(goroutines) / float64(maxProcs*10) * 100
-	if estimated > 100 {
-		estimated = 100
+	estimated := 0.0
+	if goroutines > adaptiveGoroutineFloor {
+		estimated = float64(goroutines-adaptiveGoroutineFloor) / float64(adaptiveGoroutineFloor) * 100
+		if estimated > 100 {
+			estimated = 100
+		}
 	}
 
 	a.applyDegradation(estimated)
