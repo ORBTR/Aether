@@ -110,6 +110,16 @@ type NoiseTransportConfig struct {
 	// (→ false). Set to `BoolPtr(false)` if you need to disable for interop
 	// with legacy initiators that don't handle 0xFE retry prefix.
 	RequireRetryToken *bool
+
+	// EnableResume opts in to 0.5-RTT session resumption (ticket store +
+	// initiator cache + 0xFA resume packets). AER-006/097: default OFF. The
+	// initiator resume path (tryResumeDial) reads/arms a deadline on the
+	// SHARED listener socket, which can deafen the whole transport, and the
+	// resumed conn's write/close targets that shared socket — plus the ticket
+	// identity/scope/nonce handling has open defects (AER-013/027/093-096).
+	// Leave the resume machinery uninitialized unless a caller explicitly
+	// enables it, so tryResumeDial and ticket issuance short-circuit.
+	EnableResume bool
 }
 
 // BoolPtr returns a pointer to the given bool. Useful for explicitly
@@ -338,16 +348,22 @@ func NewNoiseTransport(cfg NoiseTransportConfig) (*NoiseTransport, error) {
 	t.relayService = relay.NewRelayService(cfg.RelayConfig, nil)
 	t.relayService.SetSessionIndex(t)
 
-	// Initialize session ticket store for resumption
-	ticketStore, ticketErr := NewTicketStore()
-	if ticketErr == nil {
-		t.ticketStore = ticketStore
+	// AER-006/097: 0.5-RTT resumption is OPT-IN. When disabled (the default),
+	// leave ticketStore / initiatorTickets / seenTickets nil so tryResumeDial
+	// (transport.go Dial), responder ticket issuance (handshake.go), and the
+	// 0xFA resume packet path all short-circuit — closing the listener-death
+	// footgun and the ticket identity/scope defects until that path is
+	// reworked to route through the listener demux.
+	if cfg.EnableResume {
+		if ticketStore, ticketErr := NewTicketStore(); ticketErr == nil {
+			t.ticketStore = ticketStore
+		}
+		// Initiator-side resume cache and responder-side replay guard.
+		// Kept independent of the ticket key store — these are in-memory
+		// only and have no cryptographic secrets.
+		t.initiatorTickets = newInitiatorTicketCache(DefaultTicketCacheSize)
+		t.seenTickets = newSeenTicketCache(DefaultSeenTicketCacheSize)
 	}
-	// Initiator-side resume cache and responder-side replay guard.
-	// Kept independent of the ticket key store — these are in-memory
-	// only and have no cryptographic secrets.
-	t.initiatorTickets = newInitiatorTicketCache(DefaultTicketCacheSize)
-	t.seenTickets = newSeenTicketCache(DefaultSeenTicketCacheSize)
 	return t, nil
 }
 
