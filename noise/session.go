@@ -1097,7 +1097,20 @@ func (l *noiseListener) runReader(ctx context.Context, conn *net.UDPConn) {
 		// SLOW PATH — packet did not match an established session.
 		// Treat as handshake-candidate from unknown / first-contact
 		// source and apply the rate limits intended for that path.
-		if l.transport.sourceLimit != nil && !l.transport.sourceLimit.Allow(addr) {
+		//
+		// AER-012: exempt packets for an IN-PROGRESS handshake (we already
+		// hold listenerHandshake state for this address) from the per-source
+		// flood bucket. That bucket (10 burst, 1/sec, keyed by IP) can't keep
+		// up with the ~1.43/sec msg1/msg3 retransmit cadence, so a dial that
+		// began while the bucket was low could never self-recover — a churn
+		// amplifier. This does not widen the first-contact flood surface: the
+		// initial msg1 still had to pass the limiter to create the entry, the
+		// handshake map is hard-capped (AE-P-21), and the global limiter below
+		// still applies to every packet.
+		l.mu.Lock()
+		_, handshakeInProgress := l.handshakes[key]
+		l.mu.Unlock()
+		if !handshakeInProgress && l.transport.sourceLimit != nil && !l.transport.sourceLimit.Allow(addr) {
 			l.drops.count(DropSourceLimit)
 			continue
 		}
