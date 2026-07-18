@@ -161,8 +161,21 @@ func (w *RecvWindow) InsertChecked(seqNo uint32, payload []byte) (delivered [][]
 	// Out-of-order: buffer it with arrival timestamp, subject to both
 	// the frame-count cap and the byte cap. A byte cap breach is treated
 	// the same as a frame-count breach — drop with dropCount++.
+	//
+	// AER-067: a re-inserted still-buffered seq (reachable via the dispatch
+	// layer's ResultAncient at/above-floor fall-through) must not double-
+	// count bufferedBytes. Discount the existing entry's length up front so
+	// the cap checks and the accumulator both see a replace, not an add.
+	// Left uncorrected, bufferedBytes inflated forever (reset only by Drain)
+	// until it neared maxBytes and the window degraded to strict in-order.
 	payloadLen := int64(len(payload))
-	if len(w.buffer) >= w.maxGap {
+	if old, exists := w.buffer[seqNo]; exists {
+		w.bufferedBytes -= int64(len(old))
+		if w.bufferedBytes < 0 {
+			w.bufferedBytes = 0
+		}
+	}
+	if _, exists := w.buffer[seqNo]; !exists && len(w.buffer) >= w.maxGap {
 		atomic.AddUint64(&w.dropCount, 1)
 		return nil, false
 	}

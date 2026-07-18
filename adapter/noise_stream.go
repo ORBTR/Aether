@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -179,6 +180,18 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 		rack:        congestion.NewRACK(eng.RTT.SRTT()),
 		tlp:         congestion.NewTLP(eng.RTT.SRTT()),
 	}
+	// AER-066: surface retransmit-queue evictions instead of dropping them
+	// silently. An eviction (byte-cap pressure, deadline, or max-retries
+	// exceeded) means a reliable frame lost its RTO safety net — previously
+	// invisible, so the resulting stall/loss had no diagnosable root cause.
+	st.retransmitQ.SetOnEvict(func(e *reliability.RetransmitEntry) {
+		if e == nil || e.Frame == nil {
+			return
+		}
+		atomic.AddUint64(&s.retransmitEvicted, 1)
+		log.Printf("[RETX-EVICT] peer=%s stream=%d seq=%d — retransmit dropped, no RTO safety net",
+			s.RemoteNodeID().Short(), streamID, e.Frame.SeqNo)
+	})
 	// Seed the TLP's max_ack_delay (RFC 9002 §6.2). Without a seed,
 	// PTO uses the conservative 25ms default for the first RTT
 	// regardless of the path's actual ACK cadence — firing spurious
