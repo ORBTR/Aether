@@ -345,40 +345,48 @@ func (w *SendWindow) ProcessCompositeACK(ack *aether.CompositeACK, reorderThresh
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// Reject BaseACK that's more than MaxACKCumulativeJump beyond the
-	// current base. A well-behaved peer never jumps this far in one ACK.
-	// Attacker use: BaseACK = base + 2^31 would force a ~2B-iteration loop.
-	// Use uint32 subtraction to detect both forward overshoot and any
-	// negative jump (which would wrap to a huge value).
-	if ack.BaseACK >= w.base {
-		if ack.BaseACK-w.base > MaxACKCumulativeJump {
-			atomic.AddUint64(&w.suspiciousACKs, 1)
+	// AER-060: CACKNoCumulative means the receiver has delivered nothing
+	// in-order yet, so BaseACK is the wrapped sentinel expected-1
+	// (0xFFFFFFFF) carried only to keep the bitmap aligned. Skip the
+	// cumulative loop and its jump check entirely — reading the sentinel as
+	// a ~4-billion forward jump is exactly what made this ACK look abusive.
+	// The SACK bitmap scan below still runs and fast-retransmits seq 0.
+	if ack.Flags&aether.CACKNoCumulative == 0 {
+		// Reject BaseACK that's more than MaxACKCumulativeJump beyond the
+		// current base. A well-behaved peer never jumps this far in one ACK.
+		// Attacker use: BaseACK = base + 2^31 would force a ~2B-iteration loop.
+		// Use uint32 subtraction to detect both forward overshoot and any
+		// negative jump (which would wrap to a huge value).
+		if ack.BaseACK >= w.base {
+			if ack.BaseACK-w.base > MaxACKCumulativeJump {
+				atomic.AddUint64(&w.suspiciousACKs, 1)
+				return nil, nil
+			}
+		} else {
+			// BaseACK before our base — stale or bogus, ignore but don't flag
+			// as suspicious (can legitimately happen with reordered ACKs).
+			// Count separately for observability — bursts of stale ACKs
+			// during a wedge are diagnostic.
+			atomic.AddUint64(&w.staleBaseACKs, 1)
 			return nil, nil
 		}
-	} else {
-		// BaseACK before our base — stale or bogus, ignore but don't flag
-		// as suspicious (can legitimately happen with reordered ACKs).
-		// Count separately for observability — bursts of stale ACKs
-		// during a wedge are diagnostic.
-		atomic.AddUint64(&w.staleBaseACKs, 1)
-		return nil, nil
-	}
 
-	// 1. Cumulative ACK (bounded by MaxACKCumulativeJump)
-	for seq := w.base; seq <= ack.BaseACK; seq++ {
-		if entry, ok := w.entries[seq]; ok {
-			entry.Acked = true
-			acked = append(acked, entry)
-			w.subInFlightLocked(entry)
-			delete(w.entries, seq)
+		// 1. Cumulative ACK (bounded by MaxACKCumulativeJump)
+		for seq := w.base; seq <= ack.BaseACK; seq++ {
+			if entry, ok := w.entries[seq]; ok {
+				entry.Acked = true
+				acked = append(acked, entry)
+				w.subInFlightLocked(entry)
+				delete(w.entries, seq)
+			}
 		}
-	}
-	// Advance base
-	for {
-		if _, exists := w.entries[w.base]; !exists && w.base < w.next {
-			w.base++
-		} else {
-			break
+		// Advance base
+		for {
+			if _, exists := w.entries[w.base]; !exists && w.base < w.next {
+				w.base++
+			} else {
+				break
+			}
 		}
 	}
 

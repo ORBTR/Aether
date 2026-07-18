@@ -404,6 +404,7 @@ const (
 	CACKInvertedBitmap  CompositeACKFlags = 0x10 // Reserved for future use: bit=1 means MISSING. Interleaved FEC (FECInterleaved) now handles burst loss recovery via two offset XOR groups in the FEC layer; this flag is kept for forward-compatibility with a potential future ACK-layer loss signaling mode.
 	CACKHasGaps         CompositeACKFlags = 0x20 // Receive window has gaps. ACK-lite (BitmapLen=0) ONLY valid when HasGaps=0
 	CACKHasWindowCredit CompositeACKFlags = 0x40 // Window-credit extension: 8-byte cumulative stream-level WINDOW_UPDATE grant piggybacked on the ACK. Eliminates a separate WINDOW_UPDATE frame when the receiver has granted new credit for this stream. Sender applies via StreamWindow.ApplyUpdate with the same cumulative semantics as a standalone WINDOW_UPDATE.
+	CACKNoCumulative    CompositeACKFlags = 0x80 // No cumulative acknowledgment: the receiver has delivered nothing in-order yet (expected==0), so BaseACK carries the wrapped sentinel expected-1 (0xFFFFFFFF) purely to keep the SACK bitmap aligned (BaseACK+1+i wraps to seq i). The sender MUST skip the cumulative-ack loop and its jump check and process only the SACK bitmap. Without this, expected-1 read as a ~4-billion forward jump made the sender discard the whole ACK and charge the honest receiver with ACK-validation abuse (AER-060).
 )
 
 // FlagCOMPOSITE_ACK is set on TypeACK frames that use the Composite ACK format.
