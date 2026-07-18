@@ -12,6 +12,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"net"
+	"strconv"
 	"testing"
 	"time"
 
@@ -27,12 +28,16 @@ import (
 // interceptor expects: NodeID + hex(ed25519 signature) + hex(pubkey).
 func makeAuthedContext(t *testing.T, ctx context.Context, priv ed25519.PrivateKey, localNode, remoteNode aether.NodeID) context.Context {
 	t.Helper()
-	msg := []byte("grpc-dial:" + string(localNode) + ":" + string(remoteNode))
+	tsStr := strconv.FormatInt(time.Now().UnixNano(), 10)
+	nonceStr := "test-nonce-" + tsStr
+	msg := []byte("grpc-dial:" + string(localNode) + ":" + string(remoteNode) + ":" + tsStr + ":" + nonceStr)
 	sig := ed25519.Sign(priv, msg)
 	md := metadata.Pairs(
 		MetadataNodeID, string(localNode),
 		MetadataSignature, hex.EncodeToString(sig),
 		MetadataPubKey, hex.EncodeToString(priv.Public().(ed25519.PublicKey)),
+		MetadataNonce, nonceStr,
+		MetadataTimestamp, tsStr,
 	)
 	return metadata.NewOutgoingContext(ctx, md)
 }

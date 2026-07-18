@@ -11,7 +11,9 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"fmt"
+	"strconv"
 	"testing"
+	"time"
 
 	"github.com/ORBTR/aether"
 	"google.golang.org/grpc/metadata"
@@ -68,12 +70,16 @@ func TestAEC03_ValidSignatureAccepted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewNodeID: %v", err)
 	}
-	msg := []byte(fmt.Sprintf("grpc-dial:%s:%s", nodeID, tr.localNode))
+	tsStr := strconv.FormatInt(time.Now().UnixNano(), 10)
+	nonceStr := "test-nonce-" + tsStr
+	msg := []byte(fmt.Sprintf("grpc-dial:%s:%s:%s:%s", nodeID, tr.localNode, tsStr, nonceStr))
 	sig := ed25519.Sign(priv, msg)
 	md := metadata.New(map[string]string{
 		MetadataNodeID:    string(nodeID),
 		MetadataPubKey:    hex.EncodeToString(pub),
 		MetadataSignature: hex.EncodeToString(sig),
+		MetadataNonce:     nonceStr,
+		MetadataTimestamp: tsStr,
 	})
 	ctx := metadata.NewIncomingContext(context.Background(), md)
 	got, err := tr.extractNodeID(ctx)

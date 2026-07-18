@@ -9,12 +9,15 @@ package grpc
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,7 +37,16 @@ const (
 	MetadataSignature = "x-orbtr-signature"
 	// MetadataPubKey is the gRPC metadata key for hex-encoded Ed25519 public key
 	MetadataPubKey = "x-orbtr-pubkey"
+	// MetadataNonce and MetadataTimestamp carry per-dial freshness so a
+	// captured metadata set cannot be replayed (AER-032).
+	MetadataNonce     = "x-orbtr-nonce"
+	MetadataTimestamp = "x-orbtr-timestamp"
 )
+
+// grpcDialFreshnessWindow bounds clock skew between a dial signature's
+// timestamp and the server's clock. A dial whose timestamp is outside this
+// window, or whose nonce was already seen within it, is rejected (AER-032).
+const grpcDialFreshnessWindow = 60 * time.Second
 
 // GrpcTransportConfig configures the gRPC aether.
 // When TLSConfig is non-nil, it is used for both dial and listen. Otherwise
@@ -56,6 +68,36 @@ type GrpcTransport struct {
 	server     *grpc.Server
 	incoming   chan aether.IncomingSession
 	closeOnce  sync.Once // AER-104: guard against double-close of incoming
+	replay     *grpcDialReplayGuard // AER-032: per-dial nonce replay defense
+}
+
+// grpcDialReplayGuard rejects reuse of an authenticated dial nonce within the
+// freshness window (AER-032). Mirrors the WebSocket transport's dialReplayGuard.
+type grpcDialReplayGuard struct {
+	mu   sync.Mutex
+	seen map[string]time.Time // nonce → expiry
+}
+
+func newGrpcDialReplayGuard() *grpcDialReplayGuard {
+	return &grpcDialReplayGuard{seen: make(map[string]time.Time)}
+}
+
+// checkAndRecord returns true if the nonce is fresh (unseen within the
+// window) and records it with the given expiry; false if it is a replay.
+// Expired entries are swept on each call to bound memory.
+func (g *grpcDialReplayGuard) checkAndRecord(nonce string, now, expiry time.Time) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for k, exp := range g.seen {
+		if now.After(exp) {
+			delete(g.seen, k)
+		}
+	}
+	if exp, ok := g.seen[nonce]; ok && now.Before(exp) {
+		return false
+	}
+	g.seen[nonce] = expiry
+	return true
 }
 
 // NewGrpcTransport creates a new gRPC transport. Returns (T, error)
@@ -69,6 +111,7 @@ func NewGrpcTransport(cfg GrpcTransportConfig) (*GrpcTransport, error) {
 		listenAddr: cfg.ListenAddr,
 		tlsConfig:  cfg.TLSConfig,
 		incoming:   make(chan aether.IncomingSession, 32),
+		replay:     newGrpcDialReplayGuard(),
 	}, nil
 }
 
@@ -100,13 +143,23 @@ func (t *GrpcTransport) Dial(ctx context.Context, target aether.Target) (aether.
 		return nil, errors.New("grpc: missing address")
 	}
 
-	// Create signed metadata to prove our identity.
-	message := []byte(fmt.Sprintf("grpc-dial:%s:%s", t.localNode, target.NodeID))
+	// Create signed metadata to prove our identity. AER-032: bind a fresh
+	// timestamp + random nonce into the signed message so a captured metadata
+	// set cannot be replayed to impersonate this NodeID.
+	nonce := make([]byte, 16)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, aether.WrapOp("dial", aether.ProtoGRPC, target.NodeID, err)
+	}
+	nonceStr := base64.RawStdEncoding.EncodeToString(nonce)
+	tsStr := strconv.FormatInt(time.Now().UnixNano(), 10)
+	message := []byte(fmt.Sprintf("grpc-dial:%s:%s:%s:%s", t.localNode, target.NodeID, tsStr, nonceStr))
 	signature := ed25519.Sign(t.privateKey, message)
 	md := metadata.Pairs(
 		MetadataNodeID, string(t.localNode),
 		MetadataSignature, hex.EncodeToString(signature),
 		MetadataPubKey, hex.EncodeToString(t.privateKey.Public().(ed25519.PublicKey)),
+		MetadataNonce, nonceStr,
+		MetadataTimestamp, tsStr,
 	)
 
 	conn, err := grpc.DialContext(ctx, target.Address,
@@ -208,8 +261,22 @@ func (t *GrpcTransport) streamAuthInterceptor(
 	return handler(srv, ss)
 }
 
-// extractNodeID extracts and optionally verifies NodeID from gRPC metadata.
+// extractNodeID fully authenticates the caller's NodeID from gRPC metadata,
+// including consuming the one-time dial nonce (replay defense). Used by the
+// auth interceptors, which run once per stream.
 func (t *GrpcTransport) extractNodeID(ctx context.Context) (aether.NodeID, error) {
+	return t.extractNodeIDImpl(ctx, true)
+}
+
+// extractNodeIDVerified returns the authenticated NodeID WITHOUT re-consuming
+// the dial nonce. The stream handler calls this after the interceptor has
+// already gated the stream, so re-running the replay check would reject the
+// legitimate second read of the same nonce (AER-032).
+func (t *GrpcTransport) extractNodeIDVerified(ctx context.Context) (aether.NodeID, error) {
+	return t.extractNodeIDImpl(ctx, false)
+}
+
+func (t *GrpcTransport) extractNodeIDImpl(ctx context.Context, checkReplay bool) (aether.NodeID, error) {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		return "", errors.New("grpc: missing metadata")
@@ -254,10 +321,39 @@ func (t *GrpcTransport) extractNodeID(ctx context.Context) (aether.NodeID, error
 		return "", errors.New("grpc: public key does not match NodeID")
 	}
 
-	// Verify signature
-	message := []byte(fmt.Sprintf("grpc-dial:%s:%s", nodeID, t.localNode))
+	// AER-032: require a fresh timestamp + unseen nonce, and verify the
+	// signature over BOTH. Without this the signature was over a static
+	// message, so a captured (nodeid, sig, pubkey) triple replayed
+	// indefinitely to open sessions impersonating the victim NodeID.
+	nonces := md.Get(MetadataNonce)
+	timestamps := md.Get(MetadataTimestamp)
+	if len(nonces) == 0 || len(timestamps) == 0 {
+		return "", errors.New("grpc: missing dial freshness (nonce/timestamp)")
+	}
+	nonceStr := nonces[0]
+	tsStr := timestamps[0]
+	tsNano, err := strconv.ParseInt(tsStr, 10, 64)
+	if err != nil {
+		return "", errors.New("grpc: invalid dial timestamp")
+	}
+	now := time.Now()
+	if skew := now.Sub(time.Unix(0, tsNano)); skew > grpcDialFreshnessWindow || skew < -grpcDialFreshnessWindow {
+		return "", errors.New("grpc: stale dial timestamp")
+	}
+
+	// Verify signature over the freshness-bound message (must match Dial).
+	message := []byte(fmt.Sprintf("grpc-dial:%s:%s:%s:%s", nodeID, t.localNode, tsStr, nonceStr))
 	if !ed25519.Verify(pubKey, message, sig) {
 		return "", errors.New("grpc: invalid signature")
+	}
+
+	// Reject replays only after the signature proves authenticity, so a
+	// forged nonce cannot evict a legitimate one from the guard. checkReplay
+	// is false for the post-interceptor handler read so it doesn't reject the
+	// legitimate second read of the same stream's nonce.
+	if checkReplay && t.replay != nil &&
+		!t.replay.checkAndRecord(nonceStr, now, time.Unix(0, tsNano).Add(grpcDialFreshnessWindow)) {
+		return "", errors.New("grpc: replayed dial nonce")
 	}
 
 	return nodeID, nil
@@ -329,7 +425,7 @@ type transportServer struct {
 // Each Stream RPC becomes one mesh session (like one WebSocket connection).
 // A pair of io.Pipe bridges the gRPC stream to a net.Conn for TCPSession.
 func (s *transportServer) Stream(stream pb.TransportService_StreamServer) error {
-	nodeID, err := s.transport.extractNodeID(stream.Context())
+	nodeID, err := s.transport.extractNodeIDVerified(stream.Context())
 	if err != nil {
 		return err
 	}
