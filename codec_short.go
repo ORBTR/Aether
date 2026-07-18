@@ -197,6 +197,13 @@ func (c *Compressor) ShouldCompressACK(f *Frame) bool {
 	if f.StreamID > MaxShortHeaderStreamID {
 		return false
 	}
+	// AER-053: the ACK-full short form carries a 2-byte length. A frame whose
+	// Length exceeds 65535 would wrap that field while its full payload was
+	// still written, desyncing the decoder byte stream. Fall back to the full
+	// header for such frames (today's CompositeACK is <= ~375 B, so latent).
+	if f.Length > 0xFFFF {
+		return false
+	}
 	c.Session.mu.RLock()
 	defer c.Session.mu.RUnlock()
 	return c.Session.identitySet &&
