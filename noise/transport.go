@@ -425,7 +425,7 @@ func (t *NoiseTransport) Dial(ctx context.Context, target aether.Target) (aether
 			listener.sessions.Put(target.NodeID, addr.String(), "", &noiseConnSession{conn: nc, nodeID: target.NodeID})
 			listener.mu.Unlock()
 			dbgHandshake.Printf("Resumed session with %s via cached ticket", target.NodeID.Short())
-			return aether.NewConnection(t.localNode, target.NodeID, nc), nil
+			return aether.NewConnection(t.localNode, target.NodeID, nc, aether.ProtoNoise), nil
 		}
 		// Any error (rejected, timeout, tag mismatch) → fall through.
 		// tryResumeDial evicts the cache entry on explicit reject so we
@@ -715,7 +715,7 @@ func (t *NoiseTransport) LookupByNodeID(id aether.NodeID) aether.Connection {
 	if nc == nil {
 		return nil
 	}
-	return aether.NewConnection(t.localNode, id, nc)
+	return aether.NewConnection(t.localNode, id, nc, aether.ProtoNoise)
 }
 
 // LookupExternal implements relay.SessionIndex — delegates to RelayService's

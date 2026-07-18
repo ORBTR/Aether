@@ -407,7 +407,7 @@ func buildAetherConnectionOverConn(
 	}
 	nc.parentStop = func() { _ = conn.Close() }
 	go nc.runReader()
-	s := aether.NewConnection(local, remote, nc)
+	s := aether.NewConnection(local, remote, nc, aether.ProtoNoise)
 	s.OnClose(func() { nc.Close() })
 	return s
 }

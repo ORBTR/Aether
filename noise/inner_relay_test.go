@@ -318,14 +318,20 @@ func TestRoutingPreamble_RejectsUnknownFlagBits(t *testing.T) {
 	}
 }
 
-func TestRoutingPreamble_PanicsOnOverlongNodeID(t *testing.T) {
+// AER-108: EncodeRoutingPreamble must NOT panic on an over-length NodeID — a
+// parsed legacy-format NodeID (a public-API value) can be longer than 30 bytes
+// and would otherwise crash the process during a cross-org dial. It now
+// returns nil (the caller emits no preamble, degrading to a direct dial).
+func TestRoutingPreamble_NilOnOverlongNodeID(t *testing.T) {
 	defer func() {
-		if r := recover(); r == nil {
-			t.Fatal("EncodeRoutingPreamble must panic on NodeID > 30 bytes; no panic observed")
+		if r := recover(); r != nil {
+			t.Fatalf("EncodeRoutingPreamble must not panic on an over-length NodeID; got %v", r)
 		}
 	}()
 	overlong := aether.NodeID("vl1_this_string_is_well_beyond_30_bytes_long_xxxxx")
-	EncodeRoutingPreamble(overlong)
+	if got := EncodeRoutingPreamble(overlong); got != nil {
+		t.Fatalf("EncodeRoutingPreamble(overlong) = %d bytes, want nil", len(got))
+	}
 }
 
 func TestForwarder_CapEvictsOldest(t *testing.T) {

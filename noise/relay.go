@@ -298,7 +298,7 @@ func (l *noiseListener) handleRelayedHandshake(relayConn *noiseConn, sourceNodeI
 	delete(l.handshakes, sourceNodeID)
 	l.mu.Unlock()
 
-	s := aether.NewConnection(l.transport.localNode, remoteNode, nc)
+	s := aether.NewConnection(l.transport.localNode, remoteNode, nc, aether.ProtoNoise)
 	s.OnClose(func() { nc.Close() })
 
 	// Notify listener of new session

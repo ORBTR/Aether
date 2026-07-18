@@ -570,7 +570,7 @@ func (l *noiseListener) handleResumePacket(ctx context.Context, conn *net.UDPCon
 
 	// Deliver to the incoming-session channel so the application layer
 	// sees the resumed session just like any XK/XX-established one.
-	s := aether.NewConnection(l.transport.localNode, ticket.PeerID, nc)
+	s := aether.NewConnection(l.transport.localNode, ticket.PeerID, nc, aether.ProtoNoise)
 	s.OnClose(func() { nc.Close() })
 	select {
 	case l.incoming <- aether.IncomingSession{Session: s, Reader: nc, Writer: nc}:

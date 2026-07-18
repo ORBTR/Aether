@@ -233,7 +233,7 @@ func (t *WebsocketTransport) Dial(ctx context.Context, target aether.Target) (ae
 	// Wrap with WSConn adapter (client side: isServer=false, with ping keepalive)
 	wsConn := NewWSConn(rawConn, false, string(target.NodeID), pingInterval)
 
-	session := aether.NewConnection(t.localNode, target.NodeID, wsConn)
+	session := aether.NewConnection(t.localNode, target.NodeID, wsConn, aether.ProtoWebSocket)
 	session.SetInitialRTT(dialRTT)
 	session.OnClose(func() { wsConn.Close() })
 	return session, nil
@@ -394,7 +394,7 @@ func (t *WebsocketTransport) Listen(ctx context.Context) (aether.Listener, error
 		// Wrap with WSConn adapter (server side: isServer=true, with ping keepalive)
 		wsConn := NewWSConn(rawConn, true, string(remoteNodeID), pingInterval)
 
-		session := aether.NewConnection(t.localNode, remoteNodeID, wsConn)
+		session := aether.NewConnection(t.localNode, remoteNodeID, wsConn, aether.ProtoWebSocket)
 		session.OnClose(func() { wsConn.Close() })
 
 		select {
@@ -643,7 +643,7 @@ func (t *WebsocketTransport) DialHijack(ctx context.Context, target aether.Targe
 	// in a HijackConn that provides length-prefixed framing.
 	hjConn := NewHijackConn(tlsConn, br)
 
-	session := aether.NewConnection(t.localNode, target.NodeID, hjConn)
+	session := aether.NewConnection(t.localNode, target.NodeID, hjConn, aether.ProtoWebSocket)
 	session.SetInitialRTT(dialRTT)
 	session.OnClose(func() { hjConn.Close() })
 	return session, nil
