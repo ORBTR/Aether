@@ -577,9 +577,20 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	// Always sum acked bytes once — used both for the CUBIC OnAck call
 	// below and for the ACK-driven flow-control credit release that
 	// happens regardless of congestion controller choice.
-	var ackedBytes int64
+	//
+	// AER-081: track metered acked bytes separately. Frames <=
+	// MinGuaranteedWindow bypass StreamWindow.Consume (never acquire credit),
+	// so releasing credit for their ACKs drains dataOutstanding that a
+	// different (large) frame consumed — over-admitting in-flight and, on the
+	// connection window, releasing one stream's credit for another's ACK.
+	// Congestion control still uses the full ackedBytes (all delivered bytes).
+	var ackedBytes, meteredAckedBytes int64
 	for _, entry := range acked {
-		ackedBytes += int64(entry.Frame.Length)
+		n := int64(entry.Frame.Length)
+		ackedBytes += n
+		if n > flow.MinGuaranteedWindow {
+			meteredAckedBytes += n
+		}
 	}
 	if bbr, ok := s.congestion().(*congestion.BBRController); ok {
 		for _, entry := range acked {
@@ -607,9 +618,9 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	// Per-stream and per-conn windows both get the same delta. Each caps
 	// at its own dataOutstanding, so ACK-path + WINDOW_UPDATE-path
 	// together never over-release (see StreamWindow.ReleaseOnACK).
-	if ackedBytes > 0 {
-		st.window.ReleaseOnACK(ackedBytes)
-		s.connWindow.ReleaseOnACK(ackedBytes)
+	if meteredAckedBytes > 0 {
+		st.window.ReleaseOnACK(meteredAckedBytes)
+		s.connWindow.ReleaseOnACK(meteredAckedBytes)
 	}
 	// ECN feedback: peer reported CE-marked bytes since last ACK. Notify
 	// the controller so it can react one RTT before queue overflow.
