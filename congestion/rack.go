@@ -276,19 +276,22 @@ func (r *RACK) DetectLost(snap []SendEntrySnapshot, now time.Time) (lost []uint3
 			continue
 		}
 		if e.XmitTime.Before(fack) {
-			if !e.XmitTime.After(cutoff) {
-				// xmitTime <= fack - reoWnd → presumed lost (RFC 8985 §6.2).
+			// AER-083: an entry behind the latest delivery is presumed lost if
+			// it is beyond the reorder window by EITHER measure:
+			//   - ACK-driven cutoff: xmitTime <= fack - reoWnd, OR
+			//   - the RFC 8985 §6.2 reorder TIMER: now - xmitTime >= reoWnd.
+			// The timer lets a tail loss be declared WITHOUT a further ACK.
+			// Previously only the ACK-driven cutoff applied — an entry within
+			// the window could transition to lost only when a new ACK advanced
+			// fack, so a lost tail (with no more ACKs, and TLP unavailable) fell
+			// all the way to RTO. reliabilityTick re-polls this every ~10ms, so
+			// the timer fires promptly.
+			if !e.XmitTime.After(cutoff) || !now.Before(e.XmitTime.Add(reoWnd)) {
 				lost = append(lost, e.Seq)
 			} else {
-				// Within reorder window. The cutoff is fixed at
-				// fack-reoWnd (it can only change when fack advances
-				// via a new ACK), so time alone won't transition this
-				// entry to loss-eligible. We schedule a wakeup at the
-				// hypothetical "if cutoff were time-decreasing"
-				// crossing point — the entry's XmitTime + reoWnd —
-				// purely so the caller's adaptive scheduler has a
-				// hint to re-poll roughly when something might change.
-				// Real loss transitions happen on ACK arrival.
+				// Not yet loss-eligible — schedule a wakeup at the reorder-timer
+				// crossing (xmitTime + reoWnd) so an adaptive caller re-polls
+				// when it fires, even without a new ACK.
 				wake := e.XmitTime.Add(reoWnd)
 				if wake.After(now) && (nextWakeup.IsZero() || wake.Before(nextWakeup)) {
 					nextWakeup = wake
