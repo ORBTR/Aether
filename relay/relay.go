@@ -26,8 +26,14 @@ const (
 	PacketTypeRelayRequest = 0x07
 	PacketTypeRelayData    = 0x08
 
-	// Relay overhead
-	RelayHeaderSize = 32 // NodeID size
+	// Relay overhead. AER-098: a canonical NodeID is exactly 30 bytes
+	// ("vl1_" + 26 base32 chars). Sizing the header at 32 left 2 trailing NUL
+	// bytes when reconstructing the NodeID (aether.NodeID(hdr[:32])), so the
+	// forwarding lookup — keyed by canonical 30-byte NodeIDs — never matched.
+	RelayHeaderSize = NodeIDCanonicalSize // 30 — NodeID size
+
+	// NodeIDCanonicalSize is the byte length of a canonical textual NodeID.
+	NodeIDCanonicalSize = 30
 
 	// Ticket sizes
 	TicketNonceSize     = 16
