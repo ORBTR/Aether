@@ -71,6 +71,12 @@ type noiseConn struct {
 	recv           *noise.CipherState
 	sendMu         sync.Mutex
 	recvMu         sync.Mutex
+	// rekeying guards the send-side rekey sequence so only one goroutine
+	// ratchets. AER-008: ShouldRekey stays true until ResetSend at the end of
+	// the sequence and the explicit-nonce send path is lock-free, so two
+	// concurrent senders could both ratchet and end two keys ahead of the
+	// receiver — a silent one-way blackhole.
+	rekeying atomic.Bool
 	inbox          chan []byte
 	closed         chan struct{}
 	closeOnce      sync.Once
@@ -448,6 +454,20 @@ const rekeySignalRetries = 3
 // default) — negligible amortized overhead in exchange for closing
 // the C2 silent-decryption-failure window.
 func (c *noiseConn) maybeInitiateRekey() {
+	if !c.rekey.ShouldRekey() {
+		return
+	}
+	// AER-008: only one goroutine may run the rekey sequence. Without this,
+	// two concurrent senders both pass ShouldRekey (true until ResetSend at
+	// the very end), both call rekeySendCipher, and the sender ends at K2
+	// while the receiver ratcheted once to K1 — every later frame then fails
+	// AEAD and the session is reaped ~2 min later.
+	if !c.rekeying.CompareAndSwap(false, true) {
+		return
+	}
+	defer c.rekeying.Store(false)
+	// Re-check under the guard: another goroutine may have completed the
+	// rekey (including ResetSend) between our ShouldRekey and the CAS.
 	if !c.rekey.ShouldRekey() {
 		return
 	}
@@ -1106,7 +1126,22 @@ func (l *noiseListener) dispatchToSession(key string, msg []byte) bool {
 	defer func() {
 		_ = recover()
 	}()
-	_ = nc.decryptAndDeliver(msg)
+	err := nc.decryptAndDeliver(msg)
+	if err != nil && len(msg) > 0 && msg[0] == dialNoncePrefix {
+		// AER-003: AEAD failed AND this is a nonce-tagged handshake packet
+		// (0xFD) — almost certainly a fresh msg1 from a peer that restarted
+		// on the same 5-tuple. Do NOT claim it; return false so the readLoop
+		// routes it to handleHandshake (rate-limited) instead of silently
+		// eating every re-handshake until the dead session is reaped (which
+		// otherwise locked the peer out for minutes and tripped the 30-min
+		// address dead-cooldown). A genuine session data frame whose random
+		// first byte happens to be 0xFD would have DECRYPTED successfully and
+		// never reached here, so established traffic is unaffected.
+		return false
+	}
+	// Established-session trust: a non-handshake AEAD failure (corruption,
+	// replay, or a late frame) is swallowed as before — the cryptographic
+	// check is the gate and we don't want garbage flooding the handshake path.
 	return true
 }
 

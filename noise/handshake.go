@@ -7,6 +7,7 @@
 package noise
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -552,20 +553,26 @@ recvLoop:
 	// Skipped when no existing session is registered for this NodeID —
 	// first-time dials install unconditionally.
 	if existing := listener.sessions.Get(remoteNode); existing != nil {
+		// AER-004 (initiator mirror): only yield to an existing session that
+		// is actually alive. A dead session left by a restarted peer must not
+		// veto this freshly-completed outbound, or the dial "succeeds" onto a
+		// corpse and churns.
+		existingConn := connFromSession(existing)
+		existingDead := existingConn == nil || existingConn.IsClosed()
 		localLower := string(t.localNode) < string(remoteNode)
-		if !localLower {
-			// We should be the responder; the existing inbound is the
-			// preferred conversation. Close this outbound loser.
-			dbgHandshake.Printf("simultaneous-dial: closing outbound to %s (local %s >= remote)",
+		if !existingDead && !localLower {
+			// Existing inbound is alive and is the preferred conversation.
+			// Close this outbound loser.
+			dbgHandshake.Printf("simultaneous-dial: closing outbound to %s (local %s >= remote, existing alive)",
 				remoteNode.Short(), t.localNode.Short())
 			nc.Close()
 			return nil, aether.WrapOp("dial", aether.ProtoNoise, remoteNode,
 				fmt.Errorf("simultaneous-dial: local NodeID is the preferred responder; existing inbound wins"))
 		}
-		// We are lower; this outbound wins. Close the existing inbound
-		// loser asynchronously so it doesn't block our registration.
-		dbgHandshake.Printf("simultaneous-dial: displacing existing inbound for %s (local %s < remote)",
-			remoteNode.Short(), t.localNode.Short())
+		// Either the existing session is dead, or we are the lower NodeID:
+		// this outbound wins. Close the displaced/dead existing asynchronously.
+		dbgHandshake.Printf("simultaneous-dial: displacing existing inbound for %s (dead=%v, local %s)",
+			remoteNode.Short(), existingDead, t.localNode.Short())
 		go existing.Close()
 	}
 
@@ -791,6 +798,24 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 	l.mu.Lock()
 	hs := l.handshakes[key]
 
+	// AER-005: a nonce-tagged packet from this address whose dial nonce
+	// differs from the stored handshake's is a NEW dial. The initiator drops
+	// its nonce and re-dials with a fresh one the moment a dial times out
+	// (one lost msg2 is enough) or when the XK→XX fallback fires. The stale
+	// entry's cached msg2 is bound to the OLD dial's ephemeral, so answering
+	// the new msg1 with it fails the initiator's msg2-read every time until
+	// the 30s TTL prune — stranding every re-dial from this peer for up to
+	// ~45s. Drop the stale entry and treat this as a fresh handshake.
+	if hs != nil {
+		if incoming := currentDialNonce(msg); incoming != nil && hs.dialNonce != nil &&
+			!bytes.Equal(incoming, hs.dialNonce) {
+			dbgHandshake.Printf("re-dial from %s with fresh nonce %x (was %x): resetting stale handshake",
+				addr, incoming, hs.dialNonce)
+			delete(l.handshakes, key)
+			hs = nil
+		}
+	}
+
 	// New handshake initiation
 	if hs == nil {
 		// Check for dial nonce prefix (0xFD + 8-byte nonce) FIRST so the
@@ -989,21 +1014,32 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 	// identity-matched parentStop ensures that close does not disturb
 	// the new entry we are about to install.
 	if existing := l.sessions.Get(remoteNode); existing != nil {
+		// AER-004: only honour the deterministic tiebreak when the existing
+		// session is actually ALIVE. A peer that restarted (commonly on a new
+		// IP after a redeploy) leaves a dead session registered under its
+		// NodeID; sacrificing the freshly-completed handshake to that corpse
+		// makes the new session go dark immediately and loop (dial succeeds →
+		// reaped in 30–120s → redial → loses the tiebreak again) until the
+		// corpse idle-times out. If the existing session is closed, the new
+		// one wins regardless of NodeID ordering.
+		existingConn := connFromSession(existing)
+		existingDead := existingConn == nil || existingConn.IsClosed()
 		localLower := string(l.transport.localNode) < string(remoteNode)
-		if localLower {
-			// We should be the initiator; our outbound (the existing)
-			// is the preferred conversation. Close this inbound loser.
-			dbgHandshake.Printf("simultaneous-dial: closing inbound from %s (local %s < remote)",
+		if !existingDead && localLower {
+			// Existing (our outbound) is alive and is the preferred
+			// conversation. Close this inbound loser.
+			dbgHandshake.Printf("simultaneous-dial: closing inbound from %s (local %s < remote, existing alive)",
 				remoteNode.Short(), l.transport.localNode.Short())
 			delete(l.handshakes, key)
 			l.mu.Unlock()
 			nc.Close()
 			return
 		}
-		// We are higher; this inbound wins. Close the existing outbound
-		// loser asynchronously so it doesn't block our Put.
-		dbgHandshake.Printf("simultaneous-dial: displacing existing outbound for %s (local %s > remote)",
-			remoteNode.Short(), l.transport.localNode.Short())
+		// Either the existing session is dead, or we are the higher NodeID:
+		// this inbound wins. Close the displaced/dead existing asynchronously
+		// so it doesn't block our Put.
+		dbgHandshake.Printf("simultaneous-dial: displacing existing for %s (dead=%v, local %s)",
+			remoteNode.Short(), existingDead, l.transport.localNode.Short())
 		go existing.Close()
 	}
 	l.sessions.Put(remoteNode, key, scopeID, &noiseConnSession{conn: nc, nodeID: remoteNode})
