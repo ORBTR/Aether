@@ -109,13 +109,25 @@ func TestObserveEngine_Reset(t *testing.T) {
 func TestObserveEngine_Jitter(t *testing.T) {
 	o := NewObserveEngine()
 	base := time.Now()
-	// Uniform 1ms spacing — jitter should converge toward 1000µs
+	// Uniform 1ms spacing — a perfectly regular stream has ~0 jitter.
+	// RFC 3550 jitter measures VARIATION in transit time, not the
+	// inter-arrival interval itself (AER-073): EMAing the raw spacing made
+	// this converge to ~1000µs, which is the inter-arrival interval, not
+	// jitter.
 	for i := uint32(1); i <= 20; i++ {
 		o.RecordReceive(i, 100, base.Add(time.Duration(i)*time.Millisecond))
 	}
-	m := o.Metrics()
-	// Jitter should be around 1000µs (1ms inter-arrival, EMA converges)
-	if m.JitterUs < 500 || m.JitterUs > 1500 {
-		t.Fatalf("jitter: got %dµs, want ~1000µs", m.JitterUs)
+	if m := o.Metrics(); m.JitterUs > 200 {
+		t.Fatalf("uniform-spacing jitter: got %dµs, want ~0", m.JitterUs)
+	}
+
+	// Irregular spacing must produce non-zero jitter.
+	o2 := NewObserveEngine()
+	offsets := []int{0, 1, 5, 6, 20, 21, 40, 42, 70, 71}
+	for i, off := range offsets {
+		o2.RecordReceive(uint32(i+1), 100, base.Add(time.Duration(off)*time.Millisecond))
+	}
+	if m := o2.Metrics(); m.JitterUs == 0 {
+		t.Fatalf("irregular-spacing jitter: got 0, want > 0")
 	}
 }

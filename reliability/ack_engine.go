@@ -412,6 +412,11 @@ func (e *ACKEngine) flushLocked() {
 		e.pending, e.recvWindow.BufferedCount(), e.sendACK != nil)
 	ack := e.buildLocked()
 	e.pending = 0
+	// AER-072: capture the PREVIOUS ACK time before overwriting it, so the
+	// "resumed after silence" starvation log below measures the real gap.
+	// Reading e.lastACK after the store made every Sub() ≈ 0, so the log
+	// added specifically to expose ACK starvation could never fire.
+	prevACK := e.lastACK
 	e.lastACK = time.Now()
 
 	// Cancel pending timer
@@ -435,7 +440,6 @@ func (e *ACKEngine) flushLocked() {
 	// release before invoking the callback, then RE-ACQUIRE so the
 	// caller's deferred Unlock remains correct.
 	sendACK := e.sendACK
-	prevACK := e.lastACK
 	e.mu.Unlock()
 	if sendACK != nil {
 		sendACK(ack)
@@ -484,6 +488,17 @@ func (e *ACKEngine) buildLocked() *aether.CompositeACK {
 		BaseACK:  expected - 1, // cumulative: last in-order received
 		AckDelay: ackDelay,
 		Bitmap:   bitmap,
+	}
+
+	// AER-060: before the first in-order delivery, expected==0 and
+	// BaseACK becomes 0xFFFFFFFF (expected-1 wrapped). That value keeps the
+	// SACK bitmap aligned on the sender (BaseACK+1+i wraps to seq i) but
+	// reads as a ~4-billion cumulative forward jump, so the sender discarded
+	// the whole ACK — dropping the bitmap that would fast-retransmit seq 0 —
+	// and charged the honest receiver with ACK-validation abuse. Flag it so
+	// the sender skips the cumulative loop and processes only the bitmap.
+	if expected == 0 {
+		ack.Flags |= aether.CACKNoCumulative
 	}
 
 	// Set HasGaps flag

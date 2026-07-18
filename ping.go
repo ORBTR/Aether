@@ -108,7 +108,16 @@ func WaitForActivityPing(
 		// Requiring the Pong here (rather than any inbound frame) keeps the
 		// SeqNo/SRTT correlation honest for chatty sessions, which is why
 		// the earlier "any inbound counts" fast-path was removed.
-		if hm.LastPongReceived().After(before) {
+		//
+		// Compare against `start` (this ping's send time), NOT the pre-entry
+		// LastActivity snapshot: HandlePong calls RecordActivity() before
+		// RecordPongRecv(), so lastPongRecv is permanently >= lastActivity.
+		// Testing the pong against a LastActivity baseline therefore passed
+		// on the very first poll with no round trip, so a dead peer looked
+		// alive and every stall-probe rescue "succeeded" instantly. Only a
+		// pong stamped after we sent THIS ping (pendingPingSeq gates the seq
+		// match) proves the round trip.
+		if hm.LastPongReceived().After(start) {
 			_, avg := hm.RTT()
 			return avg, nil
 		}

@@ -49,13 +49,18 @@ type ObserveEngine struct {
 
 	jitterUs int64 // RFC 3550 exponential moving average
 
+	prevInterarrivalUs   int64 // previous inter-arrival spacing (µs) for jitter variation
+	havePrevInterarrival bool
+
 	lossWindowReceived int64
 	lossWindowExpected int64
 }
 
 // NewObserveEngine creates a new per-stream observation engine.
+// expectedSeq starts at 0 because Aether stream sequence numbers start at 0;
+// seeding it to 1 counted every stream's first frame (seq 0) as a reorder.
 func NewObserveEngine() *ObserveEngine {
-	return &ObserveEngine{expectedSeq: 1}
+	return &ObserveEngine{expectedSeq: 0}
 }
 
 // RecordReceive records a received data frame.
@@ -72,7 +77,15 @@ func (o *ObserveEngine) RecordReceive(seqNo uint32, size int, arrivalTime time.T
 		o.highestSeq = seqNo
 	}
 
-	if seqNo > o.expectedSeq {
+	// The first frame establishes the sequence baseline and must not be
+	// counted as a gap or reorder. Different transports start their counter
+	// at different values (Aether/noise stream seqs start at 0; the TCP
+	// adapter feeds a monotonic counter starting at 1), so anchoring on the
+	// first observed seq is more robust than a fixed initial expectedSeq —
+	// seeding expectedSeq to 1 previously mislabelled seq 0 as a reorder.
+	if o.packetsReceived == 1 {
+		o.expectedSeq = seqNo + 1
+	} else if seqNo > o.expectedSeq {
 		o.gapCount += int64(seqNo - o.expectedSeq)
 		o.expectedSeq = seqNo + 1
 	} else if seqNo == o.expectedSeq {
@@ -85,13 +98,27 @@ func (o *ObserveEngine) RecordReceive(seqNo uint32, size int, arrivalTime time.T
 		}
 	}
 
-	// Inter-arrival jitter (RFC 3550 §A.8)
+	// Inter-arrival jitter (RFC 3550 §A.8). We have no sender timestamp on
+	// the data path, so we approximate transit-time variation by the change
+	// in inter-arrival spacing between consecutive packets: for a uniformly
+	// paced sender, variation in arrival spacing ≈ variation in transit time.
+	// EMAing the raw spacing (the previous behaviour) converged to the mean
+	// inter-arrival interval instead — a steady 20 ms stream reported
+	// ~20000 µs of "jitter" rather than ~0, making the metric useless.
 	if !o.lastArrival.IsZero() {
 		diff := arrivalTime.Sub(o.lastArrival).Microseconds()
 		if diff < 0 {
 			diff = -diff
 		}
-		o.jitterUs += (diff - o.jitterUs) / 16
+		if o.havePrevInterarrival {
+			d := diff - o.prevInterarrivalUs
+			if d < 0 {
+				d = -d
+			}
+			o.jitterUs += (d - o.jitterUs) / 16
+		}
+		o.prevInterarrivalUs = diff
+		o.havePrevInterarrival = true
 	}
 	o.lastArrival = arrivalTime
 

@@ -551,6 +551,15 @@ func (s *NoiseSession) reliabilityTick() {
 			if s.lastAnyProgressAt.IsZero() {
 				s.lastAnyProgressAt = time.Now()
 			}
+			// AER-002: reseed the progress clock when in-flight transitions
+			// 0→N. lastAnyProgressAt otherwise advances only on ACK progress,
+			// so a session idle past the stall threshold would trip the
+			// detector on its first fresh frame — before any ACK could
+			// arrive — falsely resetting cwnd and demoting a healthy path.
+			if anyInFlight && !s.prevAnyInFlight {
+				s.lastAnyProgressAt = time.Now()
+			}
+			s.prevAnyInFlight = anyInFlight
 			lastProgressAt := s.lastAnyProgressAt
 			s.mu.Unlock()
 			sessionStuck := effectiveThreshold > 0 && anyInFlight &&
