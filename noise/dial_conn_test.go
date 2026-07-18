@@ -172,7 +172,9 @@ func TestAcceptOverConn_TicketBadSignatureRejected(t *testing.T) {
 	defer cancel()
 
 	var acceptErr error
+	acceptDone := make(chan struct{})
 	go func() {
+		defer close(acceptDone)
 		_, acceptErr = AcceptOverConn(ctx, AcceptConnConfig{
 			LocalNodeID:         "vl1_bob",
 			StaticPriv:          bPriv,
@@ -183,16 +185,19 @@ func TestAcceptOverConn_TicketBadSignatureRejected(t *testing.T) {
 	}()
 
 	if _, err := DialOverConn(ctx, DialConnConfig{
-		LocalNodeID: "vl1_alice",
-		StaticPriv:  aPriv,
-		StaticPub:   aPub,
-		Ticket:      ticket,
+		LocalNodeID:      "vl1_alice",
+		StaticPriv:       aPriv,
+		StaticPub:        aPub,
+		Ticket:           ticket,
 		HandshakeTimeout: 2 * time.Second,
 	}, clientConn); err == nil {
 		t.Fatal("DialOverConn succeeded despite bad ticket sig on accept side")
 	}
-	// Wait for accept goroutine (may have errored already)
-	time.Sleep(50 * time.Millisecond)
+	// AER-030: synchronize with the accept goroutine via a channel before
+	// reading acceptErr. The previous 50ms sleep left a data race (write in
+	// the goroutine, read here) that the -race detector flagged, making CI
+	// flaky.
+	<-acceptDone
 	if acceptErr == nil {
 		t.Error("AcceptOverConn succeeded with bad ticket signature")
 	}
