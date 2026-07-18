@@ -159,8 +159,16 @@ func (e *FrameEncryptor) Overhead() int {
 func (e *FrameEncryptor) nextNonce() aether.Nonce {
 	var nonce aether.Nonce
 	if e.random {
-		// Random nonce for unordered streams — prevents nonce reuse under reordering
-		rand.Read(nonce[:])
+		// Random nonce for unordered streams — prevents nonce reuse under reordering.
+		// AER-045: crypto/rand must not fail silently here. A discarded error
+		// leaves nonce at its zero value, and an all-zero nonce reused across
+		// frames is catastrophic (key,nonce) reuse — keystream/Poly1305
+		// one-time-key reuse enabling forgery. A crypto/rand failure means the
+		// platform RNG is broken; fail loudly rather than encrypt under a
+		// predictable nonce.
+		if _, err := rand.Read(nonce[:]); err != nil {
+			panic("aether/crypto: crypto/rand failed generating nonce: " + err.Error())
+		}
 		return nonce
 	}
 	// AE-P-02: nonce = per-encryptor random prefix (nonce[0:4]) || monotonic

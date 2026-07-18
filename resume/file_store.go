@@ -57,8 +57,16 @@ func (s *FileStore) Save(peerID string, token *Token, sessionKey []byte) error {
 	}
 
 	path := filepath.Join(s.dir, sanitizePeerID(peerID)+".json")
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	// AER-046: write atomically via a temp file + rename so a crash or power
+	// loss mid-write can't leave a truncated JSON token that fails to parse on
+	// Load. Rename is atomic on the same filesystem.
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
 		return fmt.Errorf("resume: write token file: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("resume: rename token file: %w", err)
 	}
 	return nil
 }
