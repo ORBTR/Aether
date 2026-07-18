@@ -63,11 +63,14 @@ func (m *ConnectionMap) Remove(id NodeID) {
 	sess := m.byNodeID[id]
 	delete(m.byNodeID, id)
 
-	// Remove from byAddr (find by value)
+	// Remove from byAddr (find by value). AER-051: sweep ALL addr keys that
+	// point at this session, not just the first. A session re-Put under a
+	// second addr (dual-stack, or an address change) otherwise left a
+	// dangling byAddr entry, so GetByAddr kept returning a closed session and
+	// inbound routing delivered to a dead conn until coincidental overwrite.
 	for addr, s := range m.byAddr {
 		if s == sess {
 			delete(m.byAddr, addr)
-			break
 		}
 	}
 
@@ -212,33 +215,46 @@ func (m *ConnectionMap) TenantCountAll() int {
 }
 
 // Prune removes sessions that are idle beyond maxAge.
-// Sessions must implement HealthReporter to be pruned; others are skipped.
 // Returns count of pruned sessions.
+//
+// AER-022: gate on a minimal IsAlive interface rather than the full
+// HealthReporter. noiseConnSession implements only IsAlive, so the previous
+// `sess.(HealthReporter)` assertion failed for every noise session and Prune
+// was a silent no-op for them — the documented idle eviction never ran. And
+// sessions are Closed OUTSIDE m.mu: a noise conn's close path re-enters this
+// map via parentStop → RemoveBy → m.mu.Lock(), which self-deadlocks if Close
+// runs under the lock.
 func (m *ConnectionMap) Prune(maxAge time.Duration) int {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	type aliveChecker interface {
+		IsAlive(time.Duration) bool
+	}
 
-	var pruned int
+	m.mu.Lock()
+	var toClose []Connection
 	for id, sess := range m.byNodeID {
-		if hr, ok := sess.(HealthReporter); ok {
-			if !hr.IsAlive(maxAge) {
-				_ = sess.Close()
-				delete(m.byNodeID, id)
-				for addr, s := range m.byAddr {
-					if s == sess {
-						delete(m.byAddr, addr)
-						break
-					}
-				}
-				for tid, nodeMap := range m.byScope {
-					delete(nodeMap, id)
-					if len(nodeMap) == 0 {
-						delete(m.byScope, tid)
-					}
-				}
-				pruned++
+		hr, ok := sess.(aliveChecker)
+		if !ok || hr.IsAlive(maxAge) {
+			continue
+		}
+		delete(m.byNodeID, id)
+		// AER-051: sweep ALL addr keys for this session, not just the first.
+		for addr, s := range m.byAddr {
+			if s == sess {
+				delete(m.byAddr, addr)
 			}
 		}
+		for tid, nodeMap := range m.byScope {
+			delete(nodeMap, id)
+			if len(nodeMap) == 0 {
+				delete(m.byScope, tid)
+			}
+		}
+		toClose = append(toClose, sess)
 	}
-	return pruned
+	m.mu.Unlock()
+
+	for _, sess := range toClose {
+		_ = sess.Close()
+	}
+	return len(toClose)
 }
