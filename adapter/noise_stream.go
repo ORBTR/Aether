@@ -138,12 +138,17 @@ type noiseStream struct {
 // RESET(ResetRefused) when the cap is reached (peer-initiated paths only;
 // locally-initiated OpenStream passes false).
 func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, enforceRemoteCap bool) *noiseStream {
-	// FEC group size selection (priority order):
-	// 1. Explicit cfg.FECLevel from StreamConfig (caller controls)
-	// 2. Stream ID defaults: gossip/keepalive/control = disabled, others = group 4
-	fecGroup := 4
+	// FEC group size selection. AER-062: FEC is DISABLED by default. The FEC
+	// RECEIVE path is not wired — the decoder is only ever fed repair shards
+	// (AddRepair), never DATA (AddData), and DATA frames carry no group/index
+	// metadata — so a group can never be reconstructed. Emitting repair frames
+	// by default therefore only spent 25-50% extra bandwidth with zero recovery
+	// benefit. Callers may still opt in explicitly via cfg.FECLevel (e.g. once
+	// the receive path is wired, AER-062/063), but the default no longer emits
+	// parity that can never be used.
+	fecGroup := 0
 	if cfg.FECLevel != 0 {
-		// Caller specified FEC level — map to group size
+		// Caller explicitly opted in — map the level to a group size.
 		switch reliability.FECLevel(cfg.FECLevel) {
 		case reliability.FECNone:
 			fecGroup = 0
@@ -151,12 +156,6 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 			fecGroup = 4 // 25% overhead
 		case reliability.FECInterleaved:
 			fecGroup = 4 // 50% overhead (2 interleaved groups)
-		}
-	} else {
-		// Default: disable FEC on non-throughput streams (app-level recovery)
-		switch streamID {
-		case s.layout.Keepalive, s.layout.Control:
-			fecGroup = 0
 		}
 	}
 	// WindowSize 64: tracks Aether frame reordering (NOT UDP fragment reassembly).
