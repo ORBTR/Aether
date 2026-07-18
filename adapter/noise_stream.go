@@ -41,6 +41,13 @@ type noiseStream struct {
 	recvCh   chan []byte
 	recvOnce sync.Once
 
+	// lastRTOBackoffAt is the last time reliabilityTick applied an RTO
+	// backoff for this stream. AER-065: backoff is bounded to once per RTO
+	// interval (RFC 6298 §5.5 — one doubling per timeout event) rather than
+	// once per retransmitted frame. Written and read only from the single
+	// reliabilityTick goroutine, so no lock is needed.
+	lastRTOBackoffAt time.Time
+
 	// deliverCh feeds this stream's deliverLoop goroutine. AE-M-02: the
 	// readLoop enqueues in-order payloads here (non-blocking) instead of
 	// calling the up-to-1s-blocking DeliverToRecvChWithSignals itself, so one

@@ -399,7 +399,16 @@ func (s *NoiseSession) reliabilityTick() {
 					s.sched.MarkRetransmit(streamID)
 					s.sched.Enqueue(streamID, frame)
 					st.sendWindow.BumpXmitTime(frame.SeqNo, tickNow)
-					st.rtt.BackoffRTO()
+					// AER-065: back off at most once per RTO interval, not
+					// once per retransmitted frame. A burst loss of N frames
+					// drained one-per-tick otherwise doubled RTO N times,
+					// pinning it at the 60s cap and stalling RTO-only recovery
+					// for up to a minute (RFC 6298 §5.5 doubles once per
+					// timeout event).
+					if st.lastRTOBackoffAt.IsZero() || tickNow.Sub(st.lastRTOBackoffAt) >= st.rtt.RTO() {
+						st.rtt.BackoffRTO()
+						st.lastRTOBackoffAt = tickNow
+					}
 				}
 
 				// Refresh RACK + TLP RTT estimates each tick so the

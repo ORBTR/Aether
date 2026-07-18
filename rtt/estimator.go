@@ -270,11 +270,20 @@ func (e *Estimator) Update(sample time.Duration) {
 // Update. Avoids inflating SRTT by time the receiver held the ACK
 // before transmitting it.
 //
-// Adjusted sample is max(rawRTT - ackDelay, 1µs) to prevent the
-// inputs from going negative under tiny RTTs or pathological
-// peer-reported delays.
+// AER-074 / RFC 9002 §5.3: the ack-delay adjustment is applied only when it
+// does not pull the sample below min_rtt. A hostile or buggy peer reporting
+// ackDelay ≈ rawRTT would otherwise collapse SRTT toward the 1µs floor,
+// shrinking the RTO/RACK reorder window and triggering spurious-retransmit
+// storms. When the adjustment would breach min_rtt we keep the raw sample.
 func (e *Estimator) UpdateWithDelay(rawRTT, ackDelay time.Duration) {
-	adjusted := rawRTT - ackDelay
+	e.mu.Lock()
+	minRTT := e.minRTT
+	e.mu.Unlock()
+
+	adjusted := rawRTT
+	if adjusted2 := rawRTT - ackDelay; minRTT <= 0 || adjusted2 >= minRTT {
+		adjusted = adjusted2
+	}
 	if adjusted < time.Microsecond {
 		adjusted = time.Microsecond
 	}
