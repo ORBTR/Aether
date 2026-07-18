@@ -473,7 +473,7 @@ func (s *transportServer) Stream(stream pb.TransportService_StreamServer) error 
 		}
 	}()
 
-	session := aether.NewConnection(s.transport.localNode, nodeID, conn)
+	session := aether.NewConnection(s.transport.localNode, nodeID, conn, aether.ProtoGRPC)
 	session.OnClose(func() { conn.Close() })
 
 	select {

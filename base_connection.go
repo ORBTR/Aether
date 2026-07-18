@@ -30,12 +30,21 @@ type BaseConnection struct {
 // Protocol returns the transport protocol.
 func (s *BaseConnection) Protocol() Protocol { return s.proto }
 
-// NewConnection creates a new BaseConnection.
-func NewConnection(localNode, remoteNode NodeID, conn net.Conn) *BaseConnection {
+// NewConnection creates a new BaseConnection. AER-058: pass the transport
+// protocol so Connection.Protocol() reports the real transport instead of
+// ProtoUnknown (which collapsed any protocol-grade fallback / capability
+// lookup keyed on it). The variadic parameter keeps older call sites
+// compiling; transports should always supply their protocol.
+func NewConnection(localNode, remoteNode NodeID, conn net.Conn, proto ...Protocol) *BaseConnection {
+	p := ProtoUnknown
+	if len(proto) > 0 {
+		p = proto[0]
+	}
 	return &BaseConnection{
 		localNode:  localNode,
 		remoteNode: remoteNode,
 		Conn:       conn,
+		proto:      p,
 	}
 }
 

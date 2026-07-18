@@ -95,17 +95,18 @@ var (
 // NodeID.Canonical() if unsure). Flags is reserved for future use
 // (e.g. 0x80 = reply marker).
 //
-// PANICS on a NodeID longer than RoutingPreambleNodeIDSize — silently
-// truncating would emit a packet with the wrong target and the receiver
-// would forward to the wrong machine with no way to detect the
-// corruption. A panic surfaces the programmer error loudly; canonical
-// NodeIDs are exactly 30 bytes so a violator is a caller passing
-// non-canonical data.
+// Returns nil for a NodeID longer than RoutingPreambleNodeIDSize. AER-108:
+// this used to panic to surface a programmer error, but ParseNodeID accepts a
+// documented 52-char legacy form (56 bytes) that is longer than 30, so a
+// public-API NodeID value could reach here and crash the process during a
+// cross-org dial. Truncating would forward to the wrong machine; returning nil
+// makes the caller emit the packet WITHOUT a routing preamble (degrading to a
+// direct dial) instead of crashing. Canonical NodeIDs are exactly 30 bytes.
 func EncodeRoutingPreamble(target aether.NodeID) []byte {
 	if len(target) > RoutingPreambleNodeIDSize {
-		panic("noise.EncodeRoutingPreamble: NodeID exceeds " +
-			"RoutingPreambleNodeIDSize — caller must pass a canonical " +
-			"30-byte aether.NodeID, not a longer string")
+		dbgNoise.Printf("EncodeRoutingPreamble: NodeID %q exceeds %d bytes — emitting no preamble",
+			target.Short(), RoutingPreambleNodeIDSize)
+		return nil
 	}
 	out := make([]byte, RoutingPreambleSize)
 	binary.BigEndian.PutUint16(out[0:2], RoutingPreambleMagic)

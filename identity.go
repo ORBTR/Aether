@@ -71,11 +71,19 @@ func MustParseNodeID(value string) NodeID {
 	return id
 }
 
-// NormalizeNodeID trims whitespace from a raw nodeID string.
+// NormalizeNodeID trims whitespace and canonicalizes case for a raw nodeID.
 // This is the single normalization entry point — all external nodeID inputs
-// (HTTP headers, LAD records) should pass through here before map storage or lookup.
+// (HTTP headers, LAD records) should pass through here before map storage or
+// lookup.
+//
+// AER-059: NewNodeID emits an all-lowercase form, but ParseNodeID accepts the
+// case-insensitive base32 body in any case and previously preserved it. Two
+// textual variants of the same fingerprint then compared unequal as map keys,
+// creating duplicate ConnectionMap/abuse entries for one peer. Lowercasing
+// here makes the canonical form match NewNodeID's output. The base32 alphabet
+// is case-insensitive, so this never collides two distinct identities.
 func NormalizeNodeID(raw string) string {
-	return strings.TrimSpace(raw)
+	return strings.ToLower(strings.TrimSpace(raw))
 }
 
 // Fingerprint returns the raw bytes encoded in the NodeID (SHA-256 fingerprint).
