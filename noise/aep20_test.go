@@ -34,6 +34,9 @@ func aep20NewTransport(t *testing.T) *NoiseTransport {
 		LocalNode:   nodeID,
 		ListenAddr:  "127.0.0.1:0",
 		NetworkKeys: []string{"aep20-test-network-key"},
+		// AER-006/097: resume/tickets are opt-in now; this test exercises the
+		// ticket-cap advertising path, so it enables resume explicitly.
+		EnableResume: true,
 	})
 	if err != nil {
 		t.Fatalf("AE-P-20: new transport: %v", err)
