@@ -765,6 +765,28 @@ func wrapDialResponse(dialNonce, response []byte) []byte {
 	return out
 }
 
+// isTrustedNoAmplifySource reports whether a msg1 source is on a trusted
+// private network where the anti-amplification RETRY cookie is unnecessary —
+// and actively harmful.
+//
+// The RETRY cookie defends ONLY against a spoofed source IP causing the
+// responder to amplify a large msg2 toward a victim. On Fly, same-org peers
+// reach each other over the 6PN, an IPv6 ULA (fdaa:…), and the platform
+// enforces 6PN source addresses so they cannot be spoofed across the private
+// network — the attack the cookie prevents is impossible there. Meanwhile the
+// cookie is bound to the responder PROCESS's per-process secret plus the source
+// IP, so for a same-org multi-machine app (two machines sharing one mesh
+// identity) the msg1+cookie retransmit can land on a different machine that
+// rejects the cookie, stranding every dial at msg2 timeout. Skipping the RETRY
+// for a ULA source removes that failure mode and a round-trip, with no
+// amplification exposure.
+//
+// Restricted to genuine IPv6 ULA (To4()==nil so a v4-mapped address can't slip
+// through): a public/global source still gets the RETRY.
+func isTrustedNoAmplifySource(addr *net.UDPAddr) bool {
+	return addr != nil && addr.IP != nil && addr.IP.To4() == nil && addr.IP.IsPrivate()
+}
+
 func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *net.UDPAddr, msg []byte) {
 	l.mu.Lock()
 	hs := l.handshakes[key]
@@ -802,7 +824,7 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 				return
 			}
 			innerMsg = validated
-		} else if l.transport.requireRetryToken {
+		} else if l.transport.requireRetryToken && !isTrustedNoAmplifySource(addr) {
 			token := l.transport.retryGuard.IssueToken(addr, time.Now())
 			l.drops.count(DropRetryTokenIssued)
 			dbgHandshake.Printf("RETRY token issued to %s (dialNonceWrapped=%t)", addr, dialNonce != nil)
