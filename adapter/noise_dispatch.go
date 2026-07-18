@@ -604,6 +604,13 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 				bbr.OnAck(int64(entry.Frame.Length), srtt)
 			}
 		}
+	} else if cubic, ok := s.congestion().(*congestion.CUBICController); ok {
+		// AER-077: thread current in-flight bytes into CUBIC so Proportional
+		// Rate Reduction runs during fast recovery. With pipe=0 the PRR branch
+		// was dead code and recovery exited after the FIRST ACK, so a
+		// multi-packet loss burst compounded ×0.7 per tick instead of one
+		// reduction per RTT. totalInFlightBytes() here is the post-ACK pipe.
+		cubic.OnAckWithPipe(ackedBytes, srtt, s.totalInFlightBytes())
 	} else {
 		s.congestion().OnAck(ackedBytes, srtt)
 	}
