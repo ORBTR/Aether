@@ -447,9 +447,15 @@ const rekeySignalRetries = 3
 //
 // Reliability against UDP drop: PacketTypeRekey is sent N times
 // (rekeySignalRetries) back-to-back before we ratchet our send cipher.
-// On the receive side the rekey is idempotent — the first signal
-// observed ratchets the recv cipher; subsequent signals are decrypted
-// successfully and dropped (the rekey marker is the entire payload).
+// On the receive side the FIRST signal observed ratchets the recv cipher.
+// AER-029: the duplicate copies (2 and 3) do NOT decrypt successfully after
+// that — they were encrypted under the OLD key, and once the receiver has
+// ratcheted to the new recv key its AEAD open of those copies fails and they
+// are dropped as ordinary undecryptable datagrams. The net effect (idempotent
+// rekey, extra copies discarded) is the same, but via AEAD failure, not a
+// successful decrypt. NOTE: if a correlated loss burst drops all N copies the
+// receiver never ratchets and that direction blackholes until idle timeout
+// (AER-014) — a receiver-side trial-rekey recovery is the robust fix.
 // Costs three extra datagrams every rekeyByteThreshold (~64 MiB by
 // default) — negligible amortized overhead in exchange for closing
 // the C2 silent-decryption-failure window.
