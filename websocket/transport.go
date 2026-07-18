@@ -548,6 +548,18 @@ func (t *WebsocketTransport) DialHijack(ctx context.Context, target aether.Targe
 	signature := ed25519.Sign(t.privateKey, message)
 	req.Header.Set(SignatureHeader, base64.StdEncoding.EncodeToString(signature))
 
+	// AER-018: bound the upgrade exchange with an I/O deadline. req.Write and
+	// http.ReadResponse are NOT context-aware, so a server that completes
+	// TCP+TLS but never answers the upgrade (a wedged proxy/backend) would
+	// otherwise hang this goroutine and leak tlsConn forever, past any caller
+	// timeout. Use the ctx deadline when set, else a bounded default. Cleared
+	// once the 101 is confirmed so it never affects the hijacked data conn.
+	upgradeDeadline := time.Now().Add(10 * time.Second)
+	if d, ok := ctx.Deadline(); ok {
+		upgradeDeadline = d
+	}
+	_ = tlsConn.SetDeadline(upgradeDeadline)
+
 	// Write the request manually (we own the TLS conn, no http.Client needed)
 	if err := req.Write(tlsConn); err != nil {
 		tlsConn.Close()
@@ -567,6 +579,9 @@ func (t *WebsocketTransport) DialHijack(ctx context.Context, target aether.Targe
 		return nil, aether.WrapOp("dial-hijack-status", aether.ProtoWebSocket, target.NodeID,
 			fmt.Errorf("expected 101, got %d", resp.StatusCode))
 	}
+	// Upgrade confirmed — clear the deadline so it never affects the hijacked
+	// data connection returned below (AER-018).
+	_ = tlsConn.SetDeadline(time.Time{})
 
 	// AE-P-26: verify the server's mesh identity before trusting target.NodeID.
 	// TLS only proves the endpoint holds a cert for the dialed hostname; on
@@ -761,31 +776,37 @@ func (c *HijackConn) Read(p []byte) (int, error) {
 		return n, nil
 	}
 
-	// Read 4-byte length header
-	var hdr [4]byte
-	if _, err := io.ReadFull(c.reader, hdr[:]); err != nil {
-		return 0, err
-	}
-	length := binary.BigEndian.Uint32(hdr[:])
-	if length > hijackMaxFrameSize {
-		return 0, fmt.Errorf("hijack: frame too large (%d bytes)", length)
-	}
-	if length == 0 {
-		// Keepalive frame — read next
-		return c.Read(p)
-	}
+	// AER-031: loop over zero-length keepalive frames instead of recursing.
+	// The old `return c.Read(p)` added a stack frame per keepalive; a peer
+	// streaming `00 00 00 00` prefixes forever grew the read goroutine's
+	// stack until Go's 1 GB limit fatally crashed the whole process. A loop
+	// handles the same case in constant stack space (matches WSConn.Read).
+	for {
+		// Read 4-byte length header
+		var hdr [4]byte
+		if _, err := io.ReadFull(c.reader, hdr[:]); err != nil {
+			return 0, err
+		}
+		length := binary.BigEndian.Uint32(hdr[:])
+		if length > hijackMaxFrameSize {
+			return 0, fmt.Errorf("hijack: frame too large (%d bytes)", length)
+		}
+		if length == 0 {
+			continue // keepalive frame — read the next one
+		}
 
-	// Read payload
-	payload := make([]byte, length)
-	if _, err := io.ReadFull(c.reader, payload); err != nil {
-		return 0, err
-	}
+		// Read payload
+		payload := make([]byte, length)
+		if _, err := io.ReadFull(c.reader, payload); err != nil {
+			return 0, err
+		}
 
-	n := copy(p, payload)
-	if n < len(payload) {
-		c.readBuf = payload[n:]
+		n := copy(p, payload)
+		if n < len(payload) {
+			c.readBuf = payload[n:]
+		}
+		return n, nil
 	}
-	return n, nil
 }
 
 // Write sends a length-prefixed message.

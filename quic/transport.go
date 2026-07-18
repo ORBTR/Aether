@@ -113,6 +113,34 @@ func (t *QuicTransport) Dial(ctx context.Context, target aether.Target) (aether.
 	tlsConf := t.tlsConfig.Clone()
 	tlsConf.ServerName = string(target.NodeID)
 
+	// AER-009: the target-identity check belongs on the CLIENT only. Verify
+	// the server's presented cert derives the exact NodeID we dialed. The
+	// shared VerifyConnection (used by the server) intentionally omits this.
+	expectedPeer := target.NodeID
+	baseVerify := tlsConf.VerifyConnection
+	tlsConf.VerifyConnection = func(cs tls.ConnectionState) error {
+		if baseVerify != nil {
+			if err := baseVerify(cs); err != nil {
+				return err
+			}
+		}
+		if len(cs.PeerCertificates) == 0 {
+			return errors.New("vl1: no peer certificate")
+		}
+		pub, ok := cs.PeerCertificates[0].PublicKey.(ed25519.PublicKey)
+		if !ok {
+			return errors.New("vl1: peer key is not Ed25519")
+		}
+		peerNodeID, err := aether.NewNodeID(pub)
+		if err != nil {
+			return err
+		}
+		if peerNodeID != expectedPeer {
+			return errors.New("vl1: server node ID mismatch")
+		}
+		return nil
+	}
+
 	quicCfg := &quic.Config{
 		KeepAlivePeriod: t.keepAlive,
 		Allow0RTT:       t.allow0RTT,
@@ -307,16 +335,18 @@ func generateTLSConfig(key ed25519.PrivateKey) (*tls.Config, error) {
 				return errors.New("vl1: peer key is not Ed25519")
 			}
 
-			peerNodeID, err := aether.NewNodeID(pubKey)
-			if err != nil {
+			if _, err := aether.NewNodeID(pubKey); err != nil {
 				return err
 			}
 
-			// If ServerName is set (client side), verify it matches
-			if cs.ServerName != "" && cs.ServerName != string(peerNodeID) {
-				return errors.New("vl1: peer node ID mismatch")
-			}
-
+			// AER-009: do NOT compare cs.ServerName here. This VerifyConnection
+			// runs on BOTH roles; on the SERVER cs.ServerName is the SNI the
+			// client sent (the server's OWN NodeID) while PeerCertificates[0]
+			// is the CLIENT's cert, so the comparison rejected every inbound
+			// handshake between two distinct nodes. The client-side target-
+			// NodeID check is installed on the dial config clone in Dial().
+			// Here we only validate the peer presented a well-formed Ed25519
+			// identity.
 			return nil
 		},
 	}, nil
