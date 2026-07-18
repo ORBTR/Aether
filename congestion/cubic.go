@@ -120,15 +120,30 @@ func (c *CUBICController) OnAckWithPipe(ackedBytes int64, rtt time.Duration, pip
 		}
 
 	case cubicCongestionAvoidance:
-		// CUBIC function: W(t) = C * (t - K)^3 + W_max
+		// CUBIC function W(t) = C·(t-K)³ + W_max, in the BYTE domain.
+		//
+		// AER-075: RFC 8312 defines C, K, and W_max in SEGMENT (MSS) units.
+		// This controller keeps cwnd/wMax in BYTES, so the RFC formulas must
+		// be re-expressed: with W_max_seg = wMax/MSS,
+		//   K       = cbrt( (wMax/MSS)·(1-β)/C )
+		//   W(t)_by = MSS·C·(t-K)³ + wMax
+		// The old code plugged byte-domain wMax straight into the segment
+		// formulas, inflating K by ~cbrt(MSS)≈11× and deflating the growth
+		// term by MSS — so after any loss cwnd effectively never regrew and
+		// ratcheted to the floor on lossy paths.
+		mss := float64(c.mss)
+		if mss <= 0 {
+			mss = float64(defaultMSS)
+		}
 		t := time.Since(c.tEpoch).Seconds()
-		k := math.Cbrt(c.wMax * (1 - cubicBeta) / cubicC)
-		wCubic := cubicC*math.Pow(t-k, 3) + c.wMax
+		k := math.Cbrt((c.wMax / mss) * (1 - cubicBeta) / cubicC)
+		wCubic := mss*cubicC*math.Pow(t-k, 3) + c.wMax
 
-		// TCP-friendly estimate: per-ACK additive increase (RFC 8312 Section 5.8)
-		// W_est increases by alpha_aimd * MSS * ackedBytes / cwnd per ACK
+		// TCP-friendly estimate: per-ACK additive increase (RFC 8312 §4.2).
+		// W_est increases by alpha_aimd·MSS·ackedBytes/cwnd per ACK. The MSS
+		// factor was missing, making the increase ~1/MSS (≈1400×) too small.
 		alphaAIMD := 3 * (1 - cubicBeta) / (1 + cubicBeta)
-		wEst := c.cwnd + alphaAIMD*(float64(ackedBytes)/c.cwnd)
+		wEst := c.cwnd + alphaAIMD*mss*(float64(ackedBytes)/c.cwnd)
 
 		// Use the larger of CUBIC and TCP-friendly
 		if wCubic > wEst {
