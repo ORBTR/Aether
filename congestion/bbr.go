@@ -199,6 +199,25 @@ func (b *BBRController) OnSend(n int64) DeliveryRateSample {
 	// underutilised. Heuristic: small inflight relative to cwnd.
 	b.appLimited = b.inflight < b.cwnd/2
 
+	return b.sampleLocked()
+}
+
+// StampSample captures a DeliveryRateSample from the current model state
+// WITHOUT mutating inflight. AER-076: the send path stamped a sample at
+// frame-build time via OnSend AND incremented inflight again at actual
+// transmission via the writeLoop's OnSend — double-counting every frame so
+// inflight grew without bound, the Drain-exit test (inflight <= max(bdp,
+// 4·mss)) never passed, and BBR pinned pacing at 0.35× and decayed to the
+// floor. The build-time stamp now uses StampSample (no increment); the
+// writeLoop's OnSend remains the single authoritative on-wire increment.
+func (b *BBRController) StampSample() DeliveryRateSample {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.sampleLocked()
+}
+
+// sampleLocked builds a DeliveryRateSample from current state. Caller holds b.mu.
+func (b *BBRController) sampleLocked() DeliveryRateSample {
 	return DeliveryRateSample{
 		SendTime:       time.Now(),
 		DeliveredBytes: b.delivered,
