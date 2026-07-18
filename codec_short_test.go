@@ -214,3 +214,44 @@ func TestShouldCompress_OversizedStreamIDFallsBackToFullHeader(t *testing.T) {
 		t.Fatalf("StreamID truncated: got 0x%X want 0x%X", frames[0].StreamID, oversized)
 	}
 }
+
+// TestDataShort_AbsoluteSeq_SurvivesLoss is the AER-047 regression: short
+// DATA headers carry the absolute low-16 SeqNo, so a dropped datagram does
+// NOT desync the decoder's reconstructed sequence numbers. With the old
+// delta chaining, losing frame 2 made frame 3 decode as seq 2 (payload
+// transposition) and the real frame 2's retransmit was dropped as a dup.
+func TestDataShort_AbsoluteSeq_SurvivesLoss(t *testing.T) {
+	tx := NewCompressor()
+	rx := NewCompressor()
+	const streamID = uint64(1)
+
+	enc := func(seq uint32) []byte {
+		var buf bytes.Buffer
+		f := &Frame{StreamID: streamID, Type: TypeDATA, SeqNo: seq, Length: 3,
+			Payload: []byte{byte(seq), byte(seq), byte(seq)}}
+		if _, err := tx.EncodeDataShort(&buf, f); err != nil {
+			t.Fatalf("encode seq %d: %v", seq, err)
+		}
+		return buf.Bytes()
+	}
+	dec := func(b []byte) *Frame {
+		f, err := rx.DecodeDataShort(bytes.NewReader(b[1:])) // skip indicator
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return f
+	}
+
+	// Sender emits seq 1,2,3 in order (tx advances its reference each time).
+	f1 := enc(1)
+	_ = enc(2) // this datagram is "lost" in transit
+	f3 := enc(3)
+
+	if got := dec(f1); got.SeqNo != 1 {
+		t.Fatalf("frame 1 decoded as seq %d, want 1", got.SeqNo)
+	}
+	if got := dec(f3); got.SeqNo != 3 {
+		t.Fatalf("frame 3 after a lost frame decoded as seq %d, want 3 "+
+			"(delta-chaining transposition regressed)", got.SeqNo)
+	}
+}

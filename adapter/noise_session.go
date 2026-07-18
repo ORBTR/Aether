@@ -347,8 +347,15 @@ type NoiseSession struct {
 	connID        aether.ConnectionID
 	classDefaults aether.TransportClassDefaults
 
-	// Short header compression (v2 — per-stream state)
-	compressor *aether.Compressor
+	// Short header compression, per-stream state. AER-048: separate encode
+	// (tx) and decode (rx) compressors. A single shared instance let the
+	// peer's inbound sequence numbers and the local outbound sequence numbers
+	// cross-contaminate the same StreamCompState.lastSeqNo and
+	// SessionCompState.lastSender/lastReceiver, corrupting short-header deltas
+	// and identity stamping on bidirectional streams. The TCP adapter fixed
+	// this same class as AE-P-05.
+	txCompressor *aether.Compressor
+	rxCompressor *aether.Compressor
 
 	// Per-frame encryption (optional — Noise already encrypts the transport layer)
 	// Set via SetSessionKey when per-frame AEAD is needed (e.g., relay scenarios)
@@ -435,7 +442,8 @@ func NewNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 		fecDecoder:         reliability.NewFECDecoder(),
 		interleavedEncoder: reliability.NewInterleavedFECEncoder(reliability.DefaultFECGroupSize),
 		interleavedDecoder: reliability.NewInterleavedFECDecoder(),
-		compressor:         aether.NewCompressor(),
+		txCompressor:       aether.NewCompressor(),
+		rxCompressor:       aether.NewCompressor(),
 	}
 	// Reed-Solomon encoder/decoder — instantiated even when no stream is
 	// using FECReedSolomon, because the cost is just a small Galois-field

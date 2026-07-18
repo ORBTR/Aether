@@ -977,26 +977,26 @@ func (s *NoiseSession) writeFrame(frame *aether.Frame) error {
 	var buf bytes.Buffer
 	if s.opts.HeaderComp {
 		// Control frames (not encrypted, no payload) → 4 bytes
-		if s.compressor.ShouldCompressControl(frame) {
-			s.compressor.EncodeControlShort(&buf, frame)
+		if s.txCompressor.ShouldCompressControl(frame) {
+			s.txCompressor.EncodeControlShort(&buf, frame)
 			return s.connWrite(buf.Bytes())
 		}
 		// ACK frames → 11 bytes (lite) or 3+N (full)
-		if s.compressor.ShouldCompressACK(frame) {
-			s.compressor.EncodeACKShort(&buf, frame)
+		if s.txCompressor.ShouldCompressACK(frame) {
+			s.txCompressor.EncodeACKShort(&buf, frame)
 			return s.connWrite(buf.Bytes())
 		}
 		// Encrypted DATA → 9 bytes + Nonce-in-payload
-		if frame.Flags.Has(aether.FlagENCRYPTED) && s.compressor.ShouldCompressData(frame) {
-			s.compressor.EncodeEncryptedDataShort(&buf, frame)
+		if frame.Flags.Has(aether.FlagENCRYPTED) && s.txCompressor.ShouldCompressData(frame) {
+			s.txCompressor.EncodeEncryptedDataShort(&buf, frame)
 			return s.connWrite(buf.Bytes())
 		}
 		// Unencrypted DATA → 6-9 bytes
-		if s.compressor.ShouldCompressData(frame) {
+		if s.txCompressor.ShouldCompressData(frame) {
 			if frame.Length <= 127 {
-				s.compressor.EncodeDataShortVar(&buf, frame)
+				s.txCompressor.EncodeDataShortVar(&buf, frame)
 			} else {
-				s.compressor.EncodeDataShort(&buf, frame)
+				s.txCompressor.EncodeDataShort(&buf, frame)
 			}
 			return s.connWrite(buf.Bytes())
 		}
@@ -1006,7 +1006,7 @@ func (s *NoiseSession) writeFrame(frame *aether.Frame) error {
 	if _, err := aether.EncodeFrame(&buf, frame); err != nil {
 		return err
 	}
-	s.compressor.RecordFullHeader(frame)
+	s.txCompressor.RecordFullHeader(frame)
 	return s.connWrite(buf.Bytes())
 }
 

@@ -43,7 +43,7 @@ func (s *NoiseSession) isAckImmediateStream(streamID uint64) bool {
 func (s *NoiseSession) readLoop() {
 	defer s.CloseWithError(fmt.Errorf("readLoop exited"))
 	for {
-		frame, indicator, batch, err := aether.ReadNextFrame(s.conn, s.compressor)
+		frame, indicator, batch, err := aether.ReadNextFrame(s.conn, s.rxCompressor)
 		if err != nil {
 			if err != io.EOF {
 				s.SetCloseErr(err)
@@ -799,7 +799,8 @@ func (s *NoiseSession) handleImplicitOpen(frame *aether.Frame) {
 }
 
 func (s *NoiseSession) handleClose(frame *aether.Frame) {
-	s.compressor.RemoveStream(frame.StreamID)
+	s.txCompressor.RemoveStream(frame.StreamID)
+	s.rxCompressor.RemoveStream(frame.StreamID)
 	s.mu.Lock()
 	st, ok := s.streams[frame.StreamID]
 	s.mu.Unlock()
@@ -843,7 +844,8 @@ func (s *NoiseSession) handleClose(frame *aether.Frame) {
 }
 
 func (s *NoiseSession) handleReset(frame *aether.Frame) {
-	s.compressor.RemoveStream(frame.StreamID)
+	s.txCompressor.RemoveStream(frame.StreamID)
+	s.rxCompressor.RemoveStream(frame.StreamID)
 	s.mu.Lock()
 	st, ok := s.streams[frame.StreamID]
 	if ok {
