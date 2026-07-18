@@ -285,6 +285,7 @@ const (
 	dropOpForwardNoSrc                        // OpForward with nil SrcAddr
 	dropOpReplyStaleFlow                      // OpReply with FlowID not in R-table
 	dropOpUnknown                             // RL frame with op != 1,2
+	dropInnerRelayUntrustedSrc                // AER-038: RL frame from a non-private (public) source
 	dropReasonCount
 )
 
