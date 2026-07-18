@@ -55,6 +55,7 @@ type GrpcTransport struct {
 	tlsConfig  *tls.Config
 	server     *grpc.Server
 	incoming   chan aether.IncomingSession
+	closeOnce  sync.Once // AER-104: guard against double-close of incoming
 }
 
 // NewGrpcTransport creates a new gRPC transport. Returns (T, error)
@@ -99,19 +100,16 @@ func (t *GrpcTransport) Dial(ctx context.Context, target aether.Target) (aether.
 		return nil, errors.New("grpc: missing address")
 	}
 
-	// Create signed metadata to prove our identity
+	// Create signed metadata to prove our identity.
 	message := []byte(fmt.Sprintf("grpc-dial:%s:%s", t.localNode, target.NodeID))
 	signature := ed25519.Sign(t.privateKey, message)
-
-	// Add metadata to outgoing context
 	md := metadata.Pairs(
 		MetadataNodeID, string(t.localNode),
 		MetadataSignature, hex.EncodeToString(signature),
 		MetadataPubKey, hex.EncodeToString(t.privateKey.Public().(ed25519.PublicKey)),
 	)
-	dialCtx := metadata.NewOutgoingContext(ctx, md)
 
-	conn, err := grpc.DialContext(dialCtx, target.Address,
+	conn, err := grpc.DialContext(ctx, target.Address,
 		t.dialCredentials(),
 		grpc.WithBlock(),
 	)
@@ -119,18 +117,27 @@ func (t *GrpcTransport) Dial(ctx context.Context, target aether.Target) (aether.
 		return nil, aether.WrapOp("dial", aether.ProtoGRPC, target.NodeID, err)
 	}
 
-	// Create bidirectional stream session
+	// AER-010: the identity metadata must ride the STREAM RPC — the server's
+	// auth interceptor reads it off client.Stream(ctx), not off DialContext
+	// (outgoing metadata on the dial ctx is dropped). It also must outlive the
+	// caller's dial ctx: a customary `WithTimeout(...); defer cancel()` around
+	// Dial would otherwise cancel the long-lived stream the instant the dial
+	// timeout elapsed. Derive the stream ctx from Background, carry the
+	// metadata on it, and cancel it from the session's Close.
+	streamCtx, streamCancel := context.WithCancel(metadata.NewOutgoingContext(context.Background(), md))
+
 	session := &GrpcSession{
-		conn:       conn,
-		localNode:  t.localNode,
-		remoteNode: target.NodeID,
-		sendCh:     make(chan []byte, 64),
-		recvCh:     make(chan []byte, 64),
-		closeCh:    make(chan struct{}),
+		conn:         conn,
+		localNode:    t.localNode,
+		remoteNode:   target.NodeID,
+		sendCh:       make(chan []byte, 64),
+		recvCh:       make(chan []byte, 64),
+		closeCh:      make(chan struct{}),
+		streamCancel: streamCancel,
 	}
 
 	// Start stream goroutine
-	go session.runClientStream(ctx)
+	go session.runClientStream(streamCtx)
 
 	return session, nil
 }
@@ -288,10 +295,15 @@ func (t *GrpcTransport) CreateServer() *grpc.Server {
 
 // Close shuts down the aether.
 func (t *GrpcTransport) Close() error {
-	if t.server != nil {
-		t.server.GracefulStop()
-	}
-	close(t.incoming)
+	// AER-104: GracefulStop drains active handlers before we close the
+	// producer-visible incoming channel, and closeOnce makes a second Close
+	// a no-op instead of panicking on a double close(t.incoming).
+	t.closeOnce.Do(func() {
+		if t.server != nil {
+			t.server.GracefulStop()
+		}
+		close(t.incoming)
+	})
 	return nil
 }
 
@@ -456,21 +468,36 @@ type GrpcSession struct {
 	mu         sync.Mutex
 	closed     int32
 	remoteAddr net.Addr
+
+	// streamCancel cancels the client stream's context (AER-010). Set on
+	// dialed sessions; nil for server-side sessions. Invoked from Close so
+	// the long-lived stream tears down deterministically.
+	streamCancel context.CancelFunc
 }
 
 // runClientStream manages the client-side bidirectional stream.
 func (s *GrpcSession) runClientStream(ctx context.Context) {
-	defer close(s.recvCh)
+	// Own a cancellable child context so that when the send loop exits we can
+	// abort the recv pump's blocking stream.Recv() and join it before closing
+	// recvCh (AER-034).
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	// Create the bidi stream via the generated client
 	client := pb.NewTransportServiceClient(s.conn)
 	stream, err := client.Stream(ctx)
 	if err != nil {
+		close(s.recvCh) // no pump started — safe to close directly
 		return
 	}
 
-	// Recv pump: stream → recvCh
+	// Recv pump: stream → recvCh. AER-034: recvCh is closed by THIS goroutine
+	// only after the pump has exited (recvDone), so the pump can never send on
+	// a closed channel — the previous `defer close(s.recvCh)` raced the pump's
+	// send and could panic the process on shutdown.
+	recvDone := make(chan struct{})
 	go func() {
+		defer close(recvDone)
 		for {
 			frame, err := stream.Recv()
 			if err != nil {
@@ -480,29 +507,36 @@ func (s *GrpcSession) runClientStream(ctx context.Context) {
 			case s.recvCh <- frame.Data:
 			case <-s.closeCh:
 				return
+			case <-ctx.Done():
+				return
 			}
 		}
 	}()
 
 	// Send pump: sendCh → stream
+sendLoop:
 	for {
 		select {
 		case <-ctx.Done():
 			stream.CloseSend()
-			return
+			break sendLoop
 		case <-s.closeCh:
 			stream.CloseSend()
-			return
+			break sendLoop
 		case data, ok := <-s.sendCh:
 			if !ok {
 				stream.CloseSend()
-				return
+				break sendLoop
 			}
 			if err := stream.Send(&pb.Frame{Data: data, Type: pb.FrameType_FRAME_TYPE_DATA}); err != nil {
-				return
+				break sendLoop
 			}
 		}
 	}
+
+	cancel()      // abort a recv pump blocked in stream.Recv()
+	<-recvDone    // join it
+	close(s.recvCh)
 }
 
 // Send sends data through the gRPC stream.
@@ -547,6 +581,10 @@ func (s *GrpcSession) Close() error {
 	}
 
 	close(s.closeCh)
+	// AER-010: tear down the long-lived client stream deterministically.
+	if s.streamCancel != nil {
+		s.streamCancel()
+	}
 
 	if s.conn != nil {
 		return s.conn.Close()
