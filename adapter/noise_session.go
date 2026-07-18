@@ -1090,7 +1090,7 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 		RecvWindowDrops:  recvDrops,
 		DecryptErrors:    decryptErr,
 		InboxDrops:       inboxDrops,
-		// Anti-replay classification (post-CheckV2 split). ReplayRejects
+		// Anti-replay classification (Classify/Commit split). ReplayRejects
 		// preserved as the sum so old consumers reading the aggregate
 		// see the same total — the split surfaces the operational
 		// meaning. See SessionMetrics docs for the distinction.

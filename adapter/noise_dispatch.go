@@ -277,15 +277,20 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 	// manager could re-establish them, producing the rising-churn
 	// pattern.
 	//
-	// CheckV2 separates the cases: only Ancient (SeqNo below window
+	// Classify separates the cases: only Ancient (SeqNo below window
 	// bottom — a legitimate retransmit cannot land that far behind the
 	// reliability layer's send window) and WrapAttack (SeqNo jumped past
 	// half the uint32 space, impossible in a single rekey window) are
 	// reported as abuse. Duplicate is the protocol-correct behaviour of
 	// a working reliability layer under loss.
-	switch result := st.replay.CheckV2(frame.SeqNo); result {
+	// AER-061: Classify is read-only — it does NOT mark the SeqNo seen.
+	// We commit the replay window (st.replay.Commit) only AFTER the frame is
+	// durably buffered by recvWindow below. If we marked it seen here and the
+	// reorder buffer then dropped it for capacity, every retransmit would
+	// classify ResultDuplicate and be discarded forever, wedging the stream.
+	switch result := st.replay.Classify(frame.SeqNo); result {
 	case reliability.ResultNew:
-		// fall through to delivery below
+		// fall through to delivery below; commit after a durable insert
 	case reliability.ResultDuplicate:
 		// Legitimate retransmit — the sender's reliability layer
 		// re-sent a frame because its ACK was lost or arrived late.
@@ -342,13 +347,19 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 			// arrived >64 behind an advanced topSeq. Force an eager ACK to
 			// clear the sender's retransmit timer (same rationale as
 			// ResultDuplicate at OnDuplicateReceived) so the storm stops in
-			// one round-trip, then charge abuse: a real replay FLOOD still
-			// trips the tracker, while the eager ACK keeps an occasional
-			// lost-ACK retransmit from accumulating to the threshold.
+			// one round-trip.
+			//
+			// AER-023: do NOT charge abuse here. A below-floor frame is the
+			// same class of legitimate lost-ACK retransmit as an in-window
+			// ResultDuplicate (which is never charged); on a lossy path a
+			// >64-frame burst with a lost cumulative ACK produced ~13 of
+			// these inside one RTT and tripped the abuse threshold, killing a
+			// healthy session. Genuine forgeries are still caught by
+			// ResultWrapAttack; a genuine replay flood is bounded by the
+			// eager-ACK cost, not an abuse kill.
 			if st.ackEngine != nil {
 				st.ackEngine.OnDuplicateReceived(frame.SeqNo)
 			}
-			s.reportAbuse(abuse.ReasonReplayDetected)
 			return
 		}
 		// At/above the delivery floor -- still-needed late/reordered/
@@ -358,8 +369,15 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 		return
 	}
 
-	// Reliability: insert into receive window for reordering
-	delivered := st.recvWindow.Insert(frame.SeqNo, frame.Payload)
+	// Reliability: insert into receive window for reordering. AER-061:
+	// only mark the replay window seen once the frame is durably buffered.
+	// A capacity drop leaves it un-committed so its retransmit is still
+	// deliverable. Commit is idempotent and a no-op for below-floor/ancient
+	// SeqNos, so the ResultAncient-at/above-floor fall-through is safe.
+	delivered, accepted := st.recvWindow.InsertChecked(frame.SeqNo, frame.Payload)
+	if accepted {
+		st.replay.Commit(frame.SeqNo)
+	}
 
 	// Notify ACK engine BEFORE the delivery loop. DeliverToRecvCh-
 	// WithSignals can block up to maxBackpressure (25ms) on a slow

@@ -94,13 +94,23 @@ func (w *RecvWindow) SetHOLHist(h *metrics.DurationHist) {
 // that can be delivered to the application (may be empty if the frame is
 // out-of-order, or multiple if this frame fills a gap).
 func (w *RecvWindow) Insert(seqNo uint32, payload []byte) [][]byte {
+	delivered, _ := w.InsertChecked(seqNo, payload)
+	return delivered
+}
+
+// InsertChecked is Insert plus an accepted flag. accepted is false only
+// when the frame was dropped because the reorder buffer was full (frame-
+// count or byte cap). Callers that gate a replay-window commit on durable
+// buffering (AER-061) use this so a capacity-dropped frame's retransmit is
+// still deliverable later instead of being marked seen and discarded.
+func (w *RecvWindow) InsertChecked(seqNo uint32, payload []byte) (delivered [][]byte, accepted bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	w.lastRecvTime = time.Now()
 
 	if seqNo < w.expected {
-		return nil // duplicate or already delivered
+		return nil, true // duplicate or already delivered — no buffering needed
 	}
 
 	if seqNo == w.expected {
@@ -145,7 +155,7 @@ func (w *RecvWindow) Insert(seqNo uint32, payload []byte) [][]byte {
 		if w.bufferedBytes < 0 {
 			w.bufferedBytes = 0
 		}
-		return delivered
+		return delivered, true
 	}
 
 	// Out-of-order: buffer it with arrival timestamp, subject to both
@@ -154,16 +164,16 @@ func (w *RecvWindow) Insert(seqNo uint32, payload []byte) [][]byte {
 	payloadLen := int64(len(payload))
 	if len(w.buffer) >= w.maxGap {
 		atomic.AddUint64(&w.dropCount, 1)
-		return nil
+		return nil, false
 	}
 	if w.maxBytes > 0 && w.bufferedBytes+payloadLen > w.maxBytes {
 		atomic.AddUint64(&w.dropCount, 1)
-		return nil
+		return nil, false
 	}
 	w.buffer[seqNo] = copyPayload(payload)
 	w.bufTime[seqNo] = time.Now()
 	w.bufferedBytes += payloadLen
-	return nil
+	return nil, true
 }
 
 // DropsCount returns the total number of frames dropped by this receive
