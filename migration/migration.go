@@ -188,8 +188,25 @@ func (m *Migrator) ValidateMigration(connID aether.ConnectionID, ip net.IP, port
 	return nil
 }
 
-// recordNonceLocked stores nonce with FIFO eviction. Caller must hold m.mu.
+// recordNonceLocked stores nonce with TTL-then-size eviction. Caller holds m.mu.
 func (m *Migrator) recordNonceLocked(nonce [8]byte) {
+	// AER-090: evict expired nonces by TTL first. A nonce older than
+	// MigrationTokenTTL can no longer be replayed (ValidateMigration rejects
+	// stale timestamps), so it need not occupy the seen-set. This bounds the
+	// set by the ACTUAL in-window nonce count rather than a fixed FIFO depth,
+	// closing the window where >MigrationSeenCacheSize tokens within one TTL
+	// evicted still-valid nonces and let a captured token replay. The stored
+	// per-nonce timestamp (previously dead) now drives the eviction.
+	cutoff := time.Now().Add(-MigrationTokenTTL)
+	for len(m.seenOrder) > 0 {
+		oldest := m.seenOrder[0]
+		if ts, ok := m.seenNonces[oldest]; ok && ts.After(cutoff) {
+			break // still within TTL — nothing older to prune
+		}
+		m.seenOrder = m.seenOrder[1:]
+		delete(m.seenNonces, oldest)
+	}
+	// Hard size backstop against a pathological in-window flood.
 	if len(m.seenOrder) >= MigrationSeenCacheSize {
 		oldest := m.seenOrder[0]
 		m.seenOrder = m.seenOrder[1:]
@@ -228,9 +245,21 @@ func (m *Migrator) Prune(maxAge time.Duration) {
 	}
 }
 
-// computeHMAC generates HMAC-SHA256 over data with the given key.
+// deriveMigrationKey derives a migration-HMAC-specific key from the session
+// key via a labelled HMAC (HKDF-Expand-style). AER-091: the raw session key is
+// also the AEAD frame key; using it directly as the migration MAC key reused
+// one key across two primitives. A per-purpose derived subkey removes that
+// cross-primitive coupling.
+func deriveMigrationKey(sessionKey []byte) []byte {
+	mac := hmac.New(sha256.New, sessionKey)
+	mac.Write([]byte("aether-migration-hmac-v1"))
+	return mac.Sum(nil)
+}
+
+// computeHMAC generates HMAC-SHA256 over data with a migration-specific key
+// derived from the session key (AER-091).
 func computeHMAC(data, key []byte) []byte {
-	mac := hmac.New(sha256.New, key)
+	mac := hmac.New(sha256.New, deriveMigrationKey(key))
 	mac.Write(data)
 	return mac.Sum(nil)
 }
