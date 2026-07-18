@@ -269,13 +269,19 @@ func (a *StreamAcceptor) AcceptByID(ctx context.Context, streamID uint64) (Strea
 			return nil, ctx.Err()
 		}
 		a.mu.Unlock()
+		// AER-056: Notify already claimed our slot (deleted it from the map)
+		// and is committed to sending on ch (buffered, cap 1) — it just hasn't
+		// executed the send yet. A non-blocking recv here raced that window and
+		// returned ctx.Err() while the committed stream sat unconsumed in ch,
+		// orphaning it (Notify reported delivered; no Reset ever sent). BLOCK
+		// briefly to receive it; the timeout is only a safety backstop.
 		select {
 		case st, ok := <-ch:
 			if !ok {
 				return nil, a.errClosed
 			}
 			return st, nil
-		default:
+		case <-time.After(byIDNotifyDrainTimeout):
 			return nil, ctx.Err()
 		}
 	case <-a.closed:
@@ -296,17 +302,24 @@ func (a *StreamAcceptor) AcceptByID(ctx context.Context, streamID uint64) (Strea
 			return nil, a.errClosed
 		}
 		a.mu.Unlock()
+		// AER-056: same committed-send window as the ctx.Done() drain above —
+		// block briefly for the stream Notify is committed to sending.
 		select {
 		case st, ok := <-ch:
 			if !ok {
 				return nil, a.errClosed
 			}
 			return st, nil
-		default:
+		case <-time.After(byIDNotifyDrainTimeout):
 			return nil, a.errClosed
 		}
 	}
 }
+
+// byIDNotifyDrainTimeout bounds how long AcceptByID blocks to consume a stream
+// that Notify has already committed to delivering (AER-056). The send happens
+// microseconds after Notify releases the lock, so this is only a backstop.
+const byIDNotifyDrainTimeout = 1 * time.Second
 
 // Close drains the backlog and signals all waiters that the session
 // is gone. Streams still parked on the backlog are returned via the
