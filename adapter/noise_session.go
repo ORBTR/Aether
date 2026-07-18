@@ -187,6 +187,11 @@ type NoiseSession struct {
 	// for the demote semantics.
 	tlpResetTotal uint64
 
+	// retransmitEvicted counts frames dropped from a stream's retransmit
+	// queue (byte-cap eviction, deadline, or max-retries) — each is a
+	// reliable frame that lost its RTO safety net. AER-066.
+	retransmitEvicted uint64
+
 	// Observability histograms (see metrics/duration_hist.go). All four
 	// histograms are populated on writeLoop / writeFrame hot paths;
 	// PercentileSnapshot is read once per Metrics() call (which is a

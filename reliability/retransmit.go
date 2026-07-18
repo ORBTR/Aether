@@ -283,6 +283,12 @@ func (q *RetransmitQueue) advanceEntryLocked(entry *RetransmitEntry, entryBytes 
 			if q.bufferedBytes < 0 {
 				q.bufferedBytes = 0
 			}
+			// AER-066: honour the onEvict contract on the deadline drop path
+			// too (evictForRoomLocked already does). Without this an expired
+			// frame vanished with no credit release / metric / stream signal.
+			if q.onEvict != nil {
+				q.onEvict(entry)
+			}
 			return nil // expired — skip retransmit, stale data
 		}
 	}
@@ -293,28 +299,30 @@ func (q *RetransmitQueue) advanceEntryLocked(entry *RetransmitEntry, entryBytes 
 		if q.bufferedBytes < 0 {
 			q.bufferedBytes = 0
 		}
+		// AER-066: notify onEvict on the max-retries drop as well.
+		if q.onEvict != nil {
+			q.onEvict(entry)
+		}
 		return nil // exceeded max retries — drop
 	}
 
 	// Re-enqueue with doubled RTO (exponential backoff). bufferedBytes
 	// is unchanged since the same entry stays in the queue.
 	//
-	// Re-sample the current RTTEstimator-derived RTO as a floor so a
-	// post-spike recovery is reflected in the next try. Without this,
-	// once entry.RTO doubled to e.g. 5s during a bad burst it stayed
-	// at 5s+ for the lifetime of the entry even if SRTT had recovered
-	// to 10ms (was M-RTO-Stuck-Historical). The doubled value still
-	// applies if the live RTO has also grown — we take MAX so we
-	// never under-back-off, only catch up to a recovered estimator.
+	// Reconcile the doubled value with the live RTTEstimator RTO so the
+	// entry never retransmits earlier than the path's current RTT, and
+	// never stays stuck at a stale-high value after the estimator recovers:
+	//   - live > doubled  → RTT spiked above our backoff; take the live RTO
+	//     (AER-070: the old code KEPT the smaller doubled value here and
+	//     retransmitted early, producing spurious duplicates after a spike).
+	//   - live*2 < doubled → estimator recovered well below; catch down to
+	//     live*2 so a historical backoff doesn't stay pinned (M-RTO-Stuck).
+	//   - otherwise        → keep the doubled value.
 	entry.RTO *= 2
-	if live := q.rtt.RTO(); live > 0 && live*2 > entry.RTO {
-		// keep entry.RTO (we've already backed off further than the live)
-	} else if live > 0 && live < entry.RTO {
-		// Live RTO is smaller than our doubled RTO. Only adopt the live
-		// when it's significantly smaller (less than half) so we don't
-		// thrash on small RTT samples; otherwise keep the historical
-		// backoff intact.
-		if live*2 < entry.RTO {
+	if live := q.rtt.RTO(); live > 0 {
+		if live > entry.RTO {
+			entry.RTO = live
+		} else if live*2 < entry.RTO {
 			entry.RTO = live * 2
 		}
 	}
