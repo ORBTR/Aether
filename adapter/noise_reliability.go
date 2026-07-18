@@ -471,30 +471,52 @@ func (s *NoiseSession) reliabilityTick() {
 					// Probes go into the per-stream probe slot in the
 					// scheduler (at most one in flight, replaced on
 					// re-arm), separate from the regular WFQ queue.
+					probeFired := false
 					if st.tlp.ShouldProbe(tickNow) {
-						highSeq := st.sendWindow.Next() - 1
-						if entry := st.sendWindow.GetEntry(highSeq); entry != nil {
-							s.sched.EnqueueProbe(streamID, entry.Frame)
-							st.sendWindow.BumpXmitTime(highSeq, tickNow)
-							st.tlp.MarkProbeSent(highSeq)
-							// OBS-11 aether_tlp_fires_total: increment
-							// only inside the inner branch where the
-							// probe is actually enqueued — ShouldProbe
-							// can fire on a stream whose highSeq entry
-							// has already been ACKed/evicted, in which
-							// case nothing reaches the wire and no
-							// counter bump is warranted.
+						// AER-086: probe the highest REMAINING in-flight seq,
+						// not strictly Next()-1. If that entry was selectively
+						// ACKed/evicted, GetEntry returns nil and no probe ever
+						// fired — recovery silently fell back to RTO. Scan down
+						// to the highest still-in-flight entry.
+						next := st.sendWindow.Next()
+						base := st.sendWindow.Base()
+						var probeFrame *aether.Frame
+						var probeSeq uint32
+						if next > base {
+							for seq := next - 1; ; seq-- {
+								if e := st.sendWindow.GetEntry(seq); e != nil {
+									probeFrame, probeSeq = e.Frame, seq
+									break
+								}
+								if seq == base {
+									break
+								}
+							}
+						}
+						if probeFrame != nil {
+							s.sched.EnqueueProbe(streamID, probeFrame)
+							st.sendWindow.BumpXmitTime(probeSeq, tickNow)
+							st.tlp.MarkProbeSent(probeSeq)
+							// OBS-11 aether_tlp_fires_total: increment only when
+							// a probe actually reaches the wire.
 							atomic.AddUint64(&s.tlpFiresTotal, 1)
+							probeFired = true
 							log.Printf("[TLP] peer=%s stream=%d probeSeq=%d inFlight=%d cwnd=%d",
-								s.RemoteNodeID().Short(), streamID, highSeq, inFlight, s.congestion().CWND())
+								s.RemoteNodeID().Short(), streamID, probeSeq, inFlight, s.congestion().CWND())
 						}
 					}
 
 					// Re-arm TLP based on the freshest XmitTime in the
-					// in-flight set. PendingProbe state internally
-					// suppresses spurious re-arming while a probe is
-					// outstanding.
-					var newest time.Time
+					// in-flight set. AER-080: if we fired a probe this tick its
+					// XmitTime was bumped to tickNow — newer than anything in
+					// the pre-probe snapshot — so seed `newest` with tickNow.
+					// Re-arming from the stale snapshot left scheduledAt in the
+					// past, firing probe #2 on the very next 10ms tick and
+					// burning maxConsecutiveProbes into one loss burst.
+					newest := time.Time{}
+					if probeFired {
+						newest = tickNow
+					}
 					for _, re := range rawSnap {
 						if re.XmitTime.After(newest) {
 							newest = re.XmitTime
