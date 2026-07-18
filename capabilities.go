@@ -88,7 +88,32 @@ func (c Capabilities) String() string {
 	return fmt.Sprintf("[%s]", strings.Join(parts, ", "))
 }
 
-// CapabilitiesForProtocol returns the native capabilities for a given transport protocol.
+// CapabilitiesForConnection is like CapabilitiesForProtocol but accounts for
+// whether the concrete connection is actually secured. AER-102: the protocol
+// alone does NOT imply encryption for WS/TCP/gRPC — the built-in WebSocket
+// server can listen over plain HTTP (ws://), TCP can wrap any plaintext conn,
+// and gRPC defaults to insecure credentials. Advertising CapNativeEncryption /
+// CapNativeIdentity for a plaintext connection there lets a caller that
+// consults capabilities to decide whether per-frame protection is needed
+// transmit plaintext believing the channel is authenticated and encrypted.
+// Pass secure=true only when the concrete endpoint is wss / TCP+TLS / gRPC+TLS.
+// Noise and QUIC are inherently encrypted, so `secure` is ignored for them.
+func CapabilitiesForConnection(proto Protocol, secure bool) Capabilities {
+	caps := CapabilitiesForProtocol(proto)
+	switch proto {
+	case ProtoWebSocket, ProtoTCP, ProtoGRPC:
+		if !secure {
+			caps &^= CapNativeEncryption
+			caps &^= CapNativeIdentity
+		}
+	}
+	return caps
+}
+
+// CapabilitiesForProtocol returns the native capabilities for a given transport
+// protocol, assuming a SECURE endpoint. For WS/TCP/gRPC — which can run
+// plaintext — prefer CapabilitiesForConnection so a plaintext connection does
+// not falsely advertise native encryption/identity (AER-102).
 // This determines which Aether layers are activated vs skipped for each
 func CapabilitiesForProtocol(proto Protocol) Capabilities {
 	switch proto {
