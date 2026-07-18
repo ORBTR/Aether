@@ -208,7 +208,7 @@ func (t *NoiseTransport) performInitiatorHandshakeAttempt(ctx context.Context, u
 	}
 
 	go nc.runReader()
-	s := aether.NewConnection(t.localNode, remoteNode, nc)
+	s := aether.NewConnection(t.localNode, remoteNode, nc, aether.ProtoNoise)
 	s.OnClose(func() { nc.Close() })
 	return s, nil
 }
@@ -580,7 +580,7 @@ recvLoop:
 	listener.registerDialSession(addr, nc, remoteNode)
 
 	// No separate runReader — the listener's run() loop handles all incoming packets
-	s := aether.NewConnection(t.localNode, remoteNode, nc)
+	s := aether.NewConnection(t.localNode, remoteNode, nc, aether.ProtoNoise)
 	s.OnClose(func() { nc.Close() })
 	return s, nil
 }
@@ -1090,7 +1090,7 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 	}
 
 	l.mu.Unlock()
-	s := aether.NewConnection(l.transport.localNode, remoteNode, nc)
+	s := aether.NewConnection(l.transport.localNode, remoteNode, nc, aether.ProtoNoise)
 	s.OnClose(func() { nc.Close() })
 	// Recover from panic if the listener has already closed l.incoming
 	// (noiseListener.run's `defer close(l.incoming)` at session.go:819).
