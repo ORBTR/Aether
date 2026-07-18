@@ -596,6 +596,11 @@ recvLoop:
 // DTLS use for their handshakes.
 const handshakeRetransmitInterval = 700 * time.Millisecond
 
+// acceptHandoffTimeout bounds how long a completed handshake/resume waits to
+// hand its session to a slow Accept consumer before dropping it. The handoff
+// runs off the readLoop (AER-019) so this never stalls packet dispatch.
+const acceptHandoffTimeout = 1 * time.Second
+
 // msg3RetransmitWindow bounds how long the initiator keeps re-sending msg3
 // while waiting for the peer's first inbound packet. It must comfortably exceed
 // a few RTTs plus the responder's own msg2 retransmit handling, yet stay well
@@ -944,13 +949,26 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 	// which still sends it raw, keeps interoperating (its msg3 simply retains
 	// the ~50% misroute until it upgrades).
 	msg3 := msg
+	stripped := false
 	if n := currentDialNonce(msg); n != nil {
 		msg3 = msg[1+dialNonceLen:]
+		stripped = true
 	}
 
 	// Process the third message (Initiator -> Responder)
 	// This message completes the handshake and establishes the session.
 	payload, cs1, cs2, err := state.ReadMessage(nil, msg3)
+	if err != nil && stripped {
+		// AER-020: the 0xFD-prefix strip is heuristic — a bare msg3 whose first
+		// ciphertext byte is coincidentally 0xFD (1/256, notably the cross-org
+		// raw-msg3 path) would be mis-stripped by 9 bytes and fail here. Retry
+		// with the UNstripped bytes before treating this as a failed msg3.
+		// flynn/noise checkpoints and rolls back symmetric state on a failed
+		// ReadMessage, so the retry is safe.
+		if p2, c1b, c2b, err2 := state.ReadMessage(nil, msg); err2 == nil {
+			payload, cs1, cs2, err = p2, c1b, c2b, nil
+		}
+	}
 	if err != nil {
 		// Not a valid msg3. If we have already sent msg2, this is almost
 		// certainly a retransmitted msg1 — the initiator re-sending
@@ -1092,21 +1110,24 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 	l.mu.Unlock()
 	s := aether.NewConnection(l.transport.localNode, remoteNode, nc, aether.ProtoNoise)
 	s.OnClose(func() { nc.Close() })
-	// Recover from panic if the listener has already closed l.incoming
-	// (noiseListener.run's `defer close(l.incoming)` at session.go:819).
-	// A handshake that completed AFTER ctx cancellation reaches this
-	// select with a closed channel; the ctx.Done() arm would normally
-	// race the close-then-send and lose. The recover matches the
-	// dispatchToSession defense at session.go:1007 — keeps the partial
-	// handshake from taking down the whole node.
-	defer func() {
-		_ = recover()
+	// AER-019: hand the accepted session to the Accept queue from a GOROUTINE,
+	// not inline on the readLoop. handleHandshake runs on the single readLoop;
+	// blocking here on a full l.incoming (a slow/stalled Accept consumer) would
+	// stall ALL packet dispatch on this socket — data, ACKs, and in-flight dial
+	// responses — presenting as node-wide handshake/session timeouts. The
+	// recover guards l.incoming being closed on shutdown (matches the relay
+	// accept path); a listener not draining within the timeout drops the
+	// session rather than leaking a goroutine.
+	go func() {
+		defer func() { _ = recover() }()
+		select {
+		case l.incoming <- aether.IncomingSession{Session: s, Reader: nc, Writer: nc}:
+		case <-ctx.Done():
+			nc.Close()
+		case <-time.After(acceptHandoffTimeout):
+			nc.Close()
+		}
 	}()
-	select {
-	case l.incoming <- aether.IncomingSession{Session: s, Reader: nc, Writer: nc}:
-	case <-ctx.Done():
-		return
-	}
 }
 
 // resolveHandshakeKey extracts the prologue key, optional scope ID, pattern flag,

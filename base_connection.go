@@ -25,6 +25,19 @@ type BaseConnection struct {
 	// field would let a second registration silently overwrite the first.
 	onCloseFns []func()
 	initialRTT time.Duration // TCP handshake / dial RTT for cross-region latency
+
+	// pendingRead preserves an in-flight fallback Read across a cancelled
+	// Receive (AER-050). When Receive's ctx fires while the read goroutine is
+	// still blocked in Conn.Read, the goroutine's eventual result is kept here
+	// so the NEXT Receive consumes it instead of the orphaned read swallowing
+	// and discarding that inbound message. Guarded by readMu.
+	readMu      sync.Mutex
+	pendingRead chan readResult
+}
+
+type readResult struct {
+	data []byte
+	err  error
 }
 
 // Protocol returns the transport protocol.
@@ -76,26 +89,37 @@ func (s *BaseConnection) Receive(ctx context.Context) ([]byte, error) {
 		return buf[:n], nil
 	}
 
-	// Fallback: use goroutine with context cancellation
-	type result struct {
-		n   int
-		err error
+	// Fallback: a goroutine performs the blocking Read. AER-050: reuse a
+	// still-running read from a previously cancelled Receive so a cancelled
+	// call doesn't orphan a Read that then swallows and discards the next
+	// inbound message. The read goroutine owns its own buffer, so nothing
+	// aliases across calls.
+	s.readMu.Lock()
+	ch := s.pendingRead
+	if ch == nil {
+		ch = make(chan readResult, 1)
+		s.pendingRead = ch
+		go func(out chan<- readResult) {
+			rbuf := make([]byte, 4096)
+			n, err := s.Conn.Read(rbuf)
+			out <- readResult{data: rbuf[:n], err: err}
+		}(ch)
 	}
-	done := make(chan result, 1)
-
-	go func() {
-		n, err := s.Conn.Read(buf)
-		done <- result{n, err}
-	}()
+	s.readMu.Unlock()
 
 	select {
 	case <-ctx.Done():
+		// Leave pendingRead set — the goroutine is still running and its
+		// result will be consumed by the next Receive, not lost.
 		return nil, ctx.Err()
-	case r := <-done:
+	case r := <-ch:
+		s.readMu.Lock()
+		s.pendingRead = nil
+		s.readMu.Unlock()
 		if r.err != nil {
 			return nil, r.err
 		}
-		return buf[:r.n], nil
+		return r.data, nil
 	}
 }
 

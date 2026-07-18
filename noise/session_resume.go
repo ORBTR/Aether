@@ -572,10 +572,19 @@ func (l *noiseListener) handleResumePacket(ctx context.Context, conn *net.UDPCon
 	// sees the resumed session just like any XK/XX-established one.
 	s := aether.NewConnection(l.transport.localNode, ticket.PeerID, nc, aether.ProtoNoise)
 	s.OnClose(func() { nc.Close() })
-	select {
-	case l.incoming <- aether.IncomingSession{Session: s, Reader: nc, Writer: nc}:
-	case <-ctx.Done():
-	}
+	// AER-019: hand off from a goroutine so a full Accept queue can't stall the
+	// readLoop (this runs on it). Drop the session if the listener isn't
+	// draining within the timeout rather than blocking packet dispatch.
+	go func() {
+		defer func() { _ = recover() }()
+		select {
+		case l.incoming <- aether.IncomingSession{Session: s, Reader: nc, Writer: nc}:
+		case <-ctx.Done():
+			nc.Close()
+		case <-time.After(acceptHandoffTimeout):
+			nc.Close()
+		}
+	}()
 	dbgNoise.Printf("resume: accepted session with %s via 0.5-RTT ticket", ticket.PeerID.Short())
 }
 
