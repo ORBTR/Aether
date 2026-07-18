@@ -303,10 +303,25 @@ func (r *RACK) DetectLost(snap []SendEntrySnapshot, now time.Time) (lost []uint3
 		for _, seq := range lost {
 			r.markedLost[seq] = true
 		}
+		// AER-084: bound markedLost. Entries for seqs that are never ACKed
+		// (peer-dropped range, stream reset, ACK race) are cleared only in
+		// Ack, so they would otherwise persist forever — a slow map leak, and
+		// on uint32 seq reuse a stale entry both suppresses re-marking of the
+		// new packet and inflates reoWnd as fake reorder evidence. RACK
+		// re-derives loss from fresh ACK signals each tick, so clearing the
+		// map once it grows past the cap only forgets DSACK-inflation memory,
+		// which recovers on the next reorder signal.
+		if len(r.markedLost) > rackMarkedLostCap {
+			r.markedLost = make(map[uint32]bool)
+		}
 		r.mu.Unlock()
 	}
 	return lost, nextWakeup
 }
+
+// rackMarkedLostCap bounds the markedLost map (AER-084). Far above any
+// plausible in-flight loss set so it only trips on a genuine leak.
+const rackMarkedLostCap = 4096
 
 // SendEntrySnapshot is a minimal read-only view of an in-flight frame's
 // metadata. Defined here (not imported from reliability) so the
