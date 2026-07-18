@@ -509,7 +509,11 @@ func (st *noiseStream) sendSingleFrame(ctx context.Context, data []byte) error {
 	// handler nil-checks before dereferencing.
 	if bbr, ok := st.session.congestion().(*congestion.BBRController); ok {
 		if entry := st.sendWindow.GetEntry(seqNo); entry != nil {
-			sample := bbr.OnSend(int64(frame.Length))
+			// AER-076: stamp the sample WITHOUT incrementing inflight. The
+			// writeLoop's congestion().OnSend at actual transmission is the
+			// single authoritative on-wire inflight increment; incrementing
+			// here too double-counted every frame and wedged BBR in Drain.
+			sample := bbr.StampSample()
 			entry.BBRSample = &sample
 		}
 	}
