@@ -114,8 +114,20 @@ func DecodeFrameFromBytes(data []byte) (*Frame, error) {
 	f.AckNo = binary.BigEndian.Uint32(data[30:34])
 	f.Length = binary.BigEndian.Uint32(data[34:38])
 	copy(f.Nonce[:], data[38:50])
-	if len(data) > HeaderSize {
-		f.Payload = data[HeaderSize:]
+	// AER-055: validate Length and return a Payload consistent with it
+	// (mirrors DecodeFrame). Without this, attacker bytes with
+	// Length=0xFFFFFFFF and a short body panicked any Length-trusting
+	// consumer on re-encode/relay, and honest frames with trailing bytes
+	// failed Validate (len(Payload) != Length).
+	if f.Length > MaxPayloadSize {
+		return nil, fmt.Errorf("aether: payload too large (%d > %d)", f.Length, MaxPayloadSize)
+	}
+	avail := len(data) - HeaderSize
+	if int(f.Length) > avail {
+		return nil, fmt.Errorf("aether: truncated payload (have %d, need %d)", avail, f.Length)
+	}
+	if f.Length > 0 {
+		f.Payload = data[HeaderSize : HeaderSize+int(f.Length)]
 	}
 	return f, nil
 }
@@ -281,7 +293,15 @@ func DecodeSACKBlocks(data []byte) []SACKBlock {
 // EncodeCompositeACK encodes a Composite ACK into wire format.
 // Wire: [BaseACK:4][AckDelay:2][BitmapLen:1][Bitmap:N][Flags:1][extensions...]
 func EncodeCompositeACK(ack *CompositeACK) []byte {
+	// AER-054: BitmapLen is a single wire byte. A bitmap longer than 255
+	// bytes would wrap when written (data[off] = byte(bitmapLen)) while all
+	// its bytes were still copied, so the decoder would read Flags/extensions
+	// from inside the bitmap and move the peer's send window on fabricated
+	// ACK data. Clamp to 255 (valid CompositeACK bitmaps are <= 32 bytes).
 	bitmapLen := len(ack.Bitmap)
+	if bitmapLen > 255 {
+		bitmapLen = 255
+	}
 	// Calculate total size
 	size := 4 + 2 + 1 + bitmapLen + 1 // base fields
 	if ack.Flags&CACKHasExtRanges != 0 {

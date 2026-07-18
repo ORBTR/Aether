@@ -94,10 +94,20 @@ func TestPredictPorts(t *testing.T) {
 	if len(cands) != 5 { // 4998..5002
 		t.Fatalf("got %d candidates, want 5", len(cands))
 	}
-	for i, c := range cands {
-		want := 5000 + i - 2
-		if c.Port != want {
-			t.Errorf("cands[%d].Port = %d, want %d", i, c.Port, want)
+	// AER-037: center-out ordering — the observed port must be emitted FIRST
+	// so that PunchCandidates' cap keeps it. The old ascending order emitted
+	// the observed port in the middle, so the cap dropped it entirely.
+	if cands[0].Port != 5000 {
+		t.Errorf("cands[0].Port = %d, want 5000 (observed port first)", cands[0].Port)
+	}
+	// The full candidate set must still cover the ±window range.
+	seen := make(map[int]bool)
+	for _, c := range cands {
+		seen[c.Port] = true
+	}
+	for p := 4998; p <= 5002; p++ {
+		if !seen[p] {
+			t.Errorf("missing candidate port %d", p)
 		}
 	}
 }
