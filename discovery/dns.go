@@ -117,10 +117,17 @@ func (d *DNSSRVDiscoverer) Discover(ctx context.Context) ([]PeerAddress, error) 
 		peers[i] = e.peer
 	}
 
-	// Update cache
+	// Update cache. AER-042: do NOT cache an empty result for the full TTL —
+	// a transient empty/partial SRV response (e.g. during a records rollout)
+	// would otherwise suppress rediscovery for the whole TTL after DNS
+	// recovered. Cache empties only briefly so the next Discover re-queries.
 	d.mu.Lock()
 	d.cache = peers
-	d.cacheExp = time.Now().Add(d.cacheTTL)
+	if len(peers) > 0 {
+		d.cacheExp = time.Now().Add(d.cacheTTL)
+	} else {
+		d.cacheExp = time.Now().Add(5 * time.Second)
+	}
 	d.mu.Unlock()
 
 	_ = metadata // metadata available for future use (region hints, version)

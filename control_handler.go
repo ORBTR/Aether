@@ -94,6 +94,14 @@ func (h *ControlFrameHandler) HandlePong(frame *Frame) {
 // originally inlined the two-line body each, but every transport
 // handles PRIORITY the same way so it belongs here.
 func (h *ControlFrameHandler) HandlePriority(frame *Frame) {
+	// AER-089: a peer must not set the scheduling weight of our own keepalive
+	// stream. A hostile peer could otherwise send PRIORITY(keepalive, weight=1)
+	// to down-weight our liveness traffic within its latency class. Class-based
+	// dequeue bounds the impact, but the peer should have no influence over our
+	// reserved control streams at all.
+	if h.KeepaliveStreamID != 0 && frame.StreamID == h.KeepaliveStreamID {
+		return
+	}
 	p := DecodePriority(frame.Payload)
 	h.Sched.SetWeight(frame.StreamID, p.Weight)
 }

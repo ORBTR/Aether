@@ -171,6 +171,12 @@ func DispatchRank(s Score, op DispatchOp) float64 {
 		rank *= 0.95
 	case RouteInterContinental:
 		rank *= 0.90
+	case RouteUnknown:
+		// AER-088: an unclassified path already scores on the most-lenient
+		// RTT band; without a discount here it kept ×1.0 and out-ranked a
+		// healthy classified path, inverting path selection. Discount it below
+		// InterContinental so an unknown path never wins on affinity alone.
+		rank *= 0.85
 	}
 
 	// Op-class adjustments: re-weight a single component without
