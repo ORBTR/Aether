@@ -325,6 +325,28 @@ func (w *StreamWindow) SetGrantStarveHist(h *metrics.DurationHist) {
 // Larger frames block waiting for credit, honouring ctx cancellation. After
 // ConsumeTimeout with no credit the call fails; higher layers (gossip)
 // surface this as "insufficient stream credit after 10s".
+// TryConsume attempts a non-blocking credit acquire (the fast path only) and
+// returns true if credit was available and consumed, false otherwise — it
+// NEVER blocks. AER-087: transports with native backpressure (TCP/WS) track
+// outstanding bytes for metrics but must never stall a send on Aether-level
+// credit; the blocking Consume could park a TCP Send for the full
+// ConsumeTimeout (~10s) on a drained window.
+func (w *StreamWindow) TryConsume(n int64) bool {
+	if n <= 0 || n <= MinGuaranteedWindow {
+		return true
+	}
+	if w.sem.TryAcquire(n) {
+		w.mu.Lock()
+		w.dataOutstanding += n
+		if w.dataOutstanding > w.peakOutstanding {
+			w.peakOutstanding = w.dataOutstanding
+		}
+		w.mu.Unlock()
+		return true
+	}
+	return false
+}
+
 func (w *StreamWindow) Consume(ctx context.Context, n int64) error {
 	if n <= 0 {
 		return nil

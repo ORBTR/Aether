@@ -36,6 +36,7 @@ type Scheduler struct {
 	// REALTIME bandwidth cap tracking
 	realtimeBytes int64 // bytes sent from REALTIME class in current window
 	totalBytes    int64 // total bytes sent in current window
+	nonBulkStreak int   // AER-082: consecutive non-BULK dequeues (BULK anti-starvation)
 
 	// Wake channel — Enqueue does a non-blocking signal so the writeLoop
 	// can park on a select instead of polling with time.Sleep(1ms).
@@ -400,6 +401,20 @@ func (s *Scheduler) Dequeue() (*aether.Frame, bool) {
 	// threshold, and the pinned >10% ratio never recovered. Demotion keeps the
 	// cap's purpose (REALTIME loses its absolute priority over other classes)
 	// while guaranteeing forward progress when nothing else competes.
+	// AER-082: anti-starvation floor for BULK. Strict class priority (only
+	// REALTIME is capped) otherwise lets a saturating INTERACTIVE stream starve
+	// BULK indefinitely. After bulkStarvationLimit consecutive non-BULK
+	// dequeues, serve one BULK frame first if any is queued so BULK always
+	// makes forward progress.
+	if s.nonBulkStreak >= bulkStarvationLimit {
+		s.nonBulkStreak = 0
+		if frame, _ := s.dequeueFromClass(aether.ClassBULK, order, false); frame != nil {
+			s.totalBytes += int64(aether.HeaderSize) + int64(frame.Length)
+			return frame, false
+		}
+		// No BULK queued — fall through to the normal priority order.
+	}
+
 	for _, targetClass := range []aether.LatencyClass{aether.ClassREALTIME, aether.ClassINTERACTIVE, aether.ClassBULK} {
 		if targetClass == aether.ClassREALTIME && realtimeCapped {
 			continue // capped REALTIME is served in the INTERACTIVE round below
@@ -417,12 +432,22 @@ func (s *Scheduler) Dequeue() (*aether.Frame, bool) {
 			if isRealtime {
 				s.realtimeBytes += bytesOut
 			}
+			// AER-082: track the non-BULK streak for the anti-starvation floor.
+			if targetClass == aether.ClassBULK {
+				s.nonBulkStreak = 0
+			} else {
+				s.nonBulkStreak++
+			}
 			return frame, false
 		}
 	}
 
 	return nil, false
 }
+
+// bulkStarvationLimit is the number of consecutive non-BULK dequeues after
+// which the scheduler forces one BULK frame to prevent starvation (AER-082).
+const bulkStarvationLimit = 16
 
 // dequeueFromClass picks the best frame within a specific latency class using WFQ.
 // order is the caller's snapshot of s.order (see Dequeue): iterating the snapshot

@@ -1262,10 +1262,12 @@ func (st *tcpStream) Send(ctx context.Context, data []byte) error {
 	}
 
 	// Flow control: TCP provides native backpressure, so we don't enforce
-	// Aether-level credit limits on TCP/WS adapters. The Consume call is tracked
-	// for metrics but errors are ignored. Only Noise-UDP (unreliable transport)
-	// needs application-level flow control enforcement.
-	_ = st.window.Consume(ctx, int64(len(data)))
+	// Aether-level credit limits on TCP/WS adapters. AER-087: use the
+	// non-blocking TryConsume for metrics tracking — the blocking Consume could
+	// stall this Send for the full ConsumeTimeout (~10s) on a drained window,
+	// contradicting the "TCP native backpressure only" intent. The send
+	// proceeds regardless of the return.
+	_ = st.window.TryConsume(int64(len(data)))
 
 	// MaxFrameSize enforcement (Task 15): split large payloads into
 	// MaxFrameSize-sized chunks so they interleave with other streams
