@@ -377,6 +377,14 @@ type NoiseSession struct {
 	// on a black-holed path. Updated under s.mu during reliabilityTick.
 	lastAnyProgressAt time.Time
 
+	// prevAnyInFlight records whether the previous reliabilityTick observed
+	// any in-flight data. When in-flight transitions 0→N (a fresh burst
+	// after an idle gap) the stall detector reseeds lastAnyProgressAt so a
+	// request/response workload that idled past SessionStallThreshold isn't
+	// declared stuck the instant it sends again — before any ACK could
+	// possibly return. Guarded by s.mu.
+	prevAnyInFlight bool
+
 	// peerMaxAckDelay is the peer's advertised max_ack_delay (RFC 9002
 	// §6.2) extracted from the Noise handshake NodeInfo payload via the
 	// optional noiseConnAckDelay interface on conn. Used by createStream
@@ -748,10 +756,15 @@ func (s *NoiseSession) CloseWithError(err error) error {
 		remoteShort = remoteShort[:14] + "..."
 	}
 	// Snapshot watchdog-relevant state at close time so we can see
-	// why the watchdog thought the session was stuck.
+	// why the watchdog thought the session was stuck. Read under s.mu:
+	// lastAnyProgressAt is a multi-word time.Time written under the lock
+	// during reliabilityTick, so an unsynchronised read here is a race.
+	s.mu.Lock()
+	lastProgress := s.lastAnyProgressAt
+	s.mu.Unlock()
 	stallSince := "n/a"
-	if !s.lastAnyProgressAt.IsZero() {
-		stallSince = fmt.Sprintf("%v", time.Since(s.lastAnyProgressAt))
+	if !lastProgress.IsZero() {
+		stallSince = fmt.Sprintf("%v", time.Since(lastProgress))
 	}
 	lifetime := time.Since(s.CreatedAt())
 	warmupGrace := s.opts.SessionWarmupGrace
