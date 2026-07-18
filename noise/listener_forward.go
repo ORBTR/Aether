@@ -222,6 +222,18 @@ func (l *noiseListener) onRoutingPreamble(fwd *IntraOrgForwarder, buf []byte, ad
 // on the original flow.
 func (l *noiseListener) onInnerRelay(fwd *IntraOrgForwarder, buf []byte, addr *net.UDPAddr, conn *net.UDPConn) ([]byte, *net.UDPAddr, bool) {
 	_ = conn // socket for OpReply unwrap write is picked from origin below
+	// AER-038: inner-relay OpForward/OpReply are trusted control messages
+	// exchanged between same-org machines over the private network (6PN ULA on
+	// Fly). Accept them ONLY from a private/loopback source. Processing them
+	// from ANY socket — including the public anycast IP, and BEFORE the flood
+	// limiters — let an off-path attacker inject an OpForward carrying a victim
+	// 5-tuple, poisoning the relay table to redirect/black-hole the victim's
+	// session and deliver its ciphertext to the attacker.
+	if addr == nil || addr.IP == nil || !(addr.IP.IsPrivate() || addr.IP.IsLoopback()) {
+		fwd.recordDrop(dropInnerRelayUntrustedSrc)
+		dbgNoise.Printf("forwarder: dropping inner-relay frame from untrusted (non-private) source %s", addr)
+		return nil, nil, true
+	}
 	dec, err := DecodeInnerRelay(buf)
 	if err != nil {
 		fwd.recordDrop(dropInnerRelayMalformed)
