@@ -125,7 +125,18 @@ func (s *NoiseSession) writeLoop() {
 			// otherwise incur on every paced send.
 			wait := s.pacer.TimeUntilSend(frameSize)
 			if wait > 0 {
-				s.sched.Enqueue(frame.StreamID, frame)
+				// AER-079: preserve probe status across a pacing deferral. A
+				// TLP probe re-enqueued via plain Enqueue re-emerges with
+				// isProbe=false and is then trapped behind the CanSend gate —
+				// the exact cwnd-collapse the RFC 8985 §7.5 bypass exists to
+				// escape. In the degraded-BBR regime (per-frame waits > PTO)
+				// the probe would never reach the wire, converting a
+				// recoverable tail loss into a session stall.
+				if isProbe {
+					s.sched.EnqueueProbe(frame.StreamID, frame)
+				} else {
+					s.sched.Enqueue(frame.StreamID, frame)
+				}
 				if pacingTimer == nil {
 					pacingTimer = time.NewTimer(wait)
 				} else {
