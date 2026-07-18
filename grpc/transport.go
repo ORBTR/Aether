@@ -380,10 +380,18 @@ func (t *GrpcTransport) CreateServer() *grpc.Server {
 	if t.server != nil {
 		return t.server
 	}
-	server := grpc.NewServer(
+	// AER-105: install server TLS credentials when a TLS config was supplied,
+	// matching Listen(). Previously CreateServer ignored TLSConfig and built a
+	// plaintext server even for a secure endpoint — an asymmetric contract that
+	// reinforced the false "encrypted" capability signal.
+	opts := []grpc.ServerOption{
 		grpc.UnaryInterceptor(t.unaryAuthInterceptor),
 		grpc.StreamInterceptor(t.streamAuthInterceptor),
-	)
+	}
+	if t.tlsConfig != nil {
+		opts = append(opts, grpc.Creds(credentials.NewTLS(t.tlsConfig)))
+	}
+	server := grpc.NewServer(opts...)
 	t.server = server
 	RegisterTransportService(server, t)
 	return server
