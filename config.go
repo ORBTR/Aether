@@ -100,7 +100,12 @@ func DefaultConfig() Config {
 		},
 		QUIC: &QUICConfig{
 			KeepAlive: 15 * time.Second,
-			Allow0RTT: true,
+			// AER-100: default 0-RTT OFF. The generic Connection.Send path
+			// writes arbitrary caller payload as QUIC early data, which TLS
+			// 0-RTT semantics allow an attacker to replay — unsafe for
+			// non-idempotent RPC. Opt in explicitly only for idempotent early
+			// data.
+			Allow0RTT: false,
 		},
 		WebSocket: &WebSocketConfig{
 			PingInterval: 10 * time.Second,
