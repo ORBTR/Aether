@@ -483,29 +483,39 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 		s.reportAbuse(abuse.ReasonACKValidation)
 	}
 
-	// RTT sample from first non-retransmitted acked entry
-	// Subtract ACK delay for accurate network RTT (QUIC RFC 9002 §5.3)
+	// RTT sample from the LARGEST-acked non-retransmitted entry.
+	// AER-064: RFC 9002 §5.1 requires sampling the largest acked packet,
+	// not the oldest. `acked` is lowest-seq-first, so the previous "first
+	// Retries==0 entry" sampled the OLDEST frame while AckDelay is measured
+	// against the newest received frame — every sample then included the
+	// inter-frame send gap (≥2 frames per ACK under MaxPackets=2) and, after
+	// an ACK loss, the whole lost-ACK interval, systematically inflating
+	// SRTT/RTO/RACK/TLP. Pick the most-recently-sent unretransmitted entry
+	// so the sample and AckDelay refer to the same frame.
 	maxDelay := s.classDefaults.KeepaliveInterval // use keepalive interval as max ACK delay clamp
 	if maxDelay <= 0 {
 		maxDelay = 25 * time.Millisecond
 	}
+	var sampleEntry *reliability.SendEntry
 	for _, entry := range acked {
-		if entry.Retries == 0 {
-			ackDelay := time.Duration(ack.AckDelay) * aether.AckDelayGranularity * time.Microsecond
-			if ackDelay > maxDelay {
-				ackDelay = maxDelay // upper clamp — caps RTT deflation
-			}
-			elapsed := time.Since(entry.SentAt)
-			// Reject samples where the claimed delay is impossible
-			// (would produce negative network RTT) or negative. Without
-			// this a peer reporting AckDelay=0 or AckDelay>elapsed can
-			// drive SRTT to absurdly low values, shrinking RTO and
-			// triggering spurious retransmits.
-			if ackDelay < 0 || ackDelay >= elapsed {
-				break
-			}
+		if entry.Retries == 0 && (sampleEntry == nil || entry.SentAt.After(sampleEntry.SentAt)) {
+			sampleEntry = entry
+		}
+	}
+	if sampleEntry != nil {
+		ackDelay := time.Duration(ack.AckDelay) * aether.AckDelayGranularity * time.Microsecond
+		if ackDelay > maxDelay {
+			ackDelay = maxDelay // upper clamp — caps RTT deflation
+		}
+		elapsed := time.Since(sampleEntry.SentAt)
+		// Reject samples where the claimed delay is impossible (would
+		// produce negative network RTT) or negative. Without this a peer
+		// reporting AckDelay=0 or AckDelay>elapsed can drive SRTT to
+		// absurdly low values, shrinking RTO and triggering spurious
+		// retransmits. UpdateWithDelay additionally floors the adjusted
+		// sample at min_rtt (AER-074).
+		if ackDelay >= 0 && ackDelay < elapsed {
 			st.rtt.UpdateWithDelay(elapsed, ackDelay)
-			break // only one sample per ACK
 		}
 	}
 
