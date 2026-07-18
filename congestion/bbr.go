@@ -304,6 +304,23 @@ func (b *BBRController) OnAck(ackedBytes int64, rtt time.Duration) {
 	if b.inflight < 0 {
 		b.inflight = 0
 	}
+	// AER-085: advance the round counter in the degraded path too. Without a
+	// per-packet delivered-at-send sample we approximate a round as one BDP of
+	// new delivery — advance once b.delivered passes NextRoundDelivered, then
+	// re-seed it a flight ahead. Otherwise RoundStart never fires and the
+	// Startup exit (which requires 3 stalled rounds) can never trigger, pinning
+	// a sample-less session at 2.89× pacing / 3×BDP forever.
+	if b.delivered >= b.rounds.NextRoundDelivered {
+		b.rounds.Count++
+		b.rounds.RoundStart = true
+		incr := b.inflight
+		if incr < b.mss {
+			incr = b.mss
+		}
+		b.rounds.NextRoundDelivered = b.delivered + incr
+	} else {
+		b.rounds.RoundStart = false
+	}
 	// AE-M-05: capture staleness before the refresh resets rtPropStamp; see OnAckSampled.
 	rtPropExpired := now.Sub(b.rtPropStamp) > bbrProbeRTTInterval
 	if rtt > 0 && (rtt < b.rtProp || rtPropExpired) {
