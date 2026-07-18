@@ -868,6 +868,25 @@ func (m *Manager) RecordTLPReset(session aether.Session) bool {
 		return false
 	}
 
+	// AER-017: never demote a SOLE usable path to Flapping. PickByQuality and
+	// AllSessions exclude flapping paths, so demoting the only one leaves them
+	// returning nothing for the whole demote window — consumers see "no session
+	// to peer" while a perfectly usable session exists and self-inflict a ~60s
+	// outage (and the demote events here can be manufactured by healthy
+	// idle-resume traffic, AER-002). A flapping-but-only path beats none.
+	hasAlt := false
+	for _, p := range m.paths {
+		if p != target && p.State != PathDead && p.State != PathFlapping {
+			hasAlt = true
+			break
+		}
+	}
+	if !hasAlt {
+		dbgMultipath.Printf("Path %s hit the flapping threshold but is the only usable path — not demoting",
+			target.Protocol)
+		return false
+	}
+
 	// Threshold crossed — demote.
 	wasPrimary := false
 	for i, p := range m.paths {
