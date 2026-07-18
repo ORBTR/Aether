@@ -182,6 +182,19 @@ func (s *QUICSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (
 	st.state.Transition(aether.EventSendOpen)
 
 	s.mu.Lock()
+	if existing, dup := s.streams[cfg.StreamID]; dup {
+		s.mu.Unlock()
+		// AER-036: reject a duplicate local StreamID instead of overwriting.
+		// The accept path enforces this (AE-P-06); the local OpenStream path
+		// did not, so recycling an ID before the prior stream closed orphaned
+		// the old quic.Stream (never CancelRead/Write'd) and a later dropStream
+		// on the stale entry evicted the survivor. Cancel the just-created QUIC
+		// stream we won't be tracking.
+		_ = existing
+		qs.CancelRead(0)
+		qs.CancelWrite(0)
+		return nil, fmt.Errorf("quic: stream %d already open", cfg.StreamID)
+	}
 	s.streams[cfg.StreamID] = st
 	s.mu.Unlock()
 

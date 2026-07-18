@@ -19,6 +19,10 @@ import (
 	aether "github.com/ORBTR/aether"
 )
 
+// relayServiceForwardTimeout bounds a single relay forward so a wedged or
+// backpressured target session can't pin the relaying goroutine (AER-041).
+const relayServiceForwardTimeout = 5 * time.Second
+
 // SessionIndex provides session lookup for relay forwarding.
 // Implemented by protocol adapters or a unified session registry.
 type SessionIndex interface {
@@ -82,7 +86,10 @@ func (rs *RelayService) HandleRelayRequest(sourceNodeID aether.NodeID, data []by
 	if idx != nil {
 		if sess := idx.LookupByNodeID(targetNodeID); sess != nil {
 			frame := makeRelayFrame(sourceNodeID, payload)
-			return sess.Send(context.Background(), frame)
+			// AER-041: bound the forward so a wedged target can't pin us.
+			ctx, cancel := context.WithTimeout(context.Background(), relayServiceForwardTimeout)
+			defer cancel()
+			return sess.Send(ctx, frame)
 		}
 	}
 
@@ -92,7 +99,10 @@ func (rs *RelayService) HandleRelayRequest(sourceNodeID aether.NodeID, data []by
 	rs.mu.RUnlock()
 	if e.conn != nil {
 		frame := makeRelayFrame(sourceNodeID, payload)
-		return e.conn.Send(context.Background(), frame)
+		// AER-041: bound the forward so a wedged target can't pin us.
+		ctx, cancel := context.WithTimeout(context.Background(), relayServiceForwardTimeout)
+		defer cancel()
+		return e.conn.Send(ctx, frame)
 	}
 
 	return ErrTargetUnreachable
