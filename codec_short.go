@@ -208,17 +208,41 @@ func (c *Compressor) ShouldCompressACK(f *Frame) bool {
 // Data Short Header (0x82): 9 bytes
 // ────────────────────────────────────────────────────────────────────────────
 
+// reconstructSeqNo recovers a full 32-bit sequence number from the low 16
+// bits carried on the wire, choosing the candidate closest to the expected
+// next sequence number (QUIC packet-number decoding, RFC 9000 §A.3).
+//
+// AER-047: short DATA headers carry the low 16 bits of the ABSOLUTE SeqNo,
+// not a delta from the previously decoded frame. Delta chaining assumed
+// every short frame arrived in order — on lossy/reordering Noise-UDP a single
+// dropped datagram left the decoder's reference stale, so the next frame's
+// delta reconstructed the WRONG absolute seq and its payload was delivered
+// under a lost frame's sequence number (silent transposition), while the real
+// frame's retransmit was then dropped as a duplicate. Absolute-low-bits +
+// closest-to-expected reconstruction tolerates any gap < 32768 with no chain.
+func reconstructSeqNo(expected uint32, low uint16) uint32 {
+	candidate := (expected & 0xFFFF0000) | uint32(low)
+	if candidate < expected {
+		if expected-candidate > 0x8000 {
+			candidate += 0x10000
+		}
+	} else if candidate-expected > 0x8000 && candidate >= 0x10000 {
+		candidate -= 0x10000
+	}
+	return candidate
+}
+
 // EncodeDataShort writes a 9-byte data short header + payload.
 func (c *Compressor) EncodeDataShort(w io.Writer, f *Frame) (int, error) {
 	s := c.GetOrCreateStream(f.StreamID)
 	s.mu.Lock()
-	seqDelta := uint16(f.SeqNo - s.lastSeqNo)
+	seqLow := uint16(f.SeqNo) // AER-047: absolute low 16 bits, not a delta
 	s.mu.Unlock()
 
 	var hdr [ShortDataSize]byte
 	hdr[0] = ShortDataIndicator
 	binary.BigEndian.PutUint16(hdr[1:3], uint16(f.StreamID))
-	binary.BigEndian.PutUint16(hdr[3:5], seqDelta)
+	binary.BigEndian.PutUint16(hdr[3:5], seqLow)
 	binary.BigEndian.PutUint32(hdr[5:9], f.Length)
 
 	n, err := w.Write(hdr[:])
@@ -282,7 +306,7 @@ func (c *Compressor) DecodeDataShort(r io.Reader) (*Frame, error) {
 	}
 
 	streamID := uint64(binary.BigEndian.Uint16(hdr[0:2]))
-	seqDelta := binary.BigEndian.Uint16(hdr[2:4])
+	seqLow := binary.BigEndian.Uint16(hdr[2:4])
 	length := binary.BigEndian.Uint32(hdr[4:8])
 
 	c.Session.mu.RLock()
@@ -292,7 +316,9 @@ func (c *Compressor) DecodeDataShort(r io.Reader) (*Frame, error) {
 
 	s := c.GetOrCreateStream(streamID)
 	s.mu.Lock()
-	seqNo := s.lastSeqNo + uint32(seqDelta)
+	// AER-047: reconstruct the absolute seq from the low 16 bits + the
+	// expected next seq, rather than chaining a delta off lastSeqNo.
+	seqNo := reconstructSeqNo(s.lastSeqNo+1, seqLow)
 	s.mu.Unlock()
 
 	f := &Frame{
@@ -331,13 +357,13 @@ func (c *Compressor) DecodeDataShort(r io.Reader) (*Frame, error) {
 func (c *Compressor) EncodeEncryptedDataShort(w io.Writer, f *Frame) (int, error) {
 	s := c.GetOrCreateStream(f.StreamID)
 	s.mu.Lock()
-	seqDelta := uint16(f.SeqNo - s.lastSeqNo)
+	seqLow := uint16(f.SeqNo) // AER-047: absolute low 16 bits, not a delta
 	s.mu.Unlock()
 
 	var hdr [ShortDataSize]byte
 	hdr[0] = ShortEncryptedIndicator
 	binary.BigEndian.PutUint16(hdr[1:3], uint16(f.StreamID))
-	binary.BigEndian.PutUint16(hdr[3:5], seqDelta)
+	binary.BigEndian.PutUint16(hdr[3:5], seqLow)
 	binary.BigEndian.PutUint32(hdr[5:9], f.Length)
 
 	n, err := w.Write(hdr[:])
@@ -576,13 +602,13 @@ func VarLengthSize(v uint32) int {
 func (c *Compressor) EncodeDataShortVar(w io.Writer, f *Frame) (int, error) {
 	s := c.GetOrCreateStream(f.StreamID)
 	s.mu.Lock()
-	seqDelta := uint16(f.SeqNo - s.lastSeqNo)
+	seqLow := uint16(f.SeqNo) // AER-047: absolute low 16 bits, not a delta
 	s.mu.Unlock()
 
-	var hdr [5]byte // indicator + streamID + seqDelta
+	var hdr [5]byte // indicator + streamID + seqLow
 	hdr[0] = ShortDataVarIndicator
 	binary.BigEndian.PutUint16(hdr[1:3], uint16(f.StreamID))
-	binary.BigEndian.PutUint16(hdr[3:5], seqDelta)
+	binary.BigEndian.PutUint16(hdr[3:5], seqLow)
 
 	n, err := w.Write(hdr[:])
 	if err != nil {
@@ -616,7 +642,7 @@ func (c *Compressor) DecodeDataShortVar(r io.Reader) (*Frame, error) {
 	}
 
 	streamID := uint64(binary.BigEndian.Uint16(hdr[0:2]))
-	seqDelta := binary.BigEndian.Uint16(hdr[2:4])
+	seqLow := binary.BigEndian.Uint16(hdr[2:4])
 
 	length, _, err := DecodeVarLength(r)
 	if err != nil {
@@ -630,7 +656,8 @@ func (c *Compressor) DecodeDataShortVar(r io.Reader) (*Frame, error) {
 
 	s := c.GetOrCreateStream(streamID)
 	s.mu.Lock()
-	seqNo := s.lastSeqNo + uint32(seqDelta)
+	// AER-047: reconstruct the absolute seq from the low 16 bits + expected.
+	seqNo := reconstructSeqNo(s.lastSeqNo+1, seqLow)
 	s.mu.Unlock()
 
 	f := &Frame{
