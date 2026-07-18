@@ -22,10 +22,15 @@ type ConnectionConn struct {
 	mu     sync.Mutex // guards closed
 	readMu sync.Mutex // AE-L-15: serialises Read so concurrent readers cannot race on buf
 	closed bool
-	// AE-L-15: read by Read/Write while SetDeadline may write from another
+	// AE-L-15: read by Read/Write while a setter may write from another
 	// goroutine (net.Conn allows concurrent SetDeadline vs Read/Write); time.Time
 	// is multi-word, so store it atomically to avoid a torn read.
-	deadline atomic.Pointer[time.Time]
+	// AER-110: separate read and write deadlines. A single shared pointer made
+	// SetReadDeadline clobber the write deadline (and vice versa), so a read
+	// timeout could unexpectedly time out the next write, or a write deadline
+	// could bound reads.
+	readDeadline  atomic.Pointer[time.Time]
+	writeDeadline atomic.Pointer[time.Time]
 }
 
 // NewConnectionConn wraps any Session into a net.Conn.
@@ -55,9 +60,9 @@ func (c *ConnectionConn) Read(p []byte) (int, error) {
 		return n, nil
 	}
 
-	// Receive new message with optional deadline
+	// Receive new message with optional read deadline
 	ctx := context.Background()
-	if dl := c.deadline.Load(); dl != nil && !dl.IsZero() { // AE-L-15: atomic deadline read
+	if dl := c.readDeadline.Load(); dl != nil && !dl.IsZero() { // AE-L-15: atomic deadline read
 		var cancel context.CancelFunc
 		timeout := time.Until(*dl)
 		if timeout <= 0 {
@@ -88,7 +93,7 @@ func (c *ConnectionConn) Write(p []byte) (int, error) {
 	c.mu.Unlock()
 
 	ctx := context.Background()
-	if dl := c.deadline.Load(); dl != nil && !dl.IsZero() { // AE-L-15: atomic deadline read
+	if dl := c.writeDeadline.Load(); dl != nil && !dl.IsZero() { // AE-L-15: atomic deadline read
 		var cancel context.CancelFunc
 		timeout := time.Until(*dl)
 		if timeout <= 0 {
@@ -114,19 +119,24 @@ func (c *ConnectionConn) Close() error {
 func (c *ConnectionConn) LocalAddr() net.Addr  { return &net.TCPAddr{} }
 func (c *ConnectionConn) RemoteAddr() net.Addr { return c.conn.RemoteAddr() }
 
-// SetDeadline stores the deadline atomically; net.Conn permits it to be called
-// concurrently with an in-flight Read/Write, and time.Time is multi-word, so a
-// plain field write would tear against the Read/Write reads (AE-L-15).
+// SetDeadline stores both deadlines atomically; net.Conn permits it to be
+// called concurrently with an in-flight Read/Write, and time.Time is
+// multi-word, so a plain field write would tear against the Read/Write reads
+// (AE-L-15). AER-110: read and write deadlines are stored separately so one
+// direction's deadline never clobbers the other. (A deadline change still only
+// affects the NEXT Read/Write, not one already blocked — the operation
+// snapshots its deadline when it builds its ctx.)
 func (c *ConnectionConn) SetDeadline(t time.Time) error {
-	c.deadline.Store(&t)
+	c.readDeadline.Store(&t)
+	c.writeDeadline.Store(&t)
 	return nil
 }
 func (c *ConnectionConn) SetReadDeadline(t time.Time) error {
-	c.deadline.Store(&t) // AE-L-15: atomic deadline write
+	c.readDeadline.Store(&t)
 	return nil
 }
 func (c *ConnectionConn) SetWriteDeadline(t time.Time) error {
-	c.deadline.Store(&t) // AE-L-15: atomic deadline write
+	c.writeDeadline.Store(&t)
 	return nil
 }
 
