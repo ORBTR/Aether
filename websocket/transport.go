@@ -350,6 +350,33 @@ func writeVerifyMeshDialError(w http.ResponseWriter, err error) {
 	http.Error(w, err.Error(), http.StatusBadRequest)
 }
 
+// AcceptHeaders builds the AE-P-26 signed identity response headers a
+// /mesh/ws handler MUST write into the 101 response so the aether WS dialer
+// (which requires the NodeID/PubKey/Signature triple — see Dial) can verify
+// the server owns the dialed NodeID and not close the accepted socket as
+// "server did not present a signed identity".
+//
+// This is the single source of truth for the emit: Listen's own handler uses
+// it, and callers that mount their OWN /mesh/ws handler (via VerifyMeshDial)
+// MUST pass the result to ws.HTTPUpgrader{Header: ...}. r must carry the
+// client's freshness headers (nonce+timestamp) — VerifyMeshDial has already
+// validated them. Guards on key presence (ed25519.Sign panics on a nil key):
+// a keyless transport emits only the NodeID header and the client, which
+// requires the full triple, fails closed.
+func (t *WebsocketTransport) AcceptHeaders(r *http.Request) http.Header {
+	respHdr := make(http.Header)
+	respHdr.Set(NodeIDHeader, string(t.localNode))
+	if len(t.privateKey) == ed25519.PrivateKeySize {
+		tsStr := r.Header.Get(TimestampHeader)
+		nonceStr := r.Header.Get(NonceHeader)
+		acceptMsg := []byte(fmt.Sprintf("ws-accept:%s:%s:%s", t.localNode, nonceStr, tsStr))
+		acceptSig := ed25519.Sign(t.privateKey, acceptMsg)
+		respHdr.Set(PubKeyHeader, hex.EncodeToString(t.privateKey.Public().(ed25519.PublicKey)))
+		respHdr.Set(SignatureHeader, base64.StdEncoding.EncodeToString(acceptSig))
+	}
+	return respHdr
+}
+
 func (t *WebsocketTransport) Listen(ctx context.Context) (aether.Listener, error) {
 	ch := make(chan aether.IncomingSession, 32)
 
@@ -363,27 +390,11 @@ func (t *WebsocketTransport) Listen(ctx context.Context) (aether.Listener, error
 			return
 		}
 
-		// Re-read the freshness headers VerifyMeshDial already validated —
-		// they seed the AE-P-26 accept signature below.
-		tsStr := r.Header.Get(TimestampHeader)
-		nonceStr := r.Header.Get(NonceHeader)
-
-		// AE-P-26: prove our mesh identity to the client on the plain WS path too.
-		// The server previously emitted NO identity header here, so a client had
-		// only TLS hostname validation backing target.NodeID. Sign the client's
-		// fresh dial nonce+timestamp with our own key and emit the signed triple
-		// in the 101 response; the client verifies it before trusting
-		// target.NodeID and fails closed on mismatch. Guard on key presence
-		// (ed25519.Sign panics on a nil key): a keyless transport emits only the
-		// NodeID header and the client — which requires the triple — fails closed.
-		respHdr := make(http.Header)
-		respHdr.Set(NodeIDHeader, string(t.localNode))
-		if len(t.privateKey) == ed25519.PrivateKeySize {
-			acceptMsg := []byte(fmt.Sprintf("ws-accept:%s:%s:%s", t.localNode, nonceStr, tsStr))
-			acceptSig := ed25519.Sign(t.privateKey, acceptMsg)
-			respHdr.Set(PubKeyHeader, hex.EncodeToString(t.privateKey.Public().(ed25519.PublicKey)))
-			respHdr.Set(SignatureHeader, base64.StdEncoding.EncodeToString(acceptSig))
-		}
+		// AE-P-26: emit our signed identity triple in the 101 so the client can
+		// verify the server owns target.NodeID and fails closed on mismatch.
+		// AcceptHeaders is the shared source of truth — callers that mount their
+		// own /mesh/ws handler (via VerifyMeshDial) use it too.
+		respHdr := t.AcceptHeaders(r)
 		// Upgrade to WebSocket using gobwas/ws — hijacks the HTTP connection and
 		// writes our signed identity headers into the 101 response (AE-P-26).
 		rawConn, _, _, err := ws.HTTPUpgrader{Header: respHdr}.Upgrade(r, w)
