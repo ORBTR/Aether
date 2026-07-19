@@ -234,11 +234,27 @@ func (st *tcpStream) deliverLoop() {
 // deliverCh is nil only for streams built by direct construction outside the
 // normal open paths (unit tests); those fall back to inline delivery so the
 // contract still holds, just without the HOL isolation.
-func (st *tcpStream) enqueueDelivery(payload []byte) bool {
+func (st *tcpStream) enqueueDelivery(payload []byte) (accepted bool) {
 	s := st.session
 	if st.deliverCh == nil {
 		return DeliverToRecvChWithSignals(st.recvCh, payload, st.window, st.streamID, s.sendWindowUpdateAgnostic, s.SendCongestion, &s.deliveryStats)
 	}
+	// deliverCh can be closed by a CONCURRENT teardown (deliverOnce in
+	// stopDelivery, driven by housekeepingTick stream-GC or an external
+	// session Close) while this readLoop is still dispatching a DATA frame for
+	// the stream. A select send on a closed channel is "ready" and PANICS —
+	// it does NOT fall through to default — so guard the sole deliverCh sender
+	// and treat send-on-closed as a benign drop (the session is going away, so
+	// the payload is moot). Mirrors deliverLoop's recover for the symmetric
+	// recvCh-close race (AER-033). Under heavy session churn this race fires
+	// constantly; without the guard it crashes the process (send on closed
+	// channel -> exit 2).
+	defer func() {
+		if r := recover(); r != nil {
+			dbgTCP.Printf("enqueueDelivery: send-on-closed deliverCh for stream %d (teardown race): %v", st.streamID, r)
+			accepted = false
+		}
+	}()
 	select {
 	case st.deliverCh <- payload:
 		return true
