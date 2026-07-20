@@ -219,6 +219,32 @@ type NoiseTransport struct {
 	forwarder *IntraOrgForwarder
 }
 
+// *NoiseTransport is the server-side connHost for every UDP-path noiseConn.
+// The browser DialOverConn path uses a nil connHost instead (dial_conn.go).
+// This assertion keeps the two in lockstep: adding a connHost method that
+// NoiseTransport does not implement fails the build here, not at a call site.
+var _ connHost = (*NoiseTransport)(nil)
+
+// hostNonceWindow implements connHost — the configured explicit-nonce replay
+// window size. 0 tells noiseConn.nonceWindowSize to use its default.
+func (t *NoiseTransport) hostNonceWindow() int { return t.nonceWindow }
+
+// recordInitiatorResume implements connHost. It was noiseConn.RecordResumeMaterial's
+// body, moved here so the decode + cache types (resumeMaterial,
+// initiatorTicketCache) stay //go:build !js and never enter the browser build.
+func (t *NoiseTransport) recordInitiatorResume(remoteNode aether.NodeID, data []byte) {
+	if t.initiatorTickets == nil {
+		return
+	}
+	m, err := decodeResumeMaterial(data)
+	if err != nil {
+		dbgNoise.Printf("resume: decode inbound material failed: %v", err)
+		return
+	}
+	t.initiatorTickets.Store(remoteNode, m)
+	dbgNoise.Printf("resume: cached material for %s (%d bytes opaque)", remoteNode.Short(), len(m.Opaque))
+}
+
 // SetForwarder installs the intra-org anycast forwarder. Pass nil to
 // disable (default). Safe to call once at startup before Listen; not
 // safe to swap a live forwarder out from under a running listener

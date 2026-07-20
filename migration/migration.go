@@ -1,5 +1,3 @@
-//go:build !js
-
 /*
  * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
  * Queries: licensing@orbtr.io
