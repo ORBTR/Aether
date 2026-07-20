@@ -1,5 +1,3 @@
-//go:build !js
-
 package pmtu
 
 import "github.com/ORBTR/aether"
