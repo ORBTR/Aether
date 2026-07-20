@@ -1,11 +1,11 @@
-//go:build !js
-
 /*
  * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
  * Queries: licensing@orbtr.io
  *
  * RekeyTracker manages cipher state ratcheting thresholds. Extracted from
  * noiseConn to be a composable unit reusable by any encrypted session.
+ * Build-tag agnostic (pure sync/atomic + time): noiseConn needs it under
+ * GOOS=js for the browser DialOverConn path.
  */
 package noise
 

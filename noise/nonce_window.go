@@ -1,8 +1,10 @@
-//go:build !js
-
 /*
  * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
  * Queries: licensing@orbtr.io
+ *
+ * Build-tag agnostic (pure encoding/binary + sync + flynn/noise cipher):
+ * noiseConn's explicit-nonce replay window is needed under GOOS=js for the
+ * browser DialOverConn path.
  */
 package noise
 

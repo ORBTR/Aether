@@ -47,8 +47,7 @@ import (
 // DialSessionOverConn runs an initiator Noise XX handshake over conn
 // and returns a full aether.Session (stream multiplexing + flow
 // control + scheduler). This is what browser WASM and ephemeral peer
-// scenarios should call instead of DialBrowserWS / the UDP-listener
-// based paths.
+// scenarios should call instead of the UDP-listener based paths.
 //
 // The returned session owns conn via its noiseConn wrapper; closing
 // the session closes the post-handshake crypto layer, which closes
@@ -89,16 +88,18 @@ func wrapPostHandshakeAsSession(aetherConn aether.Connection, localNodeID aether
 	return NewNoiseSession(postHandshakeConn, localNodeID, aetherConn.RemoteNodeID(), opts)
 }
 
-// DialBrowserWS opens a browser WebSocket to url and wraps it with a
-// full Aether session. The caller supplies a net.Conn wrapper (the
-// browser-specific piece that uses syscall/js); this function then
-// runs Noise over it + adds the session layer.
+// DialSessionOverBrowserWS wraps an already-open browser WebSocket
+// (supplied as conn — the browser-specific net.Conn using syscall/js,
+// opened by the endpoint's own WASM package, e.g. browser_ws.go's
+// DialWebSocket) with a full Aether session: it runs Noise XX over conn
+// and adds the session layer. This function does NOT open the WebSocket
+// itself — that moved out of adapter into the WASM glue so aether carries
+// no syscall/js browser I/O.
 //
 // The return type is *NoiseSession — callers that previously held
 // *BrowserWSSession should switch to *NoiseSession or aether.Session,
-// both of which expose OpenStream / AcceptStream identically. The
-// underlying browser WS → net.Conn wrapping is the caller's
-// responsibility and lives in each endpoint's WASM package.
+// both of which expose OpenStream / AcceptStream identically. Prefer
+// DialSessionOverConn directly for new code; this is a thin keyed wrapper.
 func DialSessionOverBrowserWS(ctx context.Context, localNodeID aether.NodeID, staticPriv, staticPub []byte, conn net.Conn, opts aether.SessionOptions) (*NoiseSession, error) {
 	return DialSessionOverConn(ctx, noise.DialConnConfig{
 		LocalNodeID: localNodeID,
