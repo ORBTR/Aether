@@ -16,15 +16,9 @@ import (
 )
 
 const (
-	// Packet types (matching PROTOCOLS.md)
-	PacketTypeData         = 0x01
-	PacketTypePing         = 0x02 // Health check ping
-	PacketTypePong         = 0x03 // Health check pong response
-	PacketTypeRekey        = 0x04 // Cipher state rekey signal
-	PacketTypeResume       = 0x05 // Session ticket resumption
-	PacketTypeResumeAck    = 0x06 // Resumption acknowledgment
-	PacketTypeRelayRequest = 0x07
-	PacketTypeRelayData    = 0x08
+	// Packet-type constants (PacketTypeData … PacketTypeRelayData) moved to
+	// the build-tag-agnostic packet_types.go so noise's agnostic noiseConn can
+	// reference them under GOOS=js.
 
 	// Relay overhead. AER-098: a canonical NodeID is exactly 30 bytes
 	// ("vl1_" + 26 base32 chars). Sizing the header at 32 left 2 trailing NUL
