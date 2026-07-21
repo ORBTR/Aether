@@ -37,11 +37,13 @@ package adapter
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"net"
 
 	"github.com/ORBTR/aether"
 	"github.com/ORBTR/aether/noise"
+	fnoise "github.com/flynn/noise"
 )
 
 // DialSessionOverConn runs an initiator Noise XX handshake over conn
@@ -105,5 +107,37 @@ func DialSessionOverBrowserWS(ctx context.Context, localNodeID aether.NodeID, st
 		LocalNodeID: localNodeID,
 		StaticPriv:  staticPriv,
 		StaticPub:   staticPub,
+	}, conn, opts)
+}
+
+// DialSessionOverConnEphemeral runs DialSessionOverConn with a freshly
+// generated, throwaway Curve25519 static keypair — for KEYLESS callers, i.e.
+// the browser `connect` path, whose peer identity is NOT the static key.
+//
+// On the DialOverConn path the static key is DH material only: the handshake
+// exchanges a minimal NodeInfo, `remoteIdentity` is left nil, and there is no
+// AE-P-26 signed-identity binding — the browser is a CLIENT, not a mesh peer
+// (ratified #R-707). So a per-connection ephemeral key is equivalent in
+// security to the old keyless BrowserWS dial: it authenticates nothing on its
+// own, and generating it here keeps the JS `connect` API keyless (no
+// staticPriv/staticPub plumbed through the WASM boundary).
+//
+// ticket is OPTIONAL — pass nil when the responder does not require an
+// aether-level ticket (e.g. the legacy /bridge/{nodeID} raw-proxy relay route,
+// where authorization is the relay's job, not aether's). noise.DialConnConfig
+// treats an empty ticket as "no ticket"; the responder enforces one ONLY when
+// its noise.AcceptConnConfig.TrustedTicketSigner is non-nil (otherwise the
+// ticket block is skipped and a ticketless conn is accepted). Pass a non-nil
+// ticket when the accept side sets TrustedTicketSigner.
+func DialSessionOverConnEphemeral(ctx context.Context, localNodeID aether.NodeID, ticket []byte, conn net.Conn, opts aether.SessionOptions) (*NoiseSession, error) {
+	kp, err := fnoise.DH25519.GenerateKeypair(rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("adapter: DialSessionOverConnEphemeral: generate ephemeral keypair: %w", err)
+	}
+	return DialSessionOverConn(ctx, noise.DialConnConfig{
+		LocalNodeID: localNodeID,
+		StaticPriv:  kp.Private,
+		StaticPub:   kp.Public,
+		Ticket:      ticket,
 	}, conn, opts)
 }
