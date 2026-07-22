@@ -362,31 +362,44 @@ func (w *SendWindow) ProcessCompositeACK(ack *aether.CompositeACK, reorderThresh
 				atomic.AddUint64(&w.suspiciousACKs, 1)
 				return nil, nil
 			}
-		} else {
-			// BaseACK before our base — stale or bogus, ignore but don't flag
-			// as suspicious (can legitimately happen with reordered ACKs).
-			// Count separately for observability — bursts of stale ACKs
-			// during a wedge are diagnostic.
-			atomic.AddUint64(&w.staleBaseACKs, 1)
-			return nil, nil
-		}
 
-		// 1. Cumulative ACK (bounded by MaxACKCumulativeJump)
-		for seq := w.base; seq <= ack.BaseACK; seq++ {
-			if entry, ok := w.entries[seq]; ok {
-				entry.Acked = true
-				acked = append(acked, entry)
-				w.subInFlightLocked(entry)
-				delete(w.entries, seq)
+			// 1. Cumulative ACK (bounded by MaxACKCumulativeJump)
+			for seq := w.base; seq <= ack.BaseACK; seq++ {
+				if entry, ok := w.entries[seq]; ok {
+					entry.Acked = true
+					acked = append(acked, entry)
+					w.subInFlightLocked(entry)
+					delete(w.entries, seq)
+				}
 			}
-		}
-		// Advance base
-		for {
-			if _, exists := w.entries[w.base]; !exists && w.base < w.next {
-				w.base++
-			} else {
-				break
+			// Advance base
+			for {
+				if _, exists := w.entries[w.base]; !exists && w.base < w.next {
+					w.base++
+				} else {
+					break
+				}
 			}
+		} else {
+			// BaseACK before our base — the cumulative point is stale (we've
+			// already advanced past it), but do NOT discard the ACK: this is
+			// the STEADY STATE of a mid-stream gap. When the receiver is
+			// missing seq G it sets expected=G and emits BaseACK=expected-1=G-1
+			// on EVERY subsequent duplicate ACK, while our base is pinned at G,
+			// so BaseACK==base-1 < base holds for the whole life of the gap.
+			// The SACK bitmap on those ACKs is FRESH and is the only signal
+			// that clears the received tail from flight and fast-retransmits G.
+			// Discarding it here (the old `return nil,nil`) starved gap
+			// recovery: inFlight never drained, base never advanced, the
+			// receiver re-ACKed forever (millions of ack_emit_duplicate), and
+			// the consumer keepalive reaped the wedged (still grade-A) session
+			// at ~62s — the fleet-wide noise-udp sawtooth. Skip only the
+			// (now-empty) cumulative removal and fall through to the bitmap /
+			// ExtRange scan below, which is indexed off BaseACK and therefore
+			// evaluates exactly base.. correctly. Counted for observability —
+			// a burst of stale-BaseACKs marks an active gap, not an attack, so
+			// it is deliberately NOT flagged as suspicious.
+			atomic.AddUint64(&w.staleBaseACKs, 1)
 		}
 	}
 

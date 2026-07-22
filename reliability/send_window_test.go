@@ -214,3 +214,59 @@ func TestProcessCompositeACK_GenuineReorderStillNACKs(t *testing.T) {
 		}
 	}
 }
+
+// TestProcessCompositeACK_StaleBaseACKStillAppliesSACK is the fleet-wide
+// noise-udp stall regression. During a mid-stream gap the receiver's
+// `expected` equals the sender's `base`, so every SACK-bearing duplicate ACK
+// carries BaseACK == base-1 (i.e. BaseACK < base). The stale-BaseACK branch
+// must NOT discard such an ACK wholesale — its cumulative point is stale but
+// its SACK bitmap is fresh and is the ONLY signal that clears the received
+// tail from flight and fast-retransmits the hole.
+//
+// Pre-fix, ProcessCompositeACK returned nil,nil in that branch BEFORE the
+// bitmap scan, so: inFlight never drained, base never advanced, the receiver
+// re-ACKed the buffered tail forever (millions of aether_ack_emit_duplicate),
+// TLP tail-probes elicited only more discarded dup-ACKs, and the consumer
+// keepalive reaped the still-grade-A session at ~62s. Measured on every
+// noise-udp pair, including the latest deployed aether — the sawtooth churn.
+func TestProcessCompositeACK_StaleBaseACKStillAppliesSACK(t *testing.T) {
+	w := fillWindow(t, 64, 20) // seq 0..19 in flight, next=20, base=0
+
+	// Advance the send base to 11 — models a receiver that delivered 0..10
+	// in order. seq 11 is then the lost head of the stream.
+	w.ProcessCompositeACK(&aether.CompositeACK{BaseACK: 10}, ReorderThreshold)
+	if got := w.Base(); got != 11 {
+		t.Fatalf("setup: Base()=%d, want 11", got)
+	}
+	if got := w.InFlight(); got != 9 { // 11..19
+		t.Fatalf("setup: InFlight()=%d, want 9", got)
+	}
+
+	// The receiver lost seq 11 but holds 12..15, so it keeps emitting a
+	// duplicate ACK whose cumulative point is expected-1 = 10 (== base-1),
+	// carrying a SACK bitmap marking seq11 missing and seq12..15 received.
+	// bit i -> seq BaseACK+1+i = 11+i, so bits 1..4 mark seq12..15.
+	ack := &aether.CompositeACK{BaseACK: 10, Bitmap: bitmap4(1, 2, 3, 4)}
+	acked, nacks := w.ProcessCompositeACK(ack, ReorderThreshold)
+
+	// The SACK bitmap must still be applied: clear seq12..15 from flight and
+	// fast-retransmit the hole at seq11. Pre-fix this returns nil,nil and the
+	// stream never recovers.
+	if len(acked) != 4 {
+		t.Fatalf("acked=%d entries, want 4 (seq12..15 SACKed) — the stale-BaseACK path is discarding the SACK bitmap and breaking gap recovery", len(acked))
+	}
+	for _, seq := range []uint32{12, 13, 14, 15} {
+		if w.GetEntry(seq) != nil {
+			t.Errorf("seq%d should be SACK-acked and removed", seq)
+		}
+	}
+	if got := w.InFlight(); got != 5 { // 11,16,17,18,19 remain
+		t.Errorf("InFlight()=%d, want 5", got)
+	}
+	if got := w.Base(); got != 11 {
+		t.Errorf("Base()=%d, want 11 (the hole at seq11 pins base until it is retransmitted+acked)", got)
+	}
+	if len(nacks) != 1 || nacks[0] != 11 {
+		t.Fatalf("nacks=%v, want [11] (the missing head must be fast-retransmitted)", nacks)
+	}
+}
