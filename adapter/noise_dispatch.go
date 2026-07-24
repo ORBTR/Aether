@@ -416,7 +416,16 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 			// connGrantDebouncer.Record). On drop, the debouncer will never
 			// see these bytes so we must grant directly here to prevent a
 			// permanent conn-level stall.
-			if !ok {
+			if ok {
+				// AER-074 T2 discriminator (M-105/M-106): count ONLY bytes
+				// admitted IN-ORDER (delivered) AND successfully enqueued to
+				// the app stream. A replay/OOO/malformed flooder produces an
+				// empty `delivered` or a failed enqueue, so it never accrues —
+				// it can never shelter into reportAbuse's forensic-only tier.
+				// This is the un-gameable "genuine delivering mesh member"
+				// signal, NOT s.bytesRecv (dispatch-path, floodable — R-842).
+				s.appBytesDelivered.Add(uint64(len(payload)))
+			} else {
 				if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
 					s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
 				}
@@ -447,6 +456,18 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	// Decode Composite ACK
 	ack := aether.DecodeCompositeACK(frame.Payload)
 	if ack == nil {
+		// AER-074 (B) diagnostic (env-gated AETHER_DEBUG_ACKDECODE=1): legit
+		// v0.0.114 CompositeACKs are decode-failing between two v0.0.114 peers
+		// (same-version runtime bug — the codec is byte-symmetric per
+		// M-100/M-104). Log the RAW failing payload to fork the cause from
+		// ground truth: frameLen!=payloadLen or payloadLen<8 ⇒ truncation /
+		// sizing / pool; otherwise a full-length garbage hex ⇒ buffer aliasing
+		// / multipath corruption AFTER Validate but BEFORE this decode.
+		if os.Getenv("AETHER_DEBUG_ACKDECODE") == "1" {
+			log.Printf("[ACKDECODE-NIL] peer=%s type=%d stream=%d seqno=%d frameLen=%d payloadLen=%d payload=%x",
+				s.RemoteNodeID().Short(), frame.Type, frame.StreamID, frame.SeqNo,
+				frame.Length, len(frame.Payload), frame.Payload)
+		}
 		s.reportAbuse(abuse.ReasonACKValidation)
 		return // malformed
 	}

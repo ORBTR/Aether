@@ -128,13 +128,20 @@ type SessionMetrics struct {
 
 	// Security observability counters. See _SECURITY.md for the attack
 	// classes each addresses.
-	SuspiciousACKs   uint64 // §3.2  — Composite ACKs rejected as malformed/oversized
-	FECGroupsEvicted uint64 // §3.5  — FEC groups evicted by count/age pruning
-	StreamRefused    uint64 // §3.12 — incoming stream opens rejected at cap
-	SeqNoWraps       uint64 // §3.3  — SeqNo jumps rejected as wrap-attack
-	RecvWindowDrops  uint64 //       — reorder-buffer overflow drops (total across streams)
-	DecryptErrors    uint64 //       — decryption failures on incoming packets
-	InboxDrops       uint64 //       — packets dropped because the session inbox was full
+	SuspiciousACKs uint64 // §3.2  — Composite ACKs rejected as malformed/oversized
+	// ForensicSuppressed (AER-074 T2): guard-covered abuse events
+	// (ack-validation / malformed-frame) RECORDED for observability but
+	// deliberately NOT scored/closed on an established, grade-A (past-warmup,
+	// actively-delivering) session — the reap-stopping forensic-only tier.
+	// Local-only (not in the wire STATS EncodeStats/DecodeStats, same as
+	// SuspiciousACKs); surfaced per-node via Library MeshMetrics.
+	ForensicSuppressed uint64
+	FECGroupsEvicted   uint64 // §3.5  — FEC groups evicted by count/age pruning
+	StreamRefused      uint64 // §3.12 — incoming stream opens rejected at cap
+	SeqNoWraps         uint64 // §3.3  — SeqNo jumps rejected as wrap-attack
+	RecvWindowDrops    uint64 //       — reorder-buffer overflow drops (total across streams)
+	DecryptErrors      uint64 //       — decryption failures on incoming packets
+	InboxDrops         uint64 //       — packets dropped because the session inbox was full
 
 	// Anti-replay classification counters (Classify/Commit split). Total
 	// ReplayRejects is the sum of these — surfaced separately because
