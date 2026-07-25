@@ -343,7 +343,24 @@ func (f *Frame) Validate() error {
 	if f.Flags.Has(FlagENCRYPTED) && f.Nonce.IsZero() {
 		return fmt.Errorf("aether: ENCRYPTED flag set but nonce is zero")
 	}
-	if minSize, ok := minPayloadSizes[f.Type]; ok && f.Length < minSize {
+	// B1: the per-type minimum describes the UNCOMPRESSED wire size, so it must
+	// not be applied to a payload that is still deflated — a 74-byte STATS frame
+	// compresses to ~40 bytes, which is legitimately below its own minimum, and
+	// checking it here rejected healthy traffic as malformed (one report every
+	// 5s per session, latent since StatsPayloadSize grew 34 -> 74 and crossed the
+	// 64-byte compression gate).
+	//
+	// The check is DEFERRED, NOT DROPPED. The receive path re-runs Validate()
+	// immediately after decompression, where FlagCOMPRESSED has been cleared and
+	// Length is the true size — so a genuinely undersized frame is still rejected
+	// and still scored as abuse. That deliberate anti-abuse intent (see the
+	// minPayloadSizes comment below) is preserved, not weakened.
+	//
+	// ⚠ ANY caller that decompresses a payload MUST re-validate afterwards, or
+	// the minimum goes unenforced for compressed frames. Today the only such
+	// caller is adapter/noise_dispatch.go processIncomingFrame.
+	if minSize, ok := minPayloadSizes[f.Type]; ok && f.Length < minSize &&
+		!f.Flags.Has(FlagCOMPRESSED) {
 		return fmt.Errorf("aether: %s payload too small (%d bytes, min %d)", f.Type, f.Length, minSize)
 	}
 	return nil
