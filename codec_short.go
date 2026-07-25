@@ -207,8 +207,25 @@ func (c *Compressor) ShouldCompressControl(f *Frame) bool {
 }
 
 // ShouldCompressACK returns true if an ACK frame can use 0x84.
+//
+// Subject to the same general rule as ShouldCompressData: the short forms have no
+// Flags field, so a frame whose interpretation depends on a flag must take the
+// full header.
 func (c *Compressor) ShouldCompressACK(f *Frame) bool {
 	if f.Type != TypeACK {
+		return false
+	}
+	// B2: the ACK short forms carry no Flags field, and DecodeACKShortFull
+	// reconstructs the Frame with Flags HARDCODED to FlagCOMPOSITE_ACK — so
+	// FlagCOMPRESSED is not merely absent, it is overwritten. The receiver then
+	// parses a raw DEFLATE stream as a CompositeACK: the high-entropy byte at the
+	// BitmapLen offset usually exceeds the remaining length, DecodeCompositeACK
+	// returns nil, and the peer is charged ReasonACKValidation for a well-formed
+	// ACK. The v0.0.114 SACK fix made this reachable in the steady state by
+	// routing mid-stream-gap recovery through bitmap-bearing ACKs, which are the
+	// ones large enough to cross the 64-byte compression gate. Fall back to the
+	// full header, which carries flags. See M-108 (root cause), M-111 (mapping).
+	if f.Flags.Has(FlagCOMPRESSED) {
 		return false
 	}
 	// AE-H-14: uint16 short-header StreamID — oversized streams need the full header.

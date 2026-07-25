@@ -114,6 +114,19 @@ func (s *NoiseSession) processIncomingFrame(frame *aether.Frame, indicator byte)
 		frame.Payload = decompressed
 		frame.Length = uint32(len(decompressed))
 		frame.Flags = frame.Flags.Clear(aether.FlagCOMPRESSED)
+
+		// B1: re-validate now that the payload is INFLATED. Validate() skips the
+		// per-type minimum while FlagCOMPRESSED is set (the deflated wire length
+		// is legitimately below the uncompressed minimum), so this is where that
+		// deferred check is actually enforced — against the true size, with the
+		// flag cleared above. Without this call the minimum would go unenforced
+		// for every compressed frame, silently disarming a deliberate anti-abuse
+		// gate; with it, a genuinely undersized frame is still rejected and still
+		// scored, exactly as before. See frame.go Validate() and minPayloadSizes.
+		if err := frame.Validate(); err != nil {
+			s.reportAbuse(abuse.ReasonMalformedFrame)
+			return
+		}
 	}
 
 	// NOTE: connection-level packetReplay check removed. It was using
