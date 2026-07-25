@@ -130,11 +130,29 @@ func (c *Compressor) RecordFullHeader(f *Frame) {
 // Encrypted frames (FlagENCRYPTED) must use 0x87 via the adapter's explicit
 // encrypted path — ShouldCompressData rejects them to prevent accidental
 // encoding as unencrypted 0x82.
+//
+// GENERAL RULE for the short forms: they have no Flags field, so ANY frame whose
+// correct interpretation depends on a flag must take the full header. Today that
+// means FlagENCRYPTED and FlagCOMPRESSED; a new flag that changes how the payload
+// is read must be added here too, or it will be lost on the wire in silence.
 func (c *Compressor) ShouldCompressData(f *Frame) bool {
 	if f.Type != TypeDATA {
 		return false
 	}
 	if f.Flags.Has(FlagENCRYPTED) {
+		return false
+	}
+	// B3: the short DATA forms (0x82/0x86) carry NO Flags field, so a frame whose
+	// payload is only interpretable WITH a flag cannot be expressed in them. The
+	// receiver decompresses solely on FlagCOMPRESSED, so encoding a deflated
+	// payload short drops the flag and hands the application raw DEFLATE bytes —
+	// and because Length matches the compressed length, Validate() passes, no
+	// guard trips and no abuse counter increments, making the corruption silent
+	// (it surfaces downstream as an unmarshal error blamed on the consumer's
+	// decoder). Fall back to the full header, which carries flags — same
+	// capability-preserving fallback as AE-H-14 below. See M-108 (root cause),
+	// M-134 (fix), and codec_short_b3_test.go (executable reproduction).
+	if f.Flags.Has(FlagCOMPRESSED) {
 		return false
 	}
 	// AE-H-14: the short-header StreamID field is uint16; a stream above
@@ -332,6 +350,13 @@ func (c *Compressor) DecodeDataShort(r io.Reader) (*Frame, error) {
 		SenderID: sender, ReceiverID: receiver,
 		StreamID: streamID, Type: TypeDATA,
 		SeqNo: seqNo, Length: length,
+		// B3: Flags is set EXPLICITLY to zero, not left implicit. The short DATA
+		// forms carry no Flags field, so zero is the only honest value — and
+		// ShouldCompressData now refuses any flag-dependent frame onto this path,
+		// so a payload arriving here is plaintext by construction. Do NOT hardcode
+		// a flag here: DecodeACKShortFull hardcodes FlagCOMPOSITE_ACK and that is
+		// exactly how B2 loses FlagCOMPRESSED. See M-108/M-134.
+		Flags: 0,
 	}
 	if length > 0 {
 		if length > MaxPayloadSize {
@@ -671,6 +696,13 @@ func (c *Compressor) DecodeDataShortVar(r io.Reader) (*Frame, error) {
 		SenderID: sender, ReceiverID: receiver,
 		StreamID: streamID, Type: TypeDATA,
 		SeqNo: seqNo, Length: length,
+		// B3: Flags is set EXPLICITLY to zero, not left implicit. The short DATA
+		// forms carry no Flags field, so zero is the only honest value — and
+		// ShouldCompressData now refuses any flag-dependent frame onto this path,
+		// so a payload arriving here is plaintext by construction. Do NOT hardcode
+		// a flag here: DecodeACKShortFull hardcodes FlagCOMPOSITE_ACK and that is
+		// exactly how B2 loses FlagCOMPRESSED. See M-108/M-134.
+		Flags: 0,
 	}
 	if length > 0 {
 		if length > MaxPayloadSize {
