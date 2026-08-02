@@ -4,6 +4,17 @@ package aether.rpc.v1;
 
 option go_package = "github.com/ORBTR/aether/rpc/pb";
 
+// AuthenticatedPrincipal is the immutable caller authority established by a
+// trusted gateway before an RPC enters the mesh. It is deliberately separate
+// from RPCRequest.context: that map is mutable request metadata and cannot
+// establish platform, customer-organisation, user, or scope authority.
+message AuthenticatedPrincipal {
+  string platform_tenant_id = 1;
+  string customer_org_id = 2;
+  string user_id = 3;
+  repeated string scopes = 4;
+}
+
 // RPCRequest represents a direct RPC call over the mesh network.
 message RPCRequest {
   string id = 1;
@@ -20,6 +31,7 @@ message RPCRequest {
   repeated string route_list = 10; // ordered remaining hops [next, ..., target]
   string request_nonce = 11;     // unique per parallel probe (dedup key)
   int64 deadline = 12;           // absolute deadline (unix nanos)
+  AuthenticatedPrincipal principal = 13;
 }
 
 // RPCResponse represents the result of an RPC call.
