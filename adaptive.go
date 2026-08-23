@@ -35,6 +35,7 @@ type AdaptiveController struct {
 	fecDegraded    bool // AE-L-03: current FEC rung decision (monitoring / future runtime FECCapable toggle)
 	schedDegraded  bool // AE-L-03: current scheduler rung decision (monitoring / future runtime SchedulerCapable toggle)
 	stopCh         chan struct{}
+	stopOnce       sync.Once // Stop is exported; concurrent callers must not double-close stopCh
 }
 
 // NewAdaptiveController creates a controller that monitors CPU and degrades
@@ -64,9 +65,18 @@ func (a *AdaptiveController) Start() {
 	}
 }
 
-// Stop halts the adaptive controller.
+// Stop halts the adaptive controller. Idempotent and safe under concurrent
+// callers.
+//
+// stopCh is the only thing the run loop selects on for termination, so Stop
+// must close it — and a bare close panics with "close of closed channel" on a
+// second call. Stop is exported on a published module, so the number of
+// callers is not this file's to bound: the sibling WSConn.Close and
+// StreamAcceptor.Close both guard their closes for the same reason.
 func (a *AdaptiveController) Stop() {
-	close(a.stopCh)
+	a.stopOnce.Do(func() {
+		close(a.stopCh)
+	})
 }
 
 // Register enrols a runtime-toggleable session so the controller can shed its
