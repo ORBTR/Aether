@@ -78,6 +78,16 @@ type AcceptConnConfig struct {
 	// is verified against this key.
 	TrustedTicketSigner ed25519.PublicKey
 
+	// TrustedTicketSignerFn resolves the trusted signer public key from the
+	// (still unverified) ticket body, for accepters whose signer varies per
+	// ticket — e.g. a relay serving many tenants, each with its own signer
+	// key, that selects the key from the ticket's own tenant scope. When set it
+	// takes precedence over TrustedTicketSigner and, like it, makes ticket auth
+	// mandatory. Inspecting the unverified body to CHOOSE the key is safe: the
+	// signature check that follows is the gate, so a forged body may name any
+	// signer but cannot forge a signature under that signer's real key.
+	TrustedTicketSignerFn func(body []byte) (ed25519.PublicKey, error)
+
 	// ValidateTicketFn runs after signature verification to enforce
 	// scope/expiry/capability semantics. Returning non-nil aborts.
 	ValidateTicketFn func(body []byte) error
@@ -210,14 +220,31 @@ func AcceptOverConn(ctx context.Context, cfg AcceptConnConfig, conn net.Conn) (a
 	// (e.g. the browser relay bridge) that relies on the ticket as its sole
 	// authenticator and does not pin ExpectedNodeID. Callers that do not want
 	// ticket auth leave TrustedTicketSigner nil (block skipped, as before).
-	if cfg.TrustedTicketSigner != nil {
+	if cfg.TrustedTicketSigner != nil || cfg.TrustedTicketSignerFn != nil {
 		if len(ticket) < ed25519.SignatureSize {
 			return nil, fmt.Errorf("noise: ticket required (got %d bytes, need >= %d)",
 				len(ticket), ed25519.SignatureSize)
 		}
 		body := ticket[:len(ticket)-ed25519.SignatureSize]
 		sig := ticket[len(ticket)-ed25519.SignatureSize:]
-		if !ed25519.Verify(cfg.TrustedTicketSigner, body, sig) {
+
+		// Resolve the trusted signer. A per-ticket resolver takes precedence and
+		// may read the (unverified) body to select the key; the ed25519.Verify
+		// below is the gate, so key selection from an unverified body cannot let
+		// a forged ticket through.
+		signer := cfg.TrustedTicketSigner
+		if cfg.TrustedTicketSignerFn != nil {
+			s, err := cfg.TrustedTicketSignerFn(body)
+			if err != nil {
+				return nil, fmt.Errorf("noise: resolve ticket signer: %w", err)
+			}
+			if len(s) != ed25519.PublicKeySize {
+				return nil, fmt.Errorf("noise: resolved ticket signer invalid (len=%d, need %d)",
+					len(s), ed25519.PublicKeySize)
+			}
+			signer = s
+		}
+		if !ed25519.Verify(signer, body, sig) {
 			return nil, fmt.Errorf("noise: ticket signature invalid")
 		}
 		if cfg.ValidateTicketFn != nil {
