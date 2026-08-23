@@ -8,6 +8,7 @@ package noise
 
 import (
 	"encoding/binary"
+	"sort"
 	"testing"
 
 	fnoise "github.com/flynn/noise"
@@ -203,6 +204,26 @@ func TestNonceEncryptor_NonceIncrement(t *testing.T) {
 	}
 }
 
+// TestNonceEncryptor_ThreadSafe asserts the property the encryptor actually
+// promises: under concurrent use it hands out unique, monotonic nonces, and
+// every packet it produces decrypts.
+//
+// It deliberately does NOT decrypt in channel-arrival order. The receiver is a
+// replay window of at most 64 (nonce_window.go:39-41) and it rejects anything
+// `age >= window` behind the highest nonce seen (:66). With 10 goroutines
+// producing 100 packets, the scheduler can delay one producer long enough that
+// its low nonce arrives more than 64 behind the highest already decrypted — so
+// the window returns errNonceReplayed, CORRECTLY. The previous form decrypted
+// straight off the channel and so depended on an arrival-order bound that the
+// window never promised: it passed in isolation and failed under full-suite
+// contention (measured by @M in #M-142: 5/5 isolated, 3/3 at -cpu=8, failed in
+// one full ./... run, passed the next).
+//
+// Fixed by sorting into nonce order before decrypting, which removes the
+// unpromised ordering dependence while keeping both real assertions. The window
+// size is NOT widened to make this pass — that would trade production replay
+// protection for a green test (#R-836). Out-of-order tolerance is the separate
+// concern of the reorder tests above.
 func TestNonceEncryptor_ThreadSafe(t *testing.T) {
 	enc, dec := testCipherPair(t)
 
@@ -217,7 +238,9 @@ func TestNonceEncryptor_ThreadSafe(t *testing.T) {
 		}(i)
 	}
 
-	// Collect and decrypt all 100 packets
+	// Collect all 100 packets first. Uniqueness is checked here, on the
+	// concurrently-produced nonces — that is the thread-safety property.
+	cts := make([][]byte, 0, 100)
 	seen := make(map[uint64]bool)
 	for i := 0; i < 100; i++ {
 		ct := <-done
@@ -226,15 +249,22 @@ func TestNonceEncryptor_ThreadSafe(t *testing.T) {
 			t.Fatalf("duplicate nonce %d", n)
 		}
 		seen[n] = true
-
-		_, err := dec.Decrypt(nil, nil, ct)
-		if err != nil {
-			t.Fatalf("decrypt nonce %d: %v", n, err)
-		}
+		cts = append(cts, ct)
 	}
 
 	if len(seen) != 100 {
 		t.Fatalf("expected 100 unique nonces, got %d", len(seen))
+	}
+
+	// Deliver in nonce order so the replay window sees a monotonic stream.
+	sort.Slice(cts, func(i, j int) bool {
+		return binary.BigEndian.Uint64(cts[i][:8]) < binary.BigEndian.Uint64(cts[j][:8])
+	})
+	for _, ct := range cts {
+		n := binary.BigEndian.Uint64(ct[:8])
+		if _, err := dec.Decrypt(nil, nil, ct); err != nil {
+			t.Fatalf("decrypt nonce %d: %v", n, err)
+		}
 	}
 }
 
