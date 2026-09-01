@@ -4,15 +4,28 @@ package aether.rpc.v1;
 
 option go_package = "github.com/ORBTR/aether/rpc/pb";
 
+// ScopeAxis is one opaque, named identity axis a trusted gateway established.
+// aether carries name and value without interpreting either; the consuming
+// project assigns meaning to name and never has aether derive one axis from
+// another. It is how an agnostic wire carries a customer organisation, a
+// platform tenant, or any other partition without naming them in the mesh.
+message ScopeAxis {
+  string name = 1;
+  string value = 2;
+}
+
 // AuthenticatedPrincipal is the immutable caller authority established by a
-// trusted gateway before an RPC enters the mesh. It is deliberately separate
-// from RPCRequest.context: that map is mutable request metadata and cannot
-// establish platform, customer-organisation, user, or scope authority.
+// trusted gateway before an RPC enters the mesh. It carries the authenticated
+// subject, the opaque identity axes the gateway established (the consuming
+// project names them; aether interprets none), and the granted scope strings.
+// It is deliberately separate from RPCRequest.context: that map is mutable
+// request metadata and cannot establish subject, axis, or scope authority. No
+// owner partition travels here — the receiver derives it from a transport-gated
+// axis, so a peer cannot forge one by setting a field.
 message AuthenticatedPrincipal {
-  string platform_tenant_id = 1;
-  string customer_org_id = 2;
-  string user_id = 3;
-  repeated string scopes = 4;
+  string subject = 1;
+  repeated ScopeAxis axes = 2;
+  repeated string scopes = 3;
 }
 
 // RPCRequest represents a direct RPC call over the mesh network.
