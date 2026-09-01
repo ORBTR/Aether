@@ -19,10 +19,12 @@ func TestAuthenticatedPrincipalRoundTripIsSeparateFromMutableContext(t *testing.
 			"orgId": "org-B",
 		},
 		Principal: &AuthenticatedPrincipal{
-			PlatformTenantId: "orbtr",
-			CustomerOrgId:    "org-A",
-			UserId:           "user-A",
-			Scopes:           []string{"org.read", "org.write"},
+			Subject: "user-A",
+			Axes: []*ScopeAxis{
+				{Name: "platform_tenant", Value: "orbtr"},
+				{Name: "customer_org", Value: "org-A"},
+			},
+			Scopes: []string{"org.read", "org.write"},
 		},
 	}
 
@@ -44,7 +46,7 @@ func TestAuthenticatedPrincipalRoundTripIsSeparateFromMutableContext(t *testing.
 
 	decoded.Context["orgId"] = "org-C"
 	if !reflect.DeepEqual(decoded.Principal.Scopes, []string{"org.read", "org.write"}) ||
-		decoded.Principal.CustomerOrgId != "org-A" {
+		decoded.Principal.GetAxes()[1].GetValue() != "org-A" {
 		t.Fatalf("mutable context rewrote principal: %#v", decoded.Principal)
 	}
 }
