@@ -103,8 +103,8 @@ func aep26DialWS(t *testing.T, target aether.Target) error {
 	return err
 }
 
-// 1) Honest end-to-end: real Listen server + real Dial. The client must accept
-//    and both sides must see the correct peer NodeID.
+//  1. Honest end-to-end: real Listen server + real Dial. The client must accept
+//     and both sides must see the correct peer NodeID.
 func TestAEP26_WSHonestRoundTripAccepted(t *testing.T) {
 	_, srvPriv, srvID := aep26Identity(t)
 	_, cliPriv, cliID := aep26Identity(t)
@@ -143,9 +143,9 @@ func TestAEP26_WSHonestRoundTripAccepted(t *testing.T) {
 	}
 }
 
-// 2) Malicious echo: server claims the victim NodeID but presents its OWN
-//    pubkey. The pubkey does not derive the claimed NodeID, so the client must
-//    fail closed before trusting it.
+//  2. Malicious echo: server claims the victim NodeID but presents its OWN
+//     pubkey. The pubkey does not derive the claimed NodeID, so the client must
+//     fail closed before trusting it.
 func TestAEP26_WSMaliciousEchoRejected(t *testing.T) {
 	_, _, victimID := aep26Identity(t)
 	atkPub, atkPriv, _ := aep26Identity(t)
@@ -160,9 +160,9 @@ func TestAEP26_WSMaliciousEchoRejected(t *testing.T) {
 	}
 }
 
-// 3) Forged signature: server presents the victim's REAL pubkey (derive passes)
-//    but signs the accept with the attacker's key. The signature must fail to
-//    verify.
+//  3. Forged signature: server presents the victim's REAL pubkey (derive passes)
+//     but signs the accept with the attacker's key. The signature must fail to
+//     verify.
 func TestAEP26_WSForgedSignatureRejected(t *testing.T) {
 	victimPub, _, victimID := aep26Identity(t)
 	_, atkPriv, _ := aep26Identity(t)
@@ -177,9 +177,9 @@ func TestAEP26_WSForgedSignatureRejected(t *testing.T) {
 	}
 }
 
-// 4) Wrong-but-honest identity: server proves a fully self-consistent identity B
-//    (correct pubkey + valid signature over B), but the client dialed target A.
-//    The proven NodeID must be required to equal the dialed target.
+//  4. Wrong-but-honest identity: server proves a fully self-consistent identity B
+//     (correct pubkey + valid signature over B), but the client dialed target A.
+//     The proven NodeID must be required to equal the dialed target.
 func TestAEP26_WSWrongTargetRejected(t *testing.T) {
 	srvPub, srvPriv, srvID := aep26Identity(t)
 	_, _, dialedID := aep26Identity(t) // a DIFFERENT target than the honest server
@@ -194,8 +194,8 @@ func TestAEP26_WSWrongTargetRejected(t *testing.T) {
 	}
 }
 
-// 5) Old/keyless server: emits NO identity headers (pre-fix behavior). The
-//    client must fail closed rather than blindly trust target.NodeID.
+//  5. Old/keyless server: emits NO identity headers (pre-fix behavior). The
+//     client must fail closed rather than blindly trust target.NodeID.
 func TestAEP26_WSMissingIdentityRejected(t *testing.T) {
 	_, _, victimID := aep26Identity(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -215,9 +215,9 @@ func TestAEP26_WSMissingIdentityRejected(t *testing.T) {
 	}
 }
 
-// 6) Nonce binding: server signs a nonce OTHER than the one the client sent.
-//    The client verifies over ITS OWN nonce, so a captured/replayed accept must
-//    not verify.
+//  6. Nonce binding: server signs a nonce OTHER than the one the client sent.
+//     The client verifies over ITS OWN nonce, so a captured/replayed accept must
+//     not verify.
 func TestAEP26_WSStaleNonceRejected(t *testing.T) {
 	srvPub, srvPriv, srvID := aep26Identity(t)
 	url := aep26MaliciousWSServer(t, srvID, srvPub, srvPriv, "some-other-captured-nonce")
@@ -230,10 +230,10 @@ func TestAEP26_WSStaleNonceRejected(t *testing.T) {
 	}
 }
 
-// 7) Hijack server-emit: a real hijack round-trip (httptest.Server exposes a
-//    genuine http.Hijacker) must make the server sign the client's fresh nonce
-//    with its own key. Proves the client's hijack-side check is not inert and
-//    that the accept is bound to THIS dial (non-replayable).
+//  7. Hijack server-emit: a real hijack round-trip (httptest.Server exposes a
+//     genuine http.Hijacker) must make the server sign the client's fresh nonce
+//     with its own key. Proves the client's hijack-side check is not inert and
+//     that the accept is bound to THIS dial (non-replayable).
 func TestAEP26_HijackServerEmitsBoundAccept(t *testing.T) {
 	_, srvPriv, srvID := aep26Identity(t)
 	srvPub := srvPriv.Public().(ed25519.PublicKey)
@@ -311,9 +311,9 @@ func TestAEP26_HijackServerEmitsBoundAccept(t *testing.T) {
 	}
 }
 
-// 8) Keyless hijack server: a transport built without a private key must NOT
-//    panic (ed25519.Sign panics on a nil key) and must emit only the NodeID
-//    header, leaving the client to fail closed on the missing triple.
+//  8. Keyless hijack server: a transport built without a private key must NOT
+//     panic (ed25519.Sign panics on a nil key) and must emit only the NodeID
+//     header, leaving the client to fail closed on the missing triple.
 func TestAEP26_HijackKeylessServerNoPanic(t *testing.T) {
 	_, _, srvID := aep26Identity(t)
 	server := aep26Transport(t, srvID, nil, "")

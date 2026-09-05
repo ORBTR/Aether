@@ -14,7 +14,7 @@ type ConnectionMap struct {
 	mu       sync.RWMutex
 	byNodeID map[NodeID]Connection
 	byAddr   map[string]Connection            // address string → session
-	byScope map[string]map[NodeID]Connection // scopeID → nodeID → session
+	byScope  map[string]map[NodeID]Connection // scopeID → nodeID → session
 }
 
 // NewConnectionMap creates an empty session map.
@@ -22,7 +22,7 @@ func NewConnectionMap() *ConnectionMap {
 	return &ConnectionMap{
 		byNodeID: make(map[NodeID]Connection),
 		byAddr:   make(map[string]Connection),
-		byScope: make(map[string]map[NodeID]Connection),
+		byScope:  make(map[string]map[NodeID]Connection),
 	}
 }
 
@@ -207,7 +207,7 @@ func (m *ConnectionMap) HasTenant(scope string) bool {
 	return ok
 }
 
-// TenantCountAll returns the total number of tenants with sessions.
+// TenantCountAll returns the total number of partitions with sessions.
 func (m *ConnectionMap) TenantCountAll() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

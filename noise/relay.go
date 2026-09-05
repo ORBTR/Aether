@@ -13,10 +13,10 @@ import (
 	"errors"
 	"time"
 
-	"github.com/flynn/noise"
 	aether "github.com/ORBTR/aether"
 	transportHealth "github.com/ORBTR/aether/health"
 	"github.com/ORBTR/aether/relay"
+	"github.com/flynn/noise"
 )
 
 // relayForwardTimeout bounds a single relay forward to an external session so
@@ -287,18 +287,18 @@ func (l *noiseListener) handleRelayedHandshake(relayConn *noiseConn, sourceNodeI
 	// - cs2 is for responder→initiator (responder uses for send)
 	cfg := aether.DefaultSessionConfig()
 	nc := &noiseConn{
-		conn:             relayConn.conn, // Share the substrate conn (UDP on native, DC/WS on browser)
-		remote:           relayConn.remote,
-		remoteNode:       remoteNode,
-		send:             cs2,
-		recv:             cs1,
-		inbox:            make(chan []byte, 256),
-		closed:           make(chan struct{}),
-		maxPacket:        l.transport.maxPacket,
-		localAddr:        relayConn.localAddr,
-		transport:        l.transport,
-		health: transportHealth.NewMonitor(0.2),
-		rekey:  NewRekeyTracker(cfg.RekeyAfterBytes, cfg.RekeyAfterDuration),
+		conn:       relayConn.conn, // Share the substrate conn (UDP on native, DC/WS on browser)
+		remote:     relayConn.remote,
+		remoteNode: remoteNode,
+		send:       cs2,
+		recv:       cs1,
+		inbox:      make(chan []byte, 256),
+		closed:     make(chan struct{}),
+		maxPacket:  l.transport.maxPacket,
+		localAddr:  relayConn.localAddr,
+		transport:  l.transport,
+		health:     transportHealth.NewMonitor(0.2),
+		rekey:      NewRekeyTracker(cfg.RekeyAfterBytes, cfg.RekeyAfterDuration),
 		writeFunc: func(data []byte) (int, error) {
 			return relayConn.sendRelayRequest(remoteNode, data)
 		},

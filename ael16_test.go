@@ -22,10 +22,10 @@ type ael16MockStream struct {
 	wasReset atomic.Bool
 }
 
-func (m *ael16MockStream) StreamID() uint64                          { return m.id }
+func (m *ael16MockStream) StreamID() uint64                            { return m.id }
 func (m *ael16MockStream) Send(ctx context.Context, data []byte) error { return nil }
 func (m *ael16MockStream) Receive(ctx context.Context) ([]byte, error) { return nil, nil }
-func (m *ael16MockStream) Close() error                              { return nil }
+func (m *ael16MockStream) Close() error                                { return nil }
 func (m *ael16MockStream) Reset(reason ResetReason) error {
 	m.wasReset.Store(true)
 	return nil

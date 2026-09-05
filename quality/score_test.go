@@ -406,7 +406,7 @@ func TestDialCooldownDuration_GrowsThenCaps(t *testing.T) {
 		{3, 2 * time.Minute, 2 * time.Minute},
 		{4, 4 * time.Minute, 4 * time.Minute},
 		{5, 8 * time.Minute, 8 * time.Minute},
-		{6, 10 * time.Minute, 10 * time.Minute}, // capped
+		{6, 10 * time.Minute, 10 * time.Minute},  // capped
 		{20, 10 * time.Minute, 10 * time.Minute}, // still capped
 	}
 	for _, tc := range tests {

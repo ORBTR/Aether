@@ -21,9 +21,9 @@ import (
 // path leaves Send nil and keeps the per-entry Retries counter local.
 type RetransmitEntry struct {
 	Frame      *aether.Frame
-	Send       *SendEntry    // optional shared send-side entry; nil for legacy callers
+	Send       *SendEntry // optional shared send-side entry; nil for legacy callers
 	NextRetry  time.Time
-	EnqueuedAt time.Time     // original enqueue time (for accurate MaxAge check)
+	EnqueuedAt time.Time // original enqueue time (for accurate MaxAge check)
 	Retries    int
 	RTO        time.Duration // RTO at time of enqueue (for exponential backoff)
 	index      int           // heap index

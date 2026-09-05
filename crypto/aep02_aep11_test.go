@@ -151,10 +151,10 @@ func TestAEP02_PrefixStableCounterMonotonic(t *testing.T) {
 func aep02Frame(t *testing.T) *aether.Frame {
 	t.Helper()
 	return &aether.Frame{
-		Type:    aether.TypeDATA,
+		Type:     aether.TypeDATA,
 		StreamID: 1,
-		Length:  32,
-		Payload: make([]byte, 32),
+		Length:   32,
+		Payload:  make([]byte, 32),
 	}
 }
 
@@ -198,7 +198,7 @@ func TestAEP11_DecryptWithNonceRejectsTamperedHeader(t *testing.T) {
 	f.SeqNo ^= 0x5A5A
 
 	if err := e.DecryptWithNonce(f, nonce); err == nil {
-		t.Fatalf("AE-P-11 regressed: DecryptWithNonce accepted a frame whose header was "+
+		t.Fatalf("AE-P-11 regressed: DecryptWithNonce accepted a frame whose header was " +
 			"tampered after sealing — the 0x87 path is still authenticating with nil AAD")
 	}
 }

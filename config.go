@@ -18,7 +18,7 @@ type Config struct {
 	PrivateKey ed25519.PrivateKey
 
 	// Protocol-specific configs (nil = disabled)
-	Noise *NoiseConfig
+	Noise     *NoiseConfig
 	QUIC      *QUICConfig
 	WebSocket *WebSocketConfig
 	GRPC      *GRPCConfig

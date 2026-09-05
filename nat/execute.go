@@ -21,6 +21,7 @@
 //   - the responder runs ExecuteProbe — a PunchProbe at every requester
 //     candidate, opening its NAT mapping without a handshake, and lets
 //     its always-running listener accept the initiator's inbound dial.
+//
 // This resolves the asymmetric Noise XX role problem: exactly one side
 // initiates, both NATs open at once.
 package nat

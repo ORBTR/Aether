@@ -16,7 +16,7 @@ import (
 	aether "github.com/ORBTR/aether"
 )
 
-// TestTicketRoundTripPreservesScopeID is the AE-H-07 regression: the tenant
+// TestTicketRoundTripPreservesScopeID is the AE-H-07 regression: the partition
 // scope the original session was bound to must survive an IssueTicket ->
 // DecryptTicket round-trip. Before the fix the ticket carried no scope, so a
 // resumed session came back scopeless ("") and bypassed resolveRelayTarget's

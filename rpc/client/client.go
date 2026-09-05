@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ORBTR/aether/rpc/pb"
 	aether "github.com/ORBTR/aether"
+	"github.com/ORBTR/aether/rpc/pb"
 )
 
 // Client provides RPC-over-VL1 client functionality using binary protobuf-style serialization.

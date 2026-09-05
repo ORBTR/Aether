@@ -40,25 +40,25 @@ const (
 )
 
 var (
-	ErrRelayNotEnabled    = errors.New("relay: not enabled")
-	ErrInvalidPacket      = errors.New("relay: invalid packet")
-	ErrTargetUnreachable  = errors.New("relay: target unreachable")
-	ErrTicketExpired      = errors.New("relay: ticket expired")
-	ErrTicketInvalid      = errors.New("relay: ticket signature invalid")
-	ErrTicketNodeMismatch  = errors.New("relay: ticket node mismatch")
-	ErrTenantMismatch      = errors.New("relay: cross-scope relay denied")
+	ErrRelayNotEnabled      = errors.New("relay: not enabled")
+	ErrInvalidPacket        = errors.New("relay: invalid packet")
+	ErrTargetUnreachable    = errors.New("relay: target unreachable")
+	ErrTicketExpired        = errors.New("relay: ticket expired")
+	ErrTicketInvalid        = errors.New("relay: ticket signature invalid")
+	ErrTicketNodeMismatch   = errors.New("relay: ticket node mismatch")
+	ErrTenantMismatch       = errors.New("relay: cross-scope relay denied")
 	ErrTicketTenantMismatch = errors.New("relay: ticket scope mismatch")
 )
 
 // RelayTicket authorizes a node to use a relay for a specific target.
 // v2 format: [nonce:16][expiry:8][nodeID:32][targetID:32][scopeID:32][signature:64]
 type RelayTicket struct {
-	Nonce     [TicketNonceSize]byte       // Random nonce for uniqueness
-	ExpiresAt time.Time                   // When the ticket expires
-	NodeID    [32]byte                    // Node authorized to use this ticket
-	TargetID  [32]byte                    // Target node the ticket allows relaying to
-	ScopeID  [TicketTenantIDSize]byte    // SHA256 of scope ID (zero = unscoped/legacy)
-	Signature [TicketSignatureSize]byte   // Ed25519 signature by relay
+	Nonce     [TicketNonceSize]byte     // Random nonce for uniqueness
+	ExpiresAt time.Time                 // When the ticket expires
+	NodeID    [32]byte                  // Node authorized to use this ticket
+	TargetID  [32]byte                  // Target node the ticket allows relaying to
+	ScopeID   [TicketTenantIDSize]byte  // SHA256 of scope ID (zero = unscoped/legacy)
+	Signature [TicketSignatureSize]byte // Ed25519 signature by relay
 }
 
 // NewRelayTicket creates a new relay ticket signed by the relay node.
@@ -74,7 +74,7 @@ func NewTenantRelayTicket(relayPrivKey ed25519.PrivateKey, nodeID, targetID [32]
 		ExpiresAt: time.Now().Add(ttl),
 		NodeID:    nodeID,
 		TargetID:  targetID,
-		ScopeID:  scopeID,
+		ScopeID:   scopeID,
 	}
 
 	// Generate random nonce

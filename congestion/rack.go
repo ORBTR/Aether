@@ -229,9 +229,9 @@ func (r *RACK) inflateReoWndLocked() {
 // timer at min(ReexamineAt) instead of polling every tick — the
 // implementation chooses but the API supports both styles.
 type LossCandidate struct {
-	Seq          uint32
-	ReexamineAt  time.Time
-	IsLossNow    bool
+	Seq         uint32
+	ReexamineAt time.Time
+	IsLossNow   bool
 }
 
 // DetectLost iterates the supplied snapshot of in-flight (seq, xmitTime)
@@ -241,9 +241,9 @@ type LossCandidate struct {
 // rather than the reliability-tick cadence).
 //
 // Uses RFC 8985 §6.2 condition: a packet is lost if all of:
-//   1) It was sent before the most recently delivered packet (xmitTime < fack)
-//   2) Its XmitTime is at least reoWnd in the past relative to fack OR
-//      lastDeliveredAt + reoWnd has elapsed since delivery.
+//  1. It was sent before the most recently delivered packet (xmitTime < fack)
+//  2. Its XmitTime is at least reoWnd in the past relative to fack OR
+//     lastDeliveredAt + reoWnd has elapsed since delivery.
 //
 // We collapse (2) to: xmitTime <= fack - reoWnd  AND  now - lastDeliveredAt >= 0
 // since the second clause is satisfied as soon as fack advances, which is

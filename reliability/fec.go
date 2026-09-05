@@ -122,10 +122,10 @@ type FECDecoder struct {
 }
 
 type fecGroup struct {
-	total     int               // total frames in group (data + repair)
-	received  map[uint8][]byte  // index → payload
-	repair    []byte            // XOR repair payload (nil until received)
-	firstSeen time.Time         // when the first frame of this group arrived (for age-based eviction — S2)
+	total     int              // total frames in group (data + repair)
+	received  map[uint8][]byte // index → payload
+	repair    []byte           // XOR repair payload (nil until received)
+	firstSeen time.Time        // when the first frame of this group arrived (for age-based eviction — S2)
 }
 
 // NewFECDecoder creates a decoder.

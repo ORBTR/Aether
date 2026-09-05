@@ -493,19 +493,20 @@ const WindowUpdateSize = 8
 // ────────────────────────────────────────────────────────────────────────────
 
 // CongestionPayloadSize is the wire size of a CONGESTION payload (5 bytes).
-//   [1 byte reason][1 byte severity 0-100][2 bytes backoff_ms][1 byte reserved]
+//
+//	[1 byte reason][1 byte severity 0-100][2 bytes backoff_ms][1 byte reserved]
 const CongestionPayloadSize = 5
 
 // CongestionReason identifies why the receiver is signalling congestion.
 type CongestionReason byte
 
 const (
-	CongestionUnspecified  CongestionReason = 0
-	CongestionQueueFull    CongestionReason = 1 // Receiver's recvCh is backlogged
-	CongestionMemoryHigh   CongestionReason = 2 // Receiver near memory pressure
-	CongestionCPUHigh      CongestionReason = 3 // Receiver can't keep up CPU-wise
-	CongestionRateLimit    CongestionReason = 4 // Receiver policy rate-limit
-	CongestionDownstream   CongestionReason = 5 // Receiver can't drain to its downstream
+	CongestionUnspecified CongestionReason = 0
+	CongestionQueueFull   CongestionReason = 1 // Receiver's recvCh is backlogged
+	CongestionMemoryHigh  CongestionReason = 2 // Receiver near memory pressure
+	CongestionCPUHigh     CongestionReason = 3 // Receiver can't keep up CPU-wise
+	CongestionRateLimit   CongestionReason = 4 // Receiver policy rate-limit
+	CongestionDownstream  CongestionReason = 5 // Receiver can't drain to its downstream
 )
 
 // CongestionPayload is an explicit backpressure hint from receiver to sender.

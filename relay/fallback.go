@@ -397,6 +397,6 @@ func (s *RelayedSession) Ticket() *RelayTicket {
 	return s.ticket
 }
 
-func (s *RelayedSession) NetConn() net.Conn { return nil } // Relay doesn't expose raw net.Conn
+func (s *RelayedSession) NetConn() net.Conn         { return nil } // Relay doesn't expose raw net.Conn
 func (s *RelayedSession) Protocol() aether.Protocol { return aether.ProtoUnknown }
-func (s *RelayedSession) OnClose(fn func()) { /* Relay handles lifecycle */ }
+func (s *RelayedSession) OnClose(fn func())         { /* Relay handles lifecycle */ }

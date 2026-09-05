@@ -26,7 +26,7 @@ var (
 //  1. **Per-scope soft cap** (`MaxRelayPairs`): when a scope hits its own
 //     pair limit, we evict its own LRU pair so the scope churns rather
 //     than stalls — protects quiet scopes from being starved by their
-//     own noisy tenants.
+//     own noisy partitions.
 //
 //  2. **Global hard cap with cross-scope WFQ preemption** (`MaxTotalPairs`):
 //     when the whole limiter is at capacity and a new pair arrives, we
@@ -71,8 +71,8 @@ func DefaultTenantLimiterConfig() ScopeLimiterConfig {
 	}
 }
 
-// tenantState tracks rate limiting state for a single scope.
-type tenantState struct {
+// partitionState tracks rate limiting state for a single scope.
+type partitionState struct {
 	// Session count is derived from ConnectionMap (not tracked here).
 	// Relay rate: token bucket.
 	relayTokens    float64
@@ -90,7 +90,7 @@ type tenantState struct {
 type TenantRelayLimiter struct {
 	mu     sync.Mutex
 	config ScopeLimiterConfig
-	state  map[string]*tenantState // scopeID → state
+	state  map[string]*partitionState // scopeID → state
 
 	// pairsEvicted counts pairs displaced by LRU when MaxRelayPairs would
 	// otherwise reject a new pair (per-scope LRU eviction). S9.
@@ -173,7 +173,7 @@ func (l *TenantRelayLimiter) pickBusiestScopeLocked() string {
 func NewTenantRelayLimiter(cfg ScopeLimiterConfig) *TenantRelayLimiter {
 	return &TenantRelayLimiter{
 		config: cfg,
-		state:  make(map[string]*tenantState),
+		state:  make(map[string]*partitionState),
 	}
 }
 
@@ -192,10 +192,10 @@ func (l *TenantRelayLimiter) UpdateConfig(cfg ScopeLimiterConfig) {
 }
 
 // getOrCreate returns the state for a scope, creating it if needed. Caller must hold l.mu.
-func (l *TenantRelayLimiter) getOrCreate(scopeID string) *tenantState {
+func (l *TenantRelayLimiter) getOrCreate(scopeID string) *partitionState {
 	s, ok := l.state[scopeID]
 	if !ok {
-		s = &tenantState{
+		s = &partitionState{
 			relayTokens:    float64(l.config.MaxRelayRate), // start full
 			relayLastCheck: time.Now(),
 			relayPairs:     make(map[string]time.Time),
@@ -320,7 +320,7 @@ func (l *TenantRelayLimiter) CheckRelayPair(scopeID, pairKey string) error {
 // evictOldestLocked drops the least-recently-used pair from a scope.
 // crossScope=true credits the WFQ counter; false credits the per-scope
 // LRU counter. Caller must hold l.mu.
-func (l *TenantRelayLimiter) evictOldestLocked(scopeID string, s *tenantState, crossScope bool) {
+func (l *TenantRelayLimiter) evictOldestLocked(scopeID string, s *partitionState, crossScope bool) {
 	var oldestKey string
 	var oldestTime time.Time
 	first := true

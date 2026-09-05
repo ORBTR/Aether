@@ -70,8 +70,8 @@ import (
 	"sync"
 	"time"
 
-	fnoise "github.com/flynn/noise"
 	aether "github.com/ORBTR/aether"
+	fnoise "github.com/flynn/noise"
 )
 
 // Wire prefixes for the resume sub-protocol. Chosen from the high-byte
@@ -223,10 +223,10 @@ func decodeResumeMaterial(data []byte) (*resumeMaterial, error) {
 const DefaultSeenTicketCacheSize = 16384
 
 type seenTicketCache struct {
-	mu      sync.Mutex
-	seen    map[string]time.Time
-	order   []string
-	max     int
+	mu    sync.Mutex
+	seen  map[string]time.Time
+	order []string
+	max   int
 }
 
 func newSeenTicketCache(max int) *seenTicketCache {
@@ -560,8 +560,8 @@ func (l *noiseListener) handleResumePacket(ctx context.Context, conn *net.UDPCon
 	nc := newNoiseConnListener(l, send, recv, addr, ticket.PeerID, nil)
 	// AE-H-07: restore the original session's tenant scope from the ticket so
 	// the resumed conn keeps its relay isolation. Without this the conn would
-	// register scopeless (""), and resolveRelayTarget's cross-tenant guard
-	// (relay.go) treats empty scope as unrestricted — bypassing tenant isolation.
+	// register scopeless (""), and resolveRelayTarget's cross-partition guard
+	// (relay.go) treats empty scope as unrestricted — bypassing partition isolation.
 	nc.scopeID = ticket.ScopeID
 	key := addr.String()
 	l.mu.Lock()

@@ -16,8 +16,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/flynn/noise"
 	aether "github.com/ORBTR/aether"
+	"github.com/flynn/noise"
 )
 
 // TestHandshakeDuplicateRetryToken_NotReadAsMsg2 is the regression guard for
@@ -91,9 +91,9 @@ func TestHandshakeDuplicateRetryToken_NotReadAsMsg2(t *testing.T) {
 	t.Cleanup(func() { _ = shimConn.Close() })
 	shimAddr := shimConn.LocalAddr().(*net.UDPAddr)
 
-	var retriesSent int64      // total RETRY tokens the shim put on the wire
-	var cookiedMsg1Seen int64  // set once the initiator answered a RETRY
-	var msg2Built int64        // set once the shim produced a genuine msg2
+	var retriesSent int64     // total RETRY tokens the shim put on the wire
+	var cookiedMsg1Seen int64 // set once the initiator answered a RETRY
+	var msg2Built int64       // set once the shim produced a genuine msg2
 	shimErr := make(chan error, 1)
 
 	// sendNonceTagged writes [0xFD][nonce][payload] — the dial-nonce envelope

@@ -34,8 +34,8 @@ type QuicTransportConfig struct {
 	// G07: 0-RTT resumption. When enabled, QUIC connections to known peers
 	// skip the TLS handshake round-trip using cached session tickets.
 	// The TLS ClientSessionCache stores tickets in memory (or SQLite via adapter).
-	Allow0RTT          bool                    // Enable 0-RTT early data
-	ClientSessionCache tls.ClientSessionCache  // If nil, uses tls.NewLRUClientSessionCache(64)
+	Allow0RTT          bool                   // Enable 0-RTT early data
+	ClientSessionCache tls.ClientSessionCache // If nil, uses tls.NewLRUClientSessionCache(64)
 }
 
 // QuicTransport implements the Transport interface using QUIC.
@@ -46,8 +46,8 @@ type QuicTransport struct {
 	keepAlive  time.Duration
 	listenAddr string
 	allow0RTT  bool
-	packetConn net.PacketConn    // if set, use this instead of creating a new socket
-	sharedTr   *quic.Transport   // reusable quic.Transport for shared PacketConn
+	packetConn net.PacketConn  // if set, use this instead of creating a new socket
+	sharedTr   *quic.Transport // reusable quic.Transport for shared PacketConn
 	mu         sync.Mutex
 }
 

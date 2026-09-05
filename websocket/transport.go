@@ -24,8 +24,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gobwas/ws"
 	"github.com/ORBTR/aether"
+	"github.com/gobwas/ws"
 )
 
 const (
@@ -759,10 +759,10 @@ type HijackSession struct {
 // HijackConn wraps a raw (post-hijack) connection with length-prefixed framing.
 // Implements net.Conn for transparent use by gossip/RPC.
 type HijackConn struct {
-	raw    net.Conn
-	reader *bufio.Reader // may contain pipelined data from HTTP response
-	mu     sync.Mutex    // protects writes
-	closed bool
+	raw     net.Conn
+	reader  *bufio.Reader // may contain pipelined data from HTTP response
+	mu      sync.Mutex    // protects writes
+	closed  bool
 	readBuf []byte // leftover from partially-consumed frame
 }
 

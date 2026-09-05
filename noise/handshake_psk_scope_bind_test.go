@@ -92,10 +92,11 @@ func newScopeTestTransport(t *testing.T, resolver TenantKeyResolver) (*NoiseTran
 //   - preamble_test.go            — preamble WIRE encode/decode
 //   - session_ticket_scope_test.go — ticket/RESUME path preserves ScopeID
 //   - relay_scope_test.go/ael10   — relay ISOLATION given a scope
+//
 // None drove a real handshake and asserted the derived session scope.
 //
 // The bind (handshake.go): resolveHandshakeKey resolves the preamble's claimed
-// tenant to that scope's registered PSKs, requires the msg1 CRC32 fingerprint to
+// partition to that scope's registered PSKs, requires the msg1 CRC32 fingerprint to
 // match one of them, and only then stamps scopeID = tenant on the accepted
 // session (handshake.go:1007). Possession is finalised by the full Noise
 // handshake, which mixes the matched PSK as the prologue — a claimant without
@@ -180,7 +181,7 @@ func TestHandshakePSKtoScopeIDBind(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = connA.Close() })
 	if got := scopeOf(t, connA); got != scopeAlpha {
-		t.Fatalf("responder DERIVED ScopeID=%q from the tenant-alpha PSK, want %q — session scope is not bound to the proven key", got, scopeAlpha)
+		t.Fatalf("responder DERIVED ScopeID=%q from the partition-alpha PSK, want %q — session scope is not bound to the proven key", got, scopeAlpha)
 	}
 
 	// --- right PSK -> derived scope (tenant-beta): the derivation tracks the
@@ -191,7 +192,7 @@ func TestHandshakePSKtoScopeIDBind(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = connB.Close() })
 	if got := scopeOf(t, connB); got != scopeBeta {
-		t.Fatalf("responder DERIVED ScopeID=%q from the tenant-beta PSK, want %q", got, scopeBeta)
+		t.Fatalf("responder DERIVED ScopeID=%q from the partition-beta PSK, want %q", got, scopeBeta)
 	}
 
 	// --- wrong PSK for a KNOWN scope -> REJECTED. Claiming tenant-alpha while
@@ -212,7 +213,7 @@ func TestHandshakePSKtoScopeIDBind(t *testing.T) {
 	// --- absent scope -> REJECTED. A scope the resolver has never heard of has
 	// no keys to match; resolveHandshakeKey rejects before any Noise state. ---
 	beforeUnknown := nl.DropSnapshot()[DropHandshakeKeyUnresolved.String()]
-	if c, derr := dialScope("tenant-unregistered", [][]byte{keyAlpha}, 2*time.Second); derr == nil {
+	if c, derr := dialScope("partition-unregistered", [][]byte{keyAlpha}, 2*time.Second); derr == nil {
 		got := scopeOf(t, c)
 		_ = c.Close()
 		t.Fatalf("handshake COMPLETED for an unregistered scope — got ScopeID=%q", got)

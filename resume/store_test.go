@@ -140,4 +140,3 @@ func TestFileStoreListEmptyDir(t *testing.T) {
 		t.Errorf("expected empty list, got %v", ids)
 	}
 }
-

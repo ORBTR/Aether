@@ -156,7 +156,7 @@ func TestTenantRelayLimiter_UpdateConfig(t *testing.T) {
 func TestTenantRelayLimiter_Cleanup(t *testing.T) {
 	limiter := NewTenantRelayLimiter(testLimiterConfig())
 
-	// Create state for two tenants
+	// Create state for two partitions
 	limiter.TrackRelayPair("scope-1", "A→B")
 	limiter.AllowRelay("scope-2") // creates state via getOrCreate
 

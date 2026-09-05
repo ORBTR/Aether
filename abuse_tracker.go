@@ -125,4 +125,3 @@ func (t *AbuseTracker) SetRegistry(r interface{}) bool {
 	t.score.Store(registry) // AE-P-01: atomic swap, race-free vs Report/PeerScore
 	return true
 }
-

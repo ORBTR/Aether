@@ -876,19 +876,19 @@ func DecodeStats(data []byte) SessionMetrics {
 		return SessionMetrics{}
 	}
 	m := SessionMetrics{
-		RTT:           time.Duration(binary.BigEndian.Uint32(data[0:4])) * time.Microsecond,
-		LossPercent:   float64(binary.BigEndian.Uint32(data[4:8])) / 10000,
-		CWND:          int64(binary.BigEndian.Uint32(data[8:12])),
-		Retransmits:   uint64(binary.BigEndian.Uint32(data[12:16])),
-		FramesSent:    binary.BigEndian.Uint64(data[16:24]),
-		BytesSent:     binary.BigEndian.Uint64(data[24:32]),
-		ActiveStreams: int(binary.BigEndian.Uint16(data[32:34])),
-		FramesRecv:    binary.BigEndian.Uint64(data[34:42]),
-		BytesRecv:     binary.BigEndian.Uint64(data[42:50]),
-		DroppedFrames: uint64(binary.BigEndian.Uint32(data[54:58])),
-		RttP50:        time.Duration(binary.BigEndian.Uint32(data[58:62])) * time.Microsecond,
-		RttP99:        time.Duration(binary.BigEndian.Uint32(data[62:66])) * time.Microsecond,
-		TLPFiresTotal: uint64(binary.BigEndian.Uint32(data[66:70])),
+		RTT:            time.Duration(binary.BigEndian.Uint32(data[0:4])) * time.Microsecond,
+		LossPercent:    float64(binary.BigEndian.Uint32(data[4:8])) / 10000,
+		CWND:           int64(binary.BigEndian.Uint32(data[8:12])),
+		Retransmits:    uint64(binary.BigEndian.Uint32(data[12:16])),
+		FramesSent:     binary.BigEndian.Uint64(data[16:24]),
+		BytesSent:      binary.BigEndian.Uint64(data[24:32]),
+		ActiveStreams:  int(binary.BigEndian.Uint16(data[32:34])),
+		FramesRecv:     binary.BigEndian.Uint64(data[34:42]),
+		BytesRecv:      binary.BigEndian.Uint64(data[42:50]),
+		DroppedFrames:  uint64(binary.BigEndian.Uint32(data[54:58])),
+		RttP50:         time.Duration(binary.BigEndian.Uint32(data[58:62])) * time.Microsecond,
+		RttP99:         time.Duration(binary.BigEndian.Uint32(data[62:66])) * time.Microsecond,
+		TLPFiresTotal:  uint64(binary.BigEndian.Uint32(data[66:70])),
 		RACKMarksTotal: uint64(binary.BigEndian.Uint32(data[70:74])),
 	}
 	if totalReorders := binary.BigEndian.Uint32(data[50:54]); totalReorders > 0 {

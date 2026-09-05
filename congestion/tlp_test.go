@@ -79,7 +79,7 @@ func TestTLPMaxConsecutiveProbes(t *testing.T) {
 	for i := 0; i < maxConsecutiveProbes; i++ {
 		tlp.MarkProbeSent(uint32(i))
 		// Without an Ack, Disarm/MarkAcked, the consecutive counter grows.
-		tlp.MarkProbeAcked()  // Clear pending so next ShouldProbe can fire.
+		tlp.MarkProbeAcked()          // Clear pending so next ShouldProbe can fire.
 		tlp.consecutiveProbes = i + 1 // simulate not resetting via internal access
 		tlp.Arm(t0.Add(time.Duration(i+1) * pto))
 	}

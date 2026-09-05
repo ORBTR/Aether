@@ -117,10 +117,10 @@ func (f FlowID) String() string {
 }
 
 var (
-	ErrInnerRelayShort     = errors.New("inner-relay: packet too short")
-	ErrInnerRelayMagic     = errors.New("inner-relay: bad magic")
-	ErrInnerRelayVersion   = errors.New("inner-relay: unsupported version")
-	ErrInnerRelayOp        = errors.New("inner-relay: unknown op")
+	ErrInnerRelayShort   = errors.New("inner-relay: packet too short")
+	ErrInnerRelayMagic   = errors.New("inner-relay: bad magic")
+	ErrInnerRelayVersion = errors.New("inner-relay: unsupported version")
+	ErrInnerRelayOp      = errors.New("inner-relay: unknown op")
 )
 
 // IsInnerRelay reports whether data starts with the inner-relay magic.
@@ -279,13 +279,13 @@ type ForwarderLookup func(target aether.NodeID) (intraOrgAddr *net.UDPAddr, ok b
 type dropReason int
 
 const (
-	dropPreambleMalformed   dropReason = iota // AE preamble decode failed
-	dropTargetUnknown                         // ForwarderLookup returned (nil,false)
-	dropInnerRelayMalformed                   // RL frame decode failed
-	dropOpForwardNoSrc                        // OpForward with nil SrcAddr
-	dropOpReplyStaleFlow                      // OpReply with FlowID not in R-table
-	dropOpUnknown                             // RL frame with op != 1,2
-	dropInnerRelayUntrustedSrc                // AER-038: RL frame from a non-private (public) source
+	dropPreambleMalformed      dropReason = iota // AE preamble decode failed
+	dropTargetUnknown                            // ForwarderLookup returned (nil,false)
+	dropInnerRelayMalformed                      // RL frame decode failed
+	dropOpForwardNoSrc                           // OpForward with nil SrcAddr
+	dropOpReplyStaleFlow                         // OpReply with FlowID not in R-table
+	dropOpUnknown                                // RL frame with op != 1,2
+	dropInnerRelayUntrustedSrc                   // AER-038: RL frame from a non-private (public) source
 	dropReasonCount
 )
 

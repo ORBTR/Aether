@@ -22,8 +22,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	pb "github.com/ORBTR/aether/grpc/pb"
 	"github.com/ORBTR/aether"
+	pb "github.com/ORBTR/aether/grpc/pb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -67,7 +67,7 @@ type GrpcTransport struct {
 	tlsConfig  *tls.Config
 	server     *grpc.Server
 	incoming   chan aether.IncomingSession
-	closeOnce  sync.Once // AER-104: guard against double-close of incoming
+	closeOnce  sync.Once            // AER-104: guard against double-close of incoming
 	replay     *grpcDialReplayGuard // AER-032: per-dial nonce replay defense
 }
 
@@ -514,12 +514,12 @@ type grpcPipeConn struct {
 
 func (c *grpcPipeConn) Read(b []byte) (int, error)         { return c.reader.Read(b) }
 func (c *grpcPipeConn) Write(b []byte) (int, error)        { return c.writer.Write(b) }
-func (c *grpcPipeConn) Close() error                        { return c.closer() }
-func (c *grpcPipeConn) LocalAddr() net.Addr                 { return grpcNetAddr{} }
-func (c *grpcPipeConn) RemoteAddr() net.Addr                { return grpcNetAddr{} }
-func (c *grpcPipeConn) SetDeadline(t time.Time) error       { return nil }
-func (c *grpcPipeConn) SetReadDeadline(t time.Time) error   { return nil }
-func (c *grpcPipeConn) SetWriteDeadline(t time.Time) error  { return nil }
+func (c *grpcPipeConn) Close() error                       { return c.closer() }
+func (c *grpcPipeConn) LocalAddr() net.Addr                { return grpcNetAddr{} }
+func (c *grpcPipeConn) RemoteAddr() net.Addr               { return grpcNetAddr{} }
+func (c *grpcPipeConn) SetDeadline(t time.Time) error      { return nil }
+func (c *grpcPipeConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *grpcPipeConn) SetWriteDeadline(t time.Time) error { return nil }
 
 type grpcNetAddr struct{}
 
@@ -638,8 +638,8 @@ sendLoop:
 		}
 	}
 
-	cancel()      // abort a recv pump blocked in stream.Recv()
-	<-recvDone    // join it
+	cancel()   // abort a recv pump blocked in stream.Recv()
+	<-recvDone // join it
 	close(s.recvCh)
 }
 
@@ -734,6 +734,6 @@ func (s *GrpcSession) Ping(ctx context.Context, timeout time.Duration) (time.Dur
 	return time.Since(start), nil
 }
 
-func (s *GrpcSession) NetConn() net.Conn { return nil } // gRPC doesn't expose raw net.Conn
+func (s *GrpcSession) NetConn() net.Conn         { return nil } // gRPC doesn't expose raw net.Conn
 func (s *GrpcSession) Protocol() aether.Protocol { return aether.ProtoGRPC }
-func (s *GrpcSession) OnClose(fn func()) { /* gRPC handles lifecycle */ }
+func (s *GrpcSession) OnClose(fn func())         { /* gRPC handles lifecycle */ }

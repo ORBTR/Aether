@@ -56,15 +56,15 @@ func (f *fakeSession) Ping(context.Context) (time.Duration, error) { return 0, n
 func (f *fakeSession) GoAway(context.Context, aether.GoAwayReason, string) error {
 	return nil
 }
-func (f *fakeSession) Close() error               { f.closed.Store(true); return nil }
-func (f *fakeSession) IsClosed() bool             { return f.closed.Load() }
-func (f *fakeSession) Health() *health.Monitor    { return f.hm }
-func (f *fakeSession) SessionKey() []byte         { return nil }
+func (f *fakeSession) Close() error            { f.closed.Store(true); return nil }
+func (f *fakeSession) IsClosed() bool          { return f.closed.Load() }
+func (f *fakeSession) Health() *health.Monitor { return f.hm }
+func (f *fakeSession) SessionKey() []byte      { return nil }
 func (f *fakeSession) ConnectionID() aether.ConnectionID {
 	return aether.ConnectionID{}
 }
-func (f *fakeSession) CongestionWindow() int64    { return 0 }
-func (f *fakeSession) Protocol() aether.Protocol  { return f.proto }
+func (f *fakeSession) CongestionWindow() int64   { return 0 }
+func (f *fakeSession) Protocol() aether.Protocol { return f.proto }
 func (f *fakeSession) Metrics() aether.SessionMetrics {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -301,7 +301,7 @@ func TestPickByQuality_SkipsFlappingAndDeadPaths(t *testing.T) {
 		t.Fatalf("EnsureK: %v", err)
 	}
 
-	m.AddPathQA(noiseSess, aether.ProtoNoise, "syd") // same-region, grade A
+	m.AddPathQA(noiseSess, aether.ProtoNoise, "syd")  // same-region, grade A
 	m.AddPathQA(wsSess, aether.ProtoWebSocket, "syd") // same-region, grade C
 
 	tracker.RecordClose(quality.Key("peer1", aether.ProtoWebSocket.String()), false)

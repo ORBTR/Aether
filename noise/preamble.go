@@ -14,7 +14,7 @@ import (
 
 // Preamble protocol for shared multi-scope transports.
 //
-// When multiple platform tenants share a single NoiseTransport (UDP port), the
+// When multiple platform partitions share a single NoiseTransport (UDP port), the
 // initiator prepends a preamble to the first handshake message so the responder
 // can resolve the correct PSK before the Noise XX handshake begins.
 //
@@ -47,10 +47,10 @@ const (
 )
 
 var (
-	ErrPreambleTooShort    = errors.New("preamble: data too short")
-	ErrTenantIDTooLong     = errors.New("preamble: scope ID exceeds maximum length")
-	ErrTenantIDEmpty       = errors.New("preamble: scope ID is empty")
-	ErrPreambleTruncated   = errors.New("preamble: data truncated before scope ID")
+	ErrPreambleTooShort  = errors.New("preamble: data too short")
+	ErrTenantIDTooLong   = errors.New("preamble: scope ID exceeds maximum length")
+	ErrTenantIDEmpty     = errors.New("preamble: scope ID is empty")
+	ErrPreambleTruncated = errors.New("preamble: data truncated before scope ID")
 )
 
 // EncodePreamble builds the preamble bytes for a given scope ID.

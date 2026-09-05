@@ -33,9 +33,9 @@ import (
 // mutexes only protect the engine-level orchestration that touches
 // multiple sub-components in one critical section.
 //
-//   sendMu — protects orchestration around SendWin / RetransmitQ
-//   recvMu — protects orchestration around RecvWin / Replay
-//   RTT     — internally synchronised; either lock may read/write it
+//	sendMu — protects orchestration around SendWin / RetransmitQ
+//	recvMu — protects orchestration around RecvWin / Replay
+//	RTT     — internally synchronised; either lock may read/write it
 type Engine struct {
 	sendMu sync.Mutex
 	recvMu sync.Mutex
@@ -50,7 +50,7 @@ type Engine struct {
 	RTT         *RTTEstimator
 	FEC         *FECEncoder // populated when FECMode is XOR or zero
 	FECDec      *FECDecoder
-	RSEnc       *RSEncoder  // populated when FECMode == FECReedSolomon
+	RSEnc       *RSEncoder // populated when FECMode == FECReedSolomon
 	RSDec       *RSDecoder
 	Replay      *ReplayWindow
 

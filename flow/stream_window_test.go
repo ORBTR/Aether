@@ -262,10 +262,10 @@ func TestConnWindow_SustainedGrants(t *testing.T) {
 // to small-payload/large-window mismatch.
 func TestStreamWindow_TimedTrigger_LargeWindow_SmallPayload(t *testing.T) {
 	const (
-		bigWindow     = 4 * 1024 * 1024 // 4 MB — production gossip config
-		smallPayload  = 70 * 1024       // 70 KB — observed gossip exchange size
-		payloadsFed   = 3               // <15 needed for THRESHOLD, <42 for WATERMARK
-		waitForTimed  = GrantMaxInterval + 100*time.Millisecond
+		bigWindow    = 4 * 1024 * 1024 // 4 MB — production gossip config
+		smallPayload = 70 * 1024       // 70 KB — observed gossip exchange size
+		payloadsFed  = 3               // <15 needed for THRESHOLD, <42 for WATERMARK
+		waitForTimed = GrantMaxInterval + 100*time.Millisecond
 	)
 
 	w := NewStreamWindow(bigWindow)

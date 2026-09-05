@@ -28,7 +28,7 @@ import (
 type bbrState int
 
 const (
-	bbrStartup  bbrState = iota
+	bbrStartup bbrState = iota
 	bbrDrain
 	bbrProbeBW
 	bbrProbeRTT
@@ -51,15 +51,15 @@ func (s bbrState) String() string {
 
 // BBR tunables.
 const (
-	bbrStartupGain  = 2.89  // 2/ln(2) — bandwidth doubles per round
-	bbrDrainGain    = 0.35  // 1/2.89 — drain queue built during startup
-	bbrProbeRTTCwnd = 4     // CWND in MSS units during ProbeRTT
-	bbrProbeRTTDur  = 200 * time.Millisecond
-	bbrProbeRTTInterval = 10 * time.Second
-	bbrMinPacingRate    = 1400.0
-	bbrStartupGrowthThreshold = 1.25 // BtlBw must grow ≥25% per round to stay in Startup
-	bbrStartupFullCntThreshold = 3   // 3 stalled rounds → exit Startup
-	bbrInflightHiHeadroom = 0.85     // CWND clamp = inflightHi * (1 - headroom)
+	bbrStartupGain             = 2.89 // 2/ln(2) — bandwidth doubles per round
+	bbrDrainGain               = 0.35 // 1/2.89 — drain queue built during startup
+	bbrProbeRTTCwnd            = 4    // CWND in MSS units during ProbeRTT
+	bbrProbeRTTDur             = 200 * time.Millisecond
+	bbrProbeRTTInterval        = 10 * time.Second
+	bbrMinPacingRate           = 1400.0
+	bbrStartupGrowthThreshold  = 1.25 // BtlBw must grow ≥25% per round to stay in Startup
+	bbrStartupFullCntThreshold = 3    // 3 stalled rounds → exit Startup
+	bbrInflightHiHeadroom      = 0.85 // CWND clamp = inflightHi * (1 - headroom)
 
 	// bbrMinSampleInterval is the shortest delivery-clock interval over which
 	// the degraded OnAck path will derive a bandwidth sample (AE-M-07). A
@@ -136,8 +136,8 @@ type BBRController struct {
 	cycleStamp time.Time
 
 	// Bandwidth and RTT estimators.
-	btlBw         float64    // bytes/sec, current bottleneck bandwidth estimate
-	btlBwFilter   maxFilter  // windowed-max filter over the last N rounds
+	btlBw         float64   // bytes/sec, current bottleneck bandwidth estimate
+	btlBwFilter   maxFilter // windowed-max filter over the last N rounds
 	rtProp        time.Duration
 	rtPropStamp   time.Time
 	probeRTTDone  time.Time

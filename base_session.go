@@ -196,4 +196,3 @@ func (b *BaseSession) SetCloseErr(err error) {
 	b.closeErr = err
 	b.closeMu.Unlock()
 }
-

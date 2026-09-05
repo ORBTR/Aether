@@ -31,19 +31,20 @@ var lastAckLogAt atomic.Int64 // unix nanos of last log emission
 // don't satisfy any of the immediate triggers (gap / control /
 // post-idle / max-packets), so it is the candidate latency amplifier
 // for low-RTT RPC.
-//   ackEmitImmediate  — gap / control stream / first frame after
-//                       idle / max-packets threshold.
-//   ackEmitDelayTimer — adaptive delayed-ACK timer fired with no
-//                       immediate trigger applied.
-//   ackEmitDuplicate  — OnDuplicateReceived forced an immediate flush
-//                       so the sender's retransmit timer clears.
+//
+//	ackEmitImmediate  — gap / control stream / first frame after
+//	                    idle / max-packets threshold.
+//	ackEmitDelayTimer — adaptive delayed-ACK timer fired with no
+//	                    immediate trigger applied.
+//	ackEmitDuplicate  — OnDuplicateReceived forced an immediate flush
+//	                    so the sender's retransmit timer clears.
 //
 // Counted globally across all engines; sum approximates ackEmitCount
 // minus on-demand Flush() calls from stream-close paths.
 var (
-	ackEmitImmediate atomic.Uint64
-	ackEmitDelayTimer    atomic.Uint64
-	ackEmitDuplicate     atomic.Uint64
+	ackEmitImmediate  atomic.Uint64
+	ackEmitDelayTimer atomic.Uint64
+	ackEmitDuplicate  atomic.Uint64
 )
 
 // AckEmitStats returns global ACK-engine emit counters for surfacing
@@ -133,12 +134,12 @@ type ACKEngine struct {
 	// LossRate to the wire (via CompositeACK LossDensity flag) until either
 	// lossMinSamples samples or lossMinDuration of stream lifetime have
 	// elapsed, whichever comes first.
-	lossSamples   []lossSample
-	lossSampleCap int
-	lossWindow    time.Duration
-	lossMinSamples int
+	lossSamples     []lossSample
+	lossSampleCap   int
+	lossWindow      time.Duration
+	lossMinSamples  int
 	lossMinDuration time.Duration
-	createdAt     time.Time
+	createdAt       time.Time
 
 	// Callback to send the ACK
 	sendACK func(ack *aether.CompositeACK)
@@ -155,8 +156,8 @@ type ACKEngine struct {
 	//
 	// Optional: nil means "no piggyback on this engine" — the stream
 	// window continues to emit standalone WINDOW_UPDATE frames.
-	currentGrantFn     func() int64
-	lastEmittedCredit  uint64
+	currentGrantFn    func() int64
+	lastEmittedCredit uint64
 
 	// Delayed ACK timer. time.Timer's own Stop() prevents the AfterFunc
 	// from running after teardown; no separate stop channel is needed.
