@@ -12,7 +12,7 @@ import (
 
 // TestAEL10_GlobalCapDominantScope is the regression test for AE-L-10.
 //
-// When a single dominant tenant is the globally busiest scope but sits far
+// When a single dominant partition is the globally busiest scope but sits far
 // below its own MaxRelayPairs, step (2) self-churn never fires (it only
 // evicts at the per-scope cap). Before the fix, step (3)'s busiest==self
 // branch self-evicted only when MaxRelayPairs<=0, so a below-cap dominant

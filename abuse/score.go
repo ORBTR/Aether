@@ -25,14 +25,14 @@ import (
 type Reason int
 
 const (
-	ReasonDecryptFail     Reason = iota // noise/session.go decrypt error
-	ReasonMalformedFrame                // frame decode / validate failure
-	ReasonACKValidation                 // S1 — Composite ACK rejected
-	ReasonStreamRefused                 // S5 — peer hit MaxConcurrentStreams
-	ReasonWHOISFlood                    // application: WHOIS spam
-	ReasonReplayDetected                // anti-replay window rejection
-	ReasonProtocolViolation             // any unexpected sequence/state
-	ReasonFlowControlAbuse              // peer hoarding credit without delivering (sustained grantsEmitted vs consumed imbalance)
+	ReasonDecryptFail       Reason = iota // noise/session.go decrypt error
+	ReasonMalformedFrame                  // frame decode / validate failure
+	ReasonACKValidation                   // S1 — Composite ACK rejected
+	ReasonStreamRefused                   // S5 — peer hit MaxConcurrentStreams
+	ReasonWHOISFlood                      // application: WHOIS spam
+	ReasonReplayDetected                  // anti-replay window rejection
+	ReasonProtocolViolation               // any unexpected sequence/state
+	ReasonFlowControlAbuse                // peer hoarding credit without delivering (sustained grantsEmitted vs consumed imbalance)
 )
 
 func (r Reason) String() string {
@@ -102,9 +102,9 @@ const (
 // Config tunes the scoring behaviour. Use DefaultConfig() unless you have
 // strong reasons to deviate.
 type Config struct {
-	Threshold     float64
-	HalfLife      time.Duration
-	BlacklistTTL  time.Duration
+	Threshold    float64
+	HalfLife     time.Duration
+	BlacklistTTL time.Duration
 }
 
 // DefaultConfig returns sensible defaults.
@@ -129,9 +129,9 @@ type PeerScore struct {
 // Score is a thread-safe registry of per-peer scores.
 // Generic over PeerKey so callers can use NodeID, PeerID, IP, etc.
 type Score[K comparable] struct {
-	mu     sync.Mutex
-	cfg    Config
-	peers  map[K]*PeerScore
+	mu    sync.Mutex
+	cfg   Config
+	peers map[K]*PeerScore
 }
 
 // New creates a Score registry with the given config.

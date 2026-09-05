@@ -33,7 +33,7 @@ const (
 type cubicState int
 
 const (
-	cubicSlowStart          cubicState = iota
+	cubicSlowStart cubicState = iota
 	cubicCongestionAvoidance
 	cubicFastRecovery
 )
@@ -58,13 +58,13 @@ const (
 // new ACKs.
 type CUBICController struct {
 	mu       sync.Mutex
-	cwnd     float64    // congestion window (bytes)
-	ssthresh float64    // slow start threshold
-	wMax     float64    // cwnd at last loss event
-	tEpoch   time.Time  // start of current CUBIC epoch
+	cwnd     float64   // congestion window (bytes)
+	ssthresh float64   // slow start threshold
+	wMax     float64   // cwnd at last loss event
+	tEpoch   time.Time // start of current CUBIC epoch
 	state    cubicState
-	acked    int64      // bytes acked since last loss
-	mss      int64      // maximum segment size (updated by PMTU discovery)
+	acked    int64 // bytes acked since last loss
+	mss      int64 // maximum segment size (updated by PMTU discovery)
 
 	// PRR (RFC 6937) accounting. Only consulted while state ==
 	// cubicFastRecovery; reset on EnterRecovery and zero outside.

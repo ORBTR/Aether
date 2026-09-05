@@ -32,7 +32,7 @@ const (
 type MDNSPeer struct {
 	NodeID       string
 	Addresses    []string
-	Signature    []byte    // ed25519 signature over NodeID + signed (addr=) addresses; Addresses may also carry an unsigned transport-observed dial hint (AE-P-15)
+	Signature    []byte // ed25519 signature over NodeID + signed (addr=) addresses; Addresses may also carry an unsigned transport-observed dial hint (AE-P-15)
 	DiscoveredAt time.Time
 }
 

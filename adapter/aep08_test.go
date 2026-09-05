@@ -50,7 +50,7 @@ func TestAEP08_BaseACKWrapRecordsProgress(t *testing.T) {
 	s.handleACK(aep08ACKFrame(5))
 
 	if got := st.lastProgressAtUnixNano.Load(); got == 0 {
-		t.Fatalf("AE-P-08 regressed: BaseACK wrap (0xFFFFFFFE → 5) recorded no progress; "+
+		t.Fatalf("AE-P-08 regressed: BaseACK wrap (0xFFFFFFFE → 5) recorded no progress; " +
 			"a plain uint32 `<=` froze the stall clock across the wrap")
 	}
 	if got := st.lastBaseACKSeen.Load(); got != 5 {
@@ -64,7 +64,7 @@ func TestAEP08_BaseACKWrapRecordsProgress(t *testing.T) {
 	s.handleACK(aep08ACKFrame(50))
 
 	if got := st.lastProgressAtUnixNano.Load(); got != 0 {
-		t.Fatalf("AE-P-08 regressed: stale BaseACK=50 (< prev=100) recorded progress; "+
+		t.Fatalf("AE-P-08 regressed: stale BaseACK=50 (< prev=100) recorded progress; " +
 			"wrap-safe comparison must still reject real backward/duplicate ACKs")
 	}
 	if got := st.lastBaseACKSeen.Load(); got != 100 {

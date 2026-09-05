@@ -25,13 +25,13 @@ const SeqNoWrapThreshold uint32 = 1 << 31
 //
 // Design matches Noise transport's nonceWindow for consistency.
 type ReplayWindow struct {
-	mu             sync.Mutex
-	bitmap         uint64 // 64-bit bitmap of received SeqNos relative to bottom
-	topSeq         uint32 // highest accepted SeqNo
-	inited         bool   // false until first frame
-	wrapsDetected  uint64 // atomic: jumps > SeqNoWrapThreshold rejected as wrap attack
-	duplicates     uint64 // atomic: total ResultDuplicate observations (legitimate retransmits)
-	ancientDrops   uint64 // atomic: total ResultAncient observations (out-of-window)
+	mu            sync.Mutex
+	bitmap        uint64 // 64-bit bitmap of received SeqNos relative to bottom
+	topSeq        uint32 // highest accepted SeqNo
+	inited        bool   // false until first frame
+	wrapsDetected uint64 // atomic: jumps > SeqNoWrapThreshold rejected as wrap attack
+	duplicates    uint64 // atomic: total ResultDuplicate observations (legitimate retransmits)
+	ancientDrops  uint64 // atomic: total ResultAncient observations (out-of-window)
 }
 
 // NewReplayWindow creates an anti-replay window.

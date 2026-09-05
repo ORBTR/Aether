@@ -47,9 +47,9 @@ func TestDialAcceptOverConn_RoundTrip(t *testing.T) {
 	defer cancel()
 
 	var (
-		wg           sync.WaitGroup
-		acceptSess   aether.Connection
-		acceptErr    error
+		wg         sync.WaitGroup
+		acceptSess aether.Connection
+		acceptErr  error
 	)
 	wg.Add(1)
 	go func() {
@@ -107,9 +107,9 @@ func TestAcceptOverConn_TicketGoodSignatureAccepted(t *testing.T) {
 	defer cancel()
 
 	var (
-		wg          sync.WaitGroup
-		validated   bool
-		acceptErr   error
+		wg        sync.WaitGroup
+		validated bool
+		acceptErr error
 	)
 	wg.Add(1)
 	go func() {

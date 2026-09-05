@@ -20,8 +20,8 @@ import (
 // Verifies transport-invariant semantics.
 func TestInvariant_StreamSendReceive(t *testing.T) {
 	adapters := []struct {
-		name    string
-		create  func(client, server net.Conn) (aether.Session, aether.Session)
+		name   string
+		create func(client, server net.Conn) (aether.Session, aether.Session)
 	}{
 		{
 			name: "TCP",

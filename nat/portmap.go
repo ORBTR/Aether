@@ -21,7 +21,7 @@ import (
 
 // MappingRequest describes a port-mapping request.
 type MappingRequest struct {
-	Protocol     string        // "udp" or "tcp"
+	Protocol     string // "udp" or "tcp"
 	InternalPort int
 	ExternalPort int           // 0 = let gateway pick
 	TTL          time.Duration // mapping lifetime

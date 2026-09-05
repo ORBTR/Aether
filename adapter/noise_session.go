@@ -720,16 +720,16 @@ func (s *NoiseSession) notifyStreamAccepted(st *noiseStream) {
 // was the snapshot from the last completed PING/PONG round-trip.
 //
 // v0.0.22:
-//   1. Fast-fail if IsClosed already — avoids syscall for known-dead
-//      sessions and lets keepalive distinguish "stuck send" from
-//      "session torn down".
-//   2. Capture LastActivity before writeFrame, then poll until either
-//      ctx fires, IsClosed flips, the activity timestamp advances, or
-//      a 2 s ceiling is reached (clamped by ctx deadline if shorter).
-//      Any inbound frame counts as "alive" — we deliberately don't
-//      track per-PING seqNo to avoid adding state. False positives
-//      (peer happens to send something else within 2 s) are fine for
-//      the keepalive use case; the goal is detecting silence.
+//  1. Fast-fail if IsClosed already — avoids syscall for known-dead
+//     sessions and lets keepalive distinguish "stuck send" from
+//     "session torn down".
+//  2. Capture LastActivity before writeFrame, then poll until either
+//     ctx fires, IsClosed flips, the activity timestamp advances, or
+//     a 2 s ceiling is reached (clamped by ctx deadline if shorter).
+//     Any inbound frame counts as "alive" — we deliberately don't
+//     track per-PING seqNo to avoid adding state. False positives
+//     (peer happens to send something else within 2 s) are fine for
+//     the keepalive use case; the goal is detecting silence.
 func (s *NoiseSession) Ping(ctx context.Context) (time.Duration, error) {
 	// CloseSignal() is owned by BaseSession and IS allocated; the local
 	// `s.closed` field (declared on NoiseSession but never make()d) was
@@ -1304,17 +1304,19 @@ func (s *NoiseSession) LastPeerStats() aether.SessionMetrics {
 // session. Since the guard already dropped/clamped the frame (CPU protection
 // is in the guard, not the score), scoring→closing is redundant + kills legit
 // sessions. Three tiers for the two guard-covered reasons:
-//   T1 warmup (< SessionWarmupGrace): SUPPRESS (no score) — original AER-074.
-//   T2 established grade-A (past warmup + actively app-DELIVERING,
-//      appBytesDelivered>0): FORENSIC-ONLY — record (forensicSuppressed) for
-//      triage visibility but do NOT score / close / arm the blacklist. A
-//      flooder never delivers app data (malformed fails Validate; bad-ACK is
-//      TypeACK, not handleData) so it can never reach T2. NOT blacklist-arming
-//      is deliberate (R-839): arming would relocate the reap-cycle to a
-//      reconnect-LOCKOUT — strictly worse.
-//   T3 post-warmup zombie (past warmup + never app-delivered): FULL Report —
-//      a genuine slow-loris that only ever sends garbage still scores + closes
-//      + is blacklisted at the accept gate.
+//
+//	T1 warmup (< SessionWarmupGrace): SUPPRESS (no score) — original AER-074.
+//	T2 established grade-A (past warmup + actively app-DELIVERING,
+//	   appBytesDelivered>0): FORENSIC-ONLY — record (forensicSuppressed) for
+//	   triage visibility but do NOT score / close / arm the blacklist. A
+//	   flooder never delivers app data (malformed fails Validate; bad-ACK is
+//	   TypeACK, not handleData) so it can never reach T2. NOT blacklist-arming
+//	   is deliberate (R-839): arming would relocate the reap-cycle to a
+//	   reconnect-LOCKOUT — strictly worse.
+//	T3 post-warmup zombie (past warmup + never app-delivered): FULL Report —
+//	   a genuine slow-loris that only ever sends garbage still scores + closes
+//	   + is blacklisted at the accept gate.
+//
 // Every OTHER reason (decrypt-fail / replay / protocol-violation /
 // flow-control-abuse — none cheap-guard-neutralized) enforces in every tier.
 func (s *NoiseSession) reportAbuse(r abuse.Reason) {

@@ -61,8 +61,8 @@ type DialConnConfig struct {
 	StaticPriv  []byte
 	StaticPub   []byte
 
-	Ticket         []byte
-	RemotePeerHint aether.NodeID // advisory; not a gate
+	Ticket           []byte
+	RemotePeerHint   aether.NodeID // advisory; not a gate
 	HandshakeTimeout time.Duration
 	MaxPacket        int
 }
@@ -80,7 +80,7 @@ type AcceptConnConfig struct {
 
 	// TrustedTicketSignerFn resolves the trusted signer public key from the
 	// (still unverified) ticket body, for accepters whose signer varies per
-	// ticket — e.g. a relay serving many tenants, each with its own signer
+	// ticket — e.g. a relay serving many partitions, each with its own signer
 	// key, that selects the key from the ticket's own tenant scope. When set it
 	// takes precedence over TrustedTicketSigner and, like it, makes ticket auth
 	// mandatory. Inspecting the unverified body to CHOOSE the key is safe: the

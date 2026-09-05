@@ -27,10 +27,10 @@ type PacingPolicy interface {
 // Controls the rate at which frames are sent to avoid bursts.
 // Rate = cwnd / RTT (bytes per second).
 type Pacer struct {
-	mu        sync.Mutex
-	tokens    float64       // available tokens (bytes)
-	maxBurst  float64       // maximum burst size (tokens)
-	rate      float64       // refill rate (bytes/sec)
+	mu         sync.Mutex
+	tokens     float64 // available tokens (bytes)
+	maxBurst   float64 // maximum burst size (tokens)
+	rate       float64 // refill rate (bytes/sec)
 	lastRefill time.Time
 }
 

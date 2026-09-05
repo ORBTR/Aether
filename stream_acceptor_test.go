@@ -33,15 +33,15 @@ import (
 // is ever consulted by StreamAcceptor; the rest satisfy the interface.
 type graceProbeStream struct{ id uint64 }
 
-func (s *graceProbeStream) StreamID() uint64                          { return s.id }
-func (s *graceProbeStream) Send(context.Context, []byte) error        { return nil }
-func (s *graceProbeStream) Receive(context.Context) ([]byte, error)   { return nil, nil }
-func (s *graceProbeStream) Close() error                              { return nil }
-func (s *graceProbeStream) Reset(ResetReason) error                   { return nil }
-func (s *graceProbeStream) SetPriority(uint8, uint64)                 {}
-func (s *graceProbeStream) Config() StreamConfig                      { return StreamConfig{StreamID: s.id} }
-func (s *graceProbeStream) IsOpen() bool                              { return true }
-func (s *graceProbeStream) Conn() net.Conn                            { return nil }
+func (s *graceProbeStream) StreamID() uint64                        { return s.id }
+func (s *graceProbeStream) Send(context.Context, []byte) error      { return nil }
+func (s *graceProbeStream) Receive(context.Context) ([]byte, error) { return nil, nil }
+func (s *graceProbeStream) Close() error                            { return nil }
+func (s *graceProbeStream) Reset(ResetReason) error                 { return nil }
+func (s *graceProbeStream) SetPriority(uint8, uint64)               {}
+func (s *graceProbeStream) Config() StreamConfig                    { return StreamConfig{StreamID: s.id} }
+func (s *graceProbeStream) IsOpen() bool                            { return true }
+func (s *graceProbeStream) Conn() net.Conn                          { return nil }
 
 // newProbeAcceptor builds an acceptor in the mode the Noise transport uses
 // (NonBlockingDrop), which is the configuration the mesh actually runs.

@@ -25,7 +25,7 @@ func TestEncodeDecodeFrame_RoundTrip(t *testing.T) {
 		}},
 		{"ack-composite", Frame{
 			StreamID: 1, Type: TypeACK, Flags: FlagCOMPOSITE_ACK,
-			AckNo: 100,
+			AckNo:  100,
 			Length: 4, Payload: []byte{0, 0, 0, 100},
 		}},
 		{"open", Frame{
@@ -45,8 +45,8 @@ func TestEncodeDecodeFrame_RoundTrip(t *testing.T) {
 		}},
 		{"encrypted-flag", Frame{
 			StreamID: 1, Type: TypeDATA, SeqNo: 5,
-			Flags: FlagENCRYPTED,
-			Nonce: Nonce{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12},
+			Flags:  FlagENCRYPTED,
+			Nonce:  Nonce{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12},
 			Length: 3, Payload: []byte{0x01, 0x02, 0x03},
 		}},
 	}

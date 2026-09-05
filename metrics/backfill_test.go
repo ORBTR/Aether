@@ -144,9 +144,9 @@ func TestDurationHist_PartialWraparoundDistribution(t *testing.T) {
 func TestDurationHist_ConcurrentRecord(t *testing.T) {
 	var h DurationHist
 	const (
-		goroutines     = 16
-		perGoroutine   = 64 // 16*64 = 1024 total, well over histRingSize
-		sampleMicros   = 7
+		goroutines   = 16
+		perGoroutine = 64 // 16*64 = 1024 total, well over histRingSize
+		sampleMicros = 7
 	)
 	var wg sync.WaitGroup
 	wg.Add(goroutines)

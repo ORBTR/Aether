@@ -184,7 +184,9 @@ func (d *RSDecoder) AddData(groupID uint32, index uint8, total uint8, payload []
 }
 
 // AddRepair records a received parity shard. Payload layout:
-//   [shardLen:2 BE][parity shard bytes]
+//
+//	[shardLen:2 BE][parity shard bytes]
+//
 // (the FEC header has already been stripped by the caller).
 func (d *RSDecoder) AddRepair(header aether.FECHeader, payload []byte) [][]byte {
 	if len(payload) < 2 {

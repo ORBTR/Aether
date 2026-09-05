@@ -25,7 +25,7 @@ import "time"
 // the raw value. Returning 0 is preserved as the "pacing disabled"
 // sentinel — CUBIC returns 0 intentionally to mean no pacing.
 const (
-	MinPacingRate = float64(1400)                        // 1 MSS / sec
+	MinPacingRate = float64(1400)                           // 1 MSS / sec
 	MaxPacingRate = float64(10*1024*1024*1024) / float64(8) // 10 Gbps in bytes/sec = 1,342,177,280
 )
 

@@ -102,19 +102,19 @@ type noiseConn struct {
 	// the sequence and the explicit-nonce send path is lock-free, so two
 	// concurrent senders could both ratchet and end two keys ahead of the
 	// receiver — a silent one-way blackhole.
-	rekeying atomic.Bool
-	inbox          chan []byte
-	closed         chan struct{}
-	closeOnce      sync.Once
-	buffer         []byte
-	maxPacket      int
-	writeFunc      func([]byte) (int, error)
-	localAddr      net.Addr
-	parentStop     func()
-	errMu          sync.RWMutex
-	err            error
-	transport      connHost        // server transport (nil in the browser DialOverConn path); see connHost
-	scopeID        string          // Set during handshake (from preamble or config)
+	rekeying   atomic.Bool
+	inbox      chan []byte
+	closed     chan struct{}
+	closeOnce  sync.Once
+	buffer     []byte
+	maxPacket  int
+	writeFunc  func([]byte) (int, error)
+	localAddr  net.Addr
+	parentStop func()
+	errMu      sync.RWMutex
+	err        error
+	transport  connHost // server transport (nil in the browser DialOverConn path); see connHost
+	scopeID    string   // Set during handshake (from preamble or config)
 
 	// Explicit nonce mode (if both sides support capExplicitNonce)
 	explicitNonce bool
@@ -819,4 +819,3 @@ func connFromSession(sess aether.Connection) *noiseConn {
 	}
 	return nil
 }
-

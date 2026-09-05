@@ -27,10 +27,10 @@ type PathState int
 
 const (
 	PathActive   PathState = iota // primary path, carrying all traffic
-	PathStandby                    // backup path, periodic probes only
-	PathProbing                    // checking if standby is still alive
-	PathDead                       // failed probes, not usable
-	PathFlapping                   // STALL-DETECT false-positive repeated; demoted for a cooldown window
+	PathStandby                   // backup path, periodic probes only
+	PathProbing                   // checking if standby is still alive
+	PathDead                      // failed probes, not usable
+	PathFlapping                  // STALL-DETECT false-positive repeated; demoted for a cooldown window
 )
 
 // String returns a human-readable state.
@@ -81,13 +81,13 @@ const (
 
 // Path represents a single transport path to a peer.
 type Path struct {
-	Session  aether.Session
-	Protocol aether.Protocol
-	State    PathState
-	Quality  int // higher = better (matches connection quality system)
-	RTT      time.Duration
-	LastProbe time.Time
-	LastSuccess time.Time
+	Session             aether.Session
+	Protocol            aether.Protocol
+	State               PathState
+	Quality             int // higher = better (matches connection quality system)
+	RTT                 time.Duration
+	LastProbe           time.Time
+	LastSuccess         time.Time
 	ConsecutiveFailures int
 
 	// CreatedAt is the wall-clock at addPathLocked time. Stable across
@@ -113,8 +113,8 @@ type Path struct {
 	// Quality + RTT + loss; bytesScheduled is what we've sent on this
 	// path in the current round. The scheduler picks the path with
 	// the largest weight*round - bytesScheduled deficit.
-	Loss          float64 // 0.0 (no loss) → 1.0 (total loss)
-	weightCache   float64
+	Loss           float64 // 0.0 (no loss) → 1.0 (total loss)
+	weightCache    float64
 	bytesScheduled int64
 
 	// PathFlapping bookkeeping. tlpResetEvents is a sliding-window
@@ -139,8 +139,8 @@ const deadResurrectCooldown = 30 * time.Second
 
 // Manager manages multiple paths to a single peer.
 type Manager struct {
-	mu    sync.Mutex
-	paths []*Path
+	mu      sync.Mutex
+	paths   []*Path
 	primary int // index of active path
 
 	// probeTick increments on every probeNonPrimary invocation. Used to
@@ -149,9 +149,9 @@ type Manager struct {
 	probeTick uint64
 
 	// Configuration
-	probeInterval    time.Duration
-	stabilityPeriod  time.Duration
-	maxFailures      int
+	probeInterval   time.Duration
+	stabilityPeriod time.Duration
+	maxFailures     int
 
 	// Redundancy level
 	redundantRealtime bool // Level 2: send REALTIME on both paths

@@ -15,8 +15,8 @@ import (
 	"sync"
 	"time"
 
-	fnoise "github.com/flynn/noise"
 	aether "github.com/ORBTR/aether"
+	fnoise "github.com/flynn/noise"
 )
 
 // Session ticket errors
@@ -35,17 +35,19 @@ const capSessionTicket uint32 = 1 << 1
 // a full Noise handshake. Encrypted with a server-side AES-256-GCM key.
 //
 // Wire format (encrypted):
-//   [12-byte nonce][encrypted ticket][16-byte GCM tag]
+//
+//	[12-byte nonce][encrypted ticket][16-byte GCM tag]
 //
 // Plaintext ticket format:
-//   [8-byte expiry (unix nanos)]
-//   [32-byte peer NodeID]
-//   [32-byte send key]
-//   [8-byte send nonce]
-//   [32-byte recv key]
-//   [8-byte recv nonce]
-//   [1-byte caps flags]
-//   [2-byte scope len][scope ID]
+//
+//	[8-byte expiry (unix nanos)]
+//	[32-byte peer NodeID]
+//	[32-byte send key]
+//	[8-byte send nonce]
+//	[32-byte recv key]
+//	[8-byte recv nonce]
+//	[1-byte caps flags]
+//	[2-byte scope len][scope ID]
 type sessionTicket struct {
 	ExpiresAt time.Time
 	PeerID    aether.NodeID
@@ -54,15 +56,15 @@ type sessionTicket struct {
 	RecvKey   [32]byte
 	RecvNonce uint64
 	Caps      uint32
-	// ScopeID is the tenant scope the original session was bound to. Carried so
+	// ScopeID is the partition scope the original session was bound to. Carried so
 	// a resumed session restores its relay isolation (AE-H-07); empty for
-	// dedicated (single-tenant) transports.
+	// dedicated (single-partition) transports.
 	ScopeID string
 }
 
 const (
 	ticketPlaintextSize = 8 + 32 + 32 + 8 + 32 + 8 + 4 // 124-byte fixed prefix; AE-H-07 scope suffix follows
-	ticketScopeLenSize  = 2                             // AE-H-07: uint16 length prefix for the scope suffix
+	ticketScopeLenSize  = 2                            // AE-H-07: uint16 length prefix for the scope suffix
 	ticketNonceSize     = 12
 	ticketTagSize       = 16
 	ticketEncryptedSize = ticketNonceSize + ticketPlaintextSize + ticketTagSize // 152 bytes
@@ -78,12 +80,12 @@ const (
 
 // TicketStore manages session ticket encryption keys and caches issued tickets.
 type TicketStore struct {
-	mu       sync.RWMutex
-	key      []byte        // AES-256 key (32 bytes)
-	prevKey  []byte        // Previous key for rotation overlap
-	ttl      time.Duration // Ticket validity duration
-	gcm      cipher.AEAD
-	prevGCM  cipher.AEAD
+	mu      sync.RWMutex
+	key     []byte        // AES-256 key (32 bytes)
+	prevKey []byte        // Previous key for rotation overlap
+	ttl     time.Duration // Ticket validity duration
+	gcm     cipher.AEAD
+	prevGCM cipher.AEAD
 
 	// AE-P-19: install time of prevGCM. Lets DecryptTicket retire the previous
 	// key one ticket TTL after rotation rather than only on the next RotateKey
@@ -93,10 +95,10 @@ type TicketStore struct {
 	// Client-side ticket cache: peerNodeID → encrypted ticket bytes.
 	// Bounded by cacheMax with FIFO eviction (cacheOrder tracks insert order).
 	// Also stores per-entry expiry so expired tickets are dropped on read.
-	cache       map[aether.NodeID]cachedTicket
-	cacheOrder  []aether.NodeID
-	cacheMax    int
-	cacheMu     sync.RWMutex
+	cache      map[aether.NodeID]cachedTicket
+	cacheOrder []aether.NodeID
+	cacheMax   int
+	cacheMu    sync.RWMutex
 }
 
 type cachedTicket struct {

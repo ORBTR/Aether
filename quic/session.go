@@ -87,4 +87,4 @@ func (s *QuicSession) RemoteNodeID() aether.NodeID {
 }
 
 func (s *QuicSession) Protocol() aether.Protocol { return aether.ProtoQUIC }
-func (s *QuicSession) OnClose(fn func()) { /* QUIC handles lifecycle */ }
+func (s *QuicSession) OnClose(fn func())         { /* QUIC handles lifecycle */ }

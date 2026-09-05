@@ -223,16 +223,16 @@ type Tracker struct {
 }
 
 type trackerEntry struct {
-	mu                  sync.Mutex
-	baselineRTT         time.Duration // EMA of session SRTT
-	lastBytesRecv       uint64
-	lastBytesAt         time.Time
-	bytesPerSec         float64
-	consecutiveFailures atomic.Int64 // session-level close-with-error count
-	reliabilityEMA      float64      // EMA of (1 if clean close, 0 if error)
-	stabilityEMA           float64 // 1 - stabilitySmoothedDelta — exposed via Stability()
-	stabilitySmoothedDelta float64 // EMA of |Δscore| (lower = more stable)
-	lastScore           float64
+	mu                     sync.Mutex
+	baselineRTT            time.Duration // EMA of session SRTT
+	lastBytesRecv          uint64
+	lastBytesAt            time.Time
+	bytesPerSec            float64
+	consecutiveFailures    atomic.Int64 // session-level close-with-error count
+	reliabilityEMA         float64      // EMA of (1 if clean close, 0 if error)
+	stabilityEMA           float64      // 1 - stabilitySmoothedDelta — exposed via Stability()
+	stabilitySmoothedDelta float64      // EMA of |Δscore| (lower = more stable)
+	lastScore              float64
 
 	// Dial-level state. Tracked separately from session-level
 	// consecutiveFailures because a dial failure means the handshake
@@ -818,9 +818,9 @@ func (t *Tracker) DialFailureCount(key string) int {
 // the formula.
 func dialCooldownDuration(failureCount int) time.Duration {
 	const (
-		baseCooldown     = 30 * time.Second
-		maxCooldown      = 10 * time.Minute
-		suppressThresh   = 3 // failures
+		baseCooldown   = 30 * time.Second
+		maxCooldown    = 10 * time.Minute
+		suppressThresh = 3 // failures
 	)
 	if failureCount <= 0 {
 		return 0

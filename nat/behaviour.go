@@ -13,14 +13,16 @@
 // strategy.
 //
 // Mapping behaviour — where does the reflexive address go?
-//   EIM   Endpoint-Independent Mapping       (Full Cone outer behaviour)
-//   ADM   Address-Dependent Mapping
-//   APDM  Address+Port Dependent Mapping     (Symmetric)
+//
+//	EIM   Endpoint-Independent Mapping       (Full Cone outer behaviour)
+//	ADM   Address-Dependent Mapping
+//	APDM  Address+Port Dependent Mapping     (Symmetric)
 //
 // Filtering behaviour — who can reach the reflexive address?
-//   EIF   Endpoint-Independent Filtering     (Full Cone)
-//   ADF   Address-Dependent Filtering        (Restricted Cone)
-//   APDF  Address+Port Dependent Filtering   (Port Restricted)
+//
+//	EIF   Endpoint-Independent Filtering     (Full Cone)
+//	ADF   Address-Dependent Filtering        (Restricted Cone)
+//	APDF  Address+Port Dependent Filtering   (Port Restricted)
 package nat
 
 import (
@@ -35,10 +37,10 @@ import (
 type MappingBehaviour int
 
 const (
-	MappingUnknown                 MappingBehaviour = iota
-	MappingEndpointIndependent                      // EIM — same reflexive for all targets
-	MappingAddressDependent                         // ADM — changes with target IP
-	MappingAddressPortDependent                     // APDM — changes with target IP+port (symmetric)
+	MappingUnknown              MappingBehaviour = iota
+	MappingEndpointIndependent                   // EIM — same reflexive for all targets
+	MappingAddressDependent                      // ADM — changes with target IP
+	MappingAddressPortDependent                  // APDM — changes with target IP+port (symmetric)
 )
 
 func (m MappingBehaviour) String() string {
@@ -58,10 +60,10 @@ func (m MappingBehaviour) String() string {
 type FilteringBehaviour int
 
 const (
-	FilteringUnknown                 FilteringBehaviour = iota
-	FilteringEndpointIndependent                        // EIF — anyone can reach
-	FilteringAddressDependent                           // ADF — only hosts we've sent to
-	FilteringAddressPortDependent                       // APDF — only IP+port we've sent to
+	FilteringUnknown              FilteringBehaviour = iota
+	FilteringEndpointIndependent                     // EIF — anyone can reach
+	FilteringAddressDependent                        // ADF — only hosts we've sent to
+	FilteringAddressPortDependent                    // APDF — only IP+port we've sent to
 )
 
 func (f FilteringBehaviour) String() string {
@@ -87,11 +89,11 @@ type NATBehaviour struct {
 // (Open/FullCone/Restricted/PortRestricted/Symmetric) enum used by
 // older callers. Uses the matrix:
 //
-//                  | EIF              | ADF              | APDF
-//   ---------------|------------------|------------------|--------------------
-//   EIM            | NATFullCone      | NATRestricted    | NATPortRestricted
-//   ADM            | NATSymmetric     | NATSymmetric     | NATSymmetric
-//   APDM           | NATSymmetric     | NATSymmetric     | NATSymmetric
+//	               | EIF              | ADF              | APDF
+//	---------------|------------------|------------------|--------------------
+//	EIM            | NATFullCone      | NATRestricted    | NATPortRestricted
+//	ADM            | NATSymmetric     | NATSymmetric     | NATSymmetric
+//	APDM           | NATSymmetric     | NATSymmetric     | NATSymmetric
 func (b NATBehaviour) LegacyType() aether.NATType {
 	if b.Mapping != MappingEndpointIndependent {
 		return aether.NATSymmetric

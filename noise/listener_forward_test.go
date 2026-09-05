@@ -127,8 +127,8 @@ func TestListenerWriteFunc_NoTTableEntry(t *testing.T) {
 // originator's public addr.
 func TestListenerWriteFunc_RelayWrapsOpReply(t *testing.T) {
 	sender := newLoopbackUDP(t)
-	relay := newLoopbackUDP(t)   // stands in for M_r
-	origin := newLoopbackUDP(t)  // stands in for the originator's public addr
+	relay := newLoopbackUDP(t)  // stands in for M_r
+	origin := newLoopbackUDP(t) // stands in for the originator's public addr
 	relayAddr := relay.LocalAddr().(*net.UDPAddr)
 	originAddr := origin.LocalAddr().(*net.UDPAddr)
 
@@ -251,16 +251,16 @@ func TestOnRoutingPreamble_DropsUnknownTarget(t *testing.T) {
 // via the IPv4-only socket and fail; this test would observe the relay
 // receiving zero bytes.
 func TestListenerWriteFunc_RelayPicksIPv6Socket_C1(t *testing.T) {
-	v4Conn := newLoopbackUDP(t)             // M_t IPv4 socket (origin reply path)
-	v6Sender := newLoopbackUDP6(t)          // M_t IPv6 socket (relay write path)
+	v4Conn := newLoopbackUDP(t)    // M_t IPv4 socket (origin reply path)
+	v6Sender := newLoopbackUDP6(t) // M_t IPv6 socket (relay write path)
 	if v6Sender == nil {
 		return // skipped above
 	}
-	v6Relay := newLoopbackUDP6(t)           // stands in for M_r's 6PN listener
+	v6Relay := newLoopbackUDP6(t) // stands in for M_r's 6PN listener
 	if v6Relay == nil {
 		return
 	}
-	origin := newLoopbackUDP(t)             // IPv4 originator
+	origin := newLoopbackUDP(t) // IPv4 originator
 	originAddr := origin.LocalAddr().(*net.UDPAddr)
 	relayAddrV6 := v6Relay.LocalAddr().(*net.UDPAddr)
 

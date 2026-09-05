@@ -20,14 +20,14 @@ type fakeRelayConn struct {
 	nodeID aether.NodeID
 }
 
-func (f *fakeRelayConn) Send(_ context.Context, _ []byte) error   { return nil }
+func (f *fakeRelayConn) Send(_ context.Context, _ []byte) error    { return nil }
 func (f *fakeRelayConn) Receive(_ context.Context) ([]byte, error) { return nil, nil }
-func (f *fakeRelayConn) Close() error                             { return nil }
-func (f *fakeRelayConn) RemoteAddr() net.Addr                     { return nil }
-func (f *fakeRelayConn) RemoteNodeID() aether.NodeID              { return f.nodeID }
-func (f *fakeRelayConn) NetConn() net.Conn                        { return nil }
-func (f *fakeRelayConn) Protocol() aether.Protocol                { return aether.Protocol(0) }
-func (f *fakeRelayConn) OnClose(func())                           {}
+func (f *fakeRelayConn) Close() error                              { return nil }
+func (f *fakeRelayConn) RemoteAddr() net.Addr                      { return nil }
+func (f *fakeRelayConn) RemoteNodeID() aether.NodeID               { return f.nodeID }
+func (f *fakeRelayConn) NetConn() net.Conn                         { return nil }
+func (f *fakeRelayConn) Protocol() aether.Protocol                 { return aether.Protocol(0) }
+func (f *fakeRelayConn) OnClose(func())                            {}
 
 func relayTestNodeID(name string) aether.NodeID {
 	buf := make([]byte, RelayHeaderSize)

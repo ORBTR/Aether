@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// Behavioural invariants for accept-side tenant scope.
+// Behavioural invariants for accept-side partition scope.
 //
 // WHAT THIS GUARDS. loom's accept loop does, once per inbound session:
 //

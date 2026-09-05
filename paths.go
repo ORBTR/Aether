@@ -22,19 +22,19 @@ const (
 
 // Path describes a candidate transport route towards a node.
 type Path struct {
-	NodeID   NodeID
+	NodeID  NodeID
 	ScopeID ScopeID
-	Address  *net.UDPAddr
-	Scope    PathScope
-	Latency  time.Duration
-	Score    float64
+	Address *net.UDPAddr
+	Scope   PathScope
+	Latency time.Duration
+	Score   float64
 }
 
 // ReachInfo provides reachability information for a peer.
 // Consumers populate this from their record types (e.g., application-specific reach records).
 type ReachInfo struct {
 	NodeID       string
-	ScopeID     string
+	ScopeID      string
 	Addresses    []ReachAddress
 	Region       string
 	Availability float64
@@ -85,12 +85,12 @@ func (s *PathSelector) Candidates(records []ReachInfo, limit int) []Path {
 				continue
 			}
 			paths = append(paths, Path{
-				NodeID:   NodeID(reach.NodeID),
+				NodeID:  NodeID(reach.NodeID),
 				ScopeID: ScopeID(reach.ScopeID),
-				Address:  udp,
-				Scope:    PathScope(addr.Scope),
-				Latency:  reach.LatencyDuration(),
-				Score:    score,
+				Address: udp,
+				Scope:   PathScope(addr.Scope),
+				Latency: reach.LatencyDuration(),
+				Score:   score,
 			})
 		}
 	}

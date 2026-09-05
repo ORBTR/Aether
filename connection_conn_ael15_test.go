@@ -54,11 +54,11 @@ func (c *ael15Conn) Close() error {
 	return nil
 }
 
-func (c *ael15Conn) RemoteAddr() net.Addr   { return &net.TCPAddr{} }
-func (c *ael15Conn) RemoteNodeID() NodeID    { return NodeID("") }
-func (c *ael15Conn) NetConn() net.Conn       { return nil }
-func (c *ael15Conn) Protocol() Protocol       { return Protocol(0) }
-func (c *ael15Conn) OnClose(fn func())        {}
+func (c *ael15Conn) RemoteAddr() net.Addr { return &net.TCPAddr{} }
+func (c *ael15Conn) RemoteNodeID() NodeID { return NodeID("") }
+func (c *ael15Conn) NetConn() net.Conn    { return nil }
+func (c *ael15Conn) Protocol() Protocol   { return Protocol(0) }
+func (c *ael15Conn) OnClose(fn func())    {}
 
 // TestAEL15_DeadlineSetRace hammers the three Set*Deadline setters concurrently
 // with in-flight Read and Write calls. Pre-fix this reports a data race on

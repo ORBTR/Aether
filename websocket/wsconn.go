@@ -248,9 +248,9 @@ func (c *WSConn) sendPing() bool {
 // net.Conn interface delegation
 func (c *WSConn) LocalAddr() net.Addr                { return c.raw.LocalAddr() }
 func (c *WSConn) RemoteAddr() net.Addr               { return c.raw.RemoteAddr() }
-func (c *WSConn) SetDeadline(t time.Time) error       { return c.raw.SetDeadline(t) }
-func (c *WSConn) SetReadDeadline(t time.Time) error    { return c.raw.SetReadDeadline(t) }
-func (c *WSConn) SetWriteDeadline(t time.Time) error   { return c.raw.SetWriteDeadline(t) }
+func (c *WSConn) SetDeadline(t time.Time) error      { return c.raw.SetDeadline(t) }
+func (c *WSConn) SetReadDeadline(t time.Time) error  { return c.raw.SetReadDeadline(t) }
+func (c *WSConn) SetWriteDeadline(t time.Time) error { return c.raw.SetWriteDeadline(t) }
 
 var _ net.Conn = (*WSConn)(nil) // compile-time interface check
 

@@ -20,11 +20,10 @@ import (
 	"github.com/pion/stun"
 
 	aether "github.com/ORBTR/aether"
-	transportCrypto "github.com/ORBTR/aether/crypto/identity"
 	vl1 "github.com/ORBTR/aether"
+	transportCrypto "github.com/ORBTR/aether/crypto/identity"
 	"github.com/ORBTR/aether/nat"
 	"github.com/ORBTR/aether/relay"
-	
 )
 
 const (
@@ -35,7 +34,7 @@ const (
 // dialOverride carries per-dial scope context for shared transports.
 type dialOverride struct {
 	ScopeID string
-	Keys     [][]byte
+	Keys    [][]byte
 }
 
 type dialOverrideKeyT struct{}
@@ -71,10 +70,10 @@ type NoiseTransportConfig struct {
 	HandshakeTimeout time.Duration
 	MaxPacketSize    int
 	STUNConfig       aether.STUNConfig // Optional STUN configuration for NAT detection
-	RelayConfig      relay.RelayConfig    // Optional Relay configuration
-	ListenAddr       string               // Address to listen on (e.g., ":0", ":41641")
-	RateLimitBurst   int                  // Rate limit burst size (0 = default 100)
-	RateLimitRate    int                  // Rate limit rate per second (0 = default 1000)
+	RelayConfig      relay.RelayConfig // Optional Relay configuration
+	ListenAddr       string            // Address to listen on (e.g., ":0", ":41641")
+	RateLimitBurst   int               // Rate limit burst size (0 = default 100)
+	RateLimitRate    int               // Rate limit rate per second (0 = default 1000)
 
 	// UDP socket buffer sizes. Zero = OS default.
 	UDPReadBuffer  int // Read buffer size in bytes (default 4 MB)
@@ -147,7 +146,7 @@ func resolveRetryTokenDefault(p *bool) bool {
 // into reusable services.
 type NoiseTransport struct {
 	// Extracted services
-	identity   *transportCrypto.Identity         // Ed25519 + Curve25519 identity
+	identity   *transportCrypto.Identity          // Ed25519 + Curve25519 identity
 	keyManager *transportCrypto.NetworkKeyManager // network key rotation + CRC32 lookup
 	peerCache  *transportCrypto.PeerKeyCache      // peer static key cache (XK reconnections)
 
@@ -159,10 +158,10 @@ type NoiseTransport struct {
 	staticPub  []byte
 
 	// Handshake + transport config
-	tenantKeyResolver TenantKeyResolver
-	handshake         time.Duration
-	maxPacket         int
-	listenAddr        string
+	partitionKeyResolver TenantKeyResolver
+	handshake            time.Duration
+	maxPacket            int
+	listenAddr           string
 
 	// NAT/STUN
 	stun     *nat.STUNClient
@@ -171,13 +170,13 @@ type NoiseTransport struct {
 	stunConn *net.UDPConn
 
 	// Relay
-	relayConfig   relay.RelayConfig
-	relayService  *relay.RelayService
+	relayConfig  relay.RelayConfig
+	relayService *relay.RelayService
 	scopeLimiter *TenantRelayLimiter
 
 	// Rate limiting
-	rateLimiter *tokenBucket    // Global handshake budget
-	sourceLimit *sourceLimiter  // Per-source-IP budget (S6 — _SECURITY.md §3.1)
+	rateLimiter *tokenBucket   // Global handshake budget
+	sourceLimit *sourceLimiter // Per-source-IP budget (S6 — _SECURITY.md §3.1)
 
 	// Source validation — issues stateless retry tokens to first-contact
 	// addresses when requireRetryToken is true. Concern S3.
@@ -191,12 +190,12 @@ type NoiseTransport struct {
 	outgoingMu       sync.Mutex
 
 	// Platform + tuning
-	bindResolver   aether.BindAddressResolver
-	udpReadBuffer  int
-	udpWriteBuffer int
-	nonceWindow    int
-	healthAlpha    float64
-	inboxSize      int
+	bindResolver     aether.BindAddressResolver
+	udpReadBuffer    int
+	udpWriteBuffer   int
+	nonceWindow      int
+	healthAlpha      float64
+	inboxSize        int
 	ticketStore      *TicketStore
 	initiatorTickets *initiatorTicketCache // initiator-side resume cache
 	seenTickets      *seenTicketCache      // responder-side replay guard
@@ -332,17 +331,17 @@ func NewNoiseTransport(cfg NoiseTransportConfig) (*NoiseTransport, error) {
 		staticPub:  id.Curve25519Pub,
 
 		// Config
-		tenantKeyResolver: cfg.TenantKeyResolver,
-		handshake:         handshake,
-		maxPacket:         maxPacket,
-		listenAddr:        cfg.ListenAddr,
+		partitionKeyResolver: cfg.TenantKeyResolver,
+		handshake:            handshake,
+		maxPacket:            maxPacket,
+		listenAddr:           cfg.ListenAddr,
 
 		// NAT/STUN
 		stun:   stunClient,
 		stunTx: make(map[string]chan *stun.Message),
 
 		// Relay
-		relayConfig:   cfg.RelayConfig,
+		relayConfig:  cfg.RelayConfig,
 		scopeLimiter: NewTenantRelayLimiter(cfg.ScopeLimiterConfig),
 
 		// Rate limiting — global + per-source (S6)

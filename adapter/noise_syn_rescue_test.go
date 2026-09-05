@@ -53,11 +53,11 @@ func (c *discardConn) Close() error {
 	}
 	return nil
 }
-func (c *discardConn) LocalAddr() net.Addr                { return &net.UDPAddr{} }
-func (c *discardConn) RemoteAddr() net.Addr               { return &net.UDPAddr{} }
-func (c *discardConn) SetDeadline(time.Time) error        { return nil }
-func (c *discardConn) SetReadDeadline(time.Time) error    { return nil }
-func (c *discardConn) SetWriteDeadline(time.Time) error   { return nil }
+func (c *discardConn) LocalAddr() net.Addr              { return &net.UDPAddr{} }
+func (c *discardConn) RemoteAddr() net.Addr             { return &net.UDPAddr{} }
+func (c *discardConn) SetDeadline(time.Time) error      { return nil }
+func (c *discardConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *discardConn) SetWriteDeadline(time.Time) error { return nil }
 
 // 📌 STATUS: THE SENDER-SIDE HALF IS **NOT IN THE TREE**. A change setting FlagSYN
 // on outbound noise DATA frames was written, tested, mutation-proven, and then

@@ -11,8 +11,8 @@ import (
 	"time"
 )
 
-// signerFor mirrors how a relay resolves a per-tenant signer: parse the tenant
-// scope out of the (unverified) ticket body and return that tenant's public key.
+// signerFor mirrors how a relay resolves a per-partition signer: parse the partition
+// scope out of the (unverified) ticket body and return that partition's public key.
 func signerFor(keys map[string]ed25519.PublicKey) func(body []byte) (ed25519.PublicKey, error) {
 	return func(body []byte) (ed25519.PublicKey, error) {
 		var t struct {
@@ -30,7 +30,7 @@ func signerFor(keys map[string]ed25519.PublicKey) func(body []byte) (ed25519.Pub
 }
 
 // A per-tenant resolver selects the right tenant's key from the ticket body and
-// the handshake completes — the multi-tenant relay path.
+// the handshake completes — the multi-partition relay path.
 func TestAcceptOverConn_PerTenantSignerResolved(t *testing.T) {
 	aPriv, aPub := newTestKeypair(t)
 	bPriv, bPub := newTestKeypair(t)
@@ -45,7 +45,7 @@ func TestAcceptOverConn_PerTenantSignerResolved(t *testing.T) {
 	}
 	keys := map[string]ed25519.PublicKey{"tenant-A": pubA, "tenant-B": pubB}
 
-	// A ticket for tenant-A, signed by tenant-A's key.
+	// A ticket for partition-A, signed by partition-A's key.
 	body := []byte(`{"target":"vl1_agent-xyz","scope":"tenant-A"}`)
 	sig := ed25519Sign(privA, body)
 	ticket := append(append([]byte(nil), body...), sig...)
@@ -87,7 +87,7 @@ func TestAcceptOverConn_PerTenantSignerResolved(t *testing.T) {
 
 // Tenant isolation: a ticket whose body claims tenant-A but is signed by a
 // different key is rejected — the resolver picks tenant-A's real key, and the
-// forged signature fails against it. A ticket forged in one tenant cannot cross
+// forged signature fails against it. A ticket forged in one partition cannot cross
 // into another.
 func TestAcceptOverConn_PerTenantCrossTenantForgeryRejected(t *testing.T) {
 	aPriv, aPub := newTestKeypair(t)
@@ -97,7 +97,7 @@ func TestAcceptOverConn_PerTenantCrossTenantForgeryRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen tenant-A signer: %v", err)
 	}
-	// The attacker signs with their OWN key, not tenant-A's.
+	// The attacker signs with their OWN key, not partition-A's.
 	_, attackerPriv, err := generateTestEd25519(t)
 	if err != nil {
 		t.Fatalf("gen attacker signer: %v", err)

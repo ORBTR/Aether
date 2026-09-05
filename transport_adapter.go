@@ -89,12 +89,12 @@ type AbuseReason uint8
 // invariant is checked at compile time via the assertions in
 // abuse/score.go.
 const (
-	AbuseReasonDecryptFail      AbuseReason = 0
-	AbuseReasonMalformedFrame   AbuseReason = 1
-	AbuseReasonACKValidation    AbuseReason = 2
-	AbuseReasonStreamRefused    AbuseReason = 3
-	AbuseReasonWHOISFlood       AbuseReason = 4
-	AbuseReasonReplayDetected   AbuseReason = 5
+	AbuseReasonDecryptFail       AbuseReason = 0
+	AbuseReasonMalformedFrame    AbuseReason = 1
+	AbuseReasonACKValidation     AbuseReason = 2
+	AbuseReasonStreamRefused     AbuseReason = 3
+	AbuseReasonWHOISFlood        AbuseReason = 4
+	AbuseReasonReplayDetected    AbuseReason = 5
 	AbuseReasonProtocolViolation AbuseReason = 6
 )
 

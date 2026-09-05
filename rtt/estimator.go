@@ -25,12 +25,12 @@
 // Capabilities preserved from both:
 //
 //   - Reliability:  MinRTO/MaxRTO bounds, BackoffRTO (RFC 6298 §5.5),
-//                   ack-delay-adjusted samples (UpdateWithDelay,
-//                   QUIC RFC 9002 §5.3), Karn's-algorithm-friendly
-//                   single-sample API (caller decides which samples
-//                   to feed it — retransmitted frames omitted).
+//     ack-delay-adjusted samples (UpdateWithDelay,
+//     QUIC RFC 9002 §5.3), Karn's-algorithm-friendly
+//     single-sample API (caller decides which samples
+//     to feed it — retransmitted frames omitted).
 //   - Health:       configurable smoothing alpha for SRTT EMA, lastRTT
-//                   accessor for diagnostic readout.
+//     accessor for diagnostic readout.
 package rtt
 
 import (
@@ -177,7 +177,7 @@ type Estimator struct {
 	// Indexed by histHead modulo histRingSize for writes. histLen tracks
 	// the number of valid entries (≤ histRingSize); reaches the cap
 	// once enough samples have arrived and stays there.
-	hist    [histRingSize]time.Duration
+	hist     [histRingSize]time.Duration
 	histHead int
 	histLen  int
 }

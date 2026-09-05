@@ -26,7 +26,7 @@ func testNodeID(name string) aether.NodeID {
 func newTestNoiseConn(scopeID string, remoteNode aether.NodeID) *noiseConn {
 	return &noiseConn{
 		remoteNode: remoteNode,
-		scopeID:   scopeID,
+		scopeID:    scopeID,
 		inbox:      make(chan []byte, 16),
 		closed:     make(chan struct{}),
 	}

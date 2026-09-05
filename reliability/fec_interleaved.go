@@ -29,10 +29,10 @@ const (
 // Losing 2 consecutive frames (e.g., 3, 4) puts each in a different group,
 // making both recoverable. This handles burst loss of up to 2 consecutive packets.
 type InterleavedFECEncoder struct {
-	mu       sync.Mutex
-	groupA   *FECEncoder // even-indexed frames
-	groupB   *FECEncoder // odd-indexed frames
-	index    int         // tracks frame position (0-based)
+	mu     sync.Mutex
+	groupA *FECEncoder // even-indexed frames
+	groupB *FECEncoder // odd-indexed frames
+	index  int         // tracks frame position (0-based)
 }
 
 // NewInterleavedFECEncoder creates an interleaved FEC encoder.

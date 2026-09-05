@@ -137,7 +137,7 @@ func TestOnProbeResponse_StaleProbeIDIgnored(t *testing.T) {
 	rec := &recordingSender{}
 	p := NewProber(rec.send)
 
-	p.StartProbe()      // sends probe #1
+	p.StartProbe()       // sends probe #1
 	p.OnProbeResponse(1) // → MSS 1200, sends probe #2
 	p.OnProbeResponse(2) // → MSS 1280, sends probe #3 (current probeID now 3)
 

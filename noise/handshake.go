@@ -37,11 +37,11 @@ func (t *NoiseTransport) performInitiatorHandshakeAttempt(ctx context.Context, u
 	// If a dial override is present (SharedTransport), use the scope's keys
 	// and prepend a preamble. Otherwise use the transport's own keys.
 	var activeKey []byte
-	var preambleTenantID string
+	var preamblePartitionID string
 	if override := getDialOverride(ctx); override != nil && len(override.Keys) > 0 {
 		activeKey = override.Keys[0]
-		preambleTenantID = override.ScopeID
-		dbgHandshake.Printf("Using dial override for scope %q", preambleTenantID)
+		preamblePartitionID = override.ScopeID
+		dbgHandshake.Printf("Using dial override for scope %q", preamblePartitionID)
 	} else {
 		activeKey = t.keyManager.ActiveKey()
 	}
@@ -97,8 +97,8 @@ func (t *NoiseTransport) performInitiatorHandshakeAttempt(ctx context.Context, u
 	}
 
 	var packet []byte
-	if preambleTenantID != "" {
-		preamble, pErr := EncodePreamble(preambleTenantID)
+	if preamblePartitionID != "" {
+		preamble, pErr := EncodePreamble(preamblePartitionID)
 		if pErr != nil {
 			return nil, pErr
 		}
@@ -118,7 +118,7 @@ func (t *NoiseTransport) performInitiatorHandshakeAttempt(ctx context.Context, u
 		dbgHandshake.Printf("Failed to send message 1: %v", err)
 		return nil, err
 	}
-	dbgHandshake.Printf("Sent message 1 (fingerprint: %x, preamble: %v, pattern: %s)", fingerprint, preambleTenantID != "", pattern.Name)
+	dbgHandshake.Printf("Sent message 1 (fingerprint: %x, preamble: %v, pattern: %s)", fingerprint, preamblePartitionID != "", pattern.Name)
 
 	deadline := t.handshakeDeadline(ctx)
 	if err := udpConn.SetReadDeadline(deadline); err != nil {
@@ -184,7 +184,7 @@ func (t *NoiseTransport) performInitiatorHandshakeAttempt(ctx context.Context, u
 	dbgHandshake.Printf("Handshake complete with %s (pattern: %s)", remoteNode.Short(), pattern.Name)
 	_ = udpConn.SetReadDeadline(time.Time{})
 	nc := newNoiseConnDial(udpConn, path.Address, remoteNode, sendCS, recvCS, t.maxPacket, t)
-	nc.scopeID = preambleTenantID
+	nc.scopeID = preamblePartitionID
 	nc.peerMaxAckDelay = decodeMaxAckDelay(remoteMaxAckDelayUS)
 
 	// Negotiate explicit nonce mode if both sides support it
@@ -236,10 +236,10 @@ func (t *NoiseTransport) performInitiatorHandshakeSharedAttempt(ctx context.Cont
 
 	// Key selection (same as performInitiatorHandshake)
 	var activeKey []byte
-	var preambleTenantID string
+	var preamblePartitionID string
 	if override := getDialOverride(ctx); override != nil && len(override.Keys) > 0 {
 		activeKey = override.Keys[0]
-		preambleTenantID = override.ScopeID
+		preamblePartitionID = override.ScopeID
 	} else {
 		activeKey = t.keyManager.ActiveKey()
 	}
@@ -290,8 +290,8 @@ func (t *NoiseTransport) performInitiatorHandshakeSharedAttempt(ctx context.Cont
 		patFlag = patternFlagXK
 	}
 	var packet []byte
-	if preambleTenantID != "" {
-		preamble, pErr := EncodePreamble(preambleTenantID)
+	if preamblePartitionID != "" {
+		preamble, pErr := EncodePreamble(preamblePartitionID)
 		if pErr != nil {
 			return nil, pErr
 		}
@@ -504,7 +504,7 @@ recvLoop:
 
 	// Create session using the listener's shared socket (like listener-accepted sessions)
 	nc := newNoiseConnListener(listener, sendCS, recvCS, addr, remoteNode, remoteIdentity)
-	nc.scopeID = preambleTenantID
+	nc.scopeID = preamblePartitionID
 	nc.peerMaxAckDelay = decodeMaxAckDelay(remoteMaxAckDelayUS)
 	// Cross-org: persist the preamble target on the noiseConn so the
 	// writeFunc continues to prepend it on every post-handshake send.
@@ -1141,7 +1141,7 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 // are looked up from the transport's static keyMap.
 func (l *noiseListener) resolveHandshakeKey(msg []byte) (prologue []byte, scopeID string, patternFlag byte, noiseMsg []byte, ok bool) {
 	// Check for preamble (shared transport mode)
-	if l.transport.tenantKeyResolver != nil && HasPreamble(msg) {
+	if l.transport.partitionKeyResolver != nil && HasPreamble(msg) {
 		tid, rest, err := DecodePreamble(msg)
 		if err != nil {
 			dbgHandshake.Printf("Failed to decode preamble: %v", err)
@@ -1151,7 +1151,7 @@ func (l *noiseListener) resolveHandshakeKey(msg []byte) (prologue []byte, scopeI
 		if len(rest) < 5 {
 			return nil, "", 0, nil, false
 		}
-		keys, err := l.transport.tenantKeyResolver.ResolveKeys(tid)
+		keys, err := l.transport.partitionKeyResolver.ResolveKeys(tid)
 		if err != nil {
 			dbgHandshake.Printf("Unknown scope in preamble: %s: %v", tid, err)
 			return nil, "", 0, nil, false

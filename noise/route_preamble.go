@@ -81,10 +81,10 @@ const (
 )
 
 var (
-	ErrRoutingPreambleTooShort       = errors.New("route-preamble: data too short")
-	ErrRoutingPreambleMagicMismatch  = errors.New("route-preamble: not a routing preamble")
-	ErrRoutingPreambleVersion        = errors.New("route-preamble: unsupported version")
-	ErrRoutingPreambleFlags          = errors.New("route-preamble: unknown flag bits set")
+	ErrRoutingPreambleTooShort      = errors.New("route-preamble: data too short")
+	ErrRoutingPreambleMagicMismatch = errors.New("route-preamble: not a routing preamble")
+	ErrRoutingPreambleVersion       = errors.New("route-preamble: unsupported version")
+	ErrRoutingPreambleFlags         = errors.New("route-preamble: unknown flag bits set")
 )
 
 // EncodeRoutingPreamble builds the 34-byte routing preamble for a given
@@ -131,7 +131,7 @@ func IsRoutingPreamble(data []byte) bool {
 
 // DecodeRoutingPreamble parses the preamble and returns (target NodeID,
 // remaining bytes, error). The remaining bytes are what the noise state
-// machine should see — i.e. the raw msg1 (possibly preceded by a tenant
+// machine should see — i.e. the raw msg1 (possibly preceded by a partition
 // preamble) with the routing preamble stripped.
 //
 // Forward-compat: unknown flag bits return ErrRoutingPreambleFlags. A
