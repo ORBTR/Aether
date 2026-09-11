@@ -64,7 +64,7 @@ import (
 //	[N bytes : payload — msg2 or data]
 //
 // Magic 0x524C ("RL") distinguishes the inner protocol from the
-// tenant-scope preamble ("TP" 0x5450) and the routing preamble
+// scope preamble ("TP" 0x5450) and the routing preamble
 // ("AE" 0x4145) and from raw noise msg1 (statistically uniform first
 // byte from a Curve25519 ephemeral pub key).
 
@@ -337,7 +337,7 @@ func NewIntraOrgForwarder(localNID aether.NodeID, lookup ForwarderLookup) *Intra
 
 // Close stops the GC sweeper and clears both flow tables. Safe to call
 // multiple times. Purging the tables (vs. relying on process exit) lets
-// callers Close a per-tenant transport during dynamic reload without
+// callers Close a per-partition transport during dynamic reload without
 // leaking entries — the abandoned forwarder won't hold references.
 func (f *IntraOrgForwarder) Close() {
 	f.once.Do(func() {

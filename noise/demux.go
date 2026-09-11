@@ -31,10 +31,10 @@ func ClassifyPacket(data []byte) PacketType {
 		return PacketNoise
 	}
 	// Recognised 2-byte preamble magics — return PacketNoise so the
-	// listener's runReader sees them and the forwarder/tenant branches
+	// listener's runReader sees them and the forwarder/scope branches
 	// can claim ownership before generic noise dispatch:
 	//
-	//   0x5450 "TP" — tenant-scope preamble
+	//   0x5450 "TP" — scope preamble
 	//   0x4145 "AE" — cross-org anycast routing preamble
 	//   0x524C "RL" — intra-org inner relay frame
 	if len(data) >= 2 {

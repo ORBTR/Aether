@@ -32,27 +32,27 @@ import (
 // logic is wired (and a preamble for a non-local NodeID just fails the
 // handshake — graceful degradation).
 
-// Wire format (prepended to noise msg1 before any TenantPreamble):
+// Wire format (prepended to noise msg1 before any scope preamble):
 //
 //	[2 bytes: magic 0x41 0x45 ("AE")]
 //	[1 byte : version (0x01)]
 //	[1 byte : flags    (reserved, 0x00)]
 //	[30 bytes: target NodeID (textual canonical form, "vl1_<26 chars>")]
 //
-// Total: 34 bytes. The standard noise msg1 (and optional TenantPreamble)
+// Total: 34 bytes. The standard noise msg1 (and optional scope preamble)
 // follow immediately after. NodeID is the textual canonical form so the
 // receiver can compare against its own NodeID string directly without
 // reconstructing the SHA-256 fingerprint mapping.
 //
 // The "AE" magic is distinct from:
-//   - the tenant-scope preamble magic "TP" (0x5450)
+//   - the scope preamble magic "TP" (0x5450)
 //   - a raw noise msg1 starting with the CRC32 fingerprint (a uint32 whose
 //     first byte is the fingerprint MSB — never 0x41, since CRC32 of the
 //     network-key set is effectively random)
 //   - a Curve25519 ephemeral public key first byte (statistically uniform)
 //
 // Detection at receive time: peek the first byte. 0x41 → routing preamble;
-// 0x54 → tenant preamble; anything else → raw msg1.
+// 0x54 → scope preamble; anything else → raw msg1.
 
 const (
 	// MetadataKeyCrossOrgPreamble is the well-known aether.Target.Metadata

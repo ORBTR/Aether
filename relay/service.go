@@ -34,7 +34,7 @@ type SessionIndex interface {
 }
 
 // externalEntry pairs a bridge session with its scope so relay forwarding can
-// enforce tenant isolation on external paths. AE-H-08.
+// enforce partition isolation on external paths. AE-H-08.
 type externalEntry struct {
 	conn    aether.Connection
 	scopeID string

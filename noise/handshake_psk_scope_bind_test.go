@@ -17,7 +17,7 @@ import (
 	aether "github.com/ORBTR/aether"
 )
 
-// scopeKeyResolver is a static in-memory TenantKeyResolver mapping a scope ID
+// scopeKeyResolver is a static in-memory PartitionKeyResolver mapping a scope ID
 // to the PSK(s) that scope is permitted to present. It is the responder's
 // authority for the PSK->ScopeID derivation under test.
 type scopeKeyResolver map[string][][]byte
@@ -34,7 +34,7 @@ func (r scopeKeyResolver) ResolveKeys(scopeID string) ([][]byte, error) {
 // SAME public-interface unwrap a real consumer uses: Accept hands back a
 // *BaseConnection (an aether.Connection, which itself carries no scope);
 // ConnProvider.NetConn() exposes the underlying transport conn, which — for a
-// preamble session — implements aether.TenantAwareSession and returns the scope
+// preamble session — implements aether.PartitionAwareSession and returns the scope
 // the responder DERIVED from the matched PSK.
 func scopeOf(t *testing.T, c aether.Connection) string {
 	t.Helper()
@@ -42,9 +42,9 @@ func scopeOf(t *testing.T, c aether.Connection) string {
 	if !ok {
 		t.Fatalf("accepted session %T is not a ConnProvider — cannot reach the transport scope", c)
 	}
-	ts, ok := cp.NetConn().(aether.TenantAwareSession)
+	ts, ok := cp.NetConn().(aether.PartitionAwareSession)
 	if !ok {
-		t.Fatalf("underlying conn %T does not implement aether.TenantAwareSession", cp.NetConn())
+		t.Fatalf("underlying conn %T does not implement aether.PartitionAwareSession", cp.NetConn())
 	}
 	return ts.ScopeID()
 }
@@ -53,7 +53,7 @@ func scopeOf(t *testing.T, c aether.Connection) string {
 // identity. resolver is set on the responder (it resolves preamble-bearing
 // msg1s); the initiator passes nil and carries its scope+keys per-dial via
 // WithDialOverride.
-func newScopeTestTransport(t *testing.T, resolver TenantKeyResolver) (*NoiseTransport, aether.NodeID) {
+func newScopeTestTransport(t *testing.T, resolver PartitionKeyResolver) (*NoiseTransport, aether.NodeID) {
 	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -70,7 +70,7 @@ func newScopeTestTransport(t *testing.T, resolver TenantKeyResolver) (*NoiseTran
 		NetworkKeys: []string{"dedicated-placeholder-key-unused-in-preamble-mode"},
 		// The derivation runs on preamble-bearing packets resolved via this
 		// resolver; nil on the initiator (scope+keys travel via WithDialOverride).
-		TenantKeyResolver: resolver,
+		PartitionKeyResolver: resolver,
 		// Amplification retry is orthogonal to PSK->ScopeID derivation; disabling
 		// it lets the reject path fire on the first msg1 (fast, deterministic).
 		RequireRetryToken: BoolPtr(false),
@@ -85,7 +85,7 @@ func newScopeTestTransport(t *testing.T, resolver TenantKeyResolver) (*NoiseTran
 // a Noise session's ScopeID is DERIVED from the tenant PSK the initiator proves
 // possession of during the handshake, NOT from the (unauthenticated) scope the
 // initiator merely claims in its preamble. This is #R-714 link-1 — the root of
-// the enforcement chain the mock-TenantAwareSession matrix (R-742) assumes but
+// the enforcement chain the mock-PartitionAwareSession matrix (R-742) assumes but
 // cannot itself prove.
 //
 // Before this test the coverage was PIECES only, never the bind:

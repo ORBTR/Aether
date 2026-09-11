@@ -14,8 +14,8 @@ import (
 //
 // WHAT THIS GUARDS. loom's accept loop does, once per inbound session:
 //
-//	if tas, ok := session.(aether.TenantAwareSession); ok {
-//	    if tid := tas.ScopeID(); tid != "" { tenantID = tid }
+//	if tas, ok := session.(aether.PartitionAwareSession); ok {
+//	    if tid := tas.ScopeID(); tid != "" { partitionID = tid }
 //	}
 //
 // MEASURED: that assertion cannot succeed today. Accept returns
@@ -30,11 +30,11 @@ import (
 // WHOLE POINT OF THIS FILE.
 //
 // An earlier version of these tests asserted "*BaseConnection must not satisfy
-// TenantAwareSession". That was wrong, and wrong in a way worth recording,
+// PartitionAwareSession". That was wrong, and wrong in a way worth recording,
 // because it was well-built enough to be believed:
 //
 //   - what was refused is a method returning "" UNCONDITIONALLY — a type
-//     claiming tenant-awareness it cannot honour;
+//     claiming partition-awareness it cannot honour;
 //   - what is NOT refused is a DELEGATING method that forwards to the inner
 //     conn (BaseConnection holds `Conn net.Conn`, and on the noise accept path
 //     that field holds the scope-bearing *noiseConn). Such a method reports
@@ -76,7 +76,7 @@ func (nopConn) SetDeadline(time.Time) error      { return nil }
 func (nopConn) SetReadDeadline(time.Time) error  { return nil }
 func (nopConn) SetWriteDeadline(time.Time) error { return nil }
 
-// TestTenantScope_BaseConnectionMustNotInventAScope is the invariant.
+// TestPartitionScope_BaseConnectionMustNotInventAScope is the invariant.
 //
 // It is the executable form of "if BaseConnection reports a scope, that scope
 // must be the inner conn's; if the inner conn has none, it must report none."
@@ -85,10 +85,10 @@ func (nopConn) SetWriteDeadline(time.Time) error { return nil }
 // not:
 //   - an unconditional `return ""` stub answers "" for the SCOPE-BEARING inner
 //     conn  -> FAILS here, which is the refusal being enforced;
-//   - a delegating implementation answers "tenant-alpha" for that conn and ""
+//   - a delegating implementation answers "partition-alpha" for that conn and ""
 //     for the plain one -> PASSES here, so the workable fix is not blocked.
-func TestTenantScope_BaseConnectionMustNotInventAScope(t *testing.T) {
-	const want = "tenant-alpha"
+func TestPartitionScope_BaseConnectionMustNotInventAScope(t *testing.T) {
+	const want = "partition-alpha"
 
 	scoped := NewConnection(
 		NodeID("vl1_local_scope_delegate_aaaa"),
@@ -103,8 +103,8 @@ func TestTenantScope_BaseConnectionMustNotInventAScope(t *testing.T) {
 		ProtoWebSocket,
 	)
 
-	scopedTAS, scopedOK := Connection(scoped).(TenantAwareSession)
-	plainTAS, plainOK := Connection(plain).(TenantAwareSession)
+	scopedTAS, scopedOK := Connection(scoped).(PartitionAwareSession)
+	plainTAS, plainOK := Connection(plain).(PartitionAwareSession)
 
 	if !scopedOK {
 		// Pre-fix tree. Record the measured state rather than passing silently:
@@ -113,7 +113,7 @@ func TestTenantScope_BaseConnectionMustNotInventAScope(t *testing.T) {
 			"scope cannot reach loom on ANY transport. This test is latent and becomes " +
 			"live when the method is added; it then requires the method to delegate.")
 		if plainOK {
-			t.Error("inconsistent: the same concrete type satisfied TenantAwareSession for " +
+			t.Error("inconsistent: the same concrete type satisfied PartitionAwareSession for " +
 				"one inner conn and not the other — that is impossible for a Go method set " +
 				"and means this test's fixtures no longer produce *BaseConnection")
 		}
@@ -124,7 +124,7 @@ func TestTenantScope_BaseConnectionMustNotInventAScope(t *testing.T) {
 	if got := scopedTAS.ScopeID(); got != want {
 		t.Errorf("BaseConnection over a scope-bearing conn reported ScopeID()=%q, want %q. "+
 			"If this is an unconditional `return \"\"`, THAT IS THE SHAPE THAT WAS REFUSED: "+
-			"it makes every connection claim tenant-awareness while answering nothing, the "+
+			"it makes every connection claim partition-awareness while answering nothing, the "+
 			"caller's `tid != \"\"` guard discards it, behaviour is unchanged, and the "+
 			"interface now asserts a property it cannot honour. Delegate to the inner conn "+
 			"instead", got, want)
@@ -137,18 +137,18 @@ func TestTenantScope_BaseConnectionMustNotInventAScope(t *testing.T) {
 	if got := plainTAS.ScopeID(); got != "" {
 		t.Errorf("BaseConnection over a conn with NO scope reported ScopeID()=%q, want \"\". "+
 			"Reporting a scope that the inner conn does not hold is the same defect in the "+
-			"opposite direction — it would silently attribute a session to a tenant", got)
+			"opposite direction — it would silently attribute a session to a partition", got)
 	}
 }
 
-// TestTenantScope_BaseConnectionIsAConnection is POSITIVE CONTROL A.
+// TestPartitionScope_BaseConnectionIsAConnection is POSITIVE CONTROL A.
 //
 // Without it the invariant passes for uninteresting reasons — a nil value, a
 // wrong constructor, a fixture that is not the accept path's type at all.
-func TestTenantScope_BaseConnectionIsAConnection(t *testing.T) {
+func TestPartitionScope_BaseConnectionIsAConnection(t *testing.T) {
 	bc := NewConnection(
-		NodeID("vl1_local_tenant_control_eeee"),
-		NodeID("vl1_remote_tenant_control_ffff"),
+		NodeID("vl1_local_partition_control_eeee"),
+		NodeID("vl1_remote_partition_control_ffff"),
 		nopConn{},
 		ProtoNoise,
 	)
@@ -175,25 +175,25 @@ type scopedTestConn struct {
 
 func (c *scopedTestConn) ScopeID() string { return c.scope }
 
-// TestTenantScope_AScopedTypeSatisfiesBoth is POSITIVE CONTROL B.
+// TestPartitionScope_AScopedTypeSatisfiesBoth is POSITIVE CONTROL B.
 //
-// ① It keeps the invariant NON-VACUOUS: if TenantAwareSession were unsatisfiable
+// ① It keeps the invariant NON-VACUOUS: if PartitionAwareSession were unsatisfiable
 // for any reason, the latent branch above would report "not implemented" forever
 // and prove nothing. This shows the assertion machinery does detect a
 // scope-bearing type.
 //
 // ② It demonstrates as a COMPILED FACT that a type can satisfy Connection and
-// TenantAwareSession simultaneously by embedding *BaseConnection — the eight
+// PartitionAwareSession simultaneously by embedding *BaseConnection — the eight
 // wrapper methods promote and the scope is additive. That answers "is a wrapper
 // shape type-correct?" without selecting it over delegation; which shape ships,
 // and where it is constructed, is not decided here.
-func TestTenantScope_AScopedTypeSatisfiesBoth(t *testing.T) {
-	const want = "tenant-beta"
+func TestPartitionScope_AScopedTypeSatisfiesBoth(t *testing.T) {
+	const want = "partition-beta"
 
 	sc := &scopedTestConn{
 		BaseConnection: NewConnection(
-			NodeID("vl1_local_tenant_scoped_gggg"),
-			NodeID("vl1_remote_tenant_scoped_hhhh"),
+			NodeID("vl1_local_partition_scoped_gggg"),
+			NodeID("vl1_remote_partition_scoped_hhhh"),
 			nopConn{},
 			ProtoNoise,
 		),
@@ -202,10 +202,10 @@ func TestTenantScope_AScopedTypeSatisfiesBoth(t *testing.T) {
 
 	var conn Connection = sc // compile-time: embedding promotes all 8 methods
 
-	tas, ok := conn.(TenantAwareSession)
+	tas, ok := conn.(PartitionAwareSession)
 	if !ok {
 		t.Fatal("a type embedding *BaseConnection and defining ScopeID() does NOT satisfy " +
-			"TenantAwareSession. That breaks one demonstrated type-correct route to an " +
+			"PartitionAwareSession. That breaks one demonstrated type-correct route to an " +
 			"accept-side scope and makes the invariant above unfalsifiable — fix this " +
 			"before trusting it")
 	}

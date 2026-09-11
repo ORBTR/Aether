@@ -55,7 +55,7 @@ func (t *NoiseTransport) handleRelayRequest(c *noiseConn, payload []byte) error 
 	if t.relayService != nil {
 		if extSess, targetScope, ok := t.relayService.ExternalScope(targetNodeID); ok {
 			if !scopeAllowed(c.scopeID, targetScope) {
-				return relay.ErrTenantMismatch
+				return relay.ErrPartitionMismatch
 			}
 			// Build relay data frame for external session: [sourceNodeID][payload]
 			frame := make([]byte, relay.RelayHeaderSize+len(data))
@@ -117,22 +117,22 @@ func (t *NoiseTransport) resolveRelayTarget(source *noiseConn, payload []byte) (
 
 	// Enforce scope isolation: both sessions must be in the same scope.
 	// Empty scopeID = dedicated mode (no restriction).
-	sourceTenant := source.scopeID
-	targetTenant := targetConn.scopeID
-	if sourceTenant != "" && targetTenant != "" && sourceTenant != targetTenant {
-		return nil, relay.ErrTenantMismatch
+	sourcePartition := source.scopeID
+	targetPartition := targetConn.scopeID
+	if sourcePartition != "" && targetPartition != "" && sourcePartition != targetPartition {
+		return nil, relay.ErrPartitionMismatch
 	}
 
 	// Per-scope relay rate limiting. AER-040: also rate-limit dedicated /
-	// empty-scope traffic. The old `activeTenant != ""` guard skipped limiting
+	// empty-scope traffic. The old `activePartition != ""` guard skipped limiting
 	// entirely when both scopes were empty, so a dedicated relay was an
 	// unmetered forwarder. Bucket empty-scope traffic under a sentinel key so
 	// per-peer limits still apply.
-	activeTenant := sourceTenant
-	if activeTenant == "" {
-		activeTenant = targetTenant
+	activePartition := sourcePartition
+	if activePartition == "" {
+		activePartition = targetPartition
 	}
-	limiterKey := activeTenant
+	limiterKey := activePartition
 	if limiterKey == "" {
 		limiterKey = relayDedicatedScopeKey
 	}
@@ -385,7 +385,7 @@ func (t *NoiseTransport) HandleExternalRelayFrame(sourceNodeID aether.NodeID, da
 	// Try Noise target (external → Noise peer)
 	if targetConn := t.findNoiseSession(targetNodeID); targetConn != nil {
 		if !scopeAllowed(sourceScope, targetConn.scopeID) {
-			return relay.ErrTenantMismatch
+			return relay.ErrPartitionMismatch
 		}
 		return targetConn.sendRelayPacket(sourceNodeID, payload)
 	}
@@ -394,7 +394,7 @@ func (t *NoiseTransport) HandleExternalRelayFrame(sourceNodeID aether.NodeID, da
 	if t.relayService != nil {
 		if extSess, targetScope, ok := t.relayService.ExternalScope(targetNodeID); ok {
 			if !scopeAllowed(sourceScope, targetScope) {
-				return relay.ErrTenantMismatch
+				return relay.ErrPartitionMismatch
 			}
 			frame := make([]byte, relay.RelayHeaderSize+len(payload))
 			copy(frame[:relay.RelayHeaderSize], sourceNodeID)

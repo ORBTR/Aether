@@ -62,7 +62,7 @@ func buildRelayPayload(targetNodeID aether.NodeID, data []byte) []byte {
 
 // ---------- scope session index tests ----------
 
-func TestTenantSessionIndex_AddRemove(t *testing.T) {
+func TestPartitionSessionIndex_AddRemove(t *testing.T) {
 	tr := newTestTransport()
 	l := tr.listener
 
@@ -72,37 +72,37 @@ func TestTenantSessionIndex_AddRemove(t *testing.T) {
 	addListenerSession(tr, "scope-1", nodeA, newTestNoiseConn("scope-1", nodeA))
 	addListenerSession(tr, "scope-1", nodeB, newTestNoiseConn("scope-1", nodeB))
 
-	if l.sessions.TenantCount("scope-1") != 2 {
-		t.Fatalf("expected 2 sessions for scope-1, got %d", l.sessions.TenantCount("scope-1"))
+	if l.sessions.PartitionCount("scope-1") != 2 {
+		t.Fatalf("expected 2 sessions for scope-1, got %d", l.sessions.PartitionCount("scope-1"))
 	}
 
 	// Remove one session
 	l.sessions.Remove(nodeA)
 
-	if l.sessions.TenantCount("scope-1") != 1 {
-		t.Fatalf("expected 1 session for scope-1 after remove, got %d", l.sessions.TenantCount("scope-1"))
+	if l.sessions.PartitionCount("scope-1") != 1 {
+		t.Fatalf("expected 1 session for scope-1 after remove, got %d", l.sessions.PartitionCount("scope-1"))
 	}
 
 	// Remove last session — scope entry should be cleaned up
 	l.sessions.Remove(nodeB)
-	if l.sessions.HasTenant("scope-1") {
+	if l.sessions.HasPartition("scope-1") {
 		t.Fatal("expected scope-1 entry to be cleaned up when empty")
 	}
 }
 
-func TestTenantSessionIndex_EmptyTenant(t *testing.T) {
+func TestPartitionSessionIndex_EmptyPartition(t *testing.T) {
 	tr := newTestTransport()
 	l := tr.listener
 	nodeA := testNodeID("nodeA")
 
 	addListenerSession(tr, "", nodeA, newTestNoiseConn("", nodeA))
 
-	if l.sessions.TenantCountAll() != 0 {
+	if l.sessions.PartitionCountAll() != 0 {
 		t.Fatal("expected no scope entries for empty scope (dedicated mode)")
 	}
 }
 
-func TestTenantSessionIndex_MultipleTenants(t *testing.T) {
+func TestPartitionSessionIndex_MultiplePartitions(t *testing.T) {
 	tr := newTestTransport()
 	l := tr.listener
 
@@ -114,26 +114,26 @@ func TestTenantSessionIndex_MultipleTenants(t *testing.T) {
 	addListenerSession(tr, "scope-2", nodeB, newTestNoiseConn("scope-2", nodeB))
 	addListenerSession(tr, "scope-1", nodeC, newTestNoiseConn("scope-1", nodeC))
 
-	if l.sessions.TenantCount("scope-1") != 2 {
-		t.Errorf("expected 2 sessions for scope-1, got %d", l.sessions.TenantCount("scope-1"))
+	if l.sessions.PartitionCount("scope-1") != 2 {
+		t.Errorf("expected 2 sessions for scope-1, got %d", l.sessions.PartitionCount("scope-1"))
 	}
-	if l.sessions.TenantCount("scope-2") != 1 {
-		t.Errorf("expected 1 session for scope-2, got %d", l.sessions.TenantCount("scope-2"))
+	if l.sessions.PartitionCount("scope-2") != 1 {
+		t.Errorf("expected 1 session for scope-2, got %d", l.sessions.PartitionCount("scope-2"))
 	}
 }
 
-func TestTenantForNode(t *testing.T) {
+func TestPartitionForNode(t *testing.T) {
 	tr := newTestTransport()
 	l := tr.listener
 	nodeA := testNodeID("nodeA")
 	addListenerSession(tr, "scope-1", nodeA, newTestNoiseConn("scope-1", nodeA))
 
-	scope := l.tenantForNode(nodeA)
+	scope := l.partitionForNode(nodeA)
 	if scope != "scope-1" {
 		t.Fatalf("expected scope-1, got %s", scope)
 	}
 
-	scope = l.tenantForNode(testNodeID("unknown"))
+	scope = l.partitionForNode(testNodeID("unknown"))
 	if scope != "" {
 		t.Fatalf("expected empty string for unknown node, got %s", scope)
 	}
@@ -143,7 +143,7 @@ func TestTenantForNode(t *testing.T) {
 // These tests use resolveRelayTarget() directly to test routing and scope
 // validation without requiring real Noise cipher states.
 
-func TestResolveRelayTarget_SameTenant_Allowed(t *testing.T) {
+func TestResolveRelayTarget_SamePartition_Allowed(t *testing.T) {
 	tr := newTestTransport()
 	sourceNode := testNodeID("source")
 	targetNode := testNodeID("target")
@@ -164,7 +164,7 @@ func TestResolveRelayTarget_SameTenant_Allowed(t *testing.T) {
 	}
 }
 
-func TestResolveRelayTarget_CrossTenant_Blocked(t *testing.T) {
+func TestResolveRelayTarget_CrossPartition_Blocked(t *testing.T) {
 	tr := newTestTransport()
 	sourceNode := testNodeID("source")
 	targetNode := testNodeID("target")
@@ -174,8 +174,8 @@ func TestResolveRelayTarget_CrossTenant_Blocked(t *testing.T) {
 
 	payload := buildRelayPayload(targetNode, []byte("hello"))
 	_, err := tr.resolveRelayTarget(sourceConn, payload)
-	if err != relay.ErrTenantMismatch {
-		t.Fatalf("expected ErrTenantMismatch, got: %v", err)
+	if err != relay.ErrPartitionMismatch {
+		t.Fatalf("expected ErrPartitionMismatch, got: %v", err)
 	}
 }
 
@@ -194,7 +194,7 @@ func TestResolveRelayTarget_DedicatedMode_Allowed(t *testing.T) {
 	}
 }
 
-func TestResolveRelayTarget_MixedTenant_Allowed(t *testing.T) {
+func TestResolveRelayTarget_MixedPartition_Allowed(t *testing.T) {
 	// Source has scope, target is dedicated (empty) — should be allowed
 	tr := newTestTransport()
 	sourceNode := testNodeID("source")
@@ -210,7 +210,7 @@ func TestResolveRelayTarget_MixedTenant_Allowed(t *testing.T) {
 	}
 }
 
-func TestResolveRelayTarget_MixedTenant_Reverse(t *testing.T) {
+func TestResolveRelayTarget_MixedPartition_Reverse(t *testing.T) {
 	// Source is dedicated (empty), target has scope — should be allowed
 	tr := newTestTransport()
 	sourceNode := testNodeID("source")
@@ -260,7 +260,7 @@ func TestResolveRelayTarget_InvalidPacket(t *testing.T) {
 	}
 }
 
-func TestResolveRelayTarget_OutgoingSession_CrossTenant(t *testing.T) {
+func TestResolveRelayTarget_OutgoingSession_CrossPartition(t *testing.T) {
 	tr := newTestTransport()
 	sourceNode := testNodeID("source")
 	targetNode := testNodeID("target")
@@ -274,12 +274,12 @@ func TestResolveRelayTarget_OutgoingSession_CrossTenant(t *testing.T) {
 
 	payload := buildRelayPayload(targetNode, []byte("hello"))
 	_, err := tr.resolveRelayTarget(sourceConn, payload)
-	if err != relay.ErrTenantMismatch {
-		t.Fatalf("expected ErrTenantMismatch for cross-scope outgoing, got: %v", err)
+	if err != relay.ErrPartitionMismatch {
+		t.Fatalf("expected ErrPartitionMismatch for cross-scope outgoing, got: %v", err)
 	}
 }
 
-func TestResolveRelayTarget_OutgoingSession_SameTenant(t *testing.T) {
+func TestResolveRelayTarget_OutgoingSession_SamePartition(t *testing.T) {
 	tr := newTestTransport()
 	sourceNode := testNodeID("source")
 	targetNode := testNodeID("target")

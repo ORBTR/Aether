@@ -48,7 +48,7 @@ func newRelayTestTransport() *NoiseTransport {
 // TestHandleRelayRequest_ExternalScopeIsolation proves the AE-H-08 fix: a Noise
 // peer relaying into an external (bridge) session is subject to the same scope
 // isolation as the Noise→Noise path. Cross-scope is denied with
-// ErrTenantMismatch and nothing is forwarded; same-scope and dedicated-mode
+// ErrPartitionMismatch and nothing is forwarded; same-scope and dedicated-mode
 // (empty scope on either side) are forwarded verbatim.
 func TestHandleRelayRequest_ExternalScopeIsolation(t *testing.T) {
 	sourceNode := testNodeID("source")
@@ -62,7 +62,7 @@ func TestHandleRelayRequest_ExternalScopeIsolation(t *testing.T) {
 		wantErr     error
 		wantSend    bool
 	}{
-		{"cross-scope blocked", "scope-1", "scope-2", relay.ErrTenantMismatch, false},
+		{"cross-scope blocked", "scope-1", "scope-2", relay.ErrPartitionMismatch, false},
 		{"same-scope allowed", "scope-1", "scope-1", nil, true},
 		{"target dedicated allowed", "scope-1", "", nil, true},
 		{"source dedicated allowed", "", "scope-2", nil, true},
@@ -110,7 +110,7 @@ func TestHandleExternalRelayFrame_ExternalToExternal_ScopeIsolation(t *testing.T
 		wantErr     error
 		wantSend    bool
 	}{
-		{"cross-scope blocked", "scope-1", "scope-2", relay.ErrTenantMismatch, false},
+		{"cross-scope blocked", "scope-1", "scope-2", relay.ErrPartitionMismatch, false},
 		{"same-scope allowed", "scope-1", "scope-1", nil, true},
 		{"target dedicated allowed", "scope-1", "", nil, true},
 		{"source dedicated allowed", "", "scope-2", nil, true},
@@ -160,7 +160,7 @@ func TestHandleExternalRelayFrame_ToNoise_ScopeIsolation(t *testing.T) {
 
 	frame := buildRelayPayload(noiseTarget, data)
 	err := tr.HandleExternalRelayFrame(srcBridge, frame)
-	if err != relay.ErrTenantMismatch {
-		t.Fatalf("expected ErrTenantMismatch for cross-scope bridge→Noise relay, got: %v", err)
+	if err != relay.ErrPartitionMismatch {
+		t.Fatalf("expected ErrPartitionMismatch for cross-scope bridge→Noise relay, got: %v", err)
 	}
 }

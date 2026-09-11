@@ -29,7 +29,7 @@ func TestAEL10_GlobalCapDominantScope(t *testing.T) {
 		MaxTotalPairs: 3,    // the hard ceiling under test
 		// no weights: the sole scope "dom" is always the busiest
 	}
-	l := NewTenantRelayLimiter(cfg)
+	l := NewPartitionRelayLimiter(cfg)
 
 	const scope = "dom"
 

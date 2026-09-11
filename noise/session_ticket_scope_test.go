@@ -78,8 +78,8 @@ func TestTicketRoundTripPreservesScopeID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildResumeCipherStates: %v", err)
 	}
-	if _, err := ts.IssueTicket(peerID, send, recv, capExplicitNonce, strings.Repeat("x", MaxScopeIDLength+1)); err != ErrTenantIDTooLong {
-		t.Errorf("IssueTicket(over-length scope) err = %v, want ErrTenantIDTooLong", err)
+	if _, err := ts.IssueTicket(peerID, send, recv, capExplicitNonce, strings.Repeat("x", MaxScopeIDLength+1)); err != ErrPartitionIDTooLong {
+		t.Errorf("IssueTicket(over-length scope) err = %v, want ErrPartitionIDTooLong", err)
 	}
 
 	// A ticket whose declared scope length disagrees with the actual suffix
