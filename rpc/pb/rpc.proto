@@ -17,15 +17,20 @@ message ScopeAxis {
 // AuthenticatedPrincipal is the immutable caller authority established by a
 // trusted gateway before an RPC enters the mesh. It carries the authenticated
 // subject, the opaque identity axes the gateway established (the consuming
-// project names them; aether interprets none), and the granted scope strings.
-// It is deliberately separate from RPCRequest.context: that map is mutable
-// request metadata and cannot establish subject, axis, or scope authority. No
-// owner partition travels here — the receiver derives it from a transport-gated
-// axis, so a peer cannot forge one by setting a field.
+// project names them; aether interprets none), the granted scope strings, and
+// the partition: the opaque scope a store selector keys on. It is deliberately
+// separate from RPCRequest.context: that map is mutable request metadata and
+// cannot establish subject, axis, scope, or partition authority.
+//
+// Every field is asserted by the sending peer. The receiver accepts a principal
+// only over a partition-bound transport, and only after its consumer admitter
+// has judged it against that transport, so whether a sender-asserted partition
+// is acceptable is the receiver's decision, not the sender's.
 message AuthenticatedPrincipal {
   string subject = 1;
   repeated ScopeAxis axes = 2;
   repeated string scopes = 3;
+  string partition = 4;
 }
 
 // RPCRequest represents a direct RPC call over the mesh network.
