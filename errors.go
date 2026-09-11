@@ -37,14 +37,14 @@ func WrapOp(op string, proto Protocol, nodeID NodeID, err error) error {
 
 // Sentinel errors — use errors.Is() to check.
 var (
-	ErrSessionClosed   = errors.New("transport: session closed")
-	ErrHandshakeFailed = errors.New("transport: handshake failed")
-	ErrRateLimited     = errors.New("transport: rate limited")
-	ErrTenantMismatch  = errors.New("transport: scope mismatch")
-	ErrKeyRotation     = errors.New("transport: key rotation in progress")
-	ErrTargetNotFound  = errors.New("transport: relay target not found")
-	ErrTicketExpired   = errors.New("transport: session ticket expired")
-	ErrTicketInvalid   = errors.New("transport: session ticket invalid")
+	ErrSessionClosed     = errors.New("transport: session closed")
+	ErrHandshakeFailed   = errors.New("transport: handshake failed")
+	ErrRateLimited       = errors.New("transport: rate limited")
+	ErrPartitionMismatch = errors.New("transport: scope mismatch")
+	ErrKeyRotation       = errors.New("transport: key rotation in progress")
+	ErrTargetNotFound    = errors.New("transport: relay target not found")
+	ErrTicketExpired     = errors.New("transport: session ticket expired")
+	ErrTicketInvalid     = errors.New("transport: session ticket invalid")
 
 	// ErrStreamCapExhausted signals that an OpenStream call was
 	// refused because the session's MaxConcurrentStreams cap was

@@ -38,16 +38,16 @@ func TestEncodePreamble(t *testing.T) {
 
 func TestEncodePreamble_Empty(t *testing.T) {
 	_, err := EncodePreamble("")
-	if err != ErrTenantIDEmpty {
-		t.Fatalf("err = %v, want ErrTenantIDEmpty", err)
+	if err != ErrPartitionIDEmpty {
+		t.Fatalf("err = %v, want ErrPartitionIDEmpty", err)
 	}
 }
 
 func TestEncodePreamble_TooLong(t *testing.T) {
 	long := strings.Repeat("x", MaxScopeIDLength+1)
 	_, err := EncodePreamble(long)
-	if err != ErrTenantIDTooLong {
-		t.Fatalf("err = %v, want ErrTenantIDTooLong", err)
+	if err != ErrPartitionIDTooLong {
+		t.Fatalf("err = %v, want ErrPartitionIDTooLong", err)
 	}
 }
 

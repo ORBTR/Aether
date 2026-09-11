@@ -83,8 +83,8 @@ func (m *ConnectionMap) Remove(id NodeID) {
 	}
 }
 
-// ForEachTenant iterates sessions for a specific scope.
-func (m *ConnectionMap) ForEachTenant(scope string, fn func(NodeID, Connection)) {
+// ForEachPartition iterates sessions for a specific scope.
+func (m *ConnectionMap) ForEachPartition(scope string, fn func(NodeID, Connection)) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for id, sess := range m.byScope[scope] {
@@ -192,23 +192,23 @@ func (m *ConnectionMap) RemoveBy(matchFn func(Connection) bool) {
 	}
 }
 
-// TenantCount returns the number of sessions for a specific scope.
-func (m *ConnectionMap) TenantCount(scope string) int {
+// PartitionCount returns the number of sessions for a specific scope.
+func (m *ConnectionMap) PartitionCount(scope string) int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return len(m.byScope[scope])
 }
 
-// HasTenant returns true if the scope has any sessions registered.
-func (m *ConnectionMap) HasTenant(scope string) bool {
+// HasPartition returns true if the scope has any sessions registered.
+func (m *ConnectionMap) HasPartition(scope string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	_, ok := m.byScope[scope]
 	return ok
 }
 
-// TenantCountAll returns the total number of partitions with sessions.
-func (m *ConnectionMap) TenantCountAll() int {
+// PartitionCountAll returns the total number of partitions with sessions.
+func (m *ConnectionMap) PartitionCountAll() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return len(m.byScope)

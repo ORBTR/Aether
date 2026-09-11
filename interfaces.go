@@ -79,10 +79,10 @@ type ConnProvider interface {
 	NetConn() net.Conn
 }
 
-// TenantAwareSession is implemented by sessions that carry a scope identifier.
-// SharedTransport preamble sessions and TenantSession wrappers implement this.
+// PartitionAwareSession is implemented by sessions that carry a scope identifier.
+// SharedTransport preamble sessions implement this.
 // Callers can type-assert incoming sessions to extract the transport-level scope.
-type TenantAwareSession interface {
+type PartitionAwareSession interface {
 	ScopeID() string
 }
 

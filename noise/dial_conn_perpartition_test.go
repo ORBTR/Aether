@@ -23,30 +23,30 @@ func signerFor(keys map[string]ed25519.PublicKey) func(body []byte) (ed25519.Pub
 		}
 		pub, ok := keys[t.Scope]
 		if !ok {
-			return nil, fmt.Errorf("unknown tenant %q", t.Scope)
+			return nil, fmt.Errorf("unknown partition %q", t.Scope)
 		}
 		return pub, nil
 	}
 }
 
-// A per-tenant resolver selects the right tenant's key from the ticket body and
+// A per-partition resolver selects the right partition's key from the ticket body and
 // the handshake completes — the multi-partition relay path.
-func TestAcceptOverConn_PerTenantSignerResolved(t *testing.T) {
+func TestAcceptOverConn_PerPartitionSignerResolved(t *testing.T) {
 	aPriv, aPub := newTestKeypair(t)
 	bPriv, bPub := newTestKeypair(t)
 
 	pubA, privA, err := generateTestEd25519(t)
 	if err != nil {
-		t.Fatalf("gen tenant-A signer: %v", err)
+		t.Fatalf("gen partition-A signer: %v", err)
 	}
 	pubB, _, err := generateTestEd25519(t)
 	if err != nil {
-		t.Fatalf("gen tenant-B signer: %v", err)
+		t.Fatalf("gen partition-B signer: %v", err)
 	}
-	keys := map[string]ed25519.PublicKey{"tenant-A": pubA, "tenant-B": pubB}
+	keys := map[string]ed25519.PublicKey{"partition-A": pubA, "partition-B": pubB}
 
 	// A ticket for partition-A, signed by partition-A's key.
-	body := []byte(`{"target":"vl1_agent-xyz","scope":"tenant-A"}`)
+	body := []byte(`{"target":"vl1_agent-xyz","scope":"partition-A"}`)
 	sig := ed25519Sign(privA, body)
 	ticket := append(append([]byte(nil), body...), sig...)
 
@@ -81,30 +81,30 @@ func TestAcceptOverConn_PerTenantSignerResolved(t *testing.T) {
 	}
 	wg.Wait()
 	if acceptErr != nil {
-		t.Fatalf("AcceptOverConn with resolved tenant-A signer: %v", acceptErr)
+		t.Fatalf("AcceptOverConn with resolved partition-A signer: %v", acceptErr)
 	}
 }
 
-// Tenant isolation: a ticket whose body claims tenant-A but is signed by a
-// different key is rejected — the resolver picks tenant-A's real key, and the
+// Partition isolation: a ticket whose body claims partition-A but is signed by a
+// different key is rejected — the resolver picks partition-A's real key, and the
 // forged signature fails against it. A ticket forged in one partition cannot cross
 // into another.
-func TestAcceptOverConn_PerTenantCrossTenantForgeryRejected(t *testing.T) {
+func TestAcceptOverConn_PerPartitionCrossPartitionForgeryRejected(t *testing.T) {
 	aPriv, aPub := newTestKeypair(t)
 	bPriv, bPub := newTestKeypair(t)
 
 	pubA, _, err := generateTestEd25519(t)
 	if err != nil {
-		t.Fatalf("gen tenant-A signer: %v", err)
+		t.Fatalf("gen partition-A signer: %v", err)
 	}
 	// The attacker signs with their OWN key, not partition-A's.
 	_, attackerPriv, err := generateTestEd25519(t)
 	if err != nil {
 		t.Fatalf("gen attacker signer: %v", err)
 	}
-	keys := map[string]ed25519.PublicKey{"tenant-A": pubA}
+	keys := map[string]ed25519.PublicKey{"partition-A": pubA}
 
-	body := []byte(`{"target":"vl1_agent-xyz","scope":"tenant-A"}`)
+	body := []byte(`{"target":"vl1_agent-xyz","scope":"partition-A"}`)
 	sig := ed25519Sign(attackerPriv, body) // signed by the wrong key
 	ticket := append(append([]byte(nil), body...), sig...)
 
@@ -138,6 +138,6 @@ func TestAcceptOverConn_PerTenantCrossTenantForgeryRejected(t *testing.T) {
 	}, clientConn)
 	wg.Wait()
 	if acceptErr == nil {
-		t.Fatal("AcceptOverConn accepted a ticket signed by the wrong key (cross-tenant forgery)")
+		t.Fatal("AcceptOverConn accepted a ticket signed by the wrong key (cross-partition forgery)")
 	}
 }

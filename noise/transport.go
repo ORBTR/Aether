@@ -51,10 +51,10 @@ func getDialOverride(ctx context.Context) *dialOverride {
 	return v
 }
 
-// TenantKeyResolver resolves network keys by scope ID for shared transports.
+// PartitionKeyResolver resolves network keys by scope ID for shared transports.
 // When set on a NoiseTransport, the listener detects preamble-bearing packets
 // and delegates PSK selection to this resolver instead of the static keyMap.
-type TenantKeyResolver interface {
+type PartitionKeyResolver interface {
 	// ResolveKeys returns the network keys (PSKs) for the given scope.
 	// The first key is used for the Noise prologue. Returns an error if
 	// the scope is unknown or has no keys registered.
@@ -89,10 +89,10 @@ type NoiseTransportConfig struct {
 	// When nil, Listen() uses ListenAddr directly (defaults to 0.0.0.0).
 	BindResolver aether.BindAddressResolver
 
-	// TenantKeyResolver enables preamble mode for shared multi-scope transports.
+	// PartitionKeyResolver enables preamble mode for shared multi-scope transports.
 	// When set, the listener detects and processes scope preambles in handshake
 	// packets. When nil, the transport operates in dedicated (single-scope) mode.
-	TenantKeyResolver TenantKeyResolver
+	PartitionKeyResolver PartitionKeyResolver
 
 	// ScopeLimiterConfig configures per-scope rate limiting for relay traffic.
 	// Only effective when relay is enabled and transport is shared (multi-scope).
@@ -158,7 +158,7 @@ type NoiseTransport struct {
 	staticPub  []byte
 
 	// Handshake + transport config
-	partitionKeyResolver TenantKeyResolver
+	partitionKeyResolver PartitionKeyResolver
 	handshake            time.Duration
 	maxPacket            int
 	listenAddr           string
@@ -172,7 +172,7 @@ type NoiseTransport struct {
 	// Relay
 	relayConfig  relay.RelayConfig
 	relayService *relay.RelayService
-	scopeLimiter *TenantRelayLimiter
+	scopeLimiter *PartitionRelayLimiter
 
 	// Rate limiting
 	rateLimiter *tokenBucket   // Global handshake budget
@@ -331,7 +331,7 @@ func NewNoiseTransport(cfg NoiseTransportConfig) (*NoiseTransport, error) {
 		staticPub:  id.Curve25519Pub,
 
 		// Config
-		partitionKeyResolver: cfg.TenantKeyResolver,
+		partitionKeyResolver: cfg.PartitionKeyResolver,
 		handshake:            handshake,
 		maxPacket:            maxPacket,
 		listenAddr:           cfg.ListenAddr,
@@ -342,7 +342,7 @@ func NewNoiseTransport(cfg NoiseTransportConfig) (*NoiseTransport, error) {
 
 		// Relay
 		relayConfig:  cfg.RelayConfig,
-		scopeLimiter: NewTenantRelayLimiter(cfg.ScopeLimiterConfig),
+		scopeLimiter: NewPartitionRelayLimiter(cfg.ScopeLimiterConfig),
 
 		// Rate limiting — global + per-source (S6)
 		rateLimiter: newTokenBucket(float64(rateLimitBurst), float64(rateLimitRate), time.Second),

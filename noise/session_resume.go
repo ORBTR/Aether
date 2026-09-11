@@ -558,7 +558,7 @@ func (l *noiseListener) handleResumePacket(ctx context.Context, conn *net.UDPCon
 	// peer via the ticket PSK + confirm-tag, not a signed NodeInfo, so no
 	// verified ed25519 identity key is available to thread through.
 	nc := newNoiseConnListener(l, send, recv, addr, ticket.PeerID, nil)
-	// AE-H-07: restore the original session's tenant scope from the ticket so
+	// AE-H-07: restore the original session's scope from the ticket so
 	// the resumed conn keeps its relay isolation. Without this the conn would
 	// register scopeless (""), and resolveRelayTarget's cross-partition guard
 	// (relay.go) treats empty scope as unrestricted — bypassing partition isolation.

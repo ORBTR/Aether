@@ -340,7 +340,7 @@ type IncomingSession struct {
 	Session  Connection
 	Reader   io.Reader
 	Writer   io.Writer
-	Metadata map[string]string // application-level metadata (e.g., "tenant_id")
+	Metadata map[string]string // application-level metadata
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

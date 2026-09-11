@@ -19,8 +19,8 @@ func testLimiterConfig() ScopeLimiterConfig {
 	}
 }
 
-func TestTenantRelayLimiter_SessionLimit(t *testing.T) {
-	limiter := NewTenantRelayLimiter(testLimiterConfig())
+func TestPartitionRelayLimiter_SessionLimit(t *testing.T) {
+	limiter := NewPartitionRelayLimiter(testLimiterConfig())
 
 	// Under limit
 	if err := limiter.CheckSessionLimit("scope-1", 2); err != nil {
@@ -28,13 +28,13 @@ func TestTenantRelayLimiter_SessionLimit(t *testing.T) {
 	}
 
 	// At limit
-	if err := limiter.CheckSessionLimit("scope-1", 3); err != ErrTenantSessionLimit {
-		t.Errorf("Expected ErrTenantSessionLimit at 3/3, got: %v", err)
+	if err := limiter.CheckSessionLimit("scope-1", 3); err != ErrPartitionSessionLimit {
+		t.Errorf("Expected ErrPartitionSessionLimit at 3/3, got: %v", err)
 	}
 
 	// Over limit
-	if err := limiter.CheckSessionLimit("scope-1", 5); err != ErrTenantSessionLimit {
-		t.Errorf("Expected ErrTenantSessionLimit at 5/3, got: %v", err)
+	if err := limiter.CheckSessionLimit("scope-1", 5); err != ErrPartitionSessionLimit {
+		t.Errorf("Expected ErrPartitionSessionLimit at 5/3, got: %v", err)
 	}
 
 	// Different scope is independent
@@ -43,8 +43,8 @@ func TestTenantRelayLimiter_SessionLimit(t *testing.T) {
 	}
 }
 
-func TestTenantRelayLimiter_SessionLimit_DedicatedMode(t *testing.T) {
-	limiter := NewTenantRelayLimiter(testLimiterConfig())
+func TestPartitionRelayLimiter_SessionLimit_DedicatedMode(t *testing.T) {
+	limiter := NewPartitionRelayLimiter(testLimiterConfig())
 
 	// Empty scope (dedicated mode) bypasses limits
 	if err := limiter.CheckSessionLimit("", 9999); err != nil {
@@ -52,8 +52,8 @@ func TestTenantRelayLimiter_SessionLimit_DedicatedMode(t *testing.T) {
 	}
 }
 
-func TestTenantRelayLimiter_RelayRate(t *testing.T) {
-	limiter := NewTenantRelayLimiter(testLimiterConfig())
+func TestPartitionRelayLimiter_RelayRate(t *testing.T) {
+	limiter := NewPartitionRelayLimiter(testLimiterConfig())
 
 	// Should allow up to MaxRelayRate packets (burst)
 	for i := 0; i < 100; i++ {
@@ -63,8 +63,8 @@ func TestTenantRelayLimiter_RelayRate(t *testing.T) {
 	}
 
 	// Next one should be rate limited (bucket empty)
-	if err := limiter.AllowRelay("scope-1"); err != ErrTenantRelayLimit {
-		t.Errorf("Expected ErrTenantRelayLimit after burst, got: %v", err)
+	if err := limiter.AllowRelay("scope-1"); err != ErrPartitionRelayLimit {
+		t.Errorf("Expected ErrPartitionRelayLimit after burst, got: %v", err)
 	}
 
 	// Different scope is independent
@@ -73,8 +73,8 @@ func TestTenantRelayLimiter_RelayRate(t *testing.T) {
 	}
 }
 
-func TestTenantRelayLimiter_RelayRate_DedicatedMode(t *testing.T) {
-	limiter := NewTenantRelayLimiter(testLimiterConfig())
+func TestPartitionRelayLimiter_RelayRate_DedicatedMode(t *testing.T) {
+	limiter := NewPartitionRelayLimiter(testLimiterConfig())
 
 	// Empty scope bypasses relay rate
 	for i := 0; i < 200; i++ {
@@ -84,8 +84,8 @@ func TestTenantRelayLimiter_RelayRate_DedicatedMode(t *testing.T) {
 	}
 }
 
-func TestTenantRelayLimiter_RelayPairLimit(t *testing.T) {
-	limiter := NewTenantRelayLimiter(testLimiterConfig())
+func TestPartitionRelayLimiter_RelayPairLimit(t *testing.T) {
+	limiter := NewPartitionRelayLimiter(testLimiterConfig())
 
 	// First two pairs allowed (cap is 2 in testLimiterConfig)
 	if err := limiter.CheckRelayPair("scope-1", "A→B"); err != nil {
@@ -129,12 +129,12 @@ func TestTenantRelayLimiter_RelayPairLimit(t *testing.T) {
 	}
 }
 
-func TestTenantRelayLimiter_UpdateConfig(t *testing.T) {
+func TestPartitionRelayLimiter_UpdateConfig(t *testing.T) {
 	cfg := testLimiterConfig()
-	limiter := NewTenantRelayLimiter(cfg)
+	limiter := NewPartitionRelayLimiter(cfg)
 
 	// Initially MaxSessions = 3
-	if err := limiter.CheckSessionLimit("scope-1", 3); err != ErrTenantSessionLimit {
+	if err := limiter.CheckSessionLimit("scope-1", 3); err != ErrPartitionSessionLimit {
 		t.Fatalf("Expected limit at 3, got: %v", err)
 	}
 
@@ -153,8 +153,8 @@ func TestTenantRelayLimiter_UpdateConfig(t *testing.T) {
 	}
 }
 
-func TestTenantRelayLimiter_Cleanup(t *testing.T) {
-	limiter := NewTenantRelayLimiter(testLimiterConfig())
+func TestPartitionRelayLimiter_Cleanup(t *testing.T) {
+	limiter := NewPartitionRelayLimiter(testLimiterConfig())
 
 	// Create state for two partitions
 	limiter.TrackRelayPair("scope-1", "A→B")
@@ -174,10 +174,10 @@ func TestTenantRelayLimiter_Cleanup(t *testing.T) {
 	}
 }
 
-func TestTenantRelayLimiter_Disabled(t *testing.T) {
+func TestPartitionRelayLimiter_Disabled(t *testing.T) {
 	cfg := testLimiterConfig()
 	cfg.Enabled = false
-	limiter := NewTenantRelayLimiter(cfg)
+	limiter := NewPartitionRelayLimiter(cfg)
 
 	// All checks pass when disabled
 	if err := limiter.CheckSessionLimit("scope-1", 9999); err != nil {
@@ -191,8 +191,8 @@ func TestTenantRelayLimiter_Disabled(t *testing.T) {
 	}
 }
 
-func TestDefaultTenantLimiterConfig(t *testing.T) {
-	cfg := DefaultTenantLimiterConfig()
+func TestDefaultPartitionLimiterConfig(t *testing.T) {
+	cfg := DefaultPartitionLimiterConfig()
 
 	if cfg.Enabled {
 		t.Error("Should be disabled by default")
@@ -208,10 +208,10 @@ func TestDefaultTenantLimiterConfig(t *testing.T) {
 	}
 }
 
-// TestTenantRelayLimiter_CrossScopeWFQ verifies S9 cross-scope fair
+// TestPartitionRelayLimiter_CrossScopeWFQ verifies S9 cross-scope fair
 // queueing: when the global MaxTotalPairs is reached, the busiest scope
 // (highest count/weight ratio) yields a slot to the incoming request.
-func TestTenantRelayLimiter_CrossScopeWFQ(t *testing.T) {
+func TestPartitionRelayLimiter_CrossScopeWFQ(t *testing.T) {
 	cfg := ScopeLimiterConfig{
 		Enabled:       true,
 		MaxRelayPairs: 10, // generous per-scope so we hit global cap first
@@ -221,7 +221,7 @@ func TestTenantRelayLimiter_CrossScopeWFQ(t *testing.T) {
 			"light": 1,
 		},
 	}
-	l := NewTenantRelayLimiter(cfg)
+	l := NewPartitionRelayLimiter(cfg)
 
 	// "heavy" installs 3 pairs; "light" installs 1. Total = 4 = cap.
 	for _, k := range []string{"h1", "h2", "h3"} {
@@ -257,10 +257,10 @@ func TestTenantRelayLimiter_CrossScopeWFQ(t *testing.T) {
 	}
 }
 
-// TestTenantRelayLimiter_WFQRespectsWeights verifies that scope weights
+// TestPartitionRelayLimiter_WFQRespectsWeights verifies that scope weights
 // skew the "busiest" selection. A scope with 3 pairs and weight=3 should
 // be considered less busy than a scope with 2 pairs and weight=1.
-func TestTenantRelayLimiter_WFQRespectsWeights(t *testing.T) {
+func TestPartitionRelayLimiter_WFQRespectsWeights(t *testing.T) {
 	cfg := ScopeLimiterConfig{
 		Enabled:       true,
 		MaxRelayPairs: 10,
@@ -270,7 +270,7 @@ func TestTenantRelayLimiter_WFQRespectsWeights(t *testing.T) {
 			"tiny": 1, // expected share 1/5 ≈ 1 pair
 		},
 	}
-	l := NewTenantRelayLimiter(cfg)
+	l := NewPartitionRelayLimiter(cfg)
 
 	// "big" has 3 pairs (ratio 3/3 = 1.0 — on target for its weight).
 	// "tiny" has 2 pairs (ratio 2/1 = 2.0 — 2× over its fair share).

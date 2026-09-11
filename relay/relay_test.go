@@ -295,7 +295,7 @@ func TestPacketTypeConstants(t *testing.T) {
 
 func TestTicketSizeConstants(t *testing.T) {
 	// Verify v2 TicketMinSize matches expected structure (with scopeID)
-	expectedV2 := TicketNonceSize + 8 + 32 + 32 + TicketTenantIDSize + TicketSignatureSize
+	expectedV2 := TicketNonceSize + 8 + 32 + 32 + TicketPartitionIDSize + TicketSignatureSize
 	if TicketMinSize != expectedV2 {
 		t.Errorf("TicketMinSize mismatch: got %d, want %d", TicketMinSize, expectedV2)
 	}
@@ -306,29 +306,29 @@ func TestTicketSizeConstants(t *testing.T) {
 		t.Errorf("ticketMinSizeV1 mismatch: got %d, want %d", ticketMinSizeV1, expectedV1)
 	}
 
-	// v2 should be exactly TicketTenantIDSize larger than v1
-	if TicketMinSize-ticketMinSizeV1 != TicketTenantIDSize {
-		t.Errorf("v2-v1 size diff should be %d, got %d", TicketTenantIDSize, TicketMinSize-ticketMinSizeV1)
+	// v2 should be exactly TicketPartitionIDSize larger than v1
+	if TicketMinSize-ticketMinSizeV1 != TicketPartitionIDSize {
+		t.Errorf("v2-v1 size diff should be %d, got %d", TicketPartitionIDSize, TicketMinSize-ticketMinSizeV1)
 	}
 }
 
 // ---------- Scoped ticket tests ----------
 
-func TestNewTenantRelayTicket(t *testing.T) {
+func TestNewPartitionRelayTicket(t *testing.T) {
 	relayPub, relayPriv := generateTestKeyPair(t)
 	nodeID := randomNodeID(t)
 	targetID := randomNodeID(t)
-	tenantHash := ScopeHash("scope-123")
+	partitionHash := ScopeHash("scope-123")
 
-	ticket, err := NewTenantRelayTicket(relayPriv, nodeID, targetID, tenantHash, time.Hour)
+	ticket, err := NewPartitionRelayTicket(relayPriv, nodeID, targetID, partitionHash, time.Hour)
 	if err != nil {
-		t.Fatalf("NewTenantRelayTicket failed: %v", err)
+		t.Fatalf("NewPartitionRelayTicket failed: %v", err)
 	}
 
-	if ticket.ScopeID != tenantHash {
+	if ticket.ScopeID != partitionHash {
 		t.Error("ScopeID mismatch")
 	}
-	if !ticket.IsTenantScoped() {
+	if !ticket.IsPartitionScoped() {
 		t.Error("Ticket should be scope-scoped")
 	}
 
@@ -338,8 +338,8 @@ func TestNewTenantRelayTicket(t *testing.T) {
 	}
 
 	// Verify with correct scope
-	if err := ticket.VerifyWithTenant(relayPub, nodeID, tenantHash); err != nil {
-		t.Errorf("VerifyWithTenant failed: %v", err)
+	if err := ticket.VerifyWithPartition(relayPub, nodeID, partitionHash); err != nil {
+		t.Errorf("VerifyWithPartition failed: %v", err)
 	}
 }
 
@@ -353,11 +353,11 @@ func TestNewRelayTicket_IsUnscoped(t *testing.T) {
 		t.Fatalf("NewRelayTicket failed: %v", err)
 	}
 
-	if ticket.IsTenantScoped() {
+	if ticket.IsPartitionScoped() {
 		t.Error("Ticket created with NewRelayTicket should be unscoped")
 	}
 
-	var zero [TicketTenantIDSize]byte
+	var zero [TicketPartitionIDSize]byte
 	if ticket.ScopeID != zero {
 		t.Error("ScopeID should be zero for unscoped ticket")
 	}
@@ -379,31 +379,31 @@ func TestScopeHash(t *testing.T) {
 	}
 
 	// Not all zeros
-	var zero [TicketTenantIDSize]byte
+	var zero [TicketPartitionIDSize]byte
 	if h1 == zero {
 		t.Error("ScopeHash should not be all zeros")
 	}
 }
 
-func TestVerifyWithTenant_WrongTenant(t *testing.T) {
+func TestVerifyWithPartition_WrongPartition(t *testing.T) {
 	relayPub, relayPriv := generateTestKeyPair(t)
 	nodeID := randomNodeID(t)
 	targetID := randomNodeID(t)
-	correctTenant := ScopeHash("scope-1")
-	wrongTenant := ScopeHash("scope-2")
+	correctPartition := ScopeHash("scope-1")
+	wrongPartition := ScopeHash("scope-2")
 
-	ticket, err := NewTenantRelayTicket(relayPriv, nodeID, targetID, correctTenant, time.Hour)
+	ticket, err := NewPartitionRelayTicket(relayPriv, nodeID, targetID, correctPartition, time.Hour)
 	if err != nil {
-		t.Fatalf("NewTenantRelayTicket failed: %v", err)
+		t.Fatalf("NewPartitionRelayTicket failed: %v", err)
 	}
 
-	err = ticket.VerifyWithTenant(relayPub, nodeID, wrongTenant)
-	if err != ErrTicketTenantMismatch {
-		t.Errorf("Expected ErrTicketTenantMismatch, got: %v", err)
+	err = ticket.VerifyWithPartition(relayPub, nodeID, wrongPartition)
+	if err != ErrTicketPartitionMismatch {
+		t.Errorf("Expected ErrTicketPartitionMismatch, got: %v", err)
 	}
 }
 
-func TestVerifyWithTenant_UnscopedTicket(t *testing.T) {
+func TestVerifyWithPartition_UnscopedTicket(t *testing.T) {
 	relayPub, relayPriv := generateTestKeyPair(t)
 	nodeID := randomNodeID(t)
 	targetID := randomNodeID(t)
@@ -414,41 +414,41 @@ func TestVerifyWithTenant_UnscopedTicket(t *testing.T) {
 		t.Fatalf("NewRelayTicket failed: %v", err)
 	}
 
-	// VerifyWithTenant should pass even with a scope hash — unscoped tickets skip scope check
-	anyTenant := ScopeHash("any-scope")
-	if err := ticket.VerifyWithTenant(relayPub, nodeID, anyTenant); err != nil {
-		t.Errorf("Unscoped ticket should pass VerifyWithTenant: %v", err)
+	// VerifyWithPartition should pass even with a scope hash — unscoped tickets skip scope check
+	anyPartition := ScopeHash("any-scope")
+	if err := ticket.VerifyWithPartition(relayPub, nodeID, anyPartition); err != nil {
+		t.Errorf("Unscoped ticket should pass VerifyWithPartition: %v", err)
 	}
 }
 
-func TestVerifyWithTenant_PropagatesBaseErrors(t *testing.T) {
+func TestVerifyWithPartition_PropagatesBaseErrors(t *testing.T) {
 	relayPub, relayPriv := generateTestKeyPair(t)
 	nodeID := randomNodeID(t)
 	targetID := randomNodeID(t)
 	wrongNode := randomNodeID(t)
-	tenantHash := ScopeHash("scope-1")
+	partitionHash := ScopeHash("scope-1")
 
-	ticket, err := NewTenantRelayTicket(relayPriv, nodeID, targetID, tenantHash, time.Hour)
+	ticket, err := NewPartitionRelayTicket(relayPriv, nodeID, targetID, partitionHash, time.Hour)
 	if err != nil {
-		t.Fatalf("NewTenantRelayTicket failed: %v", err)
+		t.Fatalf("NewPartitionRelayTicket failed: %v", err)
 	}
 
 	// Wrong node ID should return ErrTicketNodeMismatch (not scope error)
-	err = ticket.VerifyWithTenant(relayPub, wrongNode, tenantHash)
+	err = ticket.VerifyWithPartition(relayPub, wrongNode, partitionHash)
 	if err != ErrTicketNodeMismatch {
 		t.Errorf("Expected ErrTicketNodeMismatch, got: %v", err)
 	}
 }
 
-func TestTenantTicketMarshalUnmarshal(t *testing.T) {
+func TestPartitionTicketMarshalUnmarshal(t *testing.T) {
 	relayPub, relayPriv := generateTestKeyPair(t)
 	nodeID := randomNodeID(t)
 	targetID := randomNodeID(t)
-	tenantHash := ScopeHash("scope-abc")
+	partitionHash := ScopeHash("scope-abc")
 
-	original, err := NewTenantRelayTicket(relayPriv, nodeID, targetID, tenantHash, time.Hour)
+	original, err := NewPartitionRelayTicket(relayPriv, nodeID, targetID, partitionHash, time.Hour)
 	if err != nil {
-		t.Fatalf("NewTenantRelayTicket failed: %v", err)
+		t.Fatalf("NewPartitionRelayTicket failed: %v", err)
 	}
 
 	data := original.Marshal()
@@ -472,7 +472,7 @@ func TestTenantTicketMarshalUnmarshal(t *testing.T) {
 	}
 
 	// Restored ticket should still verify with scope
-	if err := restored.VerifyWithTenant(relayPub, nodeID, tenantHash); err != nil {
+	if err := restored.VerifyWithPartition(relayPub, nodeID, partitionHash); err != nil {
 		t.Errorf("Restored scope ticket verification failed: %v", err)
 	}
 }
@@ -498,7 +498,7 @@ func TestV1BackwardCompatUnmarshal(t *testing.T) {
 	// Copy nonce + expiry + nodeID + targetID from full marshal
 	copy(v1Data[:TicketNonceSize+8+32+32], fullData[:TicketNonceSize+8+32+32])
 	// Copy signature directly after targetID (skip scopeID)
-	copy(v1Data[TicketNonceSize+8+32+32:], fullData[TicketNonceSize+8+32+32+TicketTenantIDSize:])
+	copy(v1Data[TicketNonceSize+8+32+32:], fullData[TicketNonceSize+8+32+32+TicketPartitionIDSize:])
 
 	restored, err := UnmarshalTicket(v1Data)
 	if err != nil {
@@ -506,7 +506,7 @@ func TestV1BackwardCompatUnmarshal(t *testing.T) {
 	}
 
 	// ScopeID should be zero (unscoped)
-	if restored.IsTenantScoped() {
+	if restored.IsPartitionScoped() {
 		t.Error("v1 restored ticket should be unscoped")
 	}
 

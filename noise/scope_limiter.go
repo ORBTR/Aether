@@ -14,9 +14,9 @@ import (
 )
 
 var (
-	ErrTenantSessionLimit = errors.New("relay: scope session limit exceeded")
-	ErrTenantRelayLimit   = errors.New("relay: scope relay rate limit exceeded")
-	ErrTenantPairLimit    = errors.New("relay: scope relay pair limit exceeded")
+	ErrPartitionSessionLimit = errors.New("relay: scope session limit exceeded")
+	ErrPartitionRelayLimit   = errors.New("relay: scope relay rate limit exceeded")
+	ErrPartitionPairLimit    = errors.New("relay: scope relay pair limit exceeded")
 )
 
 // ScopeLimiterConfig configures per-scope rate limiting for relay traffic.
@@ -59,8 +59,8 @@ type ScopeLimiterConfig struct {
 // don't bother tuning per-scope weights — every scope gets equal share.
 const DefaultScopeWeight = 1
 
-// DefaultTenantLimiterConfig returns sensible defaults for shared relay nodes.
-func DefaultTenantLimiterConfig() ScopeLimiterConfig {
+// DefaultPartitionLimiterConfig returns sensible defaults for shared relay nodes.
+func DefaultPartitionLimiterConfig() ScopeLimiterConfig {
 	return ScopeLimiterConfig{
 		Enabled:       false,
 		MaxSessions:   500,
@@ -82,12 +82,12 @@ type partitionState struct {
 	relayPairs map[string]time.Time
 }
 
-// TenantRelayLimiter enforces per-scope resource limits on relay traffic.
+// PartitionRelayLimiter enforces per-scope resource limits on relay traffic.
 // It tracks relay packet rates and active relay pairs per scope.
 // Session counts are derived from the noiseListener's ConnectionMap scope index.
 //
 // Thread-safe: all methods acquire their own lock.
-type TenantRelayLimiter struct {
+type PartitionRelayLimiter struct {
 	mu     sync.Mutex
 	config ScopeLimiterConfig
 	state  map[string]*partitionState // scopeID → state
@@ -106,20 +106,20 @@ type TenantRelayLimiter struct {
 
 // PairsEvictedCount returns the number of relay pairs evicted under
 // per-scope LRU pressure. Observability hook for S9.
-func (l *TenantRelayLimiter) PairsEvictedCount() uint64 {
+func (l *PartitionRelayLimiter) PairsEvictedCount() uint64 {
 	return atomic.LoadUint64(&l.pairsEvicted)
 }
 
 // RelayEvictions returns the count of cross-scope WFQ evictions — pairs
 // displaced from over-committed scopes to admit requests on under-
 // committed scopes. Zero unless MaxTotalPairs is set. S9 metric.
-func (l *TenantRelayLimiter) RelayEvictions() uint64 {
+func (l *PartitionRelayLimiter) RelayEvictions() uint64 {
 	return atomic.LoadUint64(&l.relayEvictions)
 }
 
 // totalPairsLocked returns the global pair count across all scopes.
 // Caller must hold l.mu.
-func (l *TenantRelayLimiter) totalPairsLocked() int {
+func (l *PartitionRelayLimiter) totalPairsLocked() int {
 	n := 0
 	for _, s := range l.state {
 		n += len(s.relayPairs)
@@ -130,7 +130,7 @@ func (l *TenantRelayLimiter) totalPairsLocked() int {
 // scopeWeight returns the WFQ weight for a scope ID. Lookup is config-
 // driven; unmapped scopes receive DefaultScopeWeight so operators only
 // need to list scopes that deserve non-default shares.
-func (l *TenantRelayLimiter) scopeWeight(scopeID string) int {
+func (l *PartitionRelayLimiter) scopeWeight(scopeID string) int {
 	if w, ok := l.config.ScopeWeights[scopeID]; ok && w > 0 {
 		return w
 	}
@@ -146,7 +146,7 @@ func (l *TenantRelayLimiter) scopeWeight(scopeID string) int {
 // MaxTotalPairs. A scope using more than its entitlement is "busy." We
 // pick the one most over-committed relative to its weight — that's the
 // scope whose eviction restores the best fairness delta.
-func (l *TenantRelayLimiter) pickBusiestScopeLocked() string {
+func (l *PartitionRelayLimiter) pickBusiestScopeLocked() string {
 	var bestID string
 	var bestRatio float64
 	first := true
@@ -169,30 +169,30 @@ func (l *TenantRelayLimiter) pickBusiestScopeLocked() string {
 	return bestID
 }
 
-// NewTenantRelayLimiter creates a limiter with the provided configuration.
-func NewTenantRelayLimiter(cfg ScopeLimiterConfig) *TenantRelayLimiter {
-	return &TenantRelayLimiter{
+// NewPartitionRelayLimiter creates a limiter with the provided configuration.
+func NewPartitionRelayLimiter(cfg ScopeLimiterConfig) *PartitionRelayLimiter {
+	return &PartitionRelayLimiter{
 		config: cfg,
 		state:  make(map[string]*partitionState),
 	}
 }
 
 // Config returns the current limiter configuration.
-func (l *TenantRelayLimiter) Config() ScopeLimiterConfig {
+func (l *PartitionRelayLimiter) Config() ScopeLimiterConfig {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.config
 }
 
 // UpdateConfig replaces the limiter configuration at runtime.
-func (l *TenantRelayLimiter) UpdateConfig(cfg ScopeLimiterConfig) {
+func (l *PartitionRelayLimiter) UpdateConfig(cfg ScopeLimiterConfig) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.config = cfg
 }
 
 // getOrCreate returns the state for a scope, creating it if needed. Caller must hold l.mu.
-func (l *TenantRelayLimiter) getOrCreate(scopeID string) *partitionState {
+func (l *PartitionRelayLimiter) getOrCreate(scopeID string) *partitionState {
 	s, ok := l.state[scopeID]
 	if !ok {
 		s = &partitionState{
@@ -208,7 +208,7 @@ func (l *TenantRelayLimiter) getOrCreate(scopeID string) *partitionState {
 // CheckSessionLimit returns an error if adding another session for scopeID
 // would exceed the configured limit. currentCount is the number of sessions
 // the scope currently has (caller provides from ConnectionMap).
-func (l *TenantRelayLimiter) CheckSessionLimit(scopeID string, currentCount int) error {
+func (l *PartitionRelayLimiter) CheckSessionLimit(scopeID string, currentCount int) error {
 	if scopeID == "" {
 		return nil // Dedicated mode — no limits
 	}
@@ -220,15 +220,15 @@ func (l *TenantRelayLimiter) CheckSessionLimit(scopeID string, currentCount int)
 	}
 
 	if currentCount >= l.config.MaxSessions {
-		return ErrTenantSessionLimit
+		return ErrPartitionSessionLimit
 	}
 	return nil
 }
 
 // AllowRelay checks whether a relay packet is allowed for the given scope.
 // Uses a token bucket algorithm: tokens refill at MaxRelayRate per second.
-// Returns nil if allowed, ErrTenantRelayLimit if rate exceeded.
-func (l *TenantRelayLimiter) AllowRelay(scopeID string) error {
+// Returns nil if allowed, ErrPartitionRelayLimit if rate exceeded.
+func (l *PartitionRelayLimiter) AllowRelay(scopeID string) error {
 	if scopeID == "" {
 		return nil
 	}
@@ -253,7 +253,7 @@ func (l *TenantRelayLimiter) AllowRelay(scopeID string) error {
 
 	// Consume one token
 	if s.relayTokens < 1.0 {
-		return ErrTenantRelayLimit
+		return ErrPartitionRelayLimit
 	}
 	s.relayTokens -= 1.0
 	return nil
@@ -273,7 +273,7 @@ func (l *TenantRelayLimiter) AllowRelay(scopeID string) error {
 // Step 3 runs in addition to step 2, so a scope that's both over its own
 // cap AND the global cap will see its own eviction (step 2) rather than
 // evicting another scope's traffic unnecessarily.
-func (l *TenantRelayLimiter) CheckRelayPair(scopeID, pairKey string) error {
+func (l *PartitionRelayLimiter) CheckRelayPair(scopeID, pairKey string) error {
 	if scopeID == "" {
 		return nil
 	}
@@ -306,7 +306,7 @@ func (l *TenantRelayLimiter) CheckRelayPair(scopeID, pairKey string) error {
 			// AE-L-10: The calling scope itself is the busiest. We only reach
 			// here with total still >= MaxTotalPairs, so step 2 did NOT free a
 			// slot — it evicts only when the scope is already at its own
-			// MaxRelayPairs, which a below-cap dominant tenant never hits.
+			// MaxRelayPairs, which a below-cap dominant partition never hits.
 			// Self-evict this scope's LRU pair unconditionally so the caller's
 			// subsequent TrackRelayPair cannot push the global count past the
 			// hard cap. Churn within the scope, not a stall — the WFQ intent.
@@ -320,7 +320,7 @@ func (l *TenantRelayLimiter) CheckRelayPair(scopeID, pairKey string) error {
 // evictOldestLocked drops the least-recently-used pair from a scope.
 // crossScope=true credits the WFQ counter; false credits the per-scope
 // LRU counter. Caller must hold l.mu.
-func (l *TenantRelayLimiter) evictOldestLocked(scopeID string, s *partitionState, crossScope bool) {
+func (l *PartitionRelayLimiter) evictOldestLocked(scopeID string, s *partitionState, crossScope bool) {
 	var oldestKey string
 	var oldestTime time.Time
 	first := true
@@ -344,7 +344,7 @@ func (l *TenantRelayLimiter) evictOldestLocked(scopeID string, s *partitionState
 // TrackRelayPair registers an active relay pair for the scope, stamping it
 // with the current time for LRU bookkeeping.
 // Call this after CheckRelayPair succeeds and the relay is established.
-func (l *TenantRelayLimiter) TrackRelayPair(scopeID, pairKey string) {
+func (l *PartitionRelayLimiter) TrackRelayPair(scopeID, pairKey string) {
 	if scopeID == "" {
 		return
 	}
@@ -356,7 +356,7 @@ func (l *TenantRelayLimiter) TrackRelayPair(scopeID, pairKey string) {
 }
 
 // RemoveRelayPair removes a relay pair when a session closes.
-func (l *TenantRelayLimiter) RemoveRelayPair(scopeID, pairKey string) {
+func (l *PartitionRelayLimiter) RemoveRelayPair(scopeID, pairKey string) {
 	if scopeID == "" {
 		return
 	}
@@ -369,7 +369,7 @@ func (l *TenantRelayLimiter) RemoveRelayPair(scopeID, pairKey string) {
 }
 
 // RelayPairCount returns the number of active relay pairs for a scope.
-func (l *TenantRelayLimiter) RelayPairCount(scopeID string) int {
+func (l *PartitionRelayLimiter) RelayPairCount(scopeID string) int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -379,9 +379,9 @@ func (l *TenantRelayLimiter) RelayPairCount(scopeID string) int {
 	return 0
 }
 
-// Cleanup removes state for tenants with no active relay pairs.
+// Cleanup removes state for partitions with no active relay pairs.
 // Call periodically to prevent unbounded memory growth.
-func (l *TenantRelayLimiter) Cleanup() {
+func (l *PartitionRelayLimiter) Cleanup() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 

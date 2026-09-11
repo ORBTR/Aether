@@ -47,20 +47,20 @@ const (
 )
 
 var (
-	ErrPreambleTooShort  = errors.New("preamble: data too short")
-	ErrTenantIDTooLong   = errors.New("preamble: scope ID exceeds maximum length")
-	ErrTenantIDEmpty     = errors.New("preamble: scope ID is empty")
-	ErrPreambleTruncated = errors.New("preamble: data truncated before scope ID")
+	ErrPreambleTooShort   = errors.New("preamble: data too short")
+	ErrPartitionIDTooLong = errors.New("preamble: scope ID exceeds maximum length")
+	ErrPartitionIDEmpty   = errors.New("preamble: scope ID is empty")
+	ErrPreambleTruncated  = errors.New("preamble: data truncated before scope ID")
 )
 
 // EncodePreamble builds the preamble bytes for a given scope ID.
 // The caller appends the standard [CRC32][noise_msg1] after the returned bytes.
 func EncodePreamble(scopeID string) ([]byte, error) {
 	if scopeID == "" {
-		return nil, ErrTenantIDEmpty
+		return nil, ErrPartitionIDEmpty
 	}
 	if len(scopeID) > MaxScopeIDLength {
-		return nil, ErrTenantIDTooLong
+		return nil, ErrPartitionIDTooLong
 	}
 	buf := make([]byte, PreambleHeaderSize+len(scopeID))
 	binary.BigEndian.PutUint16(buf[0:2], PreambleMagic)
@@ -93,10 +93,10 @@ func DecodePreamble(data []byte) (scopeID string, rest []byte, err error) {
 
 	idLen := int(binary.BigEndian.Uint16(data[2:4]))
 	if idLen == 0 {
-		return "", nil, ErrTenantIDEmpty
+		return "", nil, ErrPartitionIDEmpty
 	}
 	if idLen > MaxScopeIDLength {
-		return "", nil, ErrTenantIDTooLong
+		return "", nil, ErrPartitionIDTooLong
 	}
 
 	end := PreambleHeaderSize + idLen

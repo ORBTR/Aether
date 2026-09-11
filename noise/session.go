@@ -558,8 +558,8 @@ func (l *noiseListener) pruneStaleHandshakes(maxAge time.Duration) {
 	}
 }
 
-// tenantForNode returns the scope ID for a node, or "" if unknown.
-func (l *noiseListener) tenantForNode(nodeID aether.NodeID) string {
+// partitionForNode returns the scope ID for a node, or "" if unknown.
+func (l *noiseListener) partitionForNode(nodeID aether.NodeID) string {
 	nc := connFromSession(l.sessions.Get(nodeID))
 	if nc != nil {
 		return nc.scopeID

@@ -1135,7 +1135,7 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 //
 // Wire format: [optional preamble][CRC32 4B][pattern flag 1B][noise msg]
 //
-// If the transport has a TenantKeyResolver and the packet starts with a preamble,
+// If the transport has a PartitionKeyResolver and the packet starts with a preamble,
 // the scope ID is extracted and keys are resolved dynamically.
 // Otherwise, the packet is assumed to start with a CRC32 fingerprint and keys
 // are looked up from the transport's static keyMap.

@@ -53,13 +53,13 @@ func TestRoutingPreamble_RejectsShort(t *testing.T) {
 }
 
 func TestRoutingPreamble_RejectsWrongMagic(t *testing.T) {
-	// Tenant-preamble magic 0x5450 starts with 'T' (0x54), distinct from
+	// Partition-preamble magic 0x5450 starts with 'T' (0x54), distinct from
 	// routing-preamble magic 0x4145 ('A'). Ensure the discriminator works.
 	wire := make([]byte, RoutingPreambleSize)
 	wire[0] = 0x54
 	wire[1] = 0x50
 	if IsRoutingPreamble(wire) {
-		t.Fatal("IsRoutingPreamble matched a tenant-preamble magic — discriminator broken")
+		t.Fatal("IsRoutingPreamble matched a partition-preamble magic — discriminator broken")
 	}
 	if _, _, err := DecodeRoutingPreamble(wire); !errors.Is(err, ErrRoutingPreambleMagicMismatch) {
 		t.Fatalf("wrong-magic err = %v, want ErrRoutingPreambleMagicMismatch", err)
@@ -84,7 +84,7 @@ func TestRoutingPreamble_IsNotMistakenForRawMsg1(t *testing.T) {
 	for _, prefix := range [][]byte{
 		{0x00, 0x00}, // zeros
 		{0xFF, 0xFF}, // ones
-		{0x54, 0x50}, // tenant-preamble magic — must NOT be confused with routing
+		{0x54, 0x50}, // partition-preamble magic — must NOT be confused with routing
 	} {
 		if IsRoutingPreamble(prefix) {
 			t.Fatalf("IsRoutingPreamble false-positive on %x", prefix)

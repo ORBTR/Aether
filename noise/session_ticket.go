@@ -210,7 +210,7 @@ func (ts *TicketStore) IssueTicket(peerID aether.NodeID, send, recv *fnoise.Ciph
 	// AE-H-07: fixed 124B prefix + [2B scopeLen][scopeID]. Scope validated to
 	// MaxScopeIDLength (matches the preamble bound) so the uint16 never truncates.
 	if len(scopeID) > MaxScopeIDLength {
-		return nil, ErrTenantIDTooLong
+		return nil, ErrPartitionIDTooLong
 	}
 	plaintext := make([]byte, ticketPlaintextSize+ticketScopeLenSize+len(scopeID))
 	binary.BigEndian.PutUint64(plaintext[0:8], uint64(ticket.ExpiresAt.UnixNano()))
