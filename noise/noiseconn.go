@@ -127,13 +127,13 @@ type noiseConn struct {
 	// Rekey tracking
 	rekey *RekeyTracker
 
-	// crossOrgPreambleTarget — when non-empty, the listener-side
+	// crossOriginPreambleTarget — when non-empty, the listener-side
 	// writeFunc prepends a routing preamble for this NodeID on every
 	// outbound write. Set by the initiator dial path when
-	// Target.Metadata[MetadataKeyCrossOrgPreamble]="1" so post-handshake
+	// Target.Metadata[MetadataKeyCrossOriginPreamble]="1" so post-handshake
 	// data also hairpins through the anycast-receiving machine and
-	// reaches the right same-org machine in the destination app.
-	crossOrgPreambleTarget aether.NodeID
+	// reaches the right same-origin machine in the destination app.
+	crossOriginPreambleTarget aether.NodeID
 
 	// peerMaxAckDelay is the peer's advertised max_ack_delay (RFC 9002
 	// §6.2) extracted from the handshake NodeInfo payload. Used by the

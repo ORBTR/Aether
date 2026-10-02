@@ -13,24 +13,19 @@ import (
 	aether "github.com/ORBTR/aether"
 )
 
-// Routing preamble — scaffold for the intra-org noise-UDP forwarder.
+// Routing preamble: the WIRE-FORMAT codec and constants of the
+// intra-origin noise-UDP forwarder. This file holds only the codec. The
+// dialer prepends the preamble in handshake.go and listener_forward.go
+// (buildNoiseConnWriteFunc); the anycast-receiving machine reads it in
+// listener_forward.go (handleForwarderPacket) and relays to the target
+// machine over 6PN with the inner relay protocol and per-flow relay tables
+// in inner_relay.go.
 //
-// SCOPE: this file currently provides the WIRE-FORMAT codec and constants.
-// The forwarder logic (listener-side branching, inner relay protocol between
-// the anycast-receiving machine and the target machine over 6PN, per-flow
-// relay table) is documented in
-// the consuming runtime cross-org anycast forwarder plan
-// and intentionally NOT shipped here — it requires sustained design + test
-// + staged rollout work that warrants its own focused session.
-//
-// What this scaffold buys: the wire format is fixed now, so a dialer
-// upgraded later can emit preambled msg1 packets and have them be
-// distinguishable from legacy msg1 by the discriminator byte. Receivers
-// without forwarder support pass preambled msg1 through to the normal
-// noise path UNMODIFIED, which means a forwarded preamble for THIS
-// machine's NodeID works correctly the moment the rest of the listener
-// logic is wired (and a preamble for a non-local NodeID just fails the
-// handshake — graceful degradation).
+// The discriminator byte keeps a preambled msg1 distinguishable from one
+// sent without a preamble. A receiver without forwarder support passes a
+// preambled msg1 through to the normal noise path UNMODIFIED, so a preamble
+// naming THIS machine's NodeID still completes the handshake and one naming
+// another NodeID fails it.
 
 // Wire format (prepended to noise msg1 before any scope preamble):
 //
@@ -55,13 +50,15 @@ import (
 // 0x54 → scope preamble; anything else → raw msg1.
 
 const (
-	// MetadataKeyCrossOrgPreamble is the well-known aether.Target.Metadata
+	// MetadataKeyCrossOriginPreamble is the well-known aether.Target.Metadata
 	// key that signals the Noise dialer should prepend a routing preamble
 	// (target = the dial Target.NodeID) to msg1 + retransmits + msg3.
-	// The value must be "1" (any other value is treated as unset). Library
-	// sets this when dialing to a cross-org anycast IPv4 so the receiving
-	// machine M_r can forward to the target machine M_t over 6PN.
-	MetadataKeyCrossOrgPreamble = "aether.cross_org_preamble"
+	// The value must be "1" (any other value is treated as unset). A dialer
+	// sets it when dialing a peer of another origin at its public anycast
+	// IPv4 so the receiving machine M_r can forward to the target machine
+	// M_t over 6PN. NoiseTransport.Dial reads it in the dialing process; the
+	// key itself never goes on the wire, only the preamble it switches on.
+	MetadataKeyCrossOriginPreamble = "aether.cross_origin_preamble"
 
 	// RoutingPreambleMagic identifies a routing-preamble-bearing packet
 	// ("AE" = AEther routing).
@@ -95,13 +92,13 @@ var (
 // NodeID.Canonical() if unsure). Flags is reserved for future use
 // (e.g. 0x80 = reply marker).
 //
-// Returns nil for a NodeID longer than RoutingPreambleNodeIDSize. AER-108:
-// this used to panic to surface a programmer error, but ParseNodeID accepts a
-// documented 52-char legacy form (56 bytes) that is longer than 30, so a
-// public-API NodeID value could reach here and crash the process during a
-// cross-org dial. Truncating would forward to the wrong machine; returning nil
-// makes the caller emit the packet WITHOUT a routing preamble (degrading to a
-// direct dial) instead of crashing. Canonical NodeIDs are exactly 30 bytes.
+// Returns nil for a NodeID longer than RoutingPreambleNodeIDSize.
+// ParseNodeID accepts a documented 52-char form (56 bytes) that is longer
+// than 30, so a public-API NodeID value can reach here during a
+// cross-origin dial. Truncating would forward to the wrong machine and a
+// panic would crash the process; returning nil makes the caller emit the
+// packet WITHOUT a routing preamble (degrading to a direct dial). Canonical
+// NodeIDs are exactly 30 bytes.
 func EncodeRoutingPreamble(target aether.NodeID) []byte {
 	if len(target) > RoutingPreambleNodeIDSize {
 		dbgNoise.Printf("EncodeRoutingPreamble: NodeID %q exceeds %d bytes — emitting no preamble",

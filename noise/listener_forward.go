@@ -10,7 +10,7 @@ import (
 	"net"
 )
 
-// noiseListener integration for the cross-org anycast forwarder.
+// noiseListener integration for the cross-origin anycast forwarder.
 //
 // The listener's runReader loop calls handleForwarderPacket on every
 // inbound datagram before the normal noise classify/dispatch path.
@@ -46,7 +46,7 @@ import (
 // CRITICAL: socket selection differs between the two branches. The
 // direct path writes to addr (the originator's IPv4 5-tuple from Fly's
 // edge) and must use the IPv4 listener socket. The relay path writes
-// to relayAddr (a same-org 6PN IPv6 ULA) and must use the IPv6 listener
+// to relayAddr (a same-origin 6PN IPv6 ULA) and must use the IPv6 listener
 // socket on dual-stack binds — using the IPv4 socket fails the write.
 // connFor(target) picks the right socket for each target's address
 // family.
@@ -73,24 +73,24 @@ func (l *noiseListener) writeRelayAware(addr *net.UDPAddr, msg []byte) (int, err
 // noiseConn (both the initiator dial path and the responder accept
 // path use newNoiseConnListener, so this one builder serves both).
 //
-// Two cross-org branches apply per write, in priority order:
+// Two cross-origin branches apply per write, in priority order:
 //
 //  1. T-table relay (responder/M_t side): the destination is a synth
 //     originator from an OpForward ingress — wrap in OpReply and send
 //     to the M_r relay addr instead of `remote`.
 //
-//  2. Per-conn routing preamble (initiator side): nc.crossOrgPreambleTarget
+//  2. Per-conn routing preamble (initiator side): nc.crossOriginPreambleTarget
 //     is non-empty — prepend an EncodeRoutingPreamble(target) frame so
 //     M_r can hairpin to the right machine in the destination app.
 //
-// Neither branch fires on same-org / direct dials (no forwarder, no
+// Neither branch fires on same-origin / direct dials (no forwarder, no
 // preamble target), so the hot path stays a plain WriteToUDP.
 func buildNoiseConnWriteFunc(nc *noiseConn, l *noiseListener, remote *net.UDPAddr) func([]byte) (int, error) {
 	return func(msg []byte) (int, error) {
 		// Check order: T-table first, then per-conn preamble. This order
 		// is correct because the two flags are role-disjoint — the
 		// T-table is only ever populated on M_t's OpForward ingress
-		// (responder side), while crossOrgPreambleTarget is only ever
+		// (responder side), while crossOriginPreambleTarget is only ever
 		// set on initiator-side noiseConns. Swapping the order would
 		// silently break post-handshake hairpin if a future change ever
 		// allowed a conn to be both.
@@ -107,8 +107,8 @@ func buildNoiseConnWriteFunc(nc *noiseConn, l *noiseListener, remote *net.UDPAdd
 				return len(msg), nil
 			}
 		}
-		// Initiator cross-org: prepend routing preamble so M_r hairpins.
-		if target := nc.crossOrgPreambleTarget; target != "" {
+		// Initiator cross-origin: prepend routing preamble so M_r hairpins.
+		if target := nc.crossOriginPreambleTarget; target != "" {
 			preamble := EncodeRoutingPreamble(target)
 			framed := make([]byte, 0, len(preamble)+len(msg))
 			framed = append(framed, preamble...)
@@ -142,13 +142,13 @@ func (l *noiseListener) handleForwarderPacket(buf []byte, addr *net.UDPAddr, con
 
 	// Routing preamble — M_r side ingress from the public anycast.
 	// Counter records receipt before any drop classification: without it,
-	// 12/12 cross_org_preamble_dials_failed paired with 0 forwarder_drops
-	// is ambiguous (packet never arrived at M_r vs. arrived and silently
-	// failed). Comparing CrossOrgMsg1Received against the dialer's
-	// preamble_dials_attempted reveals which side of the wire is the
-	// failing layer.
+	// a dialer's failed preamble dials paired with zero forwarder drops
+	// are ambiguous (packet never arrived at M_r vs. arrived and silently
+	// failed). Comparing CrossOriginMsg1Received against the dialer's
+	// count of preamble dials attempted shows which side of the wire is
+	// the failing layer.
 	if IsRoutingPreamble(buf) {
-		fwd.recordCrossOrgMsg1Received()
+		fwd.recordCrossOriginMsg1Received()
 		return l.onRoutingPreamble(fwd, buf, addr, conn)
 	}
 
@@ -163,13 +163,13 @@ func (l *noiseListener) handleForwarderPacket(buf []byte, addr *net.UDPAddr, con
 
 // onRoutingPreamble runs on the anycast-receiving machine M_r. The
 // cleartext preamble carries the target NodeID; if we're not it, look
-// up the right same-org machine and forward via OpForward.
+// up the right same-origin machine and forward via OpForward.
 //
 // The `conn` parameter is the socket the preamble arrived on (typically
 // the IPv4 anycast socket). The OUTBOUND write to targetAddr (M_t's 6PN
 // IPv6 ULA) uses connFor(targetAddr) so dual-stack binds pick the IPv6
 // socket — the inbound IPv4 socket can't write to an IPv6 destination.
-func (l *noiseListener) onRoutingPreamble(fwd *IntraOrgForwarder, buf []byte, addr *net.UDPAddr, conn *net.UDPConn) ([]byte, *net.UDPAddr, bool) {
+func (l *noiseListener) onRoutingPreamble(fwd *IntraOriginForwarder, buf []byte, addr *net.UDPAddr, conn *net.UDPConn) ([]byte, *net.UDPAddr, bool) {
 	_ = conn // socket for the OpForward write is picked from targetAddr below
 	target, rest, err := DecodeRoutingPreamble(buf)
 	if err != nil {
@@ -189,7 +189,7 @@ func (l *noiseListener) onRoutingPreamble(fwd *IntraOrgForwarder, buf []byte, ad
 		return rest, addr, false
 	}
 
-	// Non-local target: look up the same-org machine that holds the
+	// Non-local target: look up the same-origin machine that holds the
 	// target's listener. Drop if unknown — the dialer's WS fallback
 	// will still establish a session.
 	targetAddr, ok := fwd.Lookup(target)
@@ -220,15 +220,15 @@ func (l *noiseListener) onRoutingPreamble(fwd *IntraOrgForwarder, buf []byte, ad
 // IPv4 5-tuple via connFor(origin) — that picks the IPv4 socket so
 // Fly's edge 5-tuple flow tracking delivers it back to the originator
 // on the original flow.
-func (l *noiseListener) onInnerRelay(fwd *IntraOrgForwarder, buf []byte, addr *net.UDPAddr, conn *net.UDPConn) ([]byte, *net.UDPAddr, bool) {
+func (l *noiseListener) onInnerRelay(fwd *IntraOriginForwarder, buf []byte, addr *net.UDPAddr, conn *net.UDPConn) ([]byte, *net.UDPAddr, bool) {
 	_ = conn // socket for OpReply unwrap write is picked from origin below
-	// AER-038: inner-relay OpForward/OpReply are trusted control messages
-	// exchanged between same-org machines over the private network (6PN ULA on
+	// Inner-relay OpForward/OpReply are trusted control messages exchanged
+	// between same-origin machines over the private network (6PN ULA on
 	// Fly). Accept them ONLY from a private/loopback source. Processing them
 	// from ANY socket — including the public anycast IP, and BEFORE the flood
-	// limiters — let an off-path attacker inject an OpForward carrying a victim
-	// 5-tuple, poisoning the relay table to redirect/black-hole the victim's
-	// session and deliver its ciphertext to the attacker.
+	// limiters — would let an off-path attacker inject an OpForward carrying a
+	// victim 5-tuple, poisoning the relay table to redirect/black-hole the
+	// victim's session and deliver its ciphertext to the attacker.
 	if addr == nil || addr.IP == nil || !(addr.IP.IsPrivate() || addr.IP.IsLoopback()) {
 		fwd.recordDrop(dropInnerRelayUntrustedSrc)
 		dbgNoise.Printf("forwarder: dropping inner-relay frame from untrusted (non-private) source %s", addr)

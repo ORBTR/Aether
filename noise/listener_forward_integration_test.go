@@ -19,16 +19,16 @@ import (
 	"github.com/ORBTR/aether"
 )
 
-// TestCrossOrgForwarder_HairpinRoundTrip wires three NoiseTransports in
-// the same test process to verify the cross-org forwarder hairpin flow:
+// TestCrossOriginForwarder_HairpinRoundTrip wires three NoiseTransports in
+// the same test process to verify the cross-origin forwarder hairpin flow:
 //
 //	[originator] --dial--> [M_r]  -- OpForward --> [M_t]
 //	    ^                    |
 //	    +-- M_r unwraps -----+ <-- OpReply -------+
 //
 // The originator dials M_r's address but with target.NodeID = M_t's
-// NodeID and Metadata[cross_org_preamble]="1". M_r's listener sees the
-// preamble, learns the target is M_t (not local), wraps msg1 in
+// NodeID and Metadata[MetadataKeyCrossOriginPreamble]="1". M_r's listener
+// sees the preamble, learns the target is M_t (not local), wraps msg1 in
 // OpForward, and ships it to M_t over the loopback "6PN" path. M_t's
 // listener accepts via OpForward branch, injects the payload as if it
 // came from the originator, runs the handshake, and replies. M_t's
@@ -40,7 +40,7 @@ import (
 //   - M_r → M_t:                  OpForward(msg1)
 //   - M_t → M_r:                  OpReply(msg2 / data)
 //   - M_r → originator:           unwrapped via R-table lookup
-func TestCrossOrgForwarder_HairpinRoundTrip(t *testing.T) {
+func TestCrossOriginForwarder_HairpinRoundTrip(t *testing.T) {
 	// The pre-existing TestNoiseRoundTrip skips on Windows due to shared-
 	// socket timing sensitivity; this test uses the same retry-with-backoff
 	// pattern in its dial loop so it runs cross-platform.
@@ -66,7 +66,7 @@ func TestCrossOrgForwarder_HairpinRoundTrip(t *testing.T) {
 	// REGISTERS T-table entries. Without a forwarder attached, M_t
 	// can't accept the OpForward at all (the listener_forward.go
 	// guard skips both branches when transport.forwarder == nil).
-	mtFwd := NewIntraOrgForwarder(mtNodeID, nil)
+	mtFwd := NewIntraOriginForwarder(mtNodeID, nil)
 	mtTransport.SetForwarder(mtFwd)
 	t.Cleanup(func() { _ = mtTransport.Close() })
 
@@ -120,7 +120,7 @@ func TestCrossOrgForwarder_HairpinRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("M_r NewNoiseTransport: %v", err)
 	}
-	mrFwd := NewIntraOrgForwarder(mrNodeID, func(target aether.NodeID) (*net.UDPAddr, bool) {
+	mrFwd := NewIntraOriginForwarder(mrNodeID, func(target aether.NodeID) (*net.UDPAddr, bool) {
 		if target == mtNodeID {
 			return mtAddr, true
 		}
@@ -162,7 +162,7 @@ func TestCrossOrgForwarder_HairpinRoundTrip(t *testing.T) {
 	time.Sleep(80 * time.Millisecond)
 
 	// ─── Dial: target = M_t's NodeID, address = M_r's addr, with the
-	//        cross-org preamble metadata set so handshake.go emits the
+	//        cross-origin preamble metadata set so handshake.go emits the
 	//        routing preamble on msg1/retransmits/msg3. ──────────────
 	var origSession aether.Connection
 	for attempt := 0; attempt < 3; attempt++ {
@@ -172,7 +172,7 @@ func TestCrossOrgForwarder_HairpinRoundTrip(t *testing.T) {
 			NodeID:  mtNodeID,
 			Address: mrAddr.String(),
 			Metadata: map[string]string{
-				MetadataKeyCrossOrgPreamble: "1",
+				MetadataKeyCrossOriginPreamble: "1",
 			},
 		})
 		dialCancel()

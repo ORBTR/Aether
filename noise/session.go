@@ -77,7 +77,7 @@ func newNoiseConnListener(ptr *noiseListener, send, recv *noise.CipherState, rem
 		health:         transportHealth.NewMonitor(0.2), // EMA alpha default, overridden by aether.healthAlpha
 		rekey:          NewRekeyTracker(cfg.RekeyAfterBytes, cfg.RekeyAfterDuration),
 	}
-	// writeFunc closes over nc so it can read crossOrgPreambleTarget on
+	// writeFunc closes over nc so it can read crossOriginPreambleTarget on
 	// every send — letting the dial path set it post-construction
 	// without rebuilding the func. Closure also captures the listener
 	// so socket selection (connFor) can pick the right address-family
@@ -257,7 +257,7 @@ func (l *noiseListener) runReader(ctx context.Context, conn *net.UDPConn) {
 			continue
 		}
 
-		// Cross-org forwarder: routing preamble (M_r side) + inner
+		// Cross-origin forwarder: routing preamble (M_r side) + inner
 		// relay frames (both sides). MUST run BEFORE dispatchToSession
 		// because forwarder may substitute addr to the originator's
 		// 5-tuple — and dispatchToSession's key derives from addr.

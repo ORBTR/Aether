@@ -217,17 +217,18 @@ func (t *NoiseTransport) performInitiatorHandshakeAttempt(ctx context.Context, u
 // shared UDP socket. Handshake responses are received via the listener's
 // pendingDials channel dispatch. After completion, the session is registered
 // in the listener's session map for ongoing packet dispatch.
-func (t *NoiseTransport) performInitiatorHandshakeShared(ctx context.Context, listener *noiseListener, addr *net.UDPAddr, path aether.Path, crossOrgPreamble bool) (aether.Connection, error) {
-	return t.performInitiatorHandshakeSharedAttempt(ctx, listener, addr, path, false, crossOrgPreamble)
+func (t *NoiseTransport) performInitiatorHandshakeShared(ctx context.Context, listener *noiseListener, addr *net.UDPAddr, path aether.Path, crossOriginPreamble bool) (aether.Connection, error) {
+	return t.performInitiatorHandshakeSharedAttempt(ctx, listener, addr, path, false, crossOriginPreamble)
 }
 
 // performInitiatorHandshakeSharedAttempt runs one shared-socket handshake
 // attempt. `xxOnly` forces XX even if a peer key is cached — used by the
 // XK-failure retry to bound recursion depth to 1 (preventing a stale-key
 // loop if another goroutine re-caches the peer key during eviction).
-// `crossOrgPreamble` prepends a routing preamble to msg1/retransmits/msg3
-// so the cross-org anycast-receiving machine can hairpin to the target.
-func (t *NoiseTransport) performInitiatorHandshakeSharedAttempt(ctx context.Context, listener *noiseListener, addr *net.UDPAddr, path aether.Path, xxOnly bool, crossOrgPreamble bool) (aether.Connection, error) {
+// `crossOriginPreamble` prepends a routing preamble to msg1/retransmits/msg3
+// so the anycast-receiving machine of the target's origin can hairpin to the
+// target.
+func (t *NoiseTransport) performInitiatorHandshakeSharedAttempt(ctx context.Context, listener *noiseListener, addr *net.UDPAddr, path aether.Path, xxOnly bool, crossOriginPreamble bool) (aether.Connection, error) {
 	dbgHandshake.Printf("Starting shared-socket handshake to %s (xxOnly=%v)", path.NodeID.Short(), xxOnly)
 
 	// Register pending dial with a unique nonce so the responder can echo it back
@@ -313,11 +314,11 @@ func (t *NoiseTransport) performInitiatorHandshakeSharedAttempt(ctx context.Cont
 	noncePacket = append(noncePacket, nonce...)
 	noncePacket = append(noncePacket, packet...)
 
-	// Cross-org dials prepend a routing preamble OUTSIDE the dial-nonce
+	// Cross-origin dials prepend a routing preamble OUTSIDE the dial-nonce
 	// envelope. The anycast-receiving machine (M_r) strips the preamble
 	// before forwarding; the target machine (M_t) then sees the
 	// dial-nonce envelope exactly as a direct dial would have produced.
-	if crossOrgPreamble {
+	if crossOriginPreamble {
 		preamble := EncodeRoutingPreamble(path.NodeID)
 		framed := make([]byte, 0, len(preamble)+len(noncePacket))
 		framed = append(framed, preamble...)
@@ -336,12 +337,12 @@ func (t *NoiseTransport) performInitiatorHandshakeSharedAttempt(ctx context.Cont
 	}
 
 	// Receive msg2 via pending dial channel. The responder may instead
-	// reply with a RETRY packet (S3 — _SECURITY.md §3.1) to validate our
-	// source address. Detect that, then re-send msg1 with the cookie
-	// prepended. We accept at most one retry round-trip per handshake.
+	// reply with a RETRY packet to validate our source address. Detect that,
+	// then re-send msg1 with the cookie prepended. We accept at most one retry
+	// round-trip per handshake.
 	//
 	// Retransmit msg1 on a ticker until msg2 arrives or the dial deadline
-	// elapses: raw UDP drops packets, and on a cross-org / public path
+	// elapses: raw UDP drops packets, and on a cross-origin / public path
 	// there is no 6PN reliability underneath. The responder re-sends its
 	// cached msg2 when it sees a duplicate msg1, so this single ticker
 	// recovers a lost msg1 OR a lost msg2.
@@ -385,14 +386,14 @@ recvLoop:
 				wrapped = append(wrapped, nonce...)
 				wrapped = append(wrapped, cookie...)
 				wrapped = append(wrapped, packet...)
-				// Cross-org: the cookie was minted by M_t and signed with
+				// Cross-origin: the cookie was minted by M_t and signed with
 				// M_t's per-process retry secret. The retransmit MUST land
 				// back on M_t for validation — the routing preamble is the
 				// only way to ensure that. Without this, the initiator's
-				// retransmit lands on whichever same-org machine wins the
+				// retransmit lands on whichever same-origin machine wins the
 				// 5-tuple hash; if it's not M_t, validation fails and the
 				// dial stalls until timeout.
-				if crossOrgPreamble {
+				if crossOriginPreamble {
 					preamble := EncodeRoutingPreamble(path.NodeID)
 					framed := make([]byte, 0, len(preamble)+len(wrapped))
 					framed = append(framed, preamble...)
@@ -439,7 +440,7 @@ recvLoop:
 			dbgHandshake.Printf("XK shared-socket msg2 failed with %s, evicting and retrying XX: %v", path.NodeID.Short(), err)
 			t.evictPeerKey(path.NodeID)
 			listener.unregisterPendingDial(nonce)
-			return t.performInitiatorHandshakeSharedAttempt(ctx, listener, addr, path, true /* xxOnly */, crossOrgPreamble)
+			return t.performInitiatorHandshakeSharedAttempt(ctx, listener, addr, path, true /* xxOnly */, crossOriginPreamble)
 		}
 		return nil, fmt.Errorf("%w: msg2 read: %v", aether.ErrHandshakeFailed, err)
 	}
@@ -459,38 +460,37 @@ recvLoop:
 	if err != nil {
 		return nil, err
 	}
-	// Cross-org: msg3 also carries the routing preamble so any same-org
-	// machine receiving it (Fly's 5-tuple hash could land us on a
-	// different machine than msg1 in edge cases) can hairpin to M_t. The
+	// Cross-origin: msg3 also carries the routing preamble so any
+	// same-origin machine receiving it (Fly's 5-tuple hash could land us on
+	// a different machine than msg1 in edge cases) can hairpin to M_t. The
 	// preamble is OUTSIDE the noise frame; M_r strips before forwarding.
-	// Post-handshake data packets rely on Fly's edge flow stickiness —
-	// if that proves insufficient in production we revisit and add a
-	// persistent preamble-on-every-write path.
-	// Wrap msg3 in the dial-nonce envelope, exactly as msg1 already is.
+	// Post-handshake data packets carry it too: the noiseConn keeps the
+	// preamble target (set below) and buildNoiseConnWriteFunc prepends it
+	// on every write.
+	// Otherwise msg3 travels in the dial-nonce envelope, as msg1 does.
 	//
-	// msg3 was the ONLY handshake message sent as raw Noise ciphertext, and a
-	// ciphertext's first byte is uniformly random. The responder classifies
-	// inbound packets by that first byte (ClassifyPacket), and the QUIC range
-	// 0x40-0xBF is 128 of 256 values — so ~50% of raw msg3s were classified as
-	// QUIC and handed to DeliverQUICPacket, which enqueues them for quic-go
-	// with no validation whatsoever. quic-go discards them and the msg3 is
-	// gone. Not packet loss: a systematic 50% misroute at the receiver.
+	// A raw Noise ciphertext's first byte is uniformly random. The responder
+	// classifies inbound packets by that first byte (ClassifyPacket), and the
+	// QUIC range 0x40-0xBF is 128 of 256 values, so about half of raw msg3s
+	// would be classified as QUIC and handed to DeliverQUICPacket, which
+	// enqueues them for quic-go with no validation whatsoever. quic-go
+	// discards them and the msg3 is gone: a systematic misroute at the
+	// receiver, not packet loss.
 	//
-	// The consequence was the fleet-wide noise-UDP sawtooth. A swallowed msg3
-	// leaves the session HALF-OPEN — the initiator holds cipher states and
-	// believes it is connected while the responder never completes and prunes
-	// at 30s — so nothing ever comes back and STALL-DETECT reaps the session
-	// at 120s with "no forward progress". Links established, won the path,
-	// died ~2m later, and reformed, forever.
+	// A swallowed msg3 leaves the session HALF-OPEN — the initiator holds
+	// cipher states and believes it is connected while the responder never
+	// completes and prunes at 30s — so nothing comes back, STALL-DETECT reaps
+	// the session at 120s with "no forward progress", and the link reforms
+	// only to die the same way.
 	//
 	// Byte-range classification cannot separate ciphertext from QUIC — the
 	// ranges overlap by construction and no amount of tightening fixes a
 	// uniformly random byte. The envelope removes the ambiguity instead of
 	// narrowing it: dialNoncePrefix is checked BEFORE the QUIC range, so an
-	// enveloped msg3 routes as PacketDial 100% of the time. This is the same
-	// reason msg1 and msg2 were never affected — both already carry it.
+	// enveloped msg3 always routes as PacketDial, as msg1 and msg2 do because
+	// both carry the same envelope.
 	msg3Wire := wrapDialResponse(nonce, msg3)
-	if crossOrgPreamble {
+	if crossOriginPreamble {
 		preamble := EncodeRoutingPreamble(path.NodeID)
 		msg3Wire = make([]byte, 0, len(preamble)+len(msg3))
 		msg3Wire = append(msg3Wire, preamble...)
@@ -506,13 +506,13 @@ recvLoop:
 	nc := newNoiseConnListener(listener, sendCS, recvCS, addr, remoteNode, remoteIdentity)
 	nc.scopeID = preamblePartitionID
 	nc.peerMaxAckDelay = decodeMaxAckDelay(remoteMaxAckDelayUS)
-	// Cross-org: persist the preamble target on the noiseConn so the
+	// Cross-origin: persist the preamble target on the noiseConn so the
 	// writeFunc continues to prepend it on every post-handshake send.
-	// Without this, data packets from initiator → cross-org peer land
-	// on whichever same-org machine wins Fly's 5-tuple hash and there's
+	// Without this, data packets from initiator → cross-origin peer land
+	// on whichever same-origin machine wins Fly's 5-tuple hash and there's
 	// no session there — they get dropped silently.
-	if crossOrgPreamble {
-		nc.crossOrgPreambleTarget = path.NodeID
+	if crossOriginPreamble {
+		nc.crossOriginPreambleTarget = path.NodeID
 	}
 
 	if remoteCaps&capExplicitNonce != 0 {
@@ -587,7 +587,7 @@ recvLoop:
 
 // handshakeRetransmitInterval is how often the initiator re-sends msg1
 // while still waiting for msg2. The Noise handshake runs over raw UDP,
-// which drops packets — and on cross-org / public-internet paths there
+// which drops packets — and on cross-origin / public-internet paths there
 // is no 6PN reliability underneath. Without retransmission a single lost
 // msg1 or msg2 fails the whole handshake. Sized at a few × a typical
 // cross-region RTT: long enough not to duplicate-storm a slow path,
@@ -959,10 +959,11 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 	// This message completes the handshake and establishes the session.
 	payload, cs1, cs2, err := state.ReadMessage(nil, msg3)
 	if err != nil && stripped {
-		// AER-020: the 0xFD-prefix strip is heuristic — a bare msg3 whose first
-		// ciphertext byte is coincidentally 0xFD (1/256, notably the cross-org
-		// raw-msg3 path) would be mis-stripped by 9 bytes and fail here. Retry
-		// with the UNstripped bytes before treating this as a failed msg3.
+		// The 0xFD-prefix strip is heuristic — a bare msg3 whose first
+		// ciphertext byte is coincidentally 0xFD (1/256, notably the
+		// cross-origin raw-msg3 path) would be mis-stripped by 9 bytes and
+		// fail here. Retry with the UNstripped bytes before treating this as
+		// a failed msg3.
 		// flynn/noise checkpoints and rolls back symmetric state on a failed
 		// ReadMessage, so the retry is safe.
 		if p2, c1b, c2b, err2 := state.ReadMessage(nil, msg); err2 == nil {
