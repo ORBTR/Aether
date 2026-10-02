@@ -176,7 +176,7 @@ func TestInnerRelay_DiscriminatorVsOtherPreambles(t *testing.T) {
 
 // ─── forwarder flow tables ───────────────────────────────────────────
 
-func newTestForwarder(t *testing.T, lookup ForwarderLookup) (*IntraOrgForwarder, aether.NodeID) {
+func newTestForwarder(t *testing.T, lookup ForwarderLookup) (*IntraOriginForwarder, aether.NodeID) {
 	t.Helper()
 	pub, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -186,7 +186,7 @@ func newTestForwarder(t *testing.T, lookup ForwarderLookup) (*IntraOrgForwarder,
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := NewIntraOrgForwarder(nid, lookup)
+	f := NewIntraOriginForwarder(nid, lookup)
 	t.Cleanup(f.Close)
 	return f, nid
 }
@@ -255,7 +255,7 @@ func TestForwarder_Lookup(t *testing.T) {
 }
 
 func TestForwarder_NilSafeLookup(t *testing.T) {
-	var nilF *IntraOrgForwarder
+	var nilF *IntraOriginForwarder
 	if got, ok := nilF.Lookup("vl1_x"); ok || got != nil {
 		t.Fatalf("nil forwarder Lookup = (%v, %v), want (nil, false)", got, ok)
 	}
@@ -304,7 +304,7 @@ func TestForwarder_DropCountersAndCloseClearsTables(t *testing.T) {
 	f.Close()
 
 	// recordDrop on nil receiver must not panic — guard for safety.
-	var nilF *IntraOrgForwarder
+	var nilF *IntraOriginForwarder
 	nilF.recordDrop(dropPreambleMalformed)
 }
 
@@ -318,10 +318,10 @@ func TestRoutingPreamble_RejectsUnknownFlagBits(t *testing.T) {
 	}
 }
 
-// AER-108: EncodeRoutingPreamble must NOT panic on an over-length NodeID — a
-// parsed legacy-format NodeID (a public-API value) can be longer than 30 bytes
-// and would otherwise crash the process during a cross-org dial. It now
-// returns nil (the caller emits no preamble, degrading to a direct dial).
+// EncodeRoutingPreamble must NOT panic on an over-length NodeID — a parsed
+// 52-char-form NodeID (a public-API value) can be longer than 30 bytes and a
+// panic would crash the process during a cross-origin dial. It returns nil
+// (the caller emits no preamble, degrading to a direct dial).
 func TestRoutingPreamble_NilOnOverlongNodeID(t *testing.T) {
 	defer func() {
 		if r := recover(); r != nil {

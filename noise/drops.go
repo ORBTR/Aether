@@ -31,7 +31,7 @@ const (
 	DropResumeGlobalLimit                        // 0.5-RTT resume throttled globally
 	DropQUICDemux                                // classified PacketQUIC and handed to quic-go
 	DropSTUN                                     // classified PacketSTUN and handed to the STUN handler
-	DropForwarderConsumed                        // cross-org forwarder claimed the frame
+	DropForwarderConsumed                        // cross-origin forwarder claimed the frame
 	DropSessionDeliver                           // delivered to an established session (AEAD result discarded)
 	DropSourceLimit                              // first-contact per-source flood limit
 	DropGlobalLimit                              // first-contact global flood limit
@@ -82,7 +82,7 @@ func (r DropReason) String() string {
 }
 
 // NOTE: distinct from inner_relay.go's unexported dropReason, which counts
-// drops on the cross-org FORWARDER path. This one covers the listener receive
+// drops on the cross-origin FORWARDER path. This one covers the listener receive
 // path. Both exist because a drop is only diagnosable if it says WHERE it died.
 //
 // dropCounters is a fixed-size lock-free tally, one slot per DropReason.

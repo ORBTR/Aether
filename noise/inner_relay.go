@@ -18,9 +18,11 @@ import (
 	aether "github.com/ORBTR/aether"
 )
 
-// Intra-org noise-UDP forwarder — the production side of the cross-org
-// anycast hairpin documented in
-// the consuming runtime cross-org anycast forwarder plan.
+// Intra-origin noise-UDP forwarder: the receiving side of the
+// cross-origin anycast hairpin. Two machines share an origin when they
+// sit on one private network (on Fly.io, one organisation's 6PN); a
+// dialer of another origin reaches them only through the public anycast
+// address.
 //
 // Problem: Fly's public anycast IPv4 is per-app. An initiator's Noise
 // msg1 lands on whichever of the app's N machines wins the 5-tuple
@@ -29,8 +31,8 @@ import (
 // handshake fails. Caller drops to WebSocket fallback.
 //
 // Fix: the anycast-receiving machine M_r inspects the cleartext
-// routing preamble on msg1, looks up which machine M_t in the same
-// org holds the target NodeID, and forwards the datagram via 6PN.
+// routing preamble on msg1, looks up which machine M_t of the same
+// origin holds the target NodeID, and forwards the datagram via 6PN.
 // M_t processes the handshake as if msg1 had arrived natively from
 // the originator's 5-tuple, but its REPLIES go back through M_r so
 // Fly's 5-tuple flow tracking delivers them to the originator
@@ -38,14 +40,14 @@ import (
 // (IP, port) I sent msg1 to" — exactly what Noise expects.
 //
 // This file ships the inner relay wire codec, the M_r and M_t flow
-// tables, and the IntraOrgForwarder type. NoiseTransport integration
+// tables, and the IntraOriginForwarder type. NoiseTransport integration
 // (listener branching + reply-write interception) is in transport.go
 // and session.go. Library wiring (LAD-backed lookup + per-dial
 // preamble emission) is in the consuming mesh runtime.
 
 // ── wire format ──────────────────────────────────────────────────────
 //
-// op=1 forward (M_r → M_t, intra-org over 6PN):
+// op=1 forward (M_r → M_t, within one origin over 6PN):
 //
 //	[2 bytes: magic 0x52 0x4C ("RL")]
 //	[1 byte : version (0x01)]
@@ -55,7 +57,7 @@ import (
 //	[2 bytes : src_port (big-endian)]
 //	[N bytes : payload — the routing-preamble-stripped msg1 or data]
 //
-// op=2 reply (M_t → M_r, intra-org over 6PN):
+// op=2 reply (M_t → M_r, within one origin over 6PN):
 //
 //	[2 bytes: magic 0x52 0x4C ("RL")]
 //	[1 byte : version (0x01)]
@@ -247,7 +249,7 @@ const (
 
 	// flowTableMaxEntries caps each table size so a flood of bogus
 	// FlowIDs can't blow memory. Sized for ~10x expected steady-state
-	// cross-org peer count per machine — generous but bounded.
+	// cross-origin peer count per machine — generous but bounded.
 	flowTableMaxEntries = 4096
 )
 
@@ -267,15 +269,15 @@ type tFlowEntry struct {
 // ── forwarder ────────────────────────────────────────────────────────
 
 // ForwarderLookup resolves a target NodeID to the 6PN UDP address of
-// the same-org machine that holds the target's listener session. Used
+// the same-origin machine that holds the target's listener session. Used
 // only on M_r when receiving a routing-preamble msg1 destined for a
 // non-local NodeID. Returns nil + ok=false if the target is unknown
 // to the local directory; the caller drops the packet.
-type ForwarderLookup func(target aether.NodeID) (intraOrgAddr *net.UDPAddr, ok bool)
+type ForwarderLookup func(target aether.NodeID) (intraOriginAddr *net.UDPAddr, ok bool)
 
 // dropReason categorises drops on the forwarder hot path. Counters are
-// atomic uint64s on IntraOrgForwarder; the plan's Testing §5 ("drop and
-// recorded in counter") rests on these.
+// atomic uint64s on IntraOriginForwarder; recordDrop writes them and
+// Drops returns them to observers.
 type dropReason int
 
 const (
@@ -289,11 +291,11 @@ const (
 	dropReasonCount
 )
 
-// IntraOrgForwarder owns the inner relay state for one NoiseTransport.
+// IntraOriginForwarder owns the inner relay state for one NoiseTransport.
 // Installed via NoiseTransport.SetForwarder; absent forwarder = the
 // transport processes only locally-targeted preambled msg1 and ignores
 // non-local targets (graceful degradation).
-type IntraOrgForwarder struct {
+type IntraOriginForwarder struct {
 	lookup   ForwarderLookup
 	localNID aether.NodeID
 
@@ -309,22 +311,22 @@ type IntraOrgForwarder struct {
 	// lock and observers can read without contending the table mutexes.
 	drops [dropReasonCount]uint64
 
-	// crossOrgMsg1Received counts arrivals at the M_r anycast ingress
+	// crossOriginMsg1Received counts arrivals at the M_r anycast ingress
 	// before any classify/drop decision. Paired with the dialer's
 	// preamble_dials_attempted counter, it distinguishes the failure
 	// mode (packet never arrived vs arrived and dropped downstream).
-	crossOrgMsg1Received uint64
+	crossOriginMsg1Received uint64
 
 	// Stopped via Close so the sweeper goroutine exits cleanly.
 	stop chan struct{}
 	once sync.Once
 }
 
-// NewIntraOrgForwarder builds a forwarder for one transport. localNID
+// NewIntraOriginForwarder builds a forwarder for one transport. localNID
 // is the NodeID this transport listens for — routing preambles
 // targeted at localNID bypass the lookup and dispatch locally.
-func NewIntraOrgForwarder(localNID aether.NodeID, lookup ForwarderLookup) *IntraOrgForwarder {
-	f := &IntraOrgForwarder{
+func NewIntraOriginForwarder(localNID aether.NodeID, lookup ForwarderLookup) *IntraOriginForwarder {
+	f := &IntraOriginForwarder{
 		lookup:   lookup,
 		localNID: localNID,
 		r:        make(map[FlowID]*rFlowEntry),
@@ -339,7 +341,7 @@ func NewIntraOrgForwarder(localNID aether.NodeID, lookup ForwarderLookup) *Intra
 // multiple times. Purging the tables (vs. relying on process exit) lets
 // callers Close a per-partition transport during dynamic reload without
 // leaking entries — the abandoned forwarder won't hold references.
-func (f *IntraOrgForwarder) Close() {
+func (f *IntraOriginForwarder) Close() {
 	f.once.Do(func() {
 		close(f.stop)
 		f.rMu.Lock()
@@ -353,36 +355,36 @@ func (f *IntraOrgForwarder) Close() {
 
 // recordDrop bumps the per-reason drop counter atomically. Safe from the
 // hot read-path; observers can pull via Drops().
-func (f *IntraOrgForwarder) recordDrop(reason dropReason) {
+func (f *IntraOriginForwarder) recordDrop(reason dropReason) {
 	if f == nil || reason < 0 || reason >= dropReasonCount {
 		return
 	}
 	atomic.AddUint64(&f.drops[reason], 1)
 }
 
-// recordCrossOrgMsg1Received bumps the ingress success counter at M_r
+// recordCrossOriginMsg1Received bumps the ingress success counter at M_r
 // before any drop classification. Caller is the listener routing-
 // preamble dispatch path.
-func (f *IntraOrgForwarder) recordCrossOrgMsg1Received() {
+func (f *IntraOriginForwarder) recordCrossOriginMsg1Received() {
 	if f == nil {
 		return
 	}
-	atomic.AddUint64(&f.crossOrgMsg1Received, 1)
+	atomic.AddUint64(&f.crossOriginMsg1Received, 1)
 }
 
-// CrossOrgMsg1Received returns the current value of the M_r ingress
+// CrossOriginMsg1Received returns the current value of the M_r ingress
 // counter. Surfaced via /api/monitoring/mesh-debug.mesh_metrics.
-func (f *IntraOrgForwarder) CrossOrgMsg1Received() uint64 {
+func (f *IntraOriginForwarder) CrossOriginMsg1Received() uint64 {
 	if f == nil {
 		return 0
 	}
-	return atomic.LoadUint64(&f.crossOrgMsg1Received)
+	return atomic.LoadUint64(&f.crossOriginMsg1Received)
 }
 
 // Drops returns a snapshot of the per-reason drop counters. Used by
 // observability code (meshmon / monitoring handlers) to surface forwarder
 // health without exposing the internal counter array.
-func (f *IntraOrgForwarder) Drops() (preambleMalformed, targetUnknown, innerRelayMalformed, opForwardNoSrc, opReplyStaleFlow, opUnknown uint64) {
+func (f *IntraOriginForwarder) Drops() (preambleMalformed, targetUnknown, innerRelayMalformed, opForwardNoSrc, opReplyStaleFlow, opUnknown uint64) {
 	if f == nil {
 		return
 	}
@@ -397,11 +399,11 @@ func (f *IntraOrgForwarder) Drops() (preambleMalformed, targetUnknown, innerRela
 
 // LocalNodeID reports the NodeID this forwarder is configured for.
 // Listener integration uses this to decide local-vs-remote routing.
-func (f *IntraOrgForwarder) LocalNodeID() aether.NodeID { return f.localNID }
+func (f *IntraOriginForwarder) LocalNodeID() aether.NodeID { return f.localNID }
 
 // Lookup proxies to the configured lookup callback. Exposed so the
 // listener path can resolve the target without holding internal state.
-func (f *IntraOrgForwarder) Lookup(target aether.NodeID) (*net.UDPAddr, bool) {
+func (f *IntraOriginForwarder) Lookup(target aether.NodeID) (*net.UDPAddr, bool) {
 	if f == nil || f.lookup == nil {
 		return nil, false
 	}
@@ -411,7 +413,7 @@ func (f *IntraOrgForwarder) Lookup(target aether.NodeID) (*net.UDPAddr, bool) {
 // RegisterForwarded is called by M_r when it forwards an inbound
 // preambled msg1 to M_t. It stores the (FlowID → originator) mapping
 // so subsequent OpReply frames can be unwrapped and delivered back.
-func (f *IntraOrgForwarder) RegisterForwarded(flowID FlowID, srcAddr *net.UDPAddr) {
+func (f *IntraOriginForwarder) RegisterForwarded(flowID FlowID, srcAddr *net.UDPAddr) {
 	f.rMu.Lock()
 	defer f.rMu.Unlock()
 	if len(f.r) >= flowTableMaxEntries {
@@ -423,7 +425,7 @@ func (f *IntraOrgForwarder) RegisterForwarded(flowID FlowID, srcAddr *net.UDPAdd
 // LookupForwarded returns the originator address for a FlowID and
 // updates lastSeen. Used by M_r when it unwraps an OpReply from M_t.
 // Returns nil if the FlowID is unknown (expired or never registered).
-func (f *IntraOrgForwarder) LookupForwarded(flowID FlowID) *net.UDPAddr {
+func (f *IntraOriginForwarder) LookupForwarded(flowID FlowID) *net.UDPAddr {
 	f.rMu.Lock()
 	defer f.rMu.Unlock()
 	entry, ok := f.r[flowID]
@@ -439,7 +441,7 @@ func (f *IntraOrgForwarder) LookupForwarded(flowID FlowID) *net.UDPAddr {
 // came from synth_src. It records (synth_src → relay_addr, FlowID)
 // so subsequent outbound writes to synth_src can be wrapped in
 // OpReply and sent to M_r's relay socket.
-func (f *IntraOrgForwarder) RegisterRelayed(synthSrc *net.UDPAddr, relayAddr *net.UDPAddr, flowID FlowID) {
+func (f *IntraOriginForwarder) RegisterRelayed(synthSrc *net.UDPAddr, relayAddr *net.UDPAddr, flowID FlowID) {
 	key := synthSrc.String()
 	f.tMu.Lock()
 	defer f.tMu.Unlock()
@@ -453,7 +455,7 @@ func (f *IntraOrgForwarder) RegisterRelayed(synthSrc *net.UDPAddr, relayAddr *ne
 // Used by the noise transport's outbound write to detect relayed
 // flows. Returns nil if the destination is not relayed (normal write
 // proceeds).
-func (f *IntraOrgForwarder) LookupRelayed(destAddr *net.UDPAddr) (*net.UDPAddr, FlowID, bool) {
+func (f *IntraOriginForwarder) LookupRelayed(destAddr *net.UDPAddr) (*net.UDPAddr, FlowID, bool) {
 	key := destAddr.String()
 	f.tMu.Lock()
 	defer f.tMu.Unlock()
@@ -467,7 +469,7 @@ func (f *IntraOrgForwarder) LookupRelayed(destAddr *net.UDPAddr) (*net.UDPAddr, 
 
 // ── GC ───────────────────────────────────────────────────────────────
 
-func (f *IntraOrgForwarder) sweepLoop() {
+func (f *IntraOriginForwarder) sweepLoop() {
 	ticker := time.NewTicker(flowTableSweepInterval)
 	defer ticker.Stop()
 	for {
@@ -480,7 +482,7 @@ func (f *IntraOrgForwarder) sweepLoop() {
 	}
 }
 
-func (f *IntraOrgForwarder) sweep() {
+func (f *IntraOriginForwarder) sweep() {
 	cutoff := time.Now().Add(-flowTableTTL)
 	f.rMu.Lock()
 	for fid, e := range f.r {
@@ -501,7 +503,7 @@ func (f *IntraOrgForwarder) sweep() {
 // evictOldestRLocked drops the single oldest entry. Caller holds rMu.
 // LRU-ish without per-touch list maintenance — O(n) but only on the
 // rare "table full" path; steady state stays cheap.
-func (f *IntraOrgForwarder) evictOldestRLocked() {
+func (f *IntraOriginForwarder) evictOldestRLocked() {
 	var oldKey FlowID
 	var oldT time.Time
 	first := true
@@ -515,7 +517,7 @@ func (f *IntraOrgForwarder) evictOldestRLocked() {
 	}
 }
 
-func (f *IntraOrgForwarder) evictOldestTLocked() {
+func (f *IntraOriginForwarder) evictOldestTLocked() {
 	var oldKey string
 	var oldT time.Time
 	first := true
@@ -530,14 +532,14 @@ func (f *IntraOrgForwarder) evictOldestTLocked() {
 }
 
 // RTableSize reports the M_r-side table size. Test/observability only.
-func (f *IntraOrgForwarder) RTableSize() int {
+func (f *IntraOriginForwarder) RTableSize() int {
 	f.rMu.RLock()
 	defer f.rMu.RUnlock()
 	return len(f.r)
 }
 
 // TTableSize reports the M_t-side table size.
-func (f *IntraOrgForwarder) TTableSize() int {
+func (f *IntraOriginForwarder) TTableSize() int {
 	f.tMu.RLock()
 	defer f.tMu.RUnlock()
 	return len(f.t)

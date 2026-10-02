@@ -57,10 +57,10 @@ func synthListenerDualStack(nt *NoiseTransport, ipv4, ipv6 *net.UDPConn) *noiseL
 
 // buildListenerWriteFunc — test-only thin wrapper that constructs a
 // noiseConn-less writeFunc. Production code uses buildNoiseConnWriteFunc
-// directly off a real noiseConn so the per-conn crossOrgPreambleTarget
+// directly off a real noiseConn so the per-conn crossOriginPreambleTarget
 // field is in scope; these tests don't need that side of the closure.
 func buildListenerWriteFunc(l *noiseListener, remote *net.UDPAddr) func([]byte) (int, error) {
-	var nc noiseConn // empty — no crossOrgPreambleTarget
+	var nc noiseConn // empty — no crossOriginPreambleTarget
 	return buildNoiseConnWriteFunc(&nc, l, remote)
 }
 

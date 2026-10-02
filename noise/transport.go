@@ -208,14 +208,13 @@ type NoiseTransport struct {
 	nodeInfoBytes []byte
 	nodeInfoErr   error
 
-	// Cross-org anycast forwarder — intra-org noise-UDP hairpin per
-	// inner_relay.go + the design doc at
-	// the consuming runtime cross-org anycast forwarder plan.
-	// Nil = transport runs in non-forwarder mode (legacy behaviour:
-	// preambled msg1 for non-local targets is dropped, op=1 / op=2
+	// Cross-origin anycast forwarder — the intra-origin noise-UDP hairpin
+	// in inner_relay.go, read by listener_forward.go on every inbound
+	// datagram and reply write. Nil = transport runs in non-forwarder mode
+	// (preambled msg1 for non-local targets is dropped, op=1 / op=2
 	// frames are ignored). Set via SetForwarder before the listener
 	// starts processing traffic.
-	forwarder *IntraOrgForwarder
+	forwarder *IntraOriginForwarder
 }
 
 // *NoiseTransport is the server-side connHost for every UDP-path noiseConn.
@@ -244,16 +243,16 @@ func (t *NoiseTransport) recordInitiatorResume(remoteNode aether.NodeID, data []
 	dbgNoise.Printf("resume: cached material for %s (%d bytes opaque)", remoteNode.Short(), len(m.Opaque))
 }
 
-// SetForwarder installs the intra-org anycast forwarder. Pass nil to
+// SetForwarder installs the intra-origin anycast forwarder. Pass nil to
 // disable (default). Safe to call once at startup before Listen; not
 // safe to swap a live forwarder out from under a running listener
 // without coordinating with in-flight relay flows.
-func (t *NoiseTransport) SetForwarder(f *IntraOrgForwarder) {
+func (t *NoiseTransport) SetForwarder(f *IntraOriginForwarder) {
 	t.forwarder = f
 }
 
 // Forwarder returns the installed forwarder, or nil. Tests use this.
-func (t *NoiseTransport) Forwarder() *IntraOrgForwarder {
+func (t *NoiseTransport) Forwarder() *IntraOriginForwarder {
 	return t.forwarder
 }
 
@@ -444,12 +443,12 @@ func (t *NoiseTransport) Dial(ctx context.Context, target aether.Target) (aether
 		NodeID:  target.NodeID,
 	}
 
-	// Cross-org dials prepend a routing preamble so the anycast-receiving
+	// Cross-origin dials prepend a routing preamble so the anycast-receiving
 	// machine (M_r) can forward to the target machine (M_t) over 6PN.
-	// Caller opts in via target.Metadata[MetadataKeyCrossOrgPreamble]="1";
+	// Caller opts in via target.Metadata[MetadataKeyCrossOriginPreamble]="1";
 	// without it, this is a no-op and the dial behaves identically to a
-	// direct same-org or public dial.
-	crossOrgPreamble := target.Metadata != nil && target.Metadata[MetadataKeyCrossOrgPreamble] == "1"
+	// direct same-origin or public dial.
+	crossOriginPreamble := target.Metadata != nil && target.Metadata[MetadataKeyCrossOriginPreamble] == "1"
 
 	// Attempt 0.5-RTT resume before full handshake. Skips the XK/XX
 	// round-trip entirely when a valid ticket is cached for this peer.
@@ -473,7 +472,7 @@ func (t *NoiseTransport) Dial(ctx context.Context, target aether.Target) (aether
 		// don't loop attempting a dead ticket.
 	}
 
-	session, err := t.performInitiatorHandshakeShared(ctx, listener, addr, path, crossOrgPreamble)
+	session, err := t.performInitiatorHandshakeShared(ctx, listener, addr, path, crossOriginPreamble)
 	if err != nil {
 		return nil, aether.WrapOp("dial", aether.ProtoNoise, target.NodeID, err)
 	}
@@ -721,7 +720,7 @@ func (t *NoiseTransport) Receive(ctx context.Context, session aether.Connection)
 
 // Close releases transport-owned resources. The listener socket lifetime is
 // owned by the listener (not the transport), so this only tears down the
-// cross-org forwarder if one was attached — stopping its sweeper goroutine.
+// cross-origin forwarder if one was attached — stopping its sweeper goroutine.
 func (t *NoiseTransport) Close() error {
 	if t.forwarder != nil {
 		t.forwarder.Close()

@@ -35,8 +35,8 @@ func ClassifyPacket(data []byte) PacketType {
 	// can claim ownership before generic noise dispatch:
 	//
 	//   0x5450 "TP" — scope preamble
-	//   0x4145 "AE" — cross-org anycast routing preamble
-	//   0x524C "RL" — intra-org inner relay frame
+	//   0x4145 "AE" — cross-origin anycast routing preamble
+	//   0x524C "RL" — intra-origin inner relay frame
 	if len(data) >= 2 {
 		switch (uint16(data[0]) << 8) | uint16(data[1]) {
 		case 0x5450, 0x4145, 0x524C:
