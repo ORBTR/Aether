@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -411,9 +412,30 @@ func TestAcceptOverConn_ReplayedNonceRefused(t *testing.T) {
 	}
 }
 
+// unreadConn is a net.Conn whose Read records that it was called and
+// fails, so a test can show AcceptOverConn refused before reading.
+type unreadConn struct {
+	net.Conn
+	mu   sync.Mutex
+	read bool
+}
+
+func (c *unreadConn) Read([]byte) (int, error) {
+	c.mu.Lock()
+	c.read = true
+	c.mu.Unlock()
+	return 0, errors.New("unreadConn: Read called")
+}
+
+func (c *unreadConn) wasRead() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.read
+}
+
 // The binding hooks act only on a verified ticket, and the nonce cache
 // is useless without the reader of the nonce, so each misconfiguration is
-// refused before any byte is read.
+// refused, with its own reason, before any byte is read.
 func TestAcceptOverConn_TicketBindingConfigRefused(t *testing.T) {
 	signerPub, _, err := generateTestEd25519(t)
 	if err != nil {
@@ -427,16 +449,31 @@ func TestAcceptOverConn_TicketBindingConfigRefused(t *testing.T) {
 	cacheOnly.TicketNonceFn = nil
 	fnOnly := base
 	fnOnly.TicketNonces = nil
-	for name, cfg := range map[string]AcceptConnConfig{
-		"binding without a signer":   noSigner,
-		"nonce cache without reader": cacheOnly,
-		"nonce reader without cache": fnOnly,
+	for name, tc := range map[string]struct {
+		cfg    AcceptConnConfig
+		reason string
+	}{
+		"binding without a signer":   {noSigner, "ticket binding set without a ticket signer"},
+		"nonce cache without reader": {cacheOnly, "TicketNonces and TicketNonceFn are set together"},
+		"nonce reader without cache": {fnOnly, "TicketNonces and TicketNonceFn are set together"},
 	} {
 		_, serverConn := net.Pipe()
-		if _, err := AcceptOverConn(context.Background(), cfg, serverConn); err == nil {
-			t.Errorf("%s: AcceptOverConn accepted the config", name)
-		}
+		conn := &unreadConn{Conn: serverConn}
+		start := time.Now()
+		_, err := AcceptOverConn(context.Background(), tc.cfg, conn)
 		_ = serverConn.Close()
+		switch {
+		case err == nil:
+			t.Errorf("%s: AcceptOverConn accepted the config", name)
+		case !strings.Contains(err.Error(), tc.reason):
+			t.Errorf("%s: err = %v, want the refusal %q", name, err, tc.reason)
+		}
+		if conn.wasRead() {
+			t.Errorf("%s: AcceptOverConn read from the conn before refusing the config", name)
+		}
+		if waited := time.Since(start); waited > 500*time.Millisecond {
+			t.Errorf("%s: refusal took %v", name, waited)
+		}
 	}
 }
 
