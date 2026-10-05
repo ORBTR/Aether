@@ -412,6 +412,73 @@ func TestAcceptOverConn_ReplayedNonceRefused(t *testing.T) {
 	}
 }
 
+// writeCountConn is a net.Conn that counts its Writes, so a test can show
+// AcceptOverConn refused before sending msg2.
+type writeCountConn struct {
+	net.Conn
+	mu     sync.Mutex
+	writes int
+}
+
+func (c *writeCountConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	c.writes++
+	c.mu.Unlock()
+	return c.Conn.Write(p)
+}
+
+func (c *writeCountConn) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.writes
+}
+
+// A grant whose nonce the accepter has already spent is refused as soon
+// as its ticket is verified: AcceptOverConn writes no msg2, so a replayed
+// grant costs the accepter no Diffie-Hellman and its dialer no reply.
+func TestAcceptOverConn_ReplayedNonceRefusedBeforeHandshake(t *testing.T) {
+	signerPub, signerPriv, err := generateTestEd25519(t)
+	if err != nil {
+		t.Fatalf("gen signer: %v", err)
+	}
+	cfg := bindingAcceptConfig(t, signerPub, NewTicketNonceCache(16))
+	browserPriv, browserPub := newTestKeypair(t)
+	ticket := grantTicket(t, signerPriv, browserPub, []byte("nonce-0123456789"), time.Now().Add(time.Minute))
+	if err := acceptWithDialer(cfg, browserPriv, browserPub, ticket); err != nil {
+		t.Fatalf("first use of the grant: %v", err)
+	}
+
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() {
+		c, err := DialOverConn(ctx, DialConnConfig{
+			LocalNodeID:      "vl1_alice",
+			StaticPriv:       browserPriv,
+			StaticPub:        browserPub,
+			Ticket:           ticket,
+			HandshakeTimeout: 2 * time.Second,
+		}, clientConn)
+		if err == nil {
+			_ = c.Close()
+		}
+	}()
+	counted := &writeCountConn{Conn: serverConn}
+	start := time.Now()
+	_, err = AcceptOverConn(ctx, cfg, counted)
+	if !errors.Is(err, ErrTicketNonceReplayed) {
+		t.Fatalf("replayed grant: err = %v, want ErrTicketNonceReplayed", err)
+	}
+	if n := counted.count(); n != 0 {
+		t.Fatalf("replayed grant: AcceptOverConn wrote %d frame(s) before refusing it", n)
+	}
+	if waited := time.Since(start); waited > time.Second {
+		t.Fatalf("replayed grant refused after %v", waited)
+	}
+}
+
 // unreadConn is a net.Conn whose Read records that it was called and
 // fails, so a test can show AcceptOverConn refused before reading.
 type unreadConn struct {
