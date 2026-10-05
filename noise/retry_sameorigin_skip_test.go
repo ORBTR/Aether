@@ -9,14 +9,15 @@ import (
 	"testing"
 )
 
-// TestIsTrustedNoAmplifySource is the guard for the same-org noise-UDP fix.
+// TestIsTrustedNoAmplifySource pins which msg1 sources skip the
+// anti-amplification RETRY cookie.
 //
-// The anti-amplification RETRY cookie strands same-org UDP dials: it is bound to
-// the responder PROCESS's secret + source IP, so for a multi-machine app the
-// msg1+cookie retransmit can land on a different machine that rejects the cookie
-// → msg2 timeout (measured: 104 RETRY tokens/75s, dials never establish). A Fly
-// 6PN source (IPv6 ULA, fdaa:…) cannot be spoofed across the private network, so
-// the amplification the cookie defends against is impossible there — skip it.
+// The cookie is bound to the responder PROCESS's secret + source IP, so for a
+// multi-machine app on one private network the msg1+cookie retransmit can land
+// on a different machine that rejects the cookie, and the dial times out at
+// msg2. A Fly 6PN source (IPv6 ULA, fdaa:…) cannot be spoofed across the
+// private network, so the amplification the cookie defends against is
+// impossible there and the RETRY is skipped.
 //
 // A public/global source must STILL get the RETRY (real spoofing exposure).
 func TestIsTrustedNoAmplifySource(t *testing.T) {

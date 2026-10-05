@@ -27,10 +27,10 @@ const (
 	// IPv6 at a 1280-byte MTU (minus IPv6+UDP+Noise overhead). Data flows at
 	// this floor from session start; the prober then probes UPWARD to the real
 	// path maximum, so no capacity is lost on paths that support more.
-	// Fixes the prior failure: mss started at DefaultMSS (1400) and, when the
-	// first 1400-byte probe was dropped on a sub-1400 path, stayed 1400
-	// (OnProbeTimeout keeps the last success — there was none) → every data
-	// frame dropped → noise-UDP silently unusable on same-org 6PN paths.
+	// Starting at DefaultMSS (1400) instead would strand a sub-1400 path such
+	// as the 6PN: the first 1400-byte probe is dropped, OnProbeTimeout keeps
+	// the last successful size and there is none, so mss stays 1400 and every
+	// data frame is dropped.
 	SafeFloorMSS = 1200
 
 	// MaxMSS is the maximum MSS to probe for.

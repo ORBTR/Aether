@@ -1285,10 +1285,8 @@ func (s *NoiseSession) LastPeerStats() aether.SessionMetrics {
 // still settling and CE plausibility (Outstanding()) is small because the
 // window is still filling, so a well-behaved peer's early ACKs read as
 // suspicious. At weight 25 / threshold 100, four such trips inside the 60s
-// warmup grace GOAWAY-close a healthy same-org UDP session before it ever
-// stabilises (observed fleet-wide: [SESSION-CLOSE] ... lifetime=~58s
-// warmup=true reason: ack-validation — the noise-UDP churn that keeps the
-// session count collapsing to 0-1). Suppress ONLY ReasonACKValidation during
+// warmup grace would GOAWAY-close a healthy noise-UDP session before it
+// stabilises. Suppress ONLY ReasonACKValidation during
 // warmup: the guard has already rejected/clamped the offending ACK (the
 // CPU-exhaustion protection is in the guard, not in the score), so scoring it
 // here only kills legitimate sessions. Every other reason (decrypt-fail,
