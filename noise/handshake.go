@@ -782,12 +782,12 @@ func wrapDialResponse(dialNonce, response []byte) []byte {
 // and actively harmful.
 //
 // The RETRY cookie defends ONLY against a spoofed source IP causing the
-// responder to amplify a large msg2 toward a victim. On Fly, same-org peers
-// reach each other over the 6PN, an IPv6 ULA (fdaa:…), and the platform
+// responder to amplify a large msg2 toward a victim. Peers on one Fly private
+// network reach each other over the 6PN, an IPv6 ULA (fdaa:…), and the platform
 // enforces 6PN source addresses so they cannot be spoofed across the private
 // network — the attack the cookie prevents is impossible there. Meanwhile the
 // cookie is bound to the responder PROCESS's per-process secret plus the source
-// IP, so for a same-org multi-machine app (two machines sharing one mesh
+// IP, so for a multi-machine app on that network (two machines sharing one mesh
 // identity) the msg1+cookie retransmit can land on a different machine that
 // rejects the cookie, stranding every dial at msg2 timeout. Skipping the RETRY
 // for a ULA source removes that failure mode and a round-trip, with no

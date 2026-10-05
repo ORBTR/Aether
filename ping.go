@@ -125,17 +125,17 @@ func WaitForActivityPing(
 			// Deadline reached with no Pong. The noise-UDP keepalive stream
 			// is UnreliableSequenced (FEC-1), so a single dropped Pong
 			// datagram is expected on a lossy path and must NOT tear down a
-			// session that is otherwise alive and carrying gossip/RPC —
-			// that PONG-required teardown was the same-org noise-UDP
-			// persistence bug (healthy sessions killed by lost Pongs, then
-			// parked in the 30-min address dead-cooldown). Honour the
-			// documented liveness contract as a deadline fallback: if ANY
-			// inbound frame arrived since the ping was sent, the return
-			// path works and the peer is alive. No SRTT sample this round
-			// (SRTT is fed by RecordPongRecv, not this return, so a zero
-			// RTT here cannot corrupt the estimator). Only genuine silence
-			// — no Pong AND no other inbound activity within the deadline —
-			// counts as a ping failure toward the keepalive death budget.
+			// session that is otherwise alive and carrying gossip/RPC:
+			// requiring the Pong would close a healthy session on one lost
+			// datagram and park its address in the 30-min dead-cooldown.
+			// Honour the documented liveness contract as a deadline
+			// fallback: if ANY inbound frame arrived since the ping was
+			// sent, the return path works and the peer is alive. No SRTT
+			// sample this round (SRTT is fed by RecordPongRecv, not this
+			// return, so a zero RTT here cannot corrupt the estimator).
+			// Only genuine silence — no Pong AND no other inbound activity
+			// within the deadline — counts as a ping failure toward the
+			// keepalive death budget.
 			if hm.LastActivity().After(before) {
 				// Alive via other inbound traffic. Reuse the cached SRTT
 				// rather than returning a bogus 0 ms so a future RTT

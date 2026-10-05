@@ -45,7 +45,7 @@ func TestCrossOriginForwarder_HairpinRoundTrip(t *testing.T) {
 	// socket timing sensitivity; this test uses the same retry-with-backoff
 	// pattern in its dial loop so it runs cross-platform.
 	_ = runtime.GOOS
-	const netKey = "cross-org-forwarder-test-key"
+	const netKey = "cross-origin-forwarder-test-key"
 
 	// ─── M_t (target, holds the listener for the dialed NodeID) ─────
 	_, mtPriv, _ := ed25519.GenerateKey(rand.Reader)
