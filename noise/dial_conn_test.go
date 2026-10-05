@@ -412,6 +412,64 @@ func TestAcceptOverConn_ReplayedNonceRefused(t *testing.T) {
 	}
 }
 
+// Each signer's tickets spend nonces in their own space. An accepter that
+// trusts two signers through TrustedTicketSignerFn admits one grant from
+// each with the same nonce, and still refuses either grant replayed.
+func TestAcceptOverConn_NonceSpentPerSigner(t *testing.T) {
+	pubA, privA, err := generateTestEd25519(t)
+	if err != nil {
+		t.Fatalf("gen signer A: %v", err)
+	}
+	pubB, privB, err := generateTestEd25519(t)
+	if err != nil {
+		t.Fatalf("gen signer B: %v", err)
+	}
+	cfg := bindingAcceptConfig(t, nil, NewTicketNonceCache(16))
+	cfg.TrustedTicketSigner = nil
+	cfg.TrustedTicketSignerFn = func(body []byte) (ed25519.PublicKey, error) {
+		var g struct {
+			Signer string `json:"signer"`
+		}
+		if err := json.Unmarshal(body, &g); err != nil {
+			return nil, err
+		}
+		switch g.Signer {
+		case "A":
+			return pubA, nil
+		case "B":
+			return pubB, nil
+		}
+		return nil, fmt.Errorf("unknown signer %q", g.Signer)
+	}
+	browserPriv, browserPub := newTestKeypair(t)
+	exp := time.Now().Add(time.Minute)
+	grant := func(signer string, key ed25519.PrivateKey) []byte {
+		body, err := json.Marshal(map[string]any{
+			"signer":     signer,
+			"browserPub": hex.EncodeToString(browserPub),
+			"nonce":      hex.EncodeToString([]byte("nonce-shared-0001")),
+			"exp":        exp.Unix(),
+		})
+		if err != nil {
+			t.Fatalf("marshal grant: %v", err)
+		}
+		return append(body, ed25519Sign(key, body)...)
+	}
+	fromA, fromB := grant("A", privA), grant("B", privB)
+
+	if err := acceptWithDialer(cfg, browserPriv, browserPub, fromA); err != nil {
+		t.Fatalf("signer A's grant: %v", err)
+	}
+	if err := acceptWithDialer(cfg, browserPriv, browserPub, fromB); err != nil {
+		t.Fatalf("signer B's grant with the nonce A's grant spent: %v", err)
+	}
+	for name, g := range map[string][]byte{"A": fromA, "B": fromB} {
+		if err := acceptWithDialer(cfg, browserPriv, browserPub, g); !errors.Is(err, ErrTicketNonceReplayed) {
+			t.Errorf("signer %s's grant replayed: err = %v, want ErrTicketNonceReplayed", name, err)
+		}
+	}
+}
+
 // writeCountConn is a net.Conn that counts its Writes, so a test can show
 // AcceptOverConn refused before sending msg2.
 type writeCountConn struct {
@@ -548,23 +606,24 @@ func TestAcceptOverConn_TicketBindingConfigRefused(t *testing.T) {
 // admits exactly one of several concurrent uses of one nonce.
 func TestTicketNonceCache_Refusals(t *testing.T) {
 	live := time.Now().Add(time.Minute)
+	signer := ed25519.PublicKey(bytes.Repeat([]byte{7}, ed25519.PublicKeySize))
 	c := NewTicketNonceCache(2)
-	if err := c.use(nil, live); err == nil {
+	if err := c.use(signer, nil, live); err == nil {
 		t.Error("empty nonce admitted")
 	}
-	if err := c.use([]byte("n0"), time.Now().Add(-time.Second)); err == nil {
+	if err := c.use(signer, []byte("n0"), time.Now().Add(-time.Second)); err == nil {
 		t.Error("nonce whose ticket already expired admitted")
 	}
-	if err := c.use([]byte("n1"), live); err != nil {
+	if err := c.use(signer, []byte("n1"), live); err != nil {
 		t.Fatalf("n1: %v", err)
 	}
-	if err := c.use([]byte("n2"), live); err != nil {
+	if err := c.use(signer, []byte("n2"), live); err != nil {
 		t.Fatalf("n2: %v", err)
 	}
-	if err := c.use([]byte("n3"), live); !errors.Is(err, ErrTicketNonceCacheFull) {
+	if err := c.use(signer, []byte("n3"), live); !errors.Is(err, ErrTicketNonceCacheFull) {
 		t.Errorf("cache full of live nonces: err = %v, want ErrTicketNonceCacheFull", err)
 	}
-	if err := c.use([]byte("n1"), live); !errors.Is(err, ErrTicketNonceReplayed) {
+	if err := c.use(signer, []byte("n1"), live); !errors.Is(err, ErrTicketNonceReplayed) {
 		t.Errorf("live nonce forgotten: err = %v, want ErrTicketNonceReplayed", err)
 	}
 
@@ -576,7 +635,7 @@ func TestTicketNonceCache_Refusals(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if race.use([]byte("shared"), live) == nil {
+			if race.use(signer, []byte("shared"), live) == nil {
 				mu.Lock()
 				admitted++
 				mu.Unlock()
