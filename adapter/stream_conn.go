@@ -89,31 +89,35 @@ func (c *StreamConn) Read(p []byte) (int, error) {
 //
 // Send is message-atomic, so a Write either sends all of p or none of it.
 // Under a write deadline that has passed, or that passes while Send is
-// blocked, Write returns 0 and os.ErrDeadlineExceeded.
+// blocked, Write returns 0 and os.ErrDeadlineExceeded. After Close, or when
+// Close ends a blocked Send, it returns 0 and net.ErrClosed.
 func (c *StreamConn) Write(p []byte) (int, error) {
-	ctx, end, ok := c.writeDL.begin(c.parentCtx)
-	if !ok {
-		return 0, os.ErrDeadlineExceeded
+	ctx, end, err := c.writeDL.begin(c.parentCtx)
+	if err != nil {
+		return 0, err
 	}
 	defer end()
 	if err := c.stream.Send(ctx, p); err != nil {
-		if c.writeDL.passed() {
-			return 0, os.ErrDeadlineExceeded
+		if ended := c.writeDL.ended(); ended != nil {
+			return 0, ended
 		}
 		return 0, err
 	}
 	return len(p), nil
 }
 
-// Close cancels the read deadline's context, disarms the write deadline's
-// timer and closes the underlying Aether stream.
+// Close cancels the read deadline's context, ends every Write blocked in
+// Send and refuses later ones, then closes the underlying Aether stream.
+// net.Conn requires Close to unblock a blocked Write, and the stream's
+// Close alone does not: noiseStream.Close leaves a Send waiting for
+// flow-control credit until flow.ConsumeTimeout.
 func (c *StreamConn) Close() error {
 	if c.readCancel != nil {
 		c.readCancel()
 		c.readCancel = nil
 		c.readCtx = nil
 	}
-	c.writeDL.set(time.Time{})
+	c.writeDL.close()
 	return c.stream.Close()
 }
 
@@ -213,26 +217,32 @@ type streamConnAddr struct{ s string }
 func (a streamConnAddr) Network() string { return "aether" }
 func (a streamConnAddr) String() string  { return a.s }
 
-// writeDeadline is StreamConn's write deadline. Each Write registers the
-// cancel of the context its Send runs under; the deadline passing cancels
-// every registered Send, and a Write that starts after it has passed is
-// refused before Send. Re-setting the deadline re-arms the timer without
-// cancelling a running Send, so an extended or cleared deadline applies to
-// a Write already blocked, as net.Conn requires. gen discards a timer that
-// fired after a later set replaced it. Safe for concurrent use.
+// writeDeadline is StreamConn's write deadline and its close. Each Write
+// registers the cancel of the context its Send runs under; the deadline
+// passing, or close, cancels every registered Send, and a Write that
+// starts after either is refused before Send. Re-setting the deadline
+// re-arms the timer without cancelling a running Send, so an extended or
+// cleared deadline applies to a Write already blocked, as net.Conn
+// requires. gen discards a timer that fired after a later set replaced it.
+// Safe for concurrent use.
 type writeDeadline struct {
 	mu      sync.Mutex
 	timer   *time.Timer
 	gen     uint64
 	expired bool
+	closed  bool
 	running map[uint64]context.CancelFunc
 	nextID  uint64
 }
 
-// set arms the deadline at t; a zero t clears it.
+// set arms the deadline at t; a zero t clears it. After close it does
+// nothing: begin refuses every Write, so a timer would guard none.
 func (d *writeDeadline) set(t time.Time) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.closed {
+		return
+	}
 	if d.timer != nil {
 		d.timer.Stop()
 		d.timer = nil
@@ -259,20 +269,39 @@ func (d *writeDeadline) set(t time.Time) {
 
 func (d *writeDeadline) expireLocked() {
 	d.expired = true
+	d.cancelRunningLocked()
+}
+
+func (d *writeDeadline) cancelRunningLocked() {
 	for _, cancel := range d.running {
 		cancel()
 	}
 }
 
+// close stops the timer, cancels every registered Send and makes every
+// later begin refuse with net.ErrClosed.
+func (d *writeDeadline) close() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.timer != nil {
+		d.timer.Stop()
+		d.timer = nil
+	}
+	d.gen++
+	d.closed = true
+	d.cancelRunningLocked()
+}
+
 // begin returns the context one Write's Send runs under and the func that
-// releases it, or ok false when the deadline has already passed.
-func (d *writeDeadline) begin(parent context.Context) (ctx context.Context, end func(), ok bool) {
+// releases it, or the error Write returns without calling Send: net.ErrClosed
+// after close, os.ErrDeadlineExceeded once the deadline has passed.
+func (d *writeDeadline) begin(parent context.Context) (ctx context.Context, end func(), err error) {
 	ctx, cancel := context.WithCancel(parent)
 	d.mu.Lock()
-	if d.expired {
+	if err := d.endedLocked(); err != nil {
 		d.mu.Unlock()
 		cancel()
-		return nil, nil, false
+		return nil, nil, err
 	}
 	if d.running == nil {
 		d.running = make(map[uint64]context.CancelFunc)
@@ -286,14 +315,27 @@ func (d *writeDeadline) begin(parent context.Context) (ctx context.Context, end 
 		delete(d.running, id)
 		d.mu.Unlock()
 		cancel()
-	}, true
+	}, nil
 }
 
-// passed reports whether the deadline has passed and not been re-set.
-func (d *writeDeadline) passed() bool {
+// ended returns net.ErrClosed after close, os.ErrDeadlineExceeded while the
+// deadline has passed and not been re-set, and nil otherwise. Write reads
+// it to tell a Send that close or the deadline ended from one that failed
+// on its own.
+func (d *writeDeadline) ended() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.expired
+	return d.endedLocked()
+}
+
+func (d *writeDeadline) endedLocked() error {
+	if d.closed {
+		return net.ErrClosed
+	}
+	if d.expired {
+		return os.ErrDeadlineExceeded
+	}
+	return nil
 }
 
 // sendGate admits one Send at a time on a stream whose Send bounds its
