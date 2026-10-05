@@ -295,3 +295,29 @@ func (d *writeDeadline) passed() bool {
 	defer d.mu.Unlock()
 	return d.expired
 }
+
+// sendGate admits one Send at a time on a stream whose Send bounds its
+// write by cancelling it from outside: quicStream sets the stream-wide
+// QUIC write deadline, and GrpcStreamAdapter leaves a send function
+// running past its caller. A second Send sharing that write would be cut
+// short by the first one's context, or would run its send function beside
+// one still in flight. A waiting Send gives up when its own context ends.
+// The zero value is ready for use.
+type sendGate struct {
+	once sync.Once
+	slot chan struct{}
+}
+
+// acquire takes the gate, or returns ctx's error if ctx ends first.
+func (g *sendGate) acquire(ctx context.Context) error {
+	g.once.Do(func() { g.slot = make(chan struct{}, 1) })
+	select {
+	case g.slot <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// release frees the gate acquire took.
+func (g *sendGate) release() { <-g.slot }

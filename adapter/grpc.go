@@ -121,6 +121,10 @@ type GrpcStreamAdapter struct {
 	closeFn  func() error
 	connOnce sync.Once
 	connView net.Conn
+
+	sends     sendGate // one sendFn runs at a time; see Send
+	abandonMu sync.Mutex
+	abandoned error // set once a Send returned before its sendFn did
 }
 
 // NewGrpcStreamAdapter creates an Aether stream from gRPC send/recv functions.
@@ -145,8 +149,63 @@ func (s *GrpcStreamAdapter) Conn() net.Conn {
 	return s.connView
 }
 
+// Send hands data to sendFn, one Send at a time. sendFn takes no context,
+// so under a ctx that can end, sendFn runs on its own copy of data and
+// Send returns ctx's error if ctx ends first. That is how StreamConn's
+// write deadline reaches this adapter. The abandoned sendFn keeps running
+// and may still deliver the message, so the caller cannot tell whether it
+// was sent; as with a net.Conn whose write timed out partway, every later
+// Send fails, and the caller resets or closes the stream. A Send whose ctx
+// has already ended never calls sendFn.
 func (s *GrpcStreamAdapter) Send(ctx context.Context, data []byte) error {
-	return s.sendFn(data)
+	// Checked before the gate too: an abandoned sendFn still holds it.
+	if err := s.sendRefusal(ctx); err != nil {
+		return err
+	}
+	if err := s.sends.acquire(ctx); err != nil {
+		return err
+	}
+	if err := s.sendRefusal(ctx); err != nil {
+		s.sends.release()
+		return err
+	}
+	if ctx.Done() == nil {
+		defer s.sends.release()
+		return s.sendFn(data)
+	}
+	msg := append([]byte(nil), data...)
+	done := make(chan error, 1)
+	go func() {
+		done <- s.sendFn(msg)
+		s.sends.release()
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+	}
+	select {
+	case err := <-done:
+		return err
+	default:
+	}
+	s.abandonMu.Lock()
+	s.abandoned = fmt.Errorf("adapter: grpc stream %d: an earlier Send returned before its send function did, so its message may still be delivered: %w",
+		s.streamID, ctx.Err())
+	s.abandonMu.Unlock()
+	return ctx.Err()
+}
+
+// sendRefusal is the error a Send returns without calling sendFn: ctx has
+// ended, or an earlier Send was abandoned.
+func (s *GrpcStreamAdapter) sendRefusal(ctx context.Context) error {
+	s.abandonMu.Lock()
+	err := s.abandoned
+	s.abandonMu.Unlock()
+	if err != nil {
+		return err
+	}
+	return ctx.Err()
 }
 
 func (s *GrpcStreamAdapter) Receive(ctx context.Context) ([]byte, error) {
