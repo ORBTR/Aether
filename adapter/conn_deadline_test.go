@@ -8,14 +8,21 @@ package adapter
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"io"
+	"math/big"
 	"net"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/ORBTR/aether"
+	"github.com/quic-go/quic-go"
 )
 
 // creditlessStream is an aether.Stream whose Send blocks until its context
@@ -223,5 +230,179 @@ func TestGrpcConnWrapper_BlockedWriteReturnsAtDeadline(t *testing.T) {
 		if err := set(time.Now()); !errors.Is(err, os.ErrNoDeadline) {
 			t.Errorf("%s on a connection without deadlines: err = %v, want os.ErrNoDeadline", name, err)
 		}
+	}
+}
+
+// quicLoopback returns a client and a server QUICSession over one real
+// loopback QUIC connection. The server grants each stream 16 KiB of
+// receive window, so a client Write larger than that blocks until the
+// server reads.
+func quicLoopback(t *testing.T) (client, server *QUICSession) {
+	t.Helper()
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("key: %v", err)
+	}
+	tmpl := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, key.Public(), key)
+	if err != nil {
+		t.Fatalf("certificate: %v", err)
+	}
+	tlsConf := &tls.Config{
+		Certificates:       []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
+		NextProtos:         []string{"aether-deadline-test"},
+		InsecureSkipVerify: true,
+	}
+	ln, err := quic.ListenAddr("127.0.0.1:0", tlsConf, &quic.Config{
+		InitialStreamReceiveWindow:     16 << 10,
+		MaxStreamReceiveWindow:         16 << 10,
+		InitialConnectionReceiveWindow: 64 << 10,
+		MaxConnectionReceiveWindow:     64 << 10,
+	})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	accepted := make(chan quic.Connection, 1)
+	go func() {
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			close(accepted)
+			return
+		}
+		accepted <- c
+	}()
+	cc, err := quic.DialAddr(ctx, ln.Addr().String(), tlsConf, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	sc, ok := <-accepted
+	if !ok {
+		t.Fatal("accept failed")
+	}
+	client = NewQuicSession(cc, aether.NodeID("quic-client"), aether.NodeID("quic-server"))
+	server = NewQuicSession(sc, aether.NodeID("quic-server"), aether.NodeID("quic-client"))
+	t.Cleanup(func() {
+		_ = cc.CloseWithError(0, "")
+		_ = sc.CloseWithError(0, "")
+	})
+	return client, server
+}
+
+// A Write on a QUIC stream's net.Conn view that the peer's flow control
+// holds returns at its write deadline. The frame it cut short never
+// reaches the peer as a message: the peer's Receive fails with the
+// stream's reset, and a later Write on that stream fails at once.
+func TestQuicStreamConn_BlockedWriteReturnsAtWriteDeadline(t *testing.T) {
+	client, server := quicLoopback(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	st, err := client.OpenStream(ctx, aether.StreamConfig{StreamID: 1})
+	if err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+	c := st.Conn()
+
+	deadline := time.Now().Add(200 * time.Millisecond)
+	if err := c.SetWriteDeadline(deadline); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
+	}
+	r := awaitWrite(t, writeAsync(c, make([]byte, 1<<20)))
+	if !errors.Is(r.err, os.ErrDeadlineExceeded) || r.n != 0 {
+		t.Fatalf("blocked Write = (%d, %v), want (0, os.ErrDeadlineExceeded)", r.n, r.err)
+	}
+	if r.at.Before(deadline) {
+		t.Fatalf("Write returned %v before its deadline", deadline.Sub(r.at))
+	}
+
+	peer, err := server.AcceptStream(ctx)
+	if err != nil {
+		t.Fatalf("AcceptStream: %v", err)
+	}
+	recvCtx, recvCancel := context.WithTimeout(ctx, 3*time.Second)
+	defer recvCancel()
+	got, err := peer.Receive(recvCtx)
+	var reset *quic.StreamError
+	if !errors.As(err, &reset) {
+		t.Fatalf("peer Receive = (%d bytes, %v), want the stream's reset", len(got), err)
+	}
+
+	if err := c.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
+	}
+	start := time.Now()
+	if _, err := c.Write([]byte("after")); err == nil {
+		t.Fatal("Write on a stream whose frame was cut short succeeded")
+	}
+	if waited := time.Since(start); waited > time.Second {
+		t.Fatalf("Write on a reset stream took %v to fail", waited)
+	}
+}
+
+// A Write on a GrpcStreamAdapter's net.Conn view whose send function
+// blocks returns at its write deadline. The send function keeps its own
+// copy of the message, and because that message may still be delivered,
+// a later Write fails at once without calling the send function again. A
+// Send whose context has already ended never calls it.
+func TestGrpcStreamAdapterConn_BlockedWriteReturnsAtWriteDeadline(t *testing.T) {
+	release := make(chan struct{})
+	var mu sync.Mutex
+	var sent [][]byte
+	send := func(p []byte) error {
+		mu.Lock()
+		sent = append(sent, p)
+		mu.Unlock()
+		<-release
+		return nil
+	}
+	recv := func() ([]byte, error) { <-release; return nil, io.EOF }
+	a := NewGrpcStreamAdapter(1, aether.StreamConfig{}, send, recv, nil)
+	c := a.Conn()
+
+	deadline := time.Now().Add(100 * time.Millisecond)
+	if err := c.SetWriteDeadline(deadline); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
+	}
+	msg := []byte("first")
+	r := awaitWrite(t, writeAsync(c, msg))
+	if !errors.Is(r.err, os.ErrDeadlineExceeded) || r.n != 0 {
+		t.Fatalf("blocked Write = (%d, %v), want (0, os.ErrDeadlineExceeded)", r.n, r.err)
+	}
+	if r.at.Before(deadline) {
+		t.Fatalf("Write returned %v before its deadline", deadline.Sub(r.at))
+	}
+	copy(msg, "XXXXX")
+
+	if err := c.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
+	}
+	start := time.Now()
+	if _, err := c.Write([]byte("second")); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("Write after an abandoned send: err = %v, want the abandoned send's refusal", err)
+	}
+	if waited := time.Since(start); waited > time.Second {
+		t.Fatalf("Write after an abandoned send took %v to fail", waited)
+	}
+	close(release)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(sent) != 1 || string(sent[0]) != "first" {
+		t.Fatalf("send function got %q, want one call with the Write's own bytes \"first\"", sent)
+	}
+
+	fresh := NewGrpcStreamAdapter(2, aether.StreamConfig{},
+		func([]byte) error { t.Error("Send with an ended context called the send function"); return nil },
+		recv, nil)
+	ended, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := fresh.Send(ended, []byte("x")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Send with an ended context: err = %v, want context.Canceled", err)
 	}
 }

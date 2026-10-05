@@ -9,6 +9,7 @@ package adapter
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -57,6 +58,7 @@ type quicStream struct {
 	session    *QUICSession
 	connOnce   sync.Once
 	connView   net.Conn
+	sends      sendGate // one Send writes at a time; see Send
 }
 
 // NewQuicSession creates an Aether session over a QUIC connection.
@@ -281,19 +283,68 @@ func (st *quicStream) Conn() net.Conn {
 	return st.connView
 }
 
+// Send writes data as one frame, a 4-byte length then the bytes, straight
+// to the QUIC stream; QUIC carries reliability and flow control. ctx bounds
+// the write: when ctx ends while the peer's flow control holds the frame,
+// the stream's QUIC write deadline is moved to now, quic-go's Write
+// returns, and Send returns ctx's error. That is how StreamConn's write
+// deadline reaches a QUIC stream. A frame cut short partway would make the
+// peer's Receive read the next frame's bytes as the rest of this one, so
+// the stream's send side is cancelled instead (CancelWrite): the peer's
+// Receive fails with the reset and every later Send fails. A frame of
+// which nothing was written leaves the stream usable.
 func (st *quicStream) Send(ctx context.Context, data []byte) error {
 	if !st.state.CanSend() {
 		return fmt.Errorf("stream %d: cannot send", st.streamID)
 	}
-	// Write directly to QUIC stream — QUIC handles framing, reliability, flow control
-	// Prefix with 4-byte length for message boundaries
-	var lenBuf [4]byte
-	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(data)))
-	if _, err := st.quicStream.Write(lenBuf[:]); err != nil {
+	if err := st.sends.acquire(ctx); err != nil {
 		return err
 	}
-	_, err := st.quicStream.Write(data)
+	defer st.sends.release()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(data)))
+	ended := st.boundWrite(ctx)
+	n, err := st.quicStream.Write(lenBuf[:])
+	if err == nil {
+		var m int
+		m, err = st.quicStream.Write(data)
+		n += m
+	}
+	var timeout net.Error
+	if ended() && errors.As(err, &timeout) && timeout.Timeout() {
+		if n > 0 {
+			st.quicStream.CancelWrite(quic.StreamErrorCode(aether.ResetCancel))
+		}
+		return ctx.Err()
+	}
 	return err
+}
+
+// boundWrite moves the stream's QUIC write deadline to now when ctx ends,
+// which makes a blocked quic-go Write return. The returned func undoes it
+// once the write is over and reports whether ctx ended it; it clears the
+// deadline again only after the move has run, so a later Send never meets
+// a deadline left in the past. Send holds the gate across both calls.
+func (st *quicStream) boundWrite(ctx context.Context) (ended func() bool) {
+	if ctx.Done() == nil {
+		return func() bool { return false }
+	}
+	moved := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = st.quicStream.SetWriteDeadline(time.Now())
+		close(moved)
+	})
+	return func() bool {
+		if stop() {
+			return false
+		}
+		<-moved
+		_ = st.quicStream.SetWriteDeadline(time.Time{})
+		return true
+	}
 }
 
 func (st *quicStream) Receive(ctx context.Context) ([]byte, error) {
