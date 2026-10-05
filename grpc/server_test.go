@@ -11,7 +11,9 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"net"
+	"os"
 	"strconv"
 	"testing"
 	"time"
@@ -43,8 +45,9 @@ func makeAuthedContext(t *testing.T, ctx context.Context, priv ed25519.PrivateKe
 }
 
 // newBufconnServer starts an in-memory gRPC server bound to the given
-// transport and returns a dial-able client connection.
-func newBufconnServer(t *testing.T, srv *GrpcTransport) (*grpc.ClientConn, func()) {
+// transport and returns a dial-able client connection; extra dial options
+// are appended to the defaults.
+func newBufconnServer(t *testing.T, srv *GrpcTransport, extra ...grpc.DialOption) (*grpc.ClientConn, func()) {
 	t.Helper()
 	const bufSize = 1 << 20
 	lis := bufconn.Listen(bufSize)
@@ -61,11 +64,12 @@ func newBufconnServer(t *testing.T, srv *GrpcTransport) (*grpc.ClientConn, func(
 	}()
 
 	dialer := func(context.Context, string) (net.Conn, error) { return lis.Dial() }
-	cc, err := grpc.DialContext(context.Background(), "bufnet",
+	opts := append([]grpc.DialOption{
 		grpc.WithContextDialer(dialer),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithBlock(),
-	)
+	}, extra...)
+	cc, err := grpc.DialContext(context.Background(), "bufnet", opts...)
 	if err != nil {
 		t.Fatalf("dial bufconn: %v", err)
 	}
@@ -205,5 +209,91 @@ func TestGrpcServer_UnauthedRejected(t *testing.T) {
 	_, err := client.Ping(ctx, &pb.PingRequest{TimestampNs: time.Now().UnixNano()})
 	if err == nil {
 		t.Fatal("expected Ping without metadata to fail auth")
+	}
+}
+
+// The connection transportServer.Stream hands the session has real
+// deadlines. A Read with nothing to read returns at its read deadline;
+// with a client that never receives, a Write that the gRPC send window
+// has stopped returns at its write deadline. Fixed 64 KiB windows keep
+// the client from growing its window, so the stop comes after a few
+// hundred KiB.
+func TestGrpcServer_StreamBridgeDeadlines(t *testing.T) {
+	serverT, _, serverNodeID := freshServerTransport(t)
+	cc, cleanup := newBufconnServer(t, serverT,
+		grpc.WithInitialWindowSize(1<<16),
+		grpc.WithInitialConnWindowSize(1<<16),
+	)
+	defer cleanup()
+
+	clientPub, clientPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("client key: %v", err)
+	}
+	clientNodeID, err := aether.NewNodeID(clientPub)
+	if err != nil {
+		t.Fatalf("client NewNodeID: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	ctx = makeAuthedContext(t, ctx, clientPriv, clientNodeID, serverNodeID)
+
+	stream, err := pb.NewTransportServiceClient(cc).Stream(ctx)
+	if err != nil {
+		t.Fatalf("open Stream: %v", err)
+	}
+	if err := stream.Send(&pb.Frame{Data: []byte("hello"), Type: pb.FrameType_FRAME_TYPE_DATA}); err != nil {
+		t.Fatalf("send frame: %v", err)
+	}
+
+	var conn net.Conn
+	select {
+	case inc := <-serverT.Incoming():
+		p, ok := inc.Session.(interface{ NetConn() net.Conn })
+		if !ok {
+			t.Fatalf("incoming session %T exposes no NetConn", inc.Session)
+		}
+		conn = p.NetConn()
+	case <-time.After(3 * time.Second):
+		t.Fatal("no incoming session within 3s")
+	}
+	defer conn.Close()
+
+	buf := make([]byte, 64)
+	if n, err := conn.Read(buf); err != nil || string(buf[:n]) != "hello" {
+		t.Fatalf("first Read = (%q, %v), want hello", buf[:n], err)
+	}
+	readDeadline := time.Now().Add(100 * time.Millisecond)
+	if err := conn.SetReadDeadline(readDeadline); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	if _, err := conn.Read(buf); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("Read with nothing sent: err = %v, want os.ErrDeadlineExceeded", err)
+	}
+	if time.Now().Before(readDeadline) {
+		t.Fatal("Read returned before its deadline")
+	}
+
+	writeDeadline := time.Now().Add(300 * time.Millisecond)
+	if err := conn.SetWriteDeadline(writeDeadline); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
+	}
+	chunk := make([]byte, 32<<10)
+	written := 0
+	for {
+		n, err := conn.Write(chunk)
+		written += n
+		if err != nil {
+			if !errors.Is(err, os.ErrDeadlineExceeded) {
+				t.Fatalf("Write after %d bytes: err = %v, want os.ErrDeadlineExceeded", written, err)
+			}
+			break
+		}
+		if written > 64<<20 {
+			t.Fatalf("%d bytes written to a client that never receives; no Write blocked", written)
+		}
+	}
+	if time.Now().Before(writeDeadline) {
+		t.Fatal("Write returned before its deadline")
 	}
 }

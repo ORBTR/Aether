@@ -8,7 +8,9 @@ package adapter
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -65,14 +67,43 @@ type grpcConnWrapper struct {
 	}
 }
 
-func (w *grpcConnWrapper) Read(b []byte) (int, error)         { return w.conn.Read(b) }
-func (w *grpcConnWrapper) Write(b []byte) (int, error)        { return w.conn.Write(b) }
-func (w *grpcConnWrapper) Close() error                       { return w.conn.Close() }
-func (w *grpcConnWrapper) LocalAddr() net.Addr                { return grpcAddr{} }
-func (w *grpcConnWrapper) RemoteAddr() net.Addr               { return grpcAddr{} }
-func (w *grpcConnWrapper) SetDeadline(t time.Time) error      { return nil }
-func (w *grpcConnWrapper) SetReadDeadline(t time.Time) error  { return nil }
-func (w *grpcConnWrapper) SetWriteDeadline(t time.Time) error { return nil }
+func (w *grpcConnWrapper) Read(b []byte) (int, error)  { return w.conn.Read(b) }
+func (w *grpcConnWrapper) Write(b []byte) (int, error) { return w.conn.Write(b) }
+func (w *grpcConnWrapper) Close() error                { return w.conn.Close() }
+func (w *grpcConnWrapper) LocalAddr() net.Addr         { return grpcAddr{} }
+func (w *grpcConnWrapper) RemoteAddr() net.Addr        { return grpcAddr{} }
+
+// The deadline methods hand t to the wrapped connection, whose Read and
+// Write they bound. NewSessionForProtocol passes a net.Conn, so the
+// deadlines are that connection's own. A connection that has no deadline
+// method gets an error wrapping os.ErrNoDeadline: the wrapper cannot
+// interrupt a Read or Write it does not own, and reporting success would
+// leave the caller's Write unbounded.
+
+func (w *grpcConnWrapper) SetDeadline(t time.Time) error {
+	if d, ok := w.conn.(interface{ SetDeadline(time.Time) error }); ok {
+		return d.SetDeadline(t)
+	}
+	return grpcNoDeadline("SetDeadline")
+}
+
+func (w *grpcConnWrapper) SetReadDeadline(t time.Time) error {
+	if d, ok := w.conn.(interface{ SetReadDeadline(time.Time) error }); ok {
+		return d.SetReadDeadline(t)
+	}
+	return grpcNoDeadline("SetReadDeadline")
+}
+
+func (w *grpcConnWrapper) SetWriteDeadline(t time.Time) error {
+	if d, ok := w.conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		return d.SetWriteDeadline(t)
+	}
+	return grpcNoDeadline("SetWriteDeadline")
+}
+
+func grpcNoDeadline(op string) error {
+	return fmt.Errorf("adapter: grpc conn %s: %w", op, os.ErrNoDeadline)
+}
 
 type grpcAddr struct{}
 

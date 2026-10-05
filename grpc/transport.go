@@ -438,40 +438,38 @@ func (s *transportServer) Stream(stream pb.TransportService_StreamServer) error 
 		return err
 	}
 
-	// Create pipe-based bridge: gRPC stream ↔ net.Conn
-	clientReader, serverWriter := io.Pipe()
-	serverReader, clientWriter := io.Pipe()
+	// One net.Pipe bridges the gRPC stream to the net.Conn the session
+	// reads and writes: the session holds sessionEnd, the two pumps below
+	// drive pumpEnd. net.Pipe gives sessionEnd real read and write
+	// deadlines. Either pump ending closes pumpEnd, which ends both
+	// directions for the session and the other pump.
+	sessionEnd, pumpEnd := net.Pipe()
 
 	conn := &grpcPipeConn{
-		reader: serverReader,
-		writer: serverWriter,
-		closer: func() error {
-			serverWriter.Close()
-			serverReader.Close()
-			return nil
-		},
+		end:    sessionEnd,
+		closer: sessionEnd.Close,
 	}
 
-	// Pump: gRPC stream recv → serverReader (so TCPSession readLoop can read)
+	// Pump: gRPC stream recv → pumpEnd (so TCPSession readLoop can read)
 	go func() {
-		defer clientWriter.Close()
+		defer pumpEnd.Close()
 		for {
 			frame, err := stream.Recv()
 			if err != nil {
 				return
 			}
-			if _, err := clientWriter.Write(frame.Data); err != nil {
+			if _, err := pumpEnd.Write(frame.Data); err != nil {
 				return
 			}
 		}
 	}()
 
-	// Pump: clientReader → gRPC stream send (so TCPSession writeLoop sends reach remote)
+	// Pump: pumpEnd → gRPC stream send (so TCPSession writeLoop sends reach remote)
 	go func() {
-		defer clientReader.Close()
+		defer pumpEnd.Close()
 		buf := make([]byte, 65536)
 		for {
-			n, err := clientReader.Read(buf)
+			n, err := pumpEnd.Read(buf)
 			if err != nil {
 				return
 			}
@@ -505,21 +503,33 @@ func (s *transportServer) Ping(ctx context.Context, req *pb.PingRequest) (*pb.Pi
 	}, nil
 }
 
-// grpcPipeConn wraps io.Pipe reader/writer as a net.Conn for TCPSession.
+// grpcPipeConn is the session's end of the net.Pipe transportServer.Stream
+// bridges to one gRPC stream; aether.NewConnection reads and writes it.
+// Its deadlines are the pipe's: a Read or Write blocked past its deadline
+// returns os.ErrDeadlineExceeded, and a later deadline makes it usable
+// again.
 type grpcPipeConn struct {
-	reader *io.PipeReader
-	writer *io.PipeWriter
+	end    net.Conn
 	closer func() error
 }
 
-func (c *grpcPipeConn) Read(b []byte) (int, error)         { return c.reader.Read(b) }
-func (c *grpcPipeConn) Write(b []byte) (int, error)        { return c.writer.Write(b) }
-func (c *grpcPipeConn) Close() error                       { return c.closer() }
-func (c *grpcPipeConn) LocalAddr() net.Addr                { return grpcNetAddr{} }
-func (c *grpcPipeConn) RemoteAddr() net.Addr               { return grpcNetAddr{} }
-func (c *grpcPipeConn) SetDeadline(t time.Time) error      { return nil }
-func (c *grpcPipeConn) SetReadDeadline(t time.Time) error  { return nil }
-func (c *grpcPipeConn) SetWriteDeadline(t time.Time) error { return nil }
+func (c *grpcPipeConn) Read(b []byte) (int, error)  { return c.end.Read(b) }
+func (c *grpcPipeConn) Write(b []byte) (int, error) { return c.end.Write(b) }
+func (c *grpcPipeConn) Close() error                { return c.closer() }
+func (c *grpcPipeConn) LocalAddr() net.Addr         { return grpcNetAddr{} }
+func (c *grpcPipeConn) RemoteAddr() net.Addr        { return grpcNetAddr{} }
+
+func (c *grpcPipeConn) SetDeadline(t time.Time) error {
+	return c.end.SetDeadline(t)
+}
+
+func (c *grpcPipeConn) SetReadDeadline(t time.Time) error {
+	return c.end.SetReadDeadline(t)
+}
+
+func (c *grpcPipeConn) SetWriteDeadline(t time.Time) error {
+	return c.end.SetWriteDeadline(t)
+}
 
 type grpcNetAddr struct{}
 

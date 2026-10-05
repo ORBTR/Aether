@@ -8,6 +8,8 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
+	"sync"
 	"time"
 
 	"github.com/ORBTR/aether"
@@ -20,7 +22,8 @@ import (
 //
 // Key capabilities:
 //   - Read/Write with message-to-byte-stream buffering (partial reads)
-//   - SetDeadline creates per-call context.WithDeadline for timeout support
+//   - SetReadDeadline bounds Receive with a context.WithDeadline;
+//     SetWriteDeadline bounds Send through writeDeadline
 //   - Parent context propagation (cancelled when connection dies)
 //   - StreamID accessor for debug logging
 //   - net.Conn compliant (verified by interface assertion)
@@ -30,6 +33,7 @@ type StreamConn struct {
 	readCtx    context.Context    // per-exchange deadline context
 	readCancel context.CancelFunc // cancels readCtx
 	buf        []byte             // read buffer for partial message reads
+	writeDL    writeDeadline      // bounds Write; see SetWriteDeadline
 }
 
 // Ensure net.Conn compliance at compile time.
@@ -55,7 +59,8 @@ func NewStreamConn(stream aether.Stream, parentCtx ...context.Context) *StreamCo
 // This method buffers partial reads so callers can use io.ReadFull and
 // other byte-stream patterns.
 //
-// Uses readCtx (set by SetDeadline) if available, otherwise parentCtx.
+// Uses readCtx (set by SetReadDeadline or SetDeadline) if available,
+// otherwise parentCtx.
 // Not concurrent-safe — callers must not call Read from multiple goroutines.
 func (c *StreamConn) Read(p []byte) (int, error) {
 	// Return buffered data from a previous oversized Receive
@@ -81,31 +86,68 @@ func (c *StreamConn) Read(p []byte) (int, error) {
 // Write implements net.Conn. Sends data on the Aether stream as a single message.
 // On Aether, Send() enqueues to the scheduler and returns immediately (non-blocking
 // for TCP/WS). For Noise-UDP, flow control may block until credit is available.
+//
+// Send is message-atomic, so a Write either sends all of p or none of it.
+// Under a write deadline that has passed, or that passes while Send is
+// blocked, Write returns 0 and os.ErrDeadlineExceeded.
 func (c *StreamConn) Write(p []byte) (int, error) {
-	ctx := c.activeCtx()
+	ctx, end, ok := c.writeDL.begin(c.parentCtx)
+	if !ok {
+		return 0, os.ErrDeadlineExceeded
+	}
+	defer end()
 	if err := c.stream.Send(ctx, p); err != nil {
+		if c.writeDL.passed() {
+			return 0, os.ErrDeadlineExceeded
+		}
 		return 0, err
 	}
 	return len(p), nil
 }
 
-// Close cancels any active deadline and closes the underlying Aether stream.
+// Close cancels the read deadline's context, disarms the write deadline's
+// timer and closes the underlying Aether stream.
 func (c *StreamConn) Close() error {
 	if c.readCancel != nil {
 		c.readCancel()
 		c.readCancel = nil
 		c.readCtx = nil
 	}
+	c.writeDL.set(time.Time{})
 	return c.stream.Close()
 }
 
-// SetDeadline creates a per-exchange context with the given deadline.
+// SetDeadline sets the read and the write deadline, as net.Conn defines.
+func (c *StreamConn) SetDeadline(t time.Time) error {
+	c.setReadDeadline(t)
+	c.writeDL.set(t)
+	return nil
+}
+
+// SetReadDeadline creates a per-exchange context with the given deadline.
 // When the deadline fires, any blocked Read (stream.Receive) is cancelled.
 // This prevents goroutine leaks when callers use concurrent read patterns
 // with timeout-based fallback (e.g., GossipOverConn).
 //
 // Pass time.Time{} (zero) to clear the deadline and revert to parentCtx.
-func (c *StreamConn) SetDeadline(t time.Time) error {
+func (c *StreamConn) SetReadDeadline(t time.Time) error {
+	c.setReadDeadline(t)
+	return nil
+}
+
+// SetWriteDeadline bounds every Write that starts before t and every
+// Write already blocked in Send; a zero t clears it. Extending it while a
+// Write is blocked extends that Write too. Callers that run a byte
+// protocol over the view (yamux, gossip) need a Write that cannot hold
+// their send goroutine forever when the peer stops granting credit.
+func (c *StreamConn) SetWriteDeadline(t time.Time) error {
+	c.writeDL.set(t)
+	return nil
+}
+
+// setReadDeadline replaces readCtx with one bounded at t (none for a zero
+// t), cancelling the previous one.
+func (c *StreamConn) setReadDeadline(t time.Time) {
 	// Cancel any previous deadline
 	if c.readCancel != nil {
 		c.readCancel()
@@ -118,18 +160,10 @@ func (c *StreamConn) SetDeadline(t time.Time) error {
 	if t.IsZero() {
 		c.readCtx = nil
 		c.readCancel = nil
-		return nil
+		return
 	}
 	c.readCtx, c.readCancel = context.WithDeadline(c.parentCtx, t)
-	return nil
 }
-
-// SetReadDeadline delegates to SetDeadline (same context for both).
-func (c *StreamConn) SetReadDeadline(t time.Time) error { return c.SetDeadline(t) }
-
-// SetWriteDeadline is a no-op — Aether writes enqueue to the scheduler and
-// return immediately on TCP/WS. Noise-UDP flow control has its own timeout.
-func (c *StreamConn) SetWriteDeadline(t time.Time) error { return nil }
 
 // LocalAddr implements net.Conn with a placeholder Aether address.
 func (c *StreamConn) LocalAddr() net.Addr {
@@ -165,7 +199,7 @@ func (c *StreamConn) AvailableCredit() int64 {
 // that need to derive sub-contexts tied to the connection lifetime.
 func (c *StreamConn) ParentContext() context.Context { return c.parentCtx }
 
-// activeCtx returns readCtx if a deadline is set, otherwise parentCtx.
+// activeCtx returns readCtx if a read deadline is set, otherwise parentCtx.
 func (c *StreamConn) activeCtx() context.Context {
 	if c.readCtx != nil {
 		return c.readCtx
@@ -178,3 +212,86 @@ type streamConnAddr struct{ s string }
 
 func (a streamConnAddr) Network() string { return "aether" }
 func (a streamConnAddr) String() string  { return a.s }
+
+// writeDeadline is StreamConn's write deadline. Each Write registers the
+// cancel of the context its Send runs under; the deadline passing cancels
+// every registered Send, and a Write that starts after it has passed is
+// refused before Send. Re-setting the deadline re-arms the timer without
+// cancelling a running Send, so an extended or cleared deadline applies to
+// a Write already blocked, as net.Conn requires. gen discards a timer that
+// fired after a later set replaced it. Safe for concurrent use.
+type writeDeadline struct {
+	mu      sync.Mutex
+	timer   *time.Timer
+	gen     uint64
+	expired bool
+	running map[uint64]context.CancelFunc
+	nextID  uint64
+}
+
+// set arms the deadline at t; a zero t clears it.
+func (d *writeDeadline) set(t time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.timer != nil {
+		d.timer.Stop()
+		d.timer = nil
+	}
+	d.gen++
+	d.expired = false
+	if t.IsZero() {
+		return
+	}
+	wait := time.Until(t)
+	if wait <= 0 {
+		d.expireLocked()
+		return
+	}
+	gen := d.gen
+	d.timer = time.AfterFunc(wait, func() {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if d.gen == gen {
+			d.expireLocked()
+		}
+	})
+}
+
+func (d *writeDeadline) expireLocked() {
+	d.expired = true
+	for _, cancel := range d.running {
+		cancel()
+	}
+}
+
+// begin returns the context one Write's Send runs under and the func that
+// releases it, or ok false when the deadline has already passed.
+func (d *writeDeadline) begin(parent context.Context) (ctx context.Context, end func(), ok bool) {
+	ctx, cancel := context.WithCancel(parent)
+	d.mu.Lock()
+	if d.expired {
+		d.mu.Unlock()
+		cancel()
+		return nil, nil, false
+	}
+	if d.running == nil {
+		d.running = make(map[uint64]context.CancelFunc)
+	}
+	id := d.nextID
+	d.nextID++
+	d.running[id] = cancel
+	d.mu.Unlock()
+	return ctx, func() {
+		d.mu.Lock()
+		delete(d.running, id)
+		d.mu.Unlock()
+		cancel()
+	}, true
+}
+
+// passed reports whether the deadline has passed and not been re-set.
+func (d *writeDeadline) passed() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.expired
+}
