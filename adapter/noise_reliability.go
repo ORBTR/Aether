@@ -883,11 +883,15 @@ func (s *NoiseSession) reliabilityTick() {
 const writeFrameDeadline = 10 * time.Second
 
 // writeDeadlineConn is the subset of net.Conn writeFrame needs to bound
-// its writes. Real sockets (WebSocket, TLS, UDP) satisfy it with an
-// effective implementation; the StreamConn sub-stream adapter satisfies
-// it with a no-op (its writes enqueue to the scheduler and never block)
-// and grpc wrappers likewise — so the type assertion is always safe and
-// the bound simply has no effect where blocking can't occur.
+// its writes. Every net.Conn has it, so writeFrame's type assertion always
+// holds, and the bound is as real as the conn's own method. A socket
+// (WebSocket, TLS, UDP) and the StreamConn sub-stream view return a Write
+// blocked past the deadline, so a StreamConn Write waiting on flow-control
+// credit ends at writeFrameDeadline too. A conn whose method does nothing,
+// or fails (the gRPC conn wrapper returns an error wrapping
+// os.ErrNoDeadline when the conn it wraps has no deadlines), leaves the
+// Write unbounded; writeFrame ignores that error, because the frame still
+// has to be written.
 type writeDeadlineConn interface {
 	SetWriteDeadline(time.Time) error
 }
@@ -997,9 +1001,9 @@ func (s *NoiseSession) writeFrame(frame *aether.Frame) error {
 		}
 	}
 
-	// Bound every socket write for this frame. See writeFrameDeadline.
-	// No-op on non-blocking conns (StreamConn / grpc); cleared on exit
-	// so the deadline never leaks into the next writer's window.
+	// Bound every conn write for this frame; writeFrameDeadline says why
+	// and writeDeadlineConn which conns honour it. Cleared on exit so the
+	// deadline never leaks into the next writer's window.
 	if dl, ok := s.conn.(writeDeadlineConn); ok {
 		_ = dl.SetWriteDeadline(time.Now().Add(writeFrameDeadline))
 		defer dl.SetWriteDeadline(time.Time{})
