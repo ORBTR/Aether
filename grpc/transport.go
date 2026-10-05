@@ -430,46 +430,56 @@ type transportServer struct {
 }
 
 // Stream handles a bidirectional streaming connection.
-// Each Stream RPC becomes one mesh session (like one WebSocket connection).
-// A pair of io.Pipe bridges the gRPC stream to a net.Conn for TCPSession.
+// Each Stream RPC becomes one mesh session (like one WebSocket connection),
+// read and written through the grpcPipeConn the two net.Pipes below make.
 func (s *transportServer) Stream(stream pb.TransportService_StreamServer) error {
 	nodeID, err := s.transport.extractNodeIDVerified(stream.Context())
 	if err != nil {
 		return err
 	}
 
-	// One net.Pipe bridges the gRPC stream to the net.Conn the session
-	// reads and writes: the session holds sessionEnd, the two pumps below
-	// drive pumpEnd. net.Pipe gives sessionEnd real read and write
-	// deadlines. Either pump ending closes pumpEnd, which ends both
-	// directions for the session and the other pump.
-	sessionEnd, pumpEnd := net.Pipe()
+	// One net.Pipe per direction bridges the gRPC stream to the net.Conn
+	// the session reads and writes, so each direction has net.Pipe's real
+	// deadlines and closes on its own. The receive pump writes inPump and
+	// the session reads in; the session writes out and the send pump
+	// reads outPump. The peer's CloseSend ends Recv with io.EOF, which
+	// closes the inbound direction only: the session reads io.EOF and can
+	// still write the response the peer is draining. Any other Recv error
+	// means the stream is gone, so it closes the outbound direction too,
+	// and a session Write fails rather than reach a send pump that cannot
+	// deliver it.
+	in, inPump := net.Pipe()
+	out, outPump := net.Pipe()
+	conn := &grpcPipeConn{in: in, out: out}
 
-	conn := &grpcPipeConn{
-		end:    sessionEnd,
-		closer: sessionEnd.Close,
-	}
-
-	// Pump: gRPC stream recv → pumpEnd (so TCPSession readLoop can read)
+	// Pump: gRPC stream recv → inPump (so the session's reads see it)
 	go func() {
-		defer pumpEnd.Close()
+		var recvErr error
+		defer func() {
+			_ = inPump.Close()
+			if !errors.Is(recvErr, io.EOF) {
+				_ = outPump.Close()
+			}
+		}()
 		for {
 			frame, err := stream.Recv()
 			if err != nil {
+				recvErr = err
 				return
 			}
-			if _, err := pumpEnd.Write(frame.Data); err != nil {
+			if _, err := inPump.Write(frame.Data); err != nil {
+				recvErr = err
 				return
 			}
 		}
 	}()
 
-	// Pump: pumpEnd → gRPC stream send (so TCPSession writeLoop sends reach remote)
+	// Pump: outPump → gRPC stream send (so the session's writes reach remote)
 	go func() {
-		defer pumpEnd.Close()
+		defer outPump.Close()
 		buf := make([]byte, 65536)
 		for {
-			n, err := pumpEnd.Read(buf)
+			n, err := outPump.Read(buf)
 			if err != nil {
 				return
 			}
@@ -503,32 +513,38 @@ func (s *transportServer) Ping(ctx context.Context, req *pb.PingRequest) (*pb.Pi
 	}, nil
 }
 
-// grpcPipeConn is the session's end of the net.Pipe transportServer.Stream
-// bridges to one gRPC stream; aether.NewConnection reads and writes it.
-// Its deadlines are the pipe's: a Read or Write blocked past its deadline
-// returns os.ErrDeadlineExceeded, and a later deadline makes it usable
-// again.
+// grpcPipeConn is the session's side of the two net.Pipes
+// transportServer.Stream bridges to one gRPC stream; aether.NewConnection
+// reads and writes it. Read takes the inbound pipe and Write the outbound
+// one, so each direction ends on its own: Read returns io.EOF after the
+// peer's CloseSend while Write still reaches the peer. Its deadlines are
+// the pipes': a Read or Write blocked past its deadline returns
+// os.ErrDeadlineExceeded, and a later deadline makes it usable again.
+// Close closes both directions.
 type grpcPipeConn struct {
-	end    net.Conn
-	closer func() error
+	in  net.Conn // the session reads the peer's frames here
+	out net.Conn // the session's writes go to the send pump here
 }
 
-func (c *grpcPipeConn) Read(b []byte) (int, error)  { return c.end.Read(b) }
-func (c *grpcPipeConn) Write(b []byte) (int, error) { return c.end.Write(b) }
-func (c *grpcPipeConn) Close() error                { return c.closer() }
+func (c *grpcPipeConn) Read(b []byte) (int, error)  { return c.in.Read(b) }
+func (c *grpcPipeConn) Write(b []byte) (int, error) { return c.out.Write(b) }
 func (c *grpcPipeConn) LocalAddr() net.Addr         { return grpcNetAddr{} }
 func (c *grpcPipeConn) RemoteAddr() net.Addr        { return grpcNetAddr{} }
 
+func (c *grpcPipeConn) Close() error {
+	return errors.Join(c.in.Close(), c.out.Close())
+}
+
 func (c *grpcPipeConn) SetDeadline(t time.Time) error {
-	return c.end.SetDeadline(t)
+	return errors.Join(c.in.SetReadDeadline(t), c.out.SetWriteDeadline(t))
 }
 
 func (c *grpcPipeConn) SetReadDeadline(t time.Time) error {
-	return c.end.SetReadDeadline(t)
+	return c.in.SetReadDeadline(t)
 }
 
 func (c *grpcPipeConn) SetWriteDeadline(t time.Time) error {
-	return c.end.SetWriteDeadline(t)
+	return c.out.SetWriteDeadline(t)
 }
 
 type grpcNetAddr struct{}

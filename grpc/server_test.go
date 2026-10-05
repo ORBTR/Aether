@@ -12,6 +12,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"strconv"
@@ -295,5 +296,105 @@ func TestGrpcServer_StreamBridgeDeadlines(t *testing.T) {
 	}
 	if time.Now().Before(writeDeadline) {
 		t.Fatal("Write returned before its deadline")
+	}
+}
+
+// openBridge opens one TransportService stream from a fresh client key,
+// sends "hello", and returns the client stream with its cancel, plus the
+// net.Conn of the server session the stream became, already past "hello".
+func openBridge(t *testing.T, serverT *GrpcTransport, cc *grpc.ClientConn, serverNodeID aether.NodeID) (pb.TransportService_StreamClient, context.CancelFunc, net.Conn) {
+	t.Helper()
+	clientPub, clientPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("client key: %v", err)
+	}
+	clientNodeID, err := aether.NewNodeID(clientPub)
+	if err != nil {
+		t.Fatalf("client NewNodeID: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx = makeAuthedContext(t, ctx, clientPriv, clientNodeID, serverNodeID)
+	stream, err := pb.NewTransportServiceClient(cc).Stream(ctx)
+	if err != nil {
+		cancel()
+		t.Fatalf("open Stream: %v", err)
+	}
+	if err := stream.Send(&pb.Frame{Data: []byte("hello"), Type: pb.FrameType_FRAME_TYPE_DATA}); err != nil {
+		cancel()
+		t.Fatalf("send frame: %v", err)
+	}
+	var conn net.Conn
+	select {
+	case inc := <-serverT.Incoming():
+		p, ok := inc.Session.(interface{ NetConn() net.Conn })
+		if !ok {
+			cancel()
+			t.Fatalf("incoming session %T exposes no NetConn", inc.Session)
+		}
+		conn = p.NetConn()
+	case <-time.After(3 * time.Second):
+		cancel()
+		t.Fatal("no incoming session within 3s")
+	}
+	buf := make([]byte, 64)
+	if n, err := conn.Read(buf); err != nil || string(buf[:n]) != "hello" {
+		cancel()
+		t.Fatalf("first Read = (%q, %v), want hello", buf[:n], err)
+	}
+	return stream, cancel, conn
+}
+
+// The peer's CloseSend half-closes the bridge: the server session reads
+// io.EOF and can still write the response the peer is draining, which
+// the peer receives.
+func TestGrpcServer_StreamBridgeHalfClose(t *testing.T) {
+	serverT, _, serverNodeID := freshServerTransport(t)
+	cc, cleanup := newBufconnServer(t, serverT)
+	defer cleanup()
+	stream, cancel, conn := openBridge(t, serverT, cc, serverNodeID)
+	defer cancel()
+	defer conn.Close()
+
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("CloseSend: %v", err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	if n, err := conn.Read(make([]byte, 8)); !errors.Is(err, io.EOF) {
+		t.Fatalf("Read after the peer's CloseSend = (%d, %v), want io.EOF", n, err)
+	}
+	if err := conn.SetWriteDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
+	}
+	if _, err := conn.Write([]byte("resp")); err != nil {
+		t.Fatalf("server Write after the peer's CloseSend: %v", err)
+	}
+	f, err := stream.Recv()
+	if err != nil || string(f.GetData()) != "resp" {
+		t.Fatalf("peer Recv after its CloseSend = (%q, %v), want resp", f.GetData(), err)
+	}
+}
+
+// A stream that ends other than by the peer's CloseSend ends both
+// directions: once the peer cancels, the server session's next Write
+// fails instead of handing bytes to a send pump that cannot deliver them.
+func TestGrpcServer_StreamBridgeEndsBothDirectionsOnStreamError(t *testing.T) {
+	serverT, _, serverNodeID := freshServerTransport(t)
+	cc, cleanup := newBufconnServer(t, serverT)
+	defer cleanup()
+	_, cancel, conn := openBridge(t, serverT, cc, serverNodeID)
+	defer conn.Close()
+
+	cancel()
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	if _, err := conn.Read(make([]byte, 8)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("Read after the peer cancelled: err = %v, want the bridge's end", err)
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second)) // may refuse: the write end is closed
+	if _, err := conn.Write([]byte("lost")); err == nil {
+		t.Fatal("server Write after the peer cancelled succeeded")
 	}
 }
