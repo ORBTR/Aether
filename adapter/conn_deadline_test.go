@@ -406,3 +406,52 @@ func TestGrpcStreamAdapterConn_BlockedWriteReturnsAtWriteDeadline(t *testing.T) 
 		t.Fatalf("Send with an ended context: err = %v, want context.Canceled", err)
 	}
 }
+
+// Close unblocks a Write blocked in Send, as net.Conn requires, whether or
+// not a deadline is set, and a Write after Close is refused before Send.
+// A deadline set after Close does not reopen the conn for Writes.
+func TestStreamConn_CloseUnblocksBlockedWrite(t *testing.T) {
+	for _, set := range []string{"no deadline", "SetDeadline", "SetWriteDeadline"} {
+		s := newCreditlessStream()
+		c := NewStreamConn(s)
+		dl := time.Now().Add(5 * time.Second)
+		switch set {
+		case "SetDeadline":
+			_ = c.SetDeadline(dl)
+		case "SetWriteDeadline":
+			_ = c.SetWriteDeadline(dl)
+		}
+		pending := writeAsync(c, []byte("blocked"))
+		s.waitSend(t, set+": the Write's Send")
+		closedAt := time.Now()
+		if err := c.Close(); err != nil {
+			t.Fatalf("%s: Close: %v", set, err)
+		}
+		select {
+		case r := <-pending:
+			if !errors.Is(r.err, net.ErrClosed) || r.n != 0 {
+				t.Errorf("%s: Write blocked at Close = (%d, %v), want (0, net.ErrClosed)", set, r.n, r.err)
+			}
+			if waited := r.at.Sub(closedAt); waited > time.Second {
+				t.Errorf("%s: Write returned %v after Close", set, waited)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s: Write still blocked 2s after Close", set)
+		}
+
+		_ = c.SetWriteDeadline(time.Now().Add(time.Second))
+		select {
+		case r := <-writeAsync(c, []byte("late")):
+			if !errors.Is(r.err, net.ErrClosed) || r.n != 0 {
+				t.Errorf("%s: Write after Close = (%d, %v), want (0, net.ErrClosed)", set, r.n, r.err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s: Write after Close still blocked after 2s", set)
+		}
+		select {
+		case <-s.sends:
+			t.Errorf("%s: Write after Close reached Send", set)
+		default:
+		}
+	}
+}
