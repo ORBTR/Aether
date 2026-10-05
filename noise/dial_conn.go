@@ -101,8 +101,9 @@ type AcceptConnConfig struct {
 
 	// TicketNonces and TicketNonceFn, set together and only with a ticket
 	// signer, let each verified ticket open one connection per accepter: a
-	// recorded nonce is refused, and a nonce is recorded only once msg3 and
-	// ValidatePeerStaticFn pass. The accepter passes one cache to every accept.
+	// nonce already recorded for the same signer key is refused, and a nonce
+	// is recorded only once msg3 and ValidatePeerStaticFn pass. The accepter
+	// passes one cache to every accept.
 	TicketNonces *TicketNonceCache
 
 	// TicketNonceFn reads the nonce and its expiry from the verified body.
@@ -241,6 +242,7 @@ func AcceptOverConn(ctx context.Context, cfg AcceptConnConfig, conn net.Conn) (a
 	// rely on to refuse ticketLen=0 under a self-minted key. With both signer
 	// fields nil the block is skipped.
 	var body []byte
+	var signer ed25519.PublicKey
 	var nonce []byte
 	var nonceExpires time.Time
 	if ticketAuth {
@@ -255,7 +257,7 @@ func AcceptOverConn(ctx context.Context, cfg AcceptConnConfig, conn net.Conn) (a
 		// may read the (unverified) body to select the key; the ed25519.Verify
 		// below is the gate, so key selection from an unverified body cannot let
 		// a forged ticket through.
-		signer := cfg.TrustedTicketSigner
+		signer = cfg.TrustedTicketSigner
 		if cfg.TrustedTicketSignerFn != nil {
 			s, err := cfg.TrustedTicketSignerFn(body)
 			if err != nil {
@@ -282,7 +284,7 @@ func AcceptOverConn(ctx context.Context, cfg AcceptConnConfig, conn net.Conn) (a
 			}
 			// A missing, expired or seen nonce is refused before any handshake
 			// crypto runs; the nonce is recorded only after msg3 below.
-			if err := cfg.TicketNonces.check(nonce, nonceExpires); err != nil {
+			if err := cfg.TicketNonces.check(signer, nonce, nonceExpires); err != nil {
 				return nil, err
 			}
 		}
@@ -348,7 +350,7 @@ func AcceptOverConn(ctx context.Context, cfg AcceptConnConfig, conn net.Conn) (a
 	// is refused without consuming it, and of two concurrent handshakes on
 	// one ticket only the first to reach here is admitted.
 	if cfg.TicketNonces != nil {
-		if err := cfg.TicketNonces.use(nonce, nonceExpires); err != nil {
+		if err := cfg.TicketNonces.use(signer, nonce, nonceExpires); err != nil {
 			return nil, err
 		}
 	}
