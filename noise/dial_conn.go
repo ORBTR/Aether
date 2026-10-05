@@ -92,6 +92,24 @@ type AcceptConnConfig struct {
 	// scope/expiry/capability semantics. Returning non-nil aborts.
 	ValidateTicketFn func(body []byte) error
 
+	// ValidatePeerStaticFn runs after msg3 with the verified ticket body and
+	// the initiator static key msg3 authenticated, so the caller can require
+	// the key the ticket names (a grant's browserPub); non-nil aborts. The
+	// ticket travels in clear, so without this hook a copied ticket opens
+	// under any key. Setting it requires a ticket signer.
+	ValidatePeerStaticFn func(body, peerStatic []byte) error
+
+	// TicketNonces and TicketNonceFn, set together and only with a ticket
+	// signer, let each verified ticket open one connection per accepter: a
+	// recorded nonce is refused, and a nonce is recorded only once msg3 and
+	// ValidatePeerStaticFn pass. The accepter passes one cache to every accept.
+	TicketNonces *TicketNonceCache
+
+	// TicketNonceFn reads the nonce and its expiry from the verified body.
+	// expiresAt is the last instant ValidateTicketFn admits the ticket, skew
+	// included: the cache forgets the nonce after it.
+	TicketNonceFn func(body []byte) (nonce []byte, expiresAt time.Time, err error)
+
 	// ExpectedNodeID, when non-empty, pins the responder's accept to a
 	// specific initiator NodeID (used by the relay when routing to a
 	// specific target agent).
@@ -152,7 +170,7 @@ func DialOverConn(ctx context.Context, cfg DialConnConfig, conn net.Conn) (aethe
 	if err != nil {
 		return nil, fmt.Errorf("noise: write msg1: %w", err)
 	}
-	if err := writeTicketAndFrame(conn, cfg.Ticket, msg1); err != nil {
+	if err := WriteTicketAndFrame(conn, cfg.Ticket, msg1); err != nil {
 		return nil, err
 	}
 
@@ -191,6 +209,13 @@ func AcceptOverConn(ctx context.Context, cfg AcceptConnConfig, conn net.Conn) (a
 	if len(cfg.StaticPriv) == 0 || len(cfg.StaticPub) == 0 {
 		return nil, fmt.Errorf("noise: AcceptOverConn: StaticPriv/Pub required")
 	}
+	ticketAuth := cfg.TrustedTicketSigner != nil || cfg.TrustedTicketSignerFn != nil
+	if !ticketAuth && (cfg.ValidatePeerStaticFn != nil || cfg.TicketNonces != nil || cfg.TicketNonceFn != nil) {
+		return nil, fmt.Errorf("noise: AcceptOverConn: ticket binding set without a ticket signer")
+	}
+	if (cfg.TicketNonces == nil) != (cfg.TicketNonceFn == nil) {
+		return nil, fmt.Errorf("noise: AcceptOverConn: TicketNonces and TicketNonceFn are set together")
+	}
 	timeout := cfg.HandshakeTimeout
 	if timeout <= 0 {
 		timeout = dialConnHandshakeTimeout
@@ -207,25 +232,23 @@ func AcceptOverConn(ctx context.Context, cfg AcceptConnConfig, conn net.Conn) (a
 	defer func() { _ = conn.SetDeadline(time.Time{}) }()
 
 	// Msg 1 with ticket prefix.
-	ticket, msg1, err := readTicketAndFrame(conn)
+	ticket, msg1, err := ReadTicketAndFrame(conn)
 	if err != nil {
 		return nil, fmt.Errorf("noise: read msg1: %w", err)
 	}
-	// A configured TrustedTicketSigner makes ticket auth MANDATORY: an absent,
-	// empty, or truncated ticket fails CLOSED here rather than silently skipping
-	// verification. The prior `len(ticket) > 0 && signer != nil` guard let an
-	// initiator present a zero-length ticket (ticketLen=0) to skip the signature
-	// + ValidateTicketFn checks entirely and complete the XX handshake on a
-	// self-minted static key — an anonymous-accept auth bypass for any caller
-	// (e.g. the browser relay bridge) that relies on the ticket as its sole
-	// authenticator and does not pin ExpectedNodeID. Callers that do not want
-	// ticket auth leave TrustedTicketSigner nil (block skipped, as before).
-	if cfg.TrustedTicketSigner != nil || cfg.TrustedTicketSignerFn != nil {
+	// A configured signer makes the ticket mandatory: an absent, empty or
+	// truncated ticket fails closed, which callers that pin no ExpectedNodeID
+	// rely on to refuse ticketLen=0 under a self-minted key. With both signer
+	// fields nil the block is skipped.
+	var body []byte
+	var nonce []byte
+	var nonceExpires time.Time
+	if ticketAuth {
 		if len(ticket) < ed25519.SignatureSize {
 			return nil, fmt.Errorf("noise: ticket required (got %d bytes, need >= %d)",
 				len(ticket), ed25519.SignatureSize)
 		}
-		body := ticket[:len(ticket)-ed25519.SignatureSize]
+		body = ticket[:len(ticket)-ed25519.SignatureSize]
 		sig := ticket[len(ticket)-ed25519.SignatureSize:]
 
 		// Resolve the trusted signer. A per-ticket resolver takes precedence and
@@ -250,6 +273,17 @@ func AcceptOverConn(ctx context.Context, cfg AcceptConnConfig, conn net.Conn) (a
 		if cfg.ValidateTicketFn != nil {
 			if err := cfg.ValidateTicketFn(body); err != nil {
 				return nil, fmt.Errorf("noise: ticket rejected: %w", err)
+			}
+		}
+		if cfg.TicketNonceFn != nil {
+			nonce, nonceExpires, err = cfg.TicketNonceFn(body)
+			if err != nil {
+				return nil, fmt.Errorf("noise: ticket nonce: %w", err)
+			}
+			// A missing, expired or seen nonce is refused before any handshake
+			// crypto runs; the nonce is recorded only after msg3 below.
+			if err := cfg.TicketNonces.check(nonce, nonceExpires); err != nil {
+				return nil, err
 			}
 		}
 	}
@@ -303,43 +337,68 @@ func AcceptOverConn(ctx context.Context, cfg AcceptConnConfig, conn net.Conn) (a
 		return nil, fmt.Errorf("noise: remote node %s does not match expected %s",
 			remoteNode.Short(), cfg.ExpectedNodeID.Short())
 	}
+	// hs.PeerStatic is the key msg3 proved possession of; the NodeInfo
+	// payload's static key is self-asserted, so the ticket binds to this one.
+	if cfg.ValidatePeerStaticFn != nil {
+		if err := cfg.ValidatePeerStaticFn(body, hs.PeerStatic()); err != nil {
+			return nil, fmt.Errorf("noise: ticket not bound to initiator key: %w", err)
+		}
+	}
+	// The nonce is recorded last, so a ticket presented under the wrong key
+	// is refused without consuming it, and of two concurrent handshakes on
+	// one ticket only the first to reach here is admitted.
+	if cfg.TicketNonces != nil {
+		if err := cfg.TicketNonces.use(nonce, nonceExpires); err != nil {
+			return nil, err
+		}
+	}
 
 	return buildAetherConnectionOverConn(cfg.LocalNodeID, remoteNode, conn, sendCS, recvCS, maxPacket), nil
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────
 
-// writeTicketAndFrame writes [uint16:ticketLen][ticket][uint32:msgLen][msg]
-// in one Write so message-boundary substrates (DC, UDP) see it as a
-// single frame.
-func writeTicketAndFrame(conn net.Conn, ticket, msg []byte) error {
+// WriteTicketAndFrame writes an initiator's first message,
+// [uint16:ticketLen][ticket][uint32:msgLen][msg], in one Write so
+// message-boundary substrates (DC, UDP) see one frame. DialOverConn sends
+// msg1 through it; a forwarder that screened the ticket with
+// ReadTicketAndFrame re-sends the same bytes to the accepter through it.
+func WriteTicketAndFrame(w io.Writer, ticket, msg []byte) error {
+	if len(ticket) > 0xFFFF {
+		return fmt.Errorf("noise: ticket too large (%d > 65535)", len(ticket))
+	}
+	if len(msg) > maxHandshakeFrame {
+		return fmt.Errorf("noise: frame too large (%d > %d)", len(msg), maxHandshakeFrame)
+	}
 	buf := make([]byte, 2+len(ticket)+4+len(msg))
 	binary.BigEndian.PutUint16(buf[0:2], uint16(len(ticket)))
 	copy(buf[2:2+len(ticket)], ticket)
 	off := 2 + len(ticket)
 	binary.BigEndian.PutUint32(buf[off:off+4], uint32(len(msg)))
 	copy(buf[off+4:], msg)
-	_, err := conn.Write(buf)
+	_, err := w.Write(buf)
 	return err
 }
 
-// readTicketAndFrame reads the first-message envelope. Byte-stream safe
-// (TCP, WSS) — does sequential io.ReadFull calls — and message-boundary
-// safe (DC, UDP) — since the producer writes it all in one go so it
-// arrives as one datagram.
-func readTicketAndFrame(conn net.Conn) (ticket, msg []byte, err error) {
+// ReadTicketAndFrame reads an initiator's first message: the cleartext,
+// unverified ticket (nil when ticketLen is 0) and the Noise msg1 frame.
+// AcceptOverConn reads msg1 through it; a forwarder reads the ticket
+// through it to screen a dial without running the handshake. Sequential
+// io.ReadFull calls make it byte-stream safe (TCP, WSS); it is
+// message-boundary safe (DC, UDP) because WriteTicketAndFrame sends one Write.
+func ReadTicketAndFrame(r io.Reader) (ticket, msg []byte, err error) {
 	var ticketLenBuf [2]byte
-	if _, err := io.ReadFull(conn, ticketLenBuf[:]); err != nil {
+	if _, err := io.ReadFull(r, ticketLenBuf[:]); err != nil {
 		return nil, nil, fmt.Errorf("read ticketLen: %w", err)
 	}
 	ticketLen := binary.BigEndian.Uint16(ticketLenBuf[:])
 	if ticketLen > 0 {
 		ticket = make([]byte, ticketLen)
-		if _, err := io.ReadFull(conn, ticket); err != nil {
+		if _, err := io.ReadFull(r, ticket); err != nil {
 			return nil, nil, fmt.Errorf("read ticket: %w", err)
 		}
 	}
-	msg, err = readFrame(conn)
+	msg, err = readFrame(r)
 	return ticket, msg, err
 }
 
@@ -354,9 +413,9 @@ func writeFrame(conn net.Conn, msg []byte) error {
 	return err
 }
 
-func readFrame(conn net.Conn) ([]byte, error) {
+func readFrame(r io.Reader) ([]byte, error) {
 	var hdr [4]byte
-	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, err
 	}
 	n := binary.BigEndian.Uint32(hdr[:])
@@ -364,7 +423,7 @@ func readFrame(conn net.Conn) ([]byte, error) {
 		return nil, fmt.Errorf("noise: frame too large (%d > %d)", n, maxHandshakeFrame)
 	}
 	msg := make([]byte, n)
-	if _, err := io.ReadFull(conn, msg); err != nil {
+	if _, err := io.ReadFull(r, msg); err != nil {
 		return nil, err
 	}
 	return msg, nil
