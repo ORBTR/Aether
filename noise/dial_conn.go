@@ -207,6 +207,15 @@ func DialOverConn(ctx context.Context, cfg DialConnConfig, conn net.Conn) (aethe
 
 // AcceptOverConn is the responder-side counterpart of DialOverConn.
 func AcceptOverConn(ctx context.Context, cfg AcceptConnConfig, conn net.Conn) (aether.Connection, error) {
+	return acceptOverConn(ctx, cfg, conn, noise.DH25519)
+}
+
+// acceptOverConn is AcceptOverConn with the handshake's key agreement
+// passed in as dh. AcceptOverConn passes noise.DH25519, which DialOverConn
+// uses too. TestAcceptOverConn_ReplayedNonceRefusedBeforeHandshake passes
+// one that counts its calls, which is how it sees that a refused ticket
+// cost the accepter no key pair and no Diffie-Hellman.
+func acceptOverConn(ctx context.Context, cfg AcceptConnConfig, conn net.Conn, dh noise.DHFunc) (aether.Connection, error) {
 	if len(cfg.StaticPriv) == 0 || len(cfg.StaticPub) == 0 {
 		return nil, fmt.Errorf("noise: AcceptOverConn: StaticPriv/Pub required")
 	}
@@ -290,7 +299,7 @@ func AcceptOverConn(ctx context.Context, cfg AcceptConnConfig, conn net.Conn) (a
 		}
 	}
 
-	suite := noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA256)
+	suite := noise.NewCipherSuite(dh, noise.CipherChaChaPoly, noise.HashSHA256)
 	hs, err := noise.NewHandshakeState(noise.Config{
 		Pattern:     noise.HandshakeXX,
 		Initiator:   false,

@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -491,9 +492,49 @@ func (c *writeCountConn) count() int {
 	return c.writes
 }
 
+// countingDH is the handshake's key agreement with its calls counted, so a
+// test can see whether an accept generated an ephemeral key pair or
+// computed a Diffie-Hellman.
+type countingDH struct {
+	noise.DHFunc
+	mu       sync.Mutex
+	keyPairs int
+	dhs      int
+}
+
+func (c *countingDH) GenerateKeypair(random io.Reader) (noise.DHKey, error) {
+	c.mu.Lock()
+	c.keyPairs++
+	c.mu.Unlock()
+	return c.DHFunc.GenerateKeypair(random)
+}
+
+func (c *countingDH) DH(privkey, pubkey []byte) ([]byte, error) {
+	c.mu.Lock()
+	c.dhs++
+	c.mu.Unlock()
+	return c.DHFunc.DH(privkey, pubkey)
+}
+
+func (c *countingDH) counts() (keyPairs, dhs int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.keyPairs, c.dhs
+}
+
 // A grant whose nonce the accepter has already spent is refused as soon
-// as its ticket is verified: AcceptOverConn writes no msg2, so a replayed
-// grant costs the accepter no Diffie-Hellman and its dialer no reply.
+// as its ticket is verified: the accepter generates no ephemeral key
+// pair, computes no Diffie-Hellman and writes no msg2. The key agreement
+// is counted, not inferred from the missing write: the first, admitted
+// use of the grant goes through the same counter and shows the one key
+// pair and three Diffie-Hellmans a Noise XX responder performs, so the
+// zeroes for the replay are zeroes of something that counts.
+//
+// The refusal is also timed at under a second. The accepter's handshake
+// timeout is 2s, which is where a refusal that waited for the dialer's
+// next message would land; a passing run refuses within a scheduler
+// wake-up of the dialer writing its first message, and the second is room
+// for a loaded machine to start the dialer's goroutine.
 func TestAcceptOverConn_ReplayedNonceRefusedBeforeHandshake(t *testing.T) {
 	signerPub, signerPriv, err := generateTestEd25519(t)
 	if err != nil {
@@ -502,37 +543,61 @@ func TestAcceptOverConn_ReplayedNonceRefusedBeforeHandshake(t *testing.T) {
 	cfg := bindingAcceptConfig(t, signerPub, NewTicketNonceCache(16))
 	browserPriv, browserPub := newTestKeypair(t)
 	ticket := grantTicket(t, signerPriv, browserPub, []byte("nonce-0123456789"), time.Now().Add(time.Minute))
-	if err := acceptWithDialer(cfg, browserPriv, browserPub, ticket); err != nil {
-		t.Fatalf("first use of the grant: %v", err)
-	}
-
-	clientConn, serverConn := net.Pipe()
-	defer clientConn.Close()
-	defer serverConn.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	go func() {
-		c, err := DialOverConn(ctx, DialConnConfig{
-			LocalNodeID:      "vl1_alice",
-			StaticPriv:       browserPriv,
-			StaticPub:        browserPub,
-			Ticket:           ticket,
-			HandshakeTimeout: 2 * time.Second,
-		}, clientConn)
-		if err == nil {
+	dh := &countingDH{DHFunc: noise.DH25519}
+
+	// present dials serverConn's other end with the grant and returns what
+	// an accept on serverConn, wrapped by wrap, returned.
+	present := func(wrap func(net.Conn) net.Conn) error {
+		clientConn, serverConn := net.Pipe()
+		defer clientConn.Close()
+		defer serverConn.Close()
+		go func() {
+			c, err := DialOverConn(ctx, DialConnConfig{
+				LocalNodeID:      "vl1_alice",
+				StaticPriv:       browserPriv,
+				StaticPub:        browserPub,
+				Ticket:           ticket,
+				HandshakeTimeout: 2 * time.Second,
+			}, clientConn)
+			if err == nil {
+				_ = c.Close()
+			}
+		}()
+		c, err := acceptOverConn(ctx, cfg, wrap(serverConn), dh)
+		if c != nil {
 			_ = c.Close()
 		}
-	}()
-	counted := &writeCountConn{Conn: serverConn}
+		return err
+	}
+
+	if err := present(func(c net.Conn) net.Conn { return c }); err != nil {
+		t.Fatalf("first use of the grant: %v", err)
+	}
+	firstKeyPairs, firstDHs := dh.counts()
+	if firstKeyPairs != 1 || firstDHs != 3 {
+		t.Fatalf("an admitted accept generated %d key pair(s) and computed %d Diffie-Hellman(s), want 1 and 3", firstKeyPairs, firstDHs)
+	}
+
+	var counted *writeCountConn
 	start := time.Now()
-	_, err = AcceptOverConn(ctx, cfg, counted)
+	err = present(func(c net.Conn) net.Conn {
+		counted = &writeCountConn{Conn: c}
+		return counted
+	})
+	waited := time.Since(start)
 	if !errors.Is(err, ErrTicketNonceReplayed) {
 		t.Fatalf("replayed grant: err = %v, want ErrTicketNonceReplayed", err)
+	}
+	if keyPairs, dhs := dh.counts(); keyPairs != firstKeyPairs || dhs != firstDHs {
+		t.Fatalf("replayed grant: the accepter generated %d key pair(s) and computed %d Diffie-Hellman(s) before refusing it, want 0 and 0",
+			keyPairs-firstKeyPairs, dhs-firstDHs)
 	}
 	if n := counted.count(); n != 0 {
 		t.Fatalf("replayed grant: AcceptOverConn wrote %d frame(s) before refusing it", n)
 	}
-	if waited := time.Since(start); waited > time.Second {
+	if waited > time.Second {
 		t.Fatalf("replayed grant refused after %v", waited)
 	}
 }
