@@ -442,12 +442,8 @@ func (s *transportServer) Stream(stream pb.TransportService_StreamServer) error 
 	// the session reads and writes, so each direction has net.Pipe's real
 	// deadlines and closes on its own. The receive pump writes inPump and
 	// the session reads in; the session writes out and the send pump
-	// reads outPump. The peer's CloseSend ends Recv with io.EOF, which
-	// closes the inbound direction only: the session reads io.EOF and can
-	// still write the response the peer is draining. Any other Recv error
-	// means the stream is gone, so it closes the outbound direction too,
-	// and a session Write fails rather than reach a send pump that cannot
-	// deliver it.
+	// reads outPump. endBridgeRecv closes the pump ends when the receive
+	// pump stops, and says which.
 	in, inPump := net.Pipe()
 	out, outPump := net.Pipe()
 	conn := &grpcPipeConn{in: in, out: out}
@@ -455,12 +451,7 @@ func (s *transportServer) Stream(stream pb.TransportService_StreamServer) error 
 	// Pump: gRPC stream recv → inPump (so the session's reads see it)
 	go func() {
 		var recvErr error
-		defer func() {
-			_ = inPump.Close()
-			if !errors.Is(recvErr, io.EOF) {
-				_ = outPump.Close()
-			}
-		}()
+		defer func() { endBridgeRecv(recvErr, inPump, outPump) }()
 		for {
 			frame, err := stream.Recv()
 			if err != nil {
@@ -513,6 +504,21 @@ func (s *transportServer) Ping(ctx context.Context, req *pb.PingRequest) (*pb.Pi
 	}, nil
 }
 
+// endBridgeRecv closes the pump ends of transportServer.Stream's two pipes
+// when its receive pump stops with recvErr. io.EOF is the peer's
+// CloseSend: only inPump closes, so the session reads io.EOF and can still
+// write the response the peer is draining. Any other error means the
+// stream is gone, and both close, outPump first: grpcPipeConn.Read reports
+// the end only once inPump is closed, so a session that writes after
+// reading the end finds its Write already failing and hands no bytes to a
+// send pump that cannot deliver them.
+func endBridgeRecv(recvErr error, inPump, outPump io.Closer) {
+	if !errors.Is(recvErr, io.EOF) {
+		_ = outPump.Close()
+	}
+	_ = inPump.Close()
+}
+
 // grpcPipeConn is the session's side of the two net.Pipes
 // transportServer.Stream bridges to one gRPC stream; aether.NewConnection
 // reads and writes it. Read takes the inbound pipe and Write the outbound
@@ -521,9 +527,20 @@ func (s *transportServer) Ping(ctx context.Context, req *pb.PingRequest) (*pb.Pi
 // the pipes': a Read or Write blocked past its deadline returns
 // os.ErrDeadlineExceeded, and a later deadline makes it usable again.
 // Close closes both directions.
+//
+// A direction the pumps have ended is not a closed conn, and its deadline
+// setter still succeeds. net.Pipe refuses a deadline once either of its
+// ends is closed, and endBridgeRecv closes inPump on the peer's CloseSend
+// while the write half is live; passing that refusal on would make a
+// session that sets a read deadline before each Read see the refusal or
+// io.EOF depending on which call the pump's close raced. An ended
+// direction has no Read or Write left to bound, since each returns the
+// end at once, so pumpEnded reports success and the Read or Write reports
+// the end. Only Close makes a setter fail.
 type grpcPipeConn struct {
-	in  net.Conn // the session reads the peer's frames here
-	out net.Conn // the session's writes go to the send pump here
+	in     net.Conn    // the session reads the peer's frames here
+	out    net.Conn    // the session's writes go to the send pump here
+	closed atomic.Bool // set by Close; see pumpEnded
 }
 
 func (c *grpcPipeConn) Read(b []byte) (int, error)  { return c.in.Read(b) }
@@ -532,19 +549,30 @@ func (c *grpcPipeConn) LocalAddr() net.Addr         { return grpcNetAddr{} }
 func (c *grpcPipeConn) RemoteAddr() net.Addr        { return grpcNetAddr{} }
 
 func (c *grpcPipeConn) Close() error {
+	c.closed.Store(true)
 	return errors.Join(c.in.Close(), c.out.Close())
 }
 
 func (c *grpcPipeConn) SetDeadline(t time.Time) error {
-	return errors.Join(c.in.SetReadDeadline(t), c.out.SetWriteDeadline(t))
+	return errors.Join(c.SetReadDeadline(t), c.SetWriteDeadline(t))
 }
 
 func (c *grpcPipeConn) SetReadDeadline(t time.Time) error {
-	return c.in.SetReadDeadline(t)
+	return c.pumpEnded(c.in.SetReadDeadline(t))
 }
 
 func (c *grpcPipeConn) SetWriteDeadline(t time.Time) error {
-	return c.out.SetWriteDeadline(t)
+	return c.pumpEnded(c.out.SetWriteDeadline(t))
+}
+
+// pumpEnded turns a pipe's refusal of a deadline into success unless
+// Close caused it: before Close, the only closed pipe end is one
+// endBridgeRecv or the send pump closed.
+func (c *grpcPipeConn) pumpEnded(err error) error {
+	if err != nil && !c.closed.Load() {
+		return nil
+	}
+	return err
 }
 
 type grpcNetAddr struct{}
