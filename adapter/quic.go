@@ -58,7 +58,8 @@ type quicStream struct {
 	session    *QUICSession
 	connOnce   sync.Once
 	connView   net.Conn
-	sends      sendGate // one Send writes at a time; see Send
+	sends      sendGate      // one Send writes at a time; see Send
+	rx         quicFrameRead // the frame Receive is partway through; see Receive
 }
 
 // NewQuicSession creates an Aether session over a QUIC connection.
@@ -325,16 +326,33 @@ func (st *quicStream) Send(ctx context.Context, data []byte) error {
 
 // boundWrite moves the stream's QUIC write deadline to now when ctx ends,
 // which makes a blocked quic-go Write return. The returned func undoes it
-// once the write is over and reports whether ctx ended it; it clears the
-// deadline again only after the move has run, so a later Send never meets
-// a deadline left in the past. Send holds the gate across both calls.
+// once the write is over and reports whether ctx ended it. Send holds the
+// gate across both calls.
 func (st *quicStream) boundWrite(ctx context.Context) (ended func() bool) {
+	return moveDeadlineOnEnd(ctx, st.quicStream.SetWriteDeadline)
+}
+
+// boundRead moves the stream's QUIC read deadline to now when ctx ends,
+// which makes a blocked quic-go Read return. The returned func undoes it
+// once the read is over and reports whether ctx ended it. Receive calls
+// both from the one goroutine that reads the stream.
+func (st *quicStream) boundRead(ctx context.Context) (ended func() bool) {
+	return moveDeadlineOnEnd(ctx, st.quicStream.SetReadDeadline)
+}
+
+// moveDeadlineOnEnd calls set(time.Now()) when ctx ends; set is one
+// direction's deadline setter on a quic.Stream. The returned func stops
+// that or, if the move has started, waits for it and then clears the
+// deadline with set(time.Time{}), and reports whether the move ran. The
+// clear follows the move, so the next call in that direction never meets a
+// deadline left in the past. A ctx that cannot end sets nothing.
+func moveDeadlineOnEnd(ctx context.Context, set func(time.Time) error) (ended func() bool) {
 	if ctx.Done() == nil {
 		return func() bool { return false }
 	}
 	moved := make(chan struct{})
 	stop := context.AfterFunc(ctx, func() {
-		_ = st.quicStream.SetWriteDeadline(time.Now())
+		_ = set(time.Now())
 		close(moved)
 	})
 	return func() bool {
@@ -342,30 +360,86 @@ func (st *quicStream) boundWrite(ctx context.Context) (ended func() bool) {
 			return false
 		}
 		<-moved
-		_ = st.quicStream.SetWriteDeadline(time.Time{})
+		_ = set(time.Time{})
 		return true
 	}
 }
 
+// Receive reads the next frame, a 4-byte length then that many bytes, from
+// the QUIC stream. ctx bounds the read: when ctx ends while the read waits
+// for the peer's bytes, the stream's QUIC read deadline is moved to now,
+// quic-go's Read returns, and Receive returns ctx's error. That is how
+// StreamConn's read deadline reaches a QUIC stream. The part of the frame
+// read so far stays in rx and the next Receive goes on from it, so a
+// Receive that ctx ended partway through a frame loses none of it and the
+// stream stays usable. Any other failure ends the stream. A Receive whose
+// ctx has already ended reads nothing. One goroutine calls Receive at a
+// time, as StreamConn.Read does: rx and the QUIC read deadline belong to
+// the stream, not to the call.
 func (st *quicStream) Receive(ctx context.Context) ([]byte, error) {
-	// Read 4-byte length prefix
-	var lenBuf [4]byte
-	if _, err := io.ReadFull(st.quicStream, lenBuf[:]); err != nil {
-		st.dropStream() // AE-H-01: evict on stream EOF/error
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	length := binary.BigEndian.Uint32(lenBuf[:])
-	if length > aether.MaxPayloadSize {
-		st.dropStream() // AE-H-01: framing desynced, stream is dead
-		return nil, fmt.Errorf("message too large: %d", length)
+	ended := st.boundRead(ctx)
+	data, err := st.rx.read(st.quicStream)
+	var timeout net.Error
+	if ended() && errors.As(err, &timeout) && timeout.Timeout() {
+		return nil, ctx.Err()
 	}
-	data := make([]byte, length)
-	if _, err := io.ReadFull(st.quicStream, data); err != nil {
-		st.dropStream() // AE-H-01: evict on stream EOF/error
+	if err != nil {
+		st.dropStream() // the stream has ended or its framing is lost
 		return nil, err
 	}
 	st.session.Health().RecordActivity()
 	return data, nil
+}
+
+// quicFrameRead is how far quicStream.Receive has read the frame at the
+// head of its stream. n counts the bytes read of the 4-byte length and,
+// once inBody is set, of the payload instead.
+type quicFrameRead struct {
+	length [4]byte
+	body   []byte
+	inBody bool
+	n      int
+}
+
+// read reads r until the frame is whole and returns its payload. When r
+// fails first, what was read stays, and the next read goes on from it.
+func (f *quicFrameRead) read(r io.Reader) ([]byte, error) {
+	if !f.inBody {
+		if err := f.fill(r, f.length[:]); err != nil {
+			return nil, err
+		}
+		length := binary.BigEndian.Uint32(f.length[:])
+		if length > aether.MaxPayloadSize {
+			return nil, fmt.Errorf("message too large: %d", length)
+		}
+		f.body, f.inBody, f.n = make([]byte, length), true, 0
+	}
+	if err := f.fill(r, f.body); err != nil {
+		return nil, err
+	}
+	body := f.body
+	*f = quicFrameRead{}
+	return body, nil
+}
+
+// fill reads r into buf from f.n on until buf is full. Its errors are
+// io.ReadFull's: io.EOF when r ends before any byte of buf, and
+// io.ErrUnexpectedEOF when it ends partway.
+func (f *quicFrameRead) fill(r io.Reader, buf []byte) error {
+	for f.n < len(buf) {
+		m, err := r.Read(buf[f.n:])
+		f.n += m
+		if err != nil && f.n < len(buf) {
+			if err == io.EOF && f.n > 0 {
+				return io.ErrUnexpectedEOF
+			}
+			return err
+		}
+	}
+	return nil
 }
 
 // dropStream evicts st from the session's stream map. Idempotent — a

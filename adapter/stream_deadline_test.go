@@ -9,12 +9,19 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"fmt"
+	"math/big"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/ORBTR/aether"
+	"github.com/quic-go/quic-go"
 )
 
 // streamHangBound is how long these tests wait for something the code
@@ -32,6 +39,97 @@ func awaitClosed(t *testing.T, ch <-chan struct{}, what string) {
 	case <-time.After(streamHangBound):
 		t.Fatalf("%s did not happen within %v", what, streamHangBound)
 	}
+}
+
+// quicLoopbackDials is how many times quicLoopback tries for a connected
+// pair. A loopback dial now and then gets no reply at all and fails at
+// quic-go's 5s handshake idle timeout, while the dials that succeed take a
+// few milliseconds whatever the load. The handshake is not what these
+// tests measure, and each try has its own listener and client socket, so
+// four tries turn that into a 20s setup failure only if all four meet it.
+const quicLoopbackDials = 4
+
+// quicLoopback returns a client and a server QUICSession over one real
+// loopback QUIC connection. The server grants each stream 16 KiB of
+// receive window, so a client Write larger than that blocks until the
+// server reads.
+func quicLoopback(t *testing.T) (client, server *QUICSession) {
+	t.Helper()
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("key: %v", err)
+	}
+	tmpl := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, key.Public(), key)
+	if err != nil {
+		t.Fatalf("certificate: %v", err)
+	}
+	tlsConf := &tls.Config{
+		Certificates:       []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
+		NextProtos:         []string{"aether-deadline-test"},
+		InsecureSkipVerify: true,
+	}
+	var cc, sc quic.Connection
+	for try := 1; ; try++ {
+		if cc, sc, err = quicLoopbackPair(t, tlsConf); err == nil {
+			break
+		}
+		if try == quicLoopbackDials {
+			t.Fatalf("no loopback QUIC connection in %d tries; the last: %v", try, err)
+		}
+		t.Logf("loopback QUIC try %d: %v", try, err)
+	}
+	client = NewQuicSession(cc, aether.NodeID("quic-client"), aether.NodeID("quic-server"))
+	server = NewQuicSession(sc, aether.NodeID("quic-server"), aether.NodeID("quic-client"))
+	t.Cleanup(func() {
+		_ = cc.CloseWithError(0, "")
+		_ = sc.CloseWithError(0, "")
+	})
+	return client, server
+}
+
+// quicLoopbackPair listens on a fresh loopback port, dials it once and
+// returns both ends of the connection. The listener closes with the test
+// when the pair is returned, and at once when the dial or accept fails.
+func quicLoopbackPair(t *testing.T, tlsConf *tls.Config) (dialed, accepted quic.Connection, err error) {
+	t.Helper()
+	ln, err := quic.ListenAddr("127.0.0.1:0", tlsConf, &quic.Config{
+		InitialStreamReceiveWindow:     16 << 10,
+		MaxStreamReceiveWindow:         16 << 10,
+		InitialConnectionReceiveWindow: 64 << 10,
+		MaxConnectionReceiveWindow:     64 << 10,
+	})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), streamHangBound)
+	defer cancel()
+	type acceptResult struct {
+		conn quic.Connection
+		err  error
+	}
+	acceptCh := make(chan acceptResult, 1)
+	go func() {
+		c, err := ln.Accept(ctx)
+		acceptCh <- acceptResult{c, err}
+	}()
+	dialed, err = quic.DialAddr(ctx, ln.Addr().String(), tlsConf, nil)
+	if err != nil {
+		_ = ln.Close()
+		return nil, nil, fmt.Errorf("dial: %w", err)
+	}
+	a := <-acceptCh
+	if a.err != nil {
+		_ = dialed.CloseWithError(0, "")
+		_ = ln.Close()
+		return nil, nil, fmt.Errorf("accept: %w", a.err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	return dialed, a.conn, nil
 }
 
 // fakeTimeout is the error a fake quic.Stream returns for a deadline that
