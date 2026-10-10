@@ -125,6 +125,14 @@ type GrpcStreamAdapter struct {
 	sends     sendGate // one sendFn runs at a time; see Send
 	abandonMu sync.Mutex
 	abandoned error // set once a Send returned before its sendFn did
+
+	recvPending chan grpcRecv // the recvFn call a Receive left running; see Receive
+}
+
+// grpcRecv is what one recvFn call returned.
+type grpcRecv struct {
+	data []byte
+	err  error
 }
 
 // NewGrpcStreamAdapter creates an Aether stream from gRPC send/recv functions.
@@ -208,8 +216,39 @@ func (s *GrpcStreamAdapter) sendRefusal(ctx context.Context) error {
 	return ctx.Err()
 }
 
+// Receive returns the next message recvFn yields. recvFn takes no context,
+// so under a ctx that can end, recvFn runs on its own goroutine and Receive
+// returns ctx's error if ctx ends first. That is how StreamConn's read
+// deadline reaches this adapter. The recvFn left running still takes the
+// next message off the stream, so its result is kept in recvPending and
+// the next Receive waits for that call instead of making another: no
+// message is lost, recvFn never runs twice at once, and the stream stays
+// usable. A Receive whose ctx has already ended takes nothing. One
+// goroutine calls Receive at a time, as StreamConn.Read does; recvPending
+// has no lock.
 func (s *GrpcStreamAdapter) Receive(ctx context.Context) ([]byte, error) {
-	return s.recvFn()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	pending := s.recvPending
+	if pending == nil {
+		if ctx.Done() == nil {
+			return s.recvFn()
+		}
+		pending = make(chan grpcRecv, 1)
+		s.recvPending = pending
+		go func() {
+			data, err := s.recvFn()
+			pending <- grpcRecv{data, err}
+		}()
+	}
+	select {
+	case r := <-pending:
+		s.recvPending = nil
+		return r.data, r.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (s *GrpcStreamAdapter) Close() error {

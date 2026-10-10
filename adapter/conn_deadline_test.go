@@ -8,13 +8,8 @@ package adapter
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"io"
-	"math/big"
 	"net"
 	"os"
 	"sync"
@@ -231,69 +226,6 @@ func TestGrpcConnWrapper_BlockedWriteReturnsAtDeadline(t *testing.T) {
 			t.Errorf("%s on a connection without deadlines: err = %v, want os.ErrNoDeadline", name, err)
 		}
 	}
-}
-
-// quicLoopback returns a client and a server QUICSession over one real
-// loopback QUIC connection. The server grants each stream 16 KiB of
-// receive window, so a client Write larger than that blocks until the
-// server reads.
-func quicLoopback(t *testing.T) (client, server *QUICSession) {
-	t.Helper()
-	_, key, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("key: %v", err)
-	}
-	tmpl := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		NotBefore:    time.Now().Add(-time.Minute),
-		NotAfter:     time.Now().Add(time.Hour),
-	}
-	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, key.Public(), key)
-	if err != nil {
-		t.Fatalf("certificate: %v", err)
-	}
-	tlsConf := &tls.Config{
-		Certificates:       []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
-		NextProtos:         []string{"aether-deadline-test"},
-		InsecureSkipVerify: true,
-	}
-	ln, err := quic.ListenAddr("127.0.0.1:0", tlsConf, &quic.Config{
-		InitialStreamReceiveWindow:     16 << 10,
-		MaxStreamReceiveWindow:         16 << 10,
-		InitialConnectionReceiveWindow: 64 << 10,
-		MaxConnectionReceiveWindow:     64 << 10,
-	})
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	t.Cleanup(func() { _ = ln.Close() })
-
-	ctx, cancel := context.WithTimeout(context.Background(), streamHangBound)
-	defer cancel()
-	accepted := make(chan quic.Connection, 1)
-	go func() {
-		c, err := ln.Accept(ctx)
-		if err != nil {
-			close(accepted)
-			return
-		}
-		accepted <- c
-	}()
-	cc, err := quic.DialAddr(ctx, ln.Addr().String(), tlsConf, nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	sc, ok := <-accepted
-	if !ok {
-		t.Fatal("accept failed")
-	}
-	client = NewQuicSession(cc, aether.NodeID("quic-client"), aether.NodeID("quic-server"))
-	server = NewQuicSession(sc, aether.NodeID("quic-server"), aether.NodeID("quic-client"))
-	t.Cleanup(func() {
-		_ = cc.CloseWithError(0, "")
-		_ = sc.CloseWithError(0, "")
-	})
-	return client, server
 }
 
 // A Write on a QUIC stream's net.Conn view that the peer's flow control
