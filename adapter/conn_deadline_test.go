@@ -268,7 +268,7 @@ func quicLoopback(t *testing.T) (client, server *QUICSession) {
 	}
 	t.Cleanup(func() { _ = ln.Close() })
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), streamHangBound)
 	defer cancel()
 	accepted := make(chan quic.Connection, 1)
 	go func() {
@@ -392,18 +392,46 @@ func TestGrpcStreamAdapterConn_BlockedWriteReturnsAtWriteDeadline(t *testing.T) 
 	}
 	close(release)
 	mu.Lock()
-	defer mu.Unlock()
-	if len(sent) != 1 || string(sent[0]) != "first" {
-		t.Fatalf("send function got %q, want one call with the Write's own bytes \"first\"", sent)
+	got := append([][]byte(nil), sent...)
+	mu.Unlock()
+	if len(got) != 1 || string(got[0]) != "first" {
+		t.Fatalf("send function got %q, want one call with the Write's own bytes \"first\"", got)
 	}
 
+	// A Send whose context has already ended never calls the send function.
+	// A Send that did call it would run it on its own goroutine, where a
+	// failure could land after this test had returned, so the send function
+	// only records its calls and the test goroutine reads the record. The
+	// last Send has a context that cannot end, so it runs the send function
+	// itself and first waits out any call an earlier Send left running. If
+	// an earlier Send had started one and then returned on its ended
+	// context, the adapter would refuse this Send as it refuses the Write
+	// above. Without the refusal, Send picks between the ended context and
+	// the send at random, so one Send would show it only some of the time;
+	// 64 Sends leave a miss a 2^-64 chance.
+	var freshCalls [][]byte
 	fresh := NewGrpcStreamAdapter(2, aether.StreamConfig{},
-		func([]byte) error { t.Error("Send with an ended context called the send function"); return nil },
-		recv, nil)
+		func(p []byte) error {
+			mu.Lock()
+			freshCalls = append(freshCalls, p)
+			mu.Unlock()
+			return nil
+		}, recv, nil)
 	ended, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := fresh.Send(ended, []byte("x")); !errors.Is(err, context.Canceled) {
-		t.Fatalf("Send with an ended context: err = %v, want context.Canceled", err)
+	for i := 0; i < 64; i++ {
+		if err := fresh.Send(ended, []byte("x")); !errors.Is(err, context.Canceled) {
+			t.Fatalf("Send %d with an ended context: err = %v, want context.Canceled", i, err)
+		}
+	}
+	if err := fresh.Send(context.Background(), []byte("live")); err != nil {
+		t.Fatalf("Send after 64 Sends with an ended context: %v, want nil: none of them may start the send function", err)
+	}
+	mu.Lock()
+	got = append([][]byte(nil), freshCalls...)
+	mu.Unlock()
+	if len(got) != 1 || string(got[0]) != "live" {
+		t.Fatalf("send function got %q, want one call, with \"live\": a Send with an ended context called it", got)
 	}
 }
 
