@@ -45,15 +45,25 @@ func readAsync(c net.Conn) <-chan readResult {
 	return out
 }
 
+// timedOut reports whether err is what a Read past its deadline owes its
+// caller: a net.Error whose Timeout is true. The context deadline error
+// StreamConn.Read hands back from Receive is one, and so is
+// os.ErrDeadlineExceeded; which of them a view returns is not these tests'
+// subject.
+func timedOut(err error) bool {
+	var timeout net.Error
+	return errors.As(err, &timeout) && timeout.Timeout()
+}
+
 // awaitTimedOutRead fails the test unless the Read behind ch returns
-// nothing and its context's deadline error, no earlier than deadline and
-// no later than readReturnBound after it.
+// nothing and a timeout, no earlier than deadline and no later than
+// readReturnBound after it.
 func awaitTimedOutRead(t *testing.T, ch <-chan readResult, deadline time.Time) {
 	t.Helper()
 	select {
 	case r := <-ch:
-		if !errors.Is(r.err, context.DeadlineExceeded) || len(r.data) != 0 {
-			t.Fatalf("blocked Read = (%q, %v), want (nothing, context.DeadlineExceeded)", r.data, r.err)
+		if !timedOut(r.err) || len(r.data) != 0 {
+			t.Fatalf("blocked Read = (%q, %v), want (nothing, a timeout)", r.data, r.err)
 		}
 		if r.at.Before(deadline) {
 			t.Fatalf("Read returned %v before its deadline", deadline.Sub(r.at))
@@ -414,8 +424,8 @@ func TestGrpcStreamAdapterConn_BlockedReadReturnsAtReadDeadline(t *testing.T) {
 		}
 	}
 	for i := 0; i < 32; i++ {
-		if n, err := c.Read(make([]byte, 64)); !errors.Is(err, context.DeadlineExceeded) || n != 0 {
-			t.Fatalf("Read %d past its deadline = (%d, %v), want (0, context.DeadlineExceeded)", i, n, err)
+		if n, err := c.Read(make([]byte, 64)); !timedOut(err) || n != 0 {
+			t.Fatalf("Read %d past its deadline = (%d, %v), want (0, a timeout)", i, n, err)
 		}
 	}
 	if err := c.SetReadDeadline(time.Time{}); err != nil {
