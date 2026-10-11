@@ -177,15 +177,10 @@ func (t *GrpcTransport) Dial(ctx context.Context, target aether.Target) (aether.
 	// metadata on it, and cancel it from the session's Close.
 	streamCtx, streamCancel := context.WithCancel(metadata.NewOutgoingContext(context.Background(), md))
 
-	session := &GrpcSession{
-		conn:         conn,
-		localNode:    t.localNode,
-		remoteNode:   target.NodeID,
-		sendCh:       make(chan []byte, 64),
-		recvCh:       make(chan []byte, 64),
-		closeCh:      make(chan struct{}),
-		streamCancel: streamCancel,
-	}
+	session := newClientSession(streamCancel)
+	session.conn = conn
+	session.localNode = t.localNode
+	session.remoteNode = target.NodeID
 
 	// Start stream goroutine
 	go session.runClientStream(streamCtx)
