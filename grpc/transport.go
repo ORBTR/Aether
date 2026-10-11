@@ -443,7 +443,8 @@ func (s *transportServer) Stream(stream pb.TransportService_StreamServer) error 
 	// deadlines and closes on its own. The receive pump writes inPump and
 	// the session reads in; the session writes out and the send pump
 	// reads outPump. endBridgeRecv closes the pump ends when the receive
-	// pump stops, and says which.
+	// pump stops, and says which, and records a lost stream's error for
+	// conn's Read.
 	in, inPump := net.Pipe()
 	out, outPump := net.Pipe()
 	conn := &grpcPipeConn{in: in, out: out}
@@ -451,7 +452,7 @@ func (s *transportServer) Stream(stream pb.TransportService_StreamServer) error 
 	// Pump: gRPC stream recv → inPump (so the session's reads see it)
 	go func() {
 		var recvErr error
-		defer func() { endBridgeRecv(recvErr, inPump, outPump) }()
+		defer func() { endBridgeRecv(recvErr, conn, inPump, outPump) }()
 		for {
 			frame, err := stream.Recv()
 			if err != nil {
@@ -508,22 +509,32 @@ func (s *transportServer) Ping(ctx context.Context, req *pb.PingRequest) (*pb.Pi
 // when its receive pump stops with recvErr. io.EOF is the peer's
 // CloseSend: only inPump closes, so the session reads io.EOF and can still
 // write the response the peer is draining. Any other error means the
-// stream is gone, and both close, outPump first: grpcPipeConn.Read reports
-// the end only once inPump is closed, so a session that writes after
-// reading the end finds its Write already failing and hands no bytes to a
-// send pump that cannot deliver them.
-func endBridgeRecv(recvErr error, inPump, outPump io.Closer) {
+// stream is lost: conn records recvErr for its Read, and both ends close,
+// outPump first. grpcPipeConn.Read reports the end only once inPump is
+// closed, so a session that writes after reading the end finds its Write
+// already failing and hands no bytes to a send pump that cannot deliver
+// them, and the error is recorded before inPump closes, so that Read
+// always finds it.
+func endBridgeRecv(recvErr error, conn *grpcPipeConn, inPump, outPump io.Closer) {
 	if !errors.Is(recvErr, io.EOF) {
+		conn.lost.Store(&lostStream{recvErr})
 		_ = outPump.Close()
 	}
 	_ = inPump.Close()
 }
 
+// lostStream is the receive pump's error for a stream that ended other
+// than by the peer's CloseSend.
+type lostStream struct{ err error }
+
 // grpcPipeConn is the session's side of the two net.Pipes
 // transportServer.Stream bridges to one gRPC stream; aether.NewConnection
 // reads and writes it. Read takes the inbound pipe and Write the outbound
 // one, so each direction ends on its own: Read returns io.EOF after the
-// peer's CloseSend while Write still reaches the peer. Its deadlines are
+// peer's CloseSend while Write still reaches the peer. A lost stream is
+// not a half-close: Read returns the receive pump's own error for it,
+// and io.EOF only for the CloseSend, so a session that only reads can
+// tell a truncated inbound stream from a finished one. Its deadlines are
 // the pipes': a Read or Write blocked past its deadline returns
 // os.ErrDeadlineExceeded, and a later deadline makes it usable again.
 // Close closes both directions.
@@ -538,12 +549,25 @@ func endBridgeRecv(recvErr error, inPump, outPump io.Closer) {
 // end at once, so pumpEnded reports success and the Read or Write reports
 // the end. Only Close makes a setter fail.
 type grpcPipeConn struct {
-	in     net.Conn    // the session reads the peer's frames here
-	out    net.Conn    // the session's writes go to the send pump here
-	closed atomic.Bool // set by Close; see pumpEnded
+	in     net.Conn                   // the session reads the peer's frames here
+	out    net.Conn                   // the session's writes go to the send pump here
+	closed atomic.Bool                // set by Close; see pumpEnded
+	lost   atomic.Pointer[lostStream] // set by endBridgeRecv; see Read
 }
 
-func (c *grpcPipeConn) Read(b []byte) (int, error)  { return c.in.Read(b) }
+// Read reads the inbound pipe. The pipe reports any close of its far end
+// as io.EOF; when endBridgeRecv closed it for a lost stream, Read returns
+// the error the receive pump recorded instead.
+func (c *grpcPipeConn) Read(b []byte) (int, error) {
+	n, err := c.in.Read(b)
+	if err == io.EOF {
+		if lost := c.lost.Load(); lost != nil {
+			return n, lost.err
+		}
+	}
+	return n, err
+}
+
 func (c *grpcPipeConn) Write(b []byte) (int, error) { return c.out.Write(b) }
 func (c *grpcPipeConn) LocalAddr() net.Addr         { return grpcNetAddr{} }
 func (c *grpcPipeConn) RemoteAddr() net.Addr        { return grpcNetAddr{} }
