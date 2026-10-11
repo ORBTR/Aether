@@ -40,6 +40,12 @@ type GrpcSession struct {
 	// dialed sessions; nil for server-side sessions. Invoked from Close so
 	// the long-lived stream tears down deterministically.
 	streamCancel context.CancelFunc
+
+	// recvErr is the error the server ended the client stream with. It is
+	// written by runClientStream before recvCh closes and read by Receive once
+	// recvCh is drained; it stays nil for a stream the server finished and for
+	// one this session ended itself.
+	recvErr atomic.Pointer[error]
 }
 
 // runClientStream manages the client-side bidirectional stream.
@@ -54,6 +60,7 @@ func (s *GrpcSession) runClientStream(ctx context.Context) {
 	client := pb.NewTransportServiceClient(s.conn)
 	stream, err := client.Stream(ctx)
 	if err != nil {
+		s.recvErr.Store(&err)
 		close(s.recvCh) // no pump started — safe to close directly
 		return
 	}
@@ -68,6 +75,16 @@ func (s *GrpcSession) runClientStream(ctx context.Context) {
 		for {
 			frame, err := stream.Recv()
 			if err != nil {
+				// The server ended the RPC, so nothing sent from here can
+				// arrive: cancel ends the send loop, which closes recvCh and
+				// so unblocks Receive. An error this session did not cause is
+				// kept for Receive, which would otherwise report a refused or
+				// cut stream as a finished one. A cancelled ctx means this
+				// side ended the stream and the error is its own.
+				if !errors.Is(err, io.EOF) && ctx.Err() == nil {
+					s.recvErr.Store(&err)
+				}
+				cancel()
 				return
 			}
 			select {
@@ -122,7 +139,10 @@ func (s *GrpcSession) Send(ctx context.Context, payload []byte) error {
 	}
 }
 
-// Receive receives data from the gRPC stream.
+// Receive receives data from the gRPC stream. Once the server has ended the
+// stream and everything it sent has been returned, Receive returns io.EOF for
+// a stream the server finished and the server's error for one it refused or
+// cut.
 func (s *GrpcSession) Receive(ctx context.Context) ([]byte, error) {
 	if atomic.LoadInt32(&s.closed) == 1 {
 		return nil, io.EOF
@@ -135,6 +155,9 @@ func (s *GrpcSession) Receive(ctx context.Context) ([]byte, error) {
 		return nil, io.EOF
 	case data, ok := <-s.recvCh:
 		if !ok {
+			if err := s.recvErr.Load(); err != nil {
+				return nil, *err
+			}
 			return nil, io.EOF
 		}
 		return data, nil
