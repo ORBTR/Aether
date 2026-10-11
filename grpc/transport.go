@@ -432,6 +432,8 @@ type transportServer struct {
 // Stream handles a bidirectional streaming connection.
 // Each Stream RPC becomes one mesh session (like one WebSocket connection),
 // read and written through the grpcPipeConn the two net.Pipes below make.
+// The RPC lasts until its stream ends or the session closes; see the end
+// of the function.
 func (s *transportServer) Stream(stream pb.TransportService_StreamServer) error {
 	nodeID, err := s.transport.extractNodeIDVerified(stream.Context())
 	if err != nil {
@@ -447,10 +449,12 @@ func (s *transportServer) Stream(stream pb.TransportService_StreamServer) error 
 	// conn's Read.
 	in, inPump := net.Pipe()
 	out, outPump := net.Pipe()
-	conn := &grpcPipeConn{in: in, out: out}
+	conn := newGrpcPipeConn(in, out)
+	conn.recvDone, conn.sendDone = make(chan struct{}), make(chan struct{})
 
 	// Pump: gRPC stream recv → inPump (so the session's reads see it)
 	go func() {
+		defer close(conn.recvDone)
 		var recvErr error
 		defer func() { endBridgeRecv(recvErr, conn, inPump, outPump) }()
 		for {
@@ -468,6 +472,7 @@ func (s *transportServer) Stream(stream pb.TransportService_StreamServer) error 
 
 	// Pump: outPump → gRPC stream send (so the session's writes reach remote)
 	go func() {
+		defer close(conn.sendDone)
 		defer outPump.Close()
 		buf := make([]byte, 65536)
 		for {
@@ -487,12 +492,25 @@ func (s *transportServer) Stream(stream pb.TransportService_StreamServer) error 
 	select {
 	case s.transport.incoming <- aether.IncomingSession{Session: session}:
 	default:
-		conn.Close()
+		// end, not Close: Close waits for the receive pump, which waits
+		// for this function to return.
+		conn.end()
 		return errors.New("grpc: incoming session buffer full")
 	}
 
-	// Block until the stream context is done (keeps the gRPC stream alive)
-	<-stream.Context().Done()
+	// Returning is what ends the RPC: gRPC then sends the status, which
+	// the peer's Recv reads as the end, and cancels the stream, which
+	// returns a pump blocked in Recv or Send. So the RPC is held open
+	// until the stream ends or the session's Close. A stream that ended
+	// first ends the session's write half here as well, because after the
+	// peer's CloseSend the receive pump has already returned without
+	// closing outPump, and the send pump would otherwise wait in its Read
+	// for a Write it can no longer deliver.
+	select {
+	case <-stream.Context().Done():
+		_ = outPump.Close()
+	case <-conn.ended:
+	}
 	return nil
 }
 
@@ -553,6 +571,17 @@ type grpcPipeConn struct {
 	out    net.Conn                   // the session's writes go to the send pump here
 	closed atomic.Bool                // set by Close; see pumpEnded
 	lost   atomic.Pointer[lostStream] // set by endBridgeRecv; see Read
+
+	closeOnce sync.Once
+	closeErr  error         // what the first Close returns
+	ended     chan struct{} // closed by Close; transportServer.Stream returns on it
+	// recvDone and sendDone are closed by the receive and the send pump
+	// as they return; Close waits for both. nil on a conn with no pumps.
+	recvDone, sendDone chan struct{}
+}
+
+func newGrpcPipeConn(in, out net.Conn) *grpcPipeConn {
+	return &grpcPipeConn{in: in, out: out, ended: make(chan struct{})}
 }
 
 // Read reads the inbound pipe. The pipe reports any close of its far end
@@ -572,9 +601,39 @@ func (c *grpcPipeConn) Write(b []byte) (int, error) { return c.out.Write(b) }
 func (c *grpcPipeConn) LocalAddr() net.Addr         { return grpcNetAddr{} }
 func (c *grpcPipeConn) RemoteAddr() net.Addr        { return grpcNetAddr{} }
 
+// Close closes the session's ends of both pipes, which returns its
+// blocked Read and Write, ends the RPC, and waits for both pumps to
+// return: transportServer.Stream returns on ended, gRPC then ends the
+// stream, and that returns a pump blocked in Recv or Send. It runs once;
+// a later Close returns nil at once. A full close cancels both
+// directions, so bytes a Write handed to the send pump that gRPC had not
+// yet taken are not delivered; a Send that the peer's flow control holds
+// is ended rather than waited out.
 func (c *grpcPipeConn) Close() error {
-	c.closed.Store(true)
-	return errors.Join(c.in.Close(), c.out.Close())
+	if !c.end() {
+		return nil
+	}
+	for _, done := range []chan struct{}{c.recvDone, c.sendDone} {
+		if done != nil {
+			<-done
+		}
+	}
+	return c.closeErr
+}
+
+// end is Close without the wait for the pumps, and reports whether this
+// call did the closing. transportServer.Stream calls it on its own
+// goroutine for a session it never hands over, where waiting for the
+// receive pump would wait for Stream itself to return.
+func (c *grpcPipeConn) end() bool {
+	first := false
+	c.closeOnce.Do(func() {
+		first = true
+		c.closed.Store(true)
+		c.closeErr = errors.Join(c.in.Close(), c.out.Close())
+		close(c.ended)
+	})
+	return first
 }
 
 func (c *grpcPipeConn) SetDeadline(t time.Time) error {
