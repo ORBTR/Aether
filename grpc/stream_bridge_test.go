@@ -20,6 +20,8 @@ import (
 	"github.com/ORBTR/aether"
 	pb "github.com/ORBTR/aether/grpc/pb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // The connection transportServer.Stream hands the session has real
@@ -295,7 +297,10 @@ func (c closeThen) Close() error {
 // already fails. On the peer's CloseSend it ends the inbound direction
 // only, and the session's Write still reaches the send pump. A goroutine
 // stands in for the send pump and takes whatever the session writes, so a
-// Write that is not refused succeeds instead of blocking.
+// Write that is not refused succeeds instead of blocking. The session's
+// Read names the end from that same instant on: io.EOF for the peer's
+// CloseSend, and the receive pump's own error, never io.EOF, for a lost
+// stream.
 func TestEndBridgeRecv_OutboundEndsBeforeInbound(t *testing.T) {
 	for name, tc := range map[string]struct {
 		recvErr   error
@@ -315,8 +320,11 @@ func TestEndBridgeRecv_OutboundEndsBeforeInbound(t *testing.T) {
 		}()
 
 		var writeErr error
-		endBridgeRecv(tc.recvErr, closeThen{inPump, func() {
+		var reads []error
+		endBridgeRecv(tc.recvErr, conn, closeThen{inPump, func() {
 			_, writeErr = conn.Write([]byte("x"))
+			_, err := conn.Read(make([]byte, 1))
+			reads = append(reads, err)
 		}}, outPump)
 
 		if tc.writeEnds && writeErr == nil {
@@ -325,14 +333,17 @@ func TestEndBridgeRecv_OutboundEndsBeforeInbound(t *testing.T) {
 		if !tc.writeEnds && writeErr != nil {
 			t.Errorf("%s: a Write at the instant the inbound direction ended: %v, want nil", name, writeErr)
 		}
-		// The peer's CloseSend must read as io.EOF. A lost stream must read
-		// as an end; which error names it is not this test's subject.
-		n, err := conn.Read(make([]byte, 1))
-		if tc.writeEnds && err == nil {
-			t.Errorf("%s: Read after the receive pump stopped = (%d, nil), want the bridge's end", name, n)
+		for i := 0; i < 2; i++ {
+			_, err := conn.Read(make([]byte, 1))
+			reads = append(reads, err)
 		}
-		if !tc.writeEnds && !errors.Is(err, io.EOF) {
-			t.Errorf("%s: Read after the receive pump stopped = (%d, %v), want io.EOF", name, n, err)
+		for i, err := range reads {
+			if tc.writeEnds && (!errors.Is(err, tc.recvErr) || errors.Is(err, io.EOF)) {
+				t.Errorf("%s: Read %d from the instant the inbound direction ended = %v, want the pump's error %q and not io.EOF", name, i, err, tc.recvErr)
+			}
+			if !tc.writeEnds && !errors.Is(err, io.EOF) {
+				t.Errorf("%s: Read %d from the instant the inbound direction ended = %v, want io.EOF", name, i, err)
+			}
 		}
 		_ = conn.Close()
 		_ = outPump.Close()
@@ -343,9 +354,11 @@ func TestEndBridgeRecv_OutboundEndsBeforeInbound(t *testing.T) {
 // A stream that ends other than by the peer's CloseSend ends both
 // directions: once the peer cancels and the server session's Read has
 // reported the end, its next Write fails instead of handing bytes to a
-// send pump that cannot deliver them. The bridge is ended but not closed,
-// so the deadline setters still succeed and the Write itself reports the
-// end.
+// send pump that cannot deliver them. The Read reports the cancel as the
+// receive pump got it from gRPC, a Canceled status, and not as io.EOF,
+// which would read as the peer's CloseSend. The bridge is ended but not
+// closed, so the deadline setters still succeed and the Write itself
+// reports the end.
 func TestGrpcServer_StreamBridgeEndsBothDirectionsOnStreamError(t *testing.T) {
 	serverT, _, serverNodeID := freshServerTransport(t)
 	cc, cleanup := newBufconnServer(t, serverT)
@@ -359,8 +372,8 @@ func TestGrpcServer_StreamBridgeEndsBothDirectionsOnStreamError(t *testing.T) {
 		t.Fatalf("SetReadDeadline on the open bridge: %v", err)
 	}
 	cancel()
-	if _, err := conn.Read(make([]byte, 8)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
-		t.Fatalf("Read after the peer cancelled: err = %v, want the bridge's end", err)
+	if _, err := conn.Read(make([]byte, 8)); status.Code(err) != codes.Canceled || errors.Is(err, io.EOF) {
+		t.Fatalf("Read after the peer cancelled: err = %v, want the stream's Canceled status and not io.EOF", err)
 	}
 	if _, err := conn.Write([]byte("lost")); err == nil {
 		t.Fatal("server Write after the peer cancelled succeeded")
