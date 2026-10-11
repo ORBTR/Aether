@@ -78,14 +78,14 @@ func (c *StreamConn) Read(p []byte) (int, error) {
 	if n, ok := c.takeBuffered(p); ok {
 		return n, nil
 	}
-	ctx, end, err := c.readDL.begin(c.parentCtx)
+	ctx, call, err := c.readDL.begin(c.parentCtx)
 	if err != nil {
 		return 0, err
 	}
-	defer end()
+	defer call.end()
 	data, err := c.stream.Receive(ctx)
 	if err != nil {
-		if ended := c.readDL.ended(); ended != nil {
+		if ended := call.ended(); ended != nil {
 			return 0, ended
 		}
 		return 0, err
@@ -122,13 +122,13 @@ func (c *StreamConn) takeBuffered(p []byte) (int, bool) {
 // blocked, Write returns 0 and os.ErrDeadlineExceeded. After Close, or when
 // Close ends a blocked Send, it returns 0 and net.ErrClosed.
 func (c *StreamConn) Write(p []byte) (int, error) {
-	ctx, end, err := c.writeDL.begin(c.parentCtx)
+	ctx, call, err := c.writeDL.begin(c.parentCtx)
 	if err != nil {
 		return 0, err
 	}
-	defer end()
+	defer call.end()
 	if err := c.stream.Send(ctx, p); err != nil {
-		if ended := c.writeDL.ended(); ended != nil {
+		if ended := call.ended(); ended != nil {
 			return 0, ended
 		}
 		return 0, err
@@ -242,8 +242,42 @@ type connDeadline struct {
 	gen     uint64
 	expired bool
 	closed  bool
-	running map[uint64]context.CancelFunc
+	running map[uint64]*boundCall
 	nextID  uint64
+}
+
+// boundCall is one Read's Receive or one Write's Send registered with a
+// connDeadline. reason is why the deadline or close ended it, written under
+// the connDeadline's mutex when either cancels the call. Read and Write ask
+// the call, not the connDeadline, why it ended: a setter that re-arms or
+// clears the deadline after it has cancelled a call resets the
+// connDeadline's state, and the call must still report the timeout that
+// ended it.
+type boundCall struct {
+	d      *connDeadline
+	id     uint64
+	cancel context.CancelFunc
+	reason error
+}
+
+// end releases the call's context and its registration.
+func (b *boundCall) end() {
+	b.d.mu.Lock()
+	delete(b.d.running, b.id)
+	b.d.mu.Unlock()
+	b.cancel()
+}
+
+// ended returns net.ErrClosed when close ended this call or ran before it
+// returned, os.ErrDeadlineExceeded when the deadline ended it, and nil when
+// it failed on its own.
+func (b *boundCall) ended() error {
+	b.d.mu.Lock()
+	defer b.d.mu.Unlock()
+	if b.d.closed {
+		return net.ErrClosed
+	}
+	return b.reason
 }
 
 // set arms the deadline at t; a zero t clears it. After close it does
@@ -280,12 +314,17 @@ func (d *connDeadline) set(t time.Time) {
 
 func (d *connDeadline) expireLocked() {
 	d.expired = true
-	d.cancelRunningLocked()
+	d.cancelRunningLocked(os.ErrDeadlineExceeded)
 }
 
-func (d *connDeadline) cancelRunningLocked() {
-	for _, cancel := range d.running {
-		cancel()
+// cancelRunningLocked cancels every registered call and records reason on
+// each one that carries none.
+func (d *connDeadline) cancelRunningLocked(reason error) {
+	for _, call := range d.running {
+		if call.reason == nil {
+			call.reason = reason
+		}
+		call.cancel()
 	}
 }
 
@@ -300,14 +339,14 @@ func (d *connDeadline) close() {
 	}
 	d.gen++
 	d.closed = true
-	d.cancelRunningLocked()
+	d.cancelRunningLocked(net.ErrClosed)
 }
 
 // begin returns the context one Read's Receive or one Write's Send runs
-// under and the func that releases it, or the error the Read or Write
-// returns without making the call: net.ErrClosed after close,
-// os.ErrDeadlineExceeded once the deadline has passed.
-func (d *connDeadline) begin(parent context.Context) (ctx context.Context, end func(), err error) {
+// under and the call that releases it and reports why it ended, or the
+// error the Read or Write returns without making the call: net.ErrClosed
+// after close, os.ErrDeadlineExceeded once the deadline has passed.
+func (d *connDeadline) begin(parent context.Context) (ctx context.Context, call *boundCall, err error) {
 	ctx, cancel := context.WithCancel(parent)
 	d.mu.Lock()
 	if err := d.endedLocked(); err != nil {
@@ -316,28 +355,13 @@ func (d *connDeadline) begin(parent context.Context) (ctx context.Context, end f
 		return nil, nil, err
 	}
 	if d.running == nil {
-		d.running = make(map[uint64]context.CancelFunc)
+		d.running = make(map[uint64]*boundCall)
 	}
-	id := d.nextID
+	call = &boundCall{d: d, id: d.nextID, cancel: cancel}
 	d.nextID++
-	d.running[id] = cancel
+	d.running[call.id] = call
 	d.mu.Unlock()
-	return ctx, func() {
-		d.mu.Lock()
-		delete(d.running, id)
-		d.mu.Unlock()
-		cancel()
-	}, nil
-}
-
-// ended returns net.ErrClosed after close, os.ErrDeadlineExceeded while the
-// deadline has passed and not been re-set, and nil otherwise. Read and
-// Write read it to tell a call that close or the deadline ended from one
-// that failed on its own.
-func (d *connDeadline) ended() error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.endedLocked()
+	return ctx, call, nil
 }
 
 // isClosed reports whether close has run. Read asks it before it returns
@@ -349,6 +373,9 @@ func (d *connDeadline) isClosed() bool {
 	return d.closed
 }
 
+// endedLocked returns net.ErrClosed after close, os.ErrDeadlineExceeded
+// while the deadline has passed and not been re-set, and nil otherwise.
+// begin asks it before it registers a call.
 func (d *connDeadline) endedLocked() error {
 	if d.closed {
 		return net.ErrClosed
