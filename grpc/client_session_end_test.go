@@ -33,15 +33,10 @@ func dialClientSession(t *testing.T, cc *grpc.ClientConn, serverNodeID aether.No
 		t.Fatalf("client NewNodeID: %v", err)
 	}
 	streamCtx, streamCancel := context.WithCancel(makeAuthedContext(t, context.Background(), clientPriv, clientNodeID, serverNodeID))
-	s := &GrpcSession{
-		conn:         cc,
-		localNode:    clientNodeID,
-		remoteNode:   serverNodeID,
-		sendCh:       make(chan []byte, 64),
-		recvCh:       make(chan []byte, 64),
-		closeCh:      make(chan struct{}),
-		streamCancel: streamCancel,
-	}
+	s := newClientSession(streamCancel)
+	s.conn = cc
+	s.localNode = clientNodeID
+	s.remoteNode = serverNodeID
 	go s.runClientStream(streamCtx)
 	return s
 }
