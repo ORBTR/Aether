@@ -312,7 +312,7 @@ func TestEndBridgeRecv_OutboundEndsBeforeInbound(t *testing.T) {
 	} {
 		in, inPump := net.Pipe()
 		out, outPump := net.Pipe()
-		conn := &grpcPipeConn{in: in, out: out}
+		conn := newGrpcPipeConn(in, out)
 		pumped := make(chan struct{})
 		go func() {
 			defer close(pumped)
