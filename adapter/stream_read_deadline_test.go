@@ -45,11 +45,10 @@ func readAsync(c net.Conn) <-chan readResult {
 	return out
 }
 
-// timedOut reports whether err is what a Read past its deadline owes its
-// caller: a net.Error whose Timeout is true. The context deadline error
-// StreamConn.Read hands back from Receive is one, and so is
-// os.ErrDeadlineExceeded; which of them a view returns is not these tests'
-// subject.
+// timedOut reports whether err is a net.Error whose Timeout is true, as
+// what a Read past its deadline returns is. The os.ErrDeadlineExceeded
+// that StreamConn.Read returns is one; the tests in stream_conn_read_test.go
+// ask for that error by name.
 func timedOut(err error) bool {
 	var timeout net.Error
 	return errors.As(err, &timeout) && timeout.Timeout()
