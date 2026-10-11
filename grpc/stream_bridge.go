@@ -208,10 +208,11 @@ func (c *grpcPipeConn) RemoteAddr() net.Addr        { return grpcNetAddr{} }
 
 // Close closes the session's ends of both pipes, which returns its
 // blocked Read and Write, ends the RPC, and waits for both pumps to
-// return. It runs once; a later Close returns nil at once. The write end
-// closes first, and transportServer.Stream ends the RPC only once the send
-// pump has sent what it already holds, so every Write that returned nil
-// reaches the peer ahead of the RPC's end. A Send the peer's flow control
+// return. It runs once; a later Close returns nil at once.
+// transportServer.Stream ends the RPC only once the send pump has sent what
+// it already holds, so every Write that returned nil reaches the peer ahead
+// of the RPC's end; net.Pipe holds no bytes of its own, so the order the two
+// ends close in decides nothing. A Send the peer's flow control
 // still holds after closeFlushBound is cut off and the RPC ends with
 // codes.Aborted, so Close returns within that bound and the peer never reads
 // a stream with missing bytes as a clean end.

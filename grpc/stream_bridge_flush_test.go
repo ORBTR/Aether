@@ -37,8 +37,8 @@ func drainPeer(stream pb.TransportService_StreamClient) ([]byte, error) {
 // ahead of the RPC's end. net.Pipe hands a Write's bytes to the send pump
 // before stream.Send runs, so the RPC must not end until that pump has sent
 // what it holds; a peer reading a clean end with the bytes missing could not
-// tell the stream was cut. Repeated, because the race lost the bytes on
-// about one Close in five.
+// tell the stream was cut. Repeated, because whether Close or the pump's
+// stream.Send runs first differs from one round to the next.
 func TestGrpcServer_StreamBridgeCloseDeliversWhatAWriteReturned(t *testing.T) {
 	serverT, _, serverNodeID := freshServerTransport(t)
 	cc, cleanup := newBufconnServer(t, serverT)
