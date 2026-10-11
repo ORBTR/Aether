@@ -16,7 +16,16 @@ import (
 
 	"github.com/ORBTR/aether"
 	pb "github.com/ORBTR/aether/grpc/pb"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
+
+// closeFlushBound is how long transportServer.Stream lets the send pump
+// forward what the session wrote before its Close. A pump still held by the
+// peer's flow control after it is cut off, and the RPC ends with
+// codes.Aborted, so the peer reads a stream that was cut short rather than a
+// clean end. It bounds the session's Close, which waits for both pumps.
+const closeFlushBound = 2 * time.Second
 
 // Stream handles a bidirectional streaming connection.
 // Each Stream RPC becomes one mesh session (like one WebSocket connection),
@@ -98,9 +107,25 @@ func (s *transportServer) Stream(stream pb.TransportService_StreamServer) error 
 	select {
 	case <-stream.Context().Done():
 		_ = outPump.Close()
+		return nil
 	case <-conn.ended:
 	}
-	return nil
+
+	// The session closed. net.Pipe hands a Write's bytes to the send pump
+	// before stream.Send runs, so a Write that returned nil may still be in
+	// the pump; ending the RPC now would send the status ahead of them and
+	// the peer would read a clean end with them missing. Close has closed
+	// the session's write end, so the pump sends what it holds and then
+	// returns; the RPC ends after that. A pump the peer's flow control still
+	// holds after closeFlushBound is cut off with codes.Aborted.
+	select {
+	case <-conn.sendDone:
+		return nil
+	case <-stream.Context().Done():
+		return nil
+	case <-time.After(closeFlushBound):
+		return status.Error(codes.Aborted, "grpc: the session closed before its last writes could be sent")
+	}
 }
 
 // endBridgeRecv closes the pump ends of transportServer.Stream's two pipes
@@ -183,12 +208,13 @@ func (c *grpcPipeConn) RemoteAddr() net.Addr        { return grpcNetAddr{} }
 
 // Close closes the session's ends of both pipes, which returns its
 // blocked Read and Write, ends the RPC, and waits for both pumps to
-// return: transportServer.Stream returns on ended, gRPC then ends the
-// stream, and that returns a pump blocked in Recv or Send. It runs once;
-// a later Close returns nil at once. A full close cancels both
-// directions, so bytes a Write handed to the send pump that gRPC had not
-// yet taken are not delivered; a Send that the peer's flow control holds
-// is ended rather than waited out.
+// return. It runs once; a later Close returns nil at once. The write end
+// closes first, and transportServer.Stream ends the RPC only once the send
+// pump has sent what it already holds, so every Write that returned nil
+// reaches the peer ahead of the RPC's end. A Send the peer's flow control
+// still holds after closeFlushBound is cut off and the RPC ends with
+// codes.Aborted, so Close returns within that bound and the peer never reads
+// a stream with missing bytes as a clean end.
 func (c *grpcPipeConn) Close() error {
 	if !c.end() {
 		return nil
@@ -210,7 +236,9 @@ func (c *grpcPipeConn) end() bool {
 	c.closeOnce.Do(func() {
 		first = true
 		c.closed.Store(true)
-		c.closeErr = errors.Join(c.in.Close(), c.out.Close())
+		outErr := c.out.Close()
+		inErr := c.in.Close()
+		c.closeErr = errors.Join(inErr, outErr)
 		close(c.ended)
 	})
 	return first
