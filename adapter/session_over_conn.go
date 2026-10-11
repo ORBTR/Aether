@@ -69,7 +69,10 @@ func DialSessionOverConn(ctx context.Context, cfg noise.DialConnConfig, conn net
 // AcceptSessionOverConn is the responder-side counterpart. Validates
 // any presented ticket via cfg.TrustedTicketSigner / ValidateTicketFn
 // (see noise.AcceptConnConfig), then wraps the post-handshake
-// connection with the full session layer.
+// connection with the full session layer. The session's RemoteNodeID,
+// and the RemotePeerID cut from it, are the id the dialer stated for
+// itself, which nothing verifies (see noise.AcceptOverConn): identity,
+// partition and capabilities come from the verified ticket.
 func AcceptSessionOverConn(ctx context.Context, cfg noise.AcceptConnConfig, conn net.Conn, opts aether.SessionOptions) (*NoiseSession, error) {
 	aetherConn, err := noise.AcceptOverConn(ctx, cfg, conn)
 	if err != nil {

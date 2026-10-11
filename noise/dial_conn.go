@@ -111,9 +111,11 @@ type AcceptConnConfig struct {
 	// included: the cache forgets the nonce after it.
 	TicketNonceFn func(body []byte) (nonce []byte, expiresAt time.Time, err error)
 
-	// ExpectedNodeID, when non-empty, pins the responder's accept to a
-	// specific initiator NodeID (used by the relay when routing to a
-	// specific target agent).
+	// ExpectedNodeID, when non-empty, refuses a dialer whose stated node
+	// id is not this one. The dialer writes that id itself (see
+	// AcceptOverConn), so the check turns away a dial meant for another
+	// node and stops no dialer that names this one: it authenticates
+	// nothing.
 	ExpectedNodeID aether.NodeID
 
 	HandshakeTimeout time.Duration
@@ -205,7 +207,23 @@ func DialOverConn(ctx context.Context, cfg DialConnConfig, conn net.Conn) (aethe
 	return buildAetherConnectionOverConn(cfg.LocalNodeID, remoteNode, conn, sendCS, recvCS, maxPacket), nil
 }
 
-// AcceptOverConn is the responder-side counterpart of DialOverConn.
+// AcceptOverConn is the responder-side counterpart of DialOverConn. It
+// returns once msg3 is read and every check cfg configures has passed.
+//
+// What it verifies is the dialer's possession of its Noise static key
+// and, as far as cfg configures them, the ticket's signature,
+// ValidateTicketFn, ValidatePeerStaticFn against that static key, and the
+// ticket's nonce. The returned Connection's RemoteNodeID is none of
+// these: it is the node id the dialer wrote into its own msg3 payload,
+// and nothing verifies it. A node id is derived from an Ed25519 identity
+// key (aether.NewNodeID), the static key here is X25519, and the payload
+// carries no signature linking the two, so a dialer holding an admitted
+// ticket states any id it likes and is reported under it. RemoteIdentity
+// reports nil for the same reason. A consumer takes the caller's
+// identity, the partition and the capabilities from the verified ticket
+// body, which ValidateTicketFn and ValidatePeerStaticFn receive, and uses
+// RemoteNodeID only as text. TestAcceptOverConn_ReportsTheIDTheDialerStates
+// holds this.
 func AcceptOverConn(ctx context.Context, cfg AcceptConnConfig, conn net.Conn) (aether.Connection, error) {
 	return acceptOverConn(ctx, cfg, conn, noise.DH25519)
 }
@@ -340,6 +358,7 @@ func acceptOverConn(ctx context.Context, cfg AcceptConnConfig, conn net.Conn, dh
 	if err != nil {
 		return nil, fmt.Errorf("noise: process msg3: %w", err)
 	}
+	// remoteNode is the dialer's own statement; see AcceptOverConn.
 	remoteNode, err := decodeMinimalNodeInfoID(remotePayload)
 	if err != nil {
 		return nil, fmt.Errorf("noise: decode remote NodeInfo: %w", err)
@@ -460,9 +479,11 @@ func encodeMinimalNodeInfo(id aether.NodeID, staticPub []byte) ([]byte, error) {
 	return out, nil
 }
 
-// decodeMinimalNodeInfoID extracts just the NodeID from the handshake
-// payload. Static key is already bound into the Noise session via the
-// pattern — no need to return it separately here.
+// decodeMinimalNodeInfoID returns the NodeID a peer's handshake payload
+// names, as the peer wrote it: it checks the payload's length and nothing
+// else. The static key the payload carries is not compared with the key
+// the handshake proved either; a caller that needs the proved key reads
+// hs.PeerStatic, as acceptOverConn does for ValidatePeerStaticFn.
 func decodeMinimalNodeInfoID(payload []byte) (aether.NodeID, error) {
 	if len(payload) < 1 {
 		return "", fmt.Errorf("noise: NodeInfo payload empty")
@@ -478,6 +499,8 @@ func decodeMinimalNodeInfoID(payload []byte) (aether.NodeID, error) {
 // noiseConn + starts its reader + returns the aether.Connection. Used
 // by both DialOverConn and AcceptOverConn — their only post-handshake
 // difference is the sendCS/recvCS ordering which the caller supplies.
+// remote is the id decodeMinimalNodeInfoID read from the peer's payload,
+// and the Connection reports it as RemoteNodeID unchecked.
 func buildAetherConnectionOverConn(
 	local, remote aether.NodeID,
 	conn net.Conn,
