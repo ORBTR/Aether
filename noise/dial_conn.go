@@ -258,9 +258,10 @@ func acceptOverConn(ctx context.Context, cfg AcceptConnConfig, conn net.Conn, dh
 		return nil, fmt.Errorf("noise: read msg1: %w", err)
 	}
 	// A configured signer makes the ticket mandatory: an absent, empty or
-	// truncated ticket fails closed, which callers that pin no ExpectedNodeID
-	// rely on to refuse ticketLen=0 under a self-minted key. With both signer
-	// fields nil the block is skipped.
+	// truncated ticket fails closed. This is the accept path's only refusal
+	// of a dialer that sends no ticket under a key it minted itself:
+	// ExpectedNodeID compares an id the dialer states and turns no such
+	// dialer away. With both signer fields nil the block is skipped.
 	var body []byte
 	var signer ed25519.PublicKey
 	var nonce []byte
