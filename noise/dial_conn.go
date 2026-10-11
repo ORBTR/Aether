@@ -230,6 +230,13 @@ func acceptOverConn(ctx context.Context, cfg AcceptConnConfig, conn net.Conn, dh
 	if len(cfg.StaticPriv) == 0 || len(cfg.StaticPub) == 0 {
 		return nil, fmt.Errorf("noise: AcceptOverConn: StaticPriv/Pub required")
 	}
+	// A signer that is set and is not an Ed25519 public key is refused here:
+	// ed25519.Verify below panics on any other length, and the accept reaches
+	// it as soon as a dialer sends a ticket of 64 bytes or more.
+	if cfg.TrustedTicketSigner != nil && len(cfg.TrustedTicketSigner) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("noise: AcceptOverConn: TrustedTicketSigner is %d bytes, need %d",
+			len(cfg.TrustedTicketSigner), ed25519.PublicKeySize)
+	}
 	ticketAuth := cfg.TrustedTicketSigner != nil || cfg.TrustedTicketSignerFn != nil
 	if !ticketAuth && (cfg.ValidatePeerStaticFn != nil || cfg.TicketNonces != nil || cfg.TicketNonceFn != nil) {
 		return nil, fmt.Errorf("noise: AcceptOverConn: ticket binding set without a ticket signer")
@@ -258,10 +265,10 @@ func acceptOverConn(ctx context.Context, cfg AcceptConnConfig, conn net.Conn, dh
 		return nil, fmt.Errorf("noise: read msg1: %w", err)
 	}
 	// A configured signer makes the ticket mandatory: an absent, empty or
-	// truncated ticket fails closed. This is the accept path's only refusal
-	// of a dialer that sends no ticket under a key it minted itself:
-	// ExpectedNodeID compares an id the dialer states and turns no such
-	// dialer away. With both signer fields nil the block is skipped.
+	// truncated ticket fails closed, which is what refuses a dialer that sends
+	// no ticket under a key it minted itself. ExpectedNodeID does not: it
+	// compares an id the dialer states, so it stops no such dialer that names
+	// the expected id. With both signer fields nil the block is skipped.
 	var body []byte
 	var signer ed25519.PublicKey
 	var nonce []byte

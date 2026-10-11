@@ -210,12 +210,11 @@ func TestAcceptOverConn_TicketBadSignatureRejected(t *testing.T) {
 	}
 }
 
-// A configured TrustedTicketSigner must REJECT a zero-length ticket rather than
-// silently skip verification. Regression for the empty-ticket fail-open: an
-// initiator presenting ticketLen=0 previously bypassed the signature +
-// ValidateTicketFn checks and completed the XX handshake anonymously on a
-// self-minted static key — an auth bypass for ticket-only callers (relay
-// browser bridge) that do not pin ExpectedNodeID.
+// A configured TrustedTicketSigner refuses a zero-length ticket: the accept
+// does not skip the signature and ValidateTicketFn checks for a dialer that
+// sends none. Those two checks are all that binds a dialer on this path, so a
+// dialer admitted without them completes the XX handshake under a static key
+// it minted itself, which the relay's browser bridge would then pair.
 func TestAcceptOverConn_EmptyTicketRejectedWhenSignerConfigured(t *testing.T) {
 	aPriv, aPub := newTestKeypair(t)
 	bPriv, bPub := newTestKeypair(t)
