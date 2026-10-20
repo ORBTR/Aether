@@ -27,10 +27,11 @@ import (
 // This drives a real TCPSession.readLoop with a hand-built 0x85 batch whose
 // first sub-frame carries an invalid frame type (outside the [0x01,0x14]
 // valid range) and whose second is a well-formed control frame. The
-// sub-frames are full-header encoded, so the batch decoder routes each via
-// its peek byte = SenderID[0] = 0x00 (not a short indicator) to the
-// full-header decoder, reconstructing the invalid type verbatim. Pre-fix the
-// abuse score stays 0; post-fix reportAbuse fires for the malformed sub-frame.
+// sub-frames are full frames, so the batch decoder routes each by its first
+// byte, aether.FullFrameDiscriminator, to the full-frame decoder,
+// reconstructing the invalid type verbatim. Without the gate the abuse score
+// stays 0; with it reportAbuse fires for the malformed sub-frame. Both
+// sessions chose frame.short, so the server reads the batch at all.
 func TestAEM17_TCPBatchSubFrameValidated(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
@@ -42,7 +43,7 @@ func TestAEM17_TCPBatchSubFrameValidated(t *testing.T) {
 	defer server.Close()
 
 	// Sub-frame 1: invalid frame type (0xFF is outside [TypeDATA, TypeCONGESTION]).
-	// Zero SenderID → wire first byte 0x00 → batch decoder full-header path.
+	// A full frame, which the batch decoder reads behind the discriminator.
 	malformed := &aether.Frame{Type: aether.FrameType(0xFF), StreamID: 7}
 	// Sub-frame 2: a well-formed PING (no min-payload requirement) — proves
 	// valid sub-frames still flow; only the malformed one is dropped.

@@ -432,8 +432,9 @@ type NoiseSession struct {
 	// wireVersions is the wire version set the Noise handshake under conn
 	// chose, lifted at construction through the noiseConnWireVersions probe
 	// and reported by WireVersions. The empty set when conn carries none,
-	// which is the case only for a conn no Noise handshake produced. Frozen
-	// at construction, read lock-free.
+	// which is the case only for a conn no Noise handshake produced, and
+	// such a session writes and reads full frames only. Its compressors take
+	// their grammar from it. Frozen at construction, read lock-free.
 	wireVersions aether.NegotiatedWireVersions
 }
 
@@ -490,6 +491,10 @@ func NewNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 	if wv, ok := conn.(noiseConnWireVersions); ok {
 		s.wireVersions = wv.WireVersions()
 	}
+	// The grammar both directions use: short forms only when the handshake
+	// chose frame.short. Set before readLoop and writeLoop start.
+	s.txCompressor.UseWireVersions(s.wireVersions)
+	s.rxCompressor.UseWireVersions(s.wireVersions)
 
 	// Session-wide conn-level grant debouncer. Immediate-flush floor at
 	// 50% of DefaultConnCredit so burst patterns don't wait the full
