@@ -14,6 +14,7 @@ package noise
 import (
 	"context"
 	"crypto/ed25519"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"time"
@@ -35,10 +36,8 @@ const dialConnHandshakeTimeout = 10 * time.Second
 // enough to fit under WebRTC DataChannel's practical limit.
 const defaultMaxPacketOverConn = 64 * 1024
 
-// minimalNodeInfoSize is the fixed length of encodeMinimalNodeInfo
-// output: it is a length-prefixed NodeID (1-byte len + up to 255 bytes)
-// plus 32 bytes of static public key plus 1 reserved-capability byte.
-// We cap NodeID at 255 bytes (vastly more than any real NodeID).
+// minimalNodeInfoReservedByte is the value of the reserved-capability byte
+// that follows the static public key in encodeMinimalNodeInfo's payload.
 const minimalNodeInfoReservedByte = 0
 
 // DialConnConfig supplies everything DialOverConn needs. StaticPriv +
@@ -58,6 +57,12 @@ type DialConnConfig struct {
 	RemotePeerHint   aether.NodeID // advisory; not a gate
 	HandshakeTimeout time.Duration
 	MaxPacket        int
+
+	// WireVersions are the application's entries of the dialer's wire
+	// version offer, beside aether's own (aether.LocalWireVersions). The
+	// dialer chooses from its offer and the accepter's msg2 offer and refuses
+	// before writing msg3 when a required entry has no common version.
+	WireVersions aether.WireVersions
 }
 
 // AcceptConnConfig is the responder-side config.
@@ -113,6 +118,12 @@ type AcceptConnConfig struct {
 
 	HandshakeTimeout time.Duration
 	MaxPacket        int
+
+	// WireVersions are the application's entries of the accepter's wire
+	// version offer, sent in msg2 beside aether's own. The accepter chooses
+	// from its offer and the dialer's msg3 offer and refuses, returning no
+	// connection, when a required entry has no common version.
+	WireVersions aether.WireVersions
 }
 
 // DialOverConn runs an initiator Noise XX handshake over conn. On
@@ -130,6 +141,10 @@ func DialOverConn(ctx context.Context, cfg DialConnConfig, conn net.Conn) (aethe
 	}
 	if len(cfg.Ticket) > 0xFFFF {
 		return nil, fmt.Errorf("noise: DialOverConn: ticket too large (%d > 65535)", len(cfg.Ticket))
+	}
+	offer, err := aether.LocalWireVersions(cfg.WireVersions)
+	if err != nil {
+		return nil, fmt.Errorf("noise: DialOverConn: %w", err)
 	}
 
 	timeout := cfg.HandshakeTimeout
@@ -179,13 +194,19 @@ func DialOverConn(ctx context.Context, cfg DialConnConfig, conn net.Conn) (aethe
 	if err != nil {
 		return nil, fmt.Errorf("noise: process msg2: %w", err)
 	}
-	remoteNode, err := decodeMinimalNodeInfoID(remotePayload)
+	remoteNode, remoteOffer, err := decodeMinimalNodeInfo(remotePayload)
 	if err != nil {
 		return nil, fmt.Errorf("noise: decode remote NodeInfo: %w", err)
 	}
+	// Chosen before msg3: a refused accepter never receives this side's
+	// NodeInfo and no conn is built.
+	chosen, err := aether.ChooseWireVersions(offer, remoteOffer)
+	if err != nil {
+		return nil, fmt.Errorf("noise: DialOverConn: %w", err)
+	}
 
 	// Msg 3 — carry our own NodeInfo payload.
-	myPayload, err := encodeMinimalNodeInfo(cfg.LocalNodeID, cfg.StaticPub)
+	myPayload, err := encodeMinimalNodeInfo(cfg.LocalNodeID, cfg.StaticPub, offer)
 	if err != nil {
 		return nil, err
 	}
@@ -197,7 +218,7 @@ func DialOverConn(ctx context.Context, cfg DialConnConfig, conn net.Conn) (aethe
 		return nil, fmt.Errorf("noise: send msg3: %w", err)
 	}
 
-	return buildAetherConnectionOverConn(cfg.LocalNodeID, remoteNode, conn, sendCS, recvCS, maxPacket), nil
+	return buildAetherConnectionOverConn(cfg.LocalNodeID, remoteNode, conn, sendCS, recvCS, maxPacket, chosen, remoteOffer), nil
 }
 
 // AcceptOverConn is the responder-side counterpart of DialOverConn. It
@@ -243,6 +264,10 @@ func acceptOverConn(ctx context.Context, cfg AcceptConnConfig, conn net.Conn, dh
 	}
 	if (cfg.TicketNonces == nil) != (cfg.TicketNonceFn == nil) {
 		return nil, fmt.Errorf("noise: AcceptOverConn: TicketNonces and TicketNonceFn are set together")
+	}
+	offer, err := aether.LocalWireVersions(cfg.WireVersions)
+	if err != nil {
+		return nil, fmt.Errorf("noise: AcceptOverConn: %w", err)
 	}
 	timeout := cfg.HandshakeTimeout
 	if timeout <= 0 {
@@ -338,7 +363,7 @@ func acceptOverConn(ctx context.Context, cfg AcceptConnConfig, conn net.Conn, dh
 	}
 
 	// Msg 2 back to initiator carrying our NodeInfo.
-	myPayload, err := encodeMinimalNodeInfo(cfg.LocalNodeID, cfg.StaticPub)
+	myPayload, err := encodeMinimalNodeInfo(cfg.LocalNodeID, cfg.StaticPub, offer)
 	if err != nil {
 		return nil, err
 	}
@@ -360,9 +385,16 @@ func acceptOverConn(ctx context.Context, cfg AcceptConnConfig, conn net.Conn, dh
 		return nil, fmt.Errorf("noise: process msg3: %w", err)
 	}
 	// remoteNode is the dialer's own statement; see AcceptOverConn.
-	remoteNode, err := decodeMinimalNodeInfoID(remotePayload)
+	remoteNode, remoteOffer, err := decodeMinimalNodeInfo(remotePayload)
 	if err != nil {
 		return nil, fmt.Errorf("noise: decode remote NodeInfo: %w", err)
+	}
+	// The dialer chose from the same two offers before writing msg3, so a
+	// refusal here means its offer did not reach it that way; the ticket's
+	// nonce below is not spent on it.
+	chosen, err := aether.ChooseWireVersions(offer, remoteOffer)
+	if err != nil {
+		return nil, fmt.Errorf("noise: AcceptOverConn: %w", err)
 	}
 	if string(cfg.ExpectedNodeID) != "" && remoteNode != cfg.ExpectedNodeID {
 		return nil, fmt.Errorf("noise: remote node %s does not match expected %s",
@@ -384,16 +416,19 @@ func acceptOverConn(ctx context.Context, cfg AcceptConnConfig, conn net.Conn, dh
 		}
 	}
 
-	return buildAetherConnectionOverConn(cfg.LocalNodeID, remoteNode, conn, sendCS, recvCS, maxPacket), nil
+	return buildAetherConnectionOverConn(cfg.LocalNodeID, remoteNode, conn, sendCS, recvCS, maxPacket, chosen, remoteOffer), nil
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────
 
 // encodeMinimalNodeInfo produces the payload carried inside the Noise
-// handshake: [1:nodeIDLen][nodeID bytes][32:staticPub][1:reserved]. The
-// NodeID-as-string is variable-length (aether.NodeID is a base32 string
-// like "vl1_..."); the static public key is always 32 bytes.
-func encodeMinimalNodeInfo(id aether.NodeID, staticPub []byte) ([]byte, error) {
+// handshake: [1:nodeIDLen][nodeID bytes][32:staticPub][1:reserved]
+// [2:versionsLen][versions]. The NodeID-as-string is variable-length
+// (aether.NodeID is a base32 string like "vl1_..."); the static public key is
+// always 32 bytes; versions is the sender's wire version offer in the
+// aether.WireVersions encoding, which DialOverConn and AcceptOverConn choose
+// from. An offer that is not in canonical form is refused.
+func encodeMinimalNodeInfo(id aether.NodeID, staticPub []byte, offer aether.WireVersions) ([]byte, error) {
 	if len(staticPub) != 32 {
 		return nil, fmt.Errorf("noise: staticPub must be 32 bytes, got %d", len(staticPub))
 	}
@@ -401,41 +436,70 @@ func encodeMinimalNodeInfo(id aether.NodeID, staticPub []byte) ([]byte, error) {
 	if len(idBytes) > 255 {
 		return nil, fmt.Errorf("noise: NodeID too long (%d > 255)", len(idBytes))
 	}
-	out := make([]byte, 0, 1+len(idBytes)+32+1)
+	versions, err := offer.Encode()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, 0, 1+len(idBytes)+32+1+2+len(versions))
 	out = append(out, byte(len(idBytes)))
 	out = append(out, idBytes...)
 	out = append(out, staticPub...)
 	out = append(out, minimalNodeInfoReservedByte)
+	out = binary.BigEndian.AppendUint16(out, uint16(len(versions)))
+	out = append(out, versions...)
 	return out, nil
 }
 
-// decodeMinimalNodeInfoID returns the NodeID a peer's handshake payload
-// names, as the peer wrote it: it checks the payload's length and nothing
-// else. The static key the payload carries is not compared with the key
-// the handshake proved either; a caller that needs the proved key reads
+// decodeMinimalNodeInfo returns the NodeID a peer's handshake payload names,
+// as the peer wrote it, and the peer's wire version offer. The payload must
+// be exactly what encodeMinimalNodeInfo writes: a payload that ends before the
+// versions field, declares more than aether.MaxWireVersionsEncodedSize, runs
+// short or carries trailing bytes is refused with
+// aether.ErrWireVersionsMalformed, so a peer without an offer completes no
+// handshake. The static key the payload carries is not compared with the key
+// the handshake proved; a caller that needs the proved key reads
 // hs.PeerStatic, as acceptOverConn does for ValidatePeerStaticFn.
-func decodeMinimalNodeInfoID(payload []byte) (aether.NodeID, error) {
+func decodeMinimalNodeInfo(payload []byte) (aether.NodeID, aether.WireVersions, error) {
 	if len(payload) < 1 {
-		return "", fmt.Errorf("noise: NodeInfo payload empty")
+		return "", nil, fmt.Errorf("noise: NodeInfo payload empty")
 	}
 	idLen := int(payload[0])
-	if len(payload) < 1+idLen+32+1 {
-		return "", fmt.Errorf("noise: NodeInfo payload truncated (%d < %d)", len(payload), 1+idLen+33)
+	fixed := 1 + idLen + 32 + 1
+	if len(payload) < fixed {
+		return "", nil, fmt.Errorf("noise: NodeInfo payload truncated (%d < %d)", len(payload), fixed)
 	}
-	return aether.NodeID(payload[1 : 1+idLen]), nil
+	id := aether.NodeID(payload[1 : 1+idLen])
+	rest := payload[fixed:]
+	if len(rest) < 2 {
+		return "", nil, fmt.Errorf("noise: NodeInfo payload has no versions field: %w", aether.ErrWireVersionsMalformed)
+	}
+	n := int(binary.BigEndian.Uint16(rest))
+	if n > aether.MaxWireVersionsEncodedSize || len(rest) != 2+n {
+		return "", nil, fmt.Errorf("noise: NodeInfo versions field declares %d bytes with %d present: %w",
+			n, len(rest)-2, aether.ErrWireVersionsMalformed)
+	}
+	offer, err := aether.DecodeWireVersions(rest[2:])
+	if err != nil {
+		return "", nil, fmt.Errorf("noise: NodeInfo versions: %w", err)
+	}
+	return id, offer, nil
 }
 
 // buildAetherConnectionOverConn wraps post-handshake state into a
 // noiseConn + starts its reader + returns the aether.Connection. Used
 // by both DialOverConn and AcceptOverConn — their only post-handshake
 // difference is the sendCS/recvCS ordering which the caller supplies.
-// remote is the id decodeMinimalNodeInfoID read from the peer's payload,
-// and the Connection reports it as RemoteNodeID unchecked.
+// remote is the id decodeMinimalNodeInfo read from the peer's payload,
+// and the Connection reports it as RemoteNodeID unchecked. chosen and
+// peerOffer are the handshake's wire version set and the peer's offer; the
+// conn reports chosen through WireVersions.
 func buildAetherConnectionOverConn(
 	local, remote aether.NodeID,
 	conn net.Conn,
 	sendCS, recvCS *noise.CipherState,
 	maxPacket int,
+	chosen aether.NegotiatedWireVersions,
+	peerOffer aether.WireVersions,
 ) aether.Connection {
 	cfg := aether.DefaultSessionConfig()
 	// remoteIdentity is intentionally left nil: this path exchanges a
@@ -454,6 +518,9 @@ func buildAetherConnectionOverConn(
 		localAddr:  conn.LocalAddr(),
 		health:     transportHealth.NewMonitor(0.2),
 		rekey:      NewRekeyTracker(cfg.RekeyAfterBytes, cfg.RekeyAfterDuration),
+
+		wireVersions:     chosen,
+		peerWireVersions: peerOffer,
 	}
 	nc.parentStop = func() { _ = conn.Close() }
 	go nc.runReader()

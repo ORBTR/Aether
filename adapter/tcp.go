@@ -103,7 +103,49 @@ type TCPSession struct {
 	// it via AggregateAetherStats to publish aether_deliver_* under
 	// /api/monitoring/mesh-debug.
 	deliveryStats DeliveryStats
+
+	// wireOffer is the wire version offer this session's preface sends:
+	// aether's entries plus opts.WireVersions (aether.LocalWireVersions).
+	// wireOfferErr is that merge's refusal, which closes the session before
+	// any preface is written. Both are set in NewTCPSession before any
+	// goroutine starts and never change.
+	wireOffer    aether.WireVersions
+	wireOfferErr error
+
+	// wireDone closes when the preface exchange ends: the peer's preface was
+	// read and the choice made, or the exchange failed or the session closed
+	// first. wireResult then holds the chosen set or the reason. OpenStream
+	// waits on it and readLoop decodes no frame before it, which is what puts
+	// the refusal of a mismatched peer ahead of every stream.
+	// prefaceWritten closes once this side's preface write has returned, so
+	// a refusing readLoop can let its preface reach the peer before the conn
+	// closes and the peer reaches the same refusal. wireTimer ends an
+	// exchange the peer leaves unanswered.
+	wireDone       chan struct{}
+	wireOnce       sync.Once
+	wireResult     atomic.Pointer[tcpWireResult]
+	prefaceWritten chan struct{}
+	wireTimer      *time.Timer
+	prefaceTimeout time.Duration
 }
+
+// tcpWireResult is the outcome of a TCPSession's preface exchange: the set
+// both offers chose, or the reason there is none.
+type tcpWireResult struct {
+	chosen aether.NegotiatedWireVersions
+	err    error
+}
+
+// wireVersionsPrefaceTimeout bounds a TCPSession's preface exchange: a peer
+// whose preface has not arrived by then has the session closed with
+// errWireVersionsPrefaceTimeout. NewTCPSession copies it into the session
+// (prefaceTimeout), so a test can shorten it for the sessions it builds
+// without racing sessions already running.
+var wireVersionsPrefaceTimeout = 10 * time.Second
+
+// errWireVersionsPrefaceTimeout is the close reason of a session whose peer
+// sent no complete preface within wireVersionsPrefaceTimeout.
+var errWireVersionsPrefaceTimeout = fmt.Errorf("%w: peer sent no preface within the deadline", aether.ErrHandshakeFailed)
 
 // tcpStream is a single Aether stream multiplexed over a TCP connection.
 type tcpStream struct {
@@ -312,7 +354,12 @@ func NewTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 		txCompressor:  aether.NewCompressor(), // AE-P-05: encode-side state
 		rxCompressor:  aether.NewCompressor(), // AE-P-05: decode-side state
 		tickStop:      make(chan struct{}),
+
+		wireDone:       make(chan struct{}),
+		prefaceWritten: make(chan struct{}),
+		prefaceTimeout: wireVersionsPrefaceTimeout,
 	}
+	s.wireOffer, s.wireOfferErr = aether.LocalWireVersions(opts.WireVersions)
 	// Per-peer abuse tracker — per-session registry by default,
 	// overridable via SetAbuseScoreRegistry for cross-session scoring.
 	// The tracker wraps the registry plus the threshold-breaker
@@ -367,10 +414,132 @@ func NewTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 	// through, so no transport can leak a deadline into a live session.
 	_ = conn.SetDeadline(time.Time{})
 
+	// The preface is the first thing written. Every frame write holds
+	// writeMu, so taking it here and releasing it in writePreface, once the
+	// preface write returns, orders the preface ahead of any frame whichever
+	// goroutine writes first.
+	s.writeMu.Lock()
+	s.wireTimer = time.AfterFunc(s.prefaceTimeout, func() {
+		if s.finishWireVersions(aether.NegotiatedWireVersions{}, errWireVersionsPrefaceTimeout) {
+			s.CloseWithError(errWireVersionsPrefaceTimeout)
+		}
+	})
+	go s.writePreface()
 	go s.readLoop()
 	go s.writeLoop()
 	go s.housekeepingTick()
 	return s
+}
+
+// writePreface writes this session's wire version preface, then releases
+// the writeMu NewTCPSession took. A malformed local offer writes nothing.
+// A failed write ends the exchange, if it is still open, and closes the
+// session. writeMu is released before any close so the close path's own
+// frame writes cannot wait on it.
+func (s *TCPSession) writePreface() {
+	err := s.wireOfferErr
+	if err == nil {
+		err = aether.WriteWireVersionsPreface(s.conn, s.wireOffer)
+		if err != nil {
+			err = fmt.Errorf("wire versions preface write: %w", err)
+		}
+	}
+	s.writeMu.Unlock()
+	close(s.prefaceWritten)
+	if err != nil {
+		s.finishWireVersions(aether.NegotiatedWireVersions{}, err)
+		s.CloseWithError(err)
+	}
+}
+
+// readPreface reads the peer's preface (bounded by
+// aether.ReadWireVersionsPreface and wireVersionsPrefaceTimeout) and makes
+// the choice from the two offers. It runs at the head of readLoop, so on a
+// refusal no frame has been decoded and no stream exists.
+func (s *TCPSession) readPreface() error {
+	if s.wireOfferErr != nil {
+		return s.wireOfferErr
+	}
+	peer, err := aether.ReadWireVersionsPreface(s.conn)
+	if err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+		return fmt.Errorf("wire versions preface: %w", err)
+	}
+	chosen, err := aether.ChooseWireVersions(s.wireOffer, peer)
+	if err != nil {
+		return err
+	}
+	if !s.finishWireVersions(chosen, nil) {
+		// The deadline or a close ended the exchange first.
+		if r := s.wireResult.Load(); r != nil && r.err != nil {
+			return r.err
+		}
+		return aether.ErrSessionClosed
+	}
+	return nil
+}
+
+// finishWireVersions records the outcome of the preface exchange once and
+// releases everything waiting on wireDone. It reports whether this call was
+// the one that ended the exchange.
+func (s *TCPSession) finishWireVersions(chosen aether.NegotiatedWireVersions, err error) bool {
+	first := false
+	s.wireOnce.Do(func() {
+		first = true
+		s.wireResult.Store(&tcpWireResult{chosen: chosen, err: err})
+		if s.wireTimer != nil {
+			s.wireTimer.Stop()
+		}
+		close(s.wireDone)
+	})
+	return first
+}
+
+// awaitWireVersions blocks until the preface exchange has ended, returning
+// its refusal, the caller's context error, or ErrSessionClosed. OpenStream
+// calls it before creating any stream state.
+func (s *TCPSession) awaitWireVersions(ctx context.Context) error {
+	select {
+	case <-s.wireDone:
+	case <-s.CloseSignal():
+		if err := s.wireRefusal(); err != nil {
+			return err
+		}
+		return aether.ErrSessionClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if r := s.wireResult.Load(); r.err != nil {
+		return r.err
+	}
+	return nil
+}
+
+// wireRefusal returns why the preface exchange produced no set, or nil when
+// it chose one or the session was simply closed. AcceptStream and
+// AcceptStreamByID return it in place of the acceptor's ErrSessionClosed so
+// a caller sees the mismatch that closed the session.
+func (s *TCPSession) wireRefusal() error {
+	if r := s.wireResult.Load(); r != nil && r.err != nil && r.err != aether.ErrSessionClosed {
+		return r.err
+	}
+	return nil
+}
+
+// WireVersions returns the set the preface exchange chose. It waits for the
+// exchange to end, which wireVersionsPrefaceTimeout bounds, and returns the
+// empty set for a session that refused its peer or closed first.
+func (s *TCPSession) WireVersions() aether.NegotiatedWireVersions {
+	select {
+	case <-s.wireDone:
+	case <-s.CloseSignal():
+	}
+	if r := s.wireResult.Load(); r != nil {
+		return r.chosen
+	}
+	return aether.NegotiatedWireVersions{}
 }
 
 // readLoop reads Aether frames from the TCP connection and dispatches to streams.
@@ -385,6 +554,20 @@ func (s *TCPSession) readLoop() {
 	// generic "readLoop exited" placeholder that masked the cause.
 	var exitErr error
 	defer func() { s.CloseWithError(exitErr) }()
+	if err := s.readPreface(); err != nil {
+		dbgTCP.Printf("readLoop: preface refused err=%v remote=%s", err, s.RemoteNodeID().Short())
+		s.finishWireVersions(aether.NegotiatedWireVersions{}, err)
+		// Let this side's own preface reach the peer before the conn closes,
+		// so the peer reads both offers and reaches the same refusal rather
+		// than a bare end of stream.
+		select {
+		case <-s.prefaceWritten:
+		case <-s.CloseSignal():
+		case <-time.After(s.prefaceTimeout):
+		}
+		exitErr = err
+		return
+	}
 	for {
 		frame, _, batch, err := aether.ReadNextFrame(s.conn, s.rxCompressor) // AE-P-05: RX state
 		if err != nil {
@@ -1001,8 +1184,16 @@ func (s *TCPSession) writeFrame(frame *aether.Frame) error {
 func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (aether.Stream, error) {
 	select {
 	case <-s.CloseSignal():
+		if err := s.wireRefusal(); err != nil {
+			return nil, err
+		}
 		return nil, fmt.Errorf("session closed")
 	default:
+	}
+	// No stream exists before the wire versions are chosen: a refused peer
+	// returns the refusal here and the session holds nothing to tear down.
+	if err := s.awaitWireVersions(ctx); err != nil {
+		return nil, err
 	}
 
 	st := &tcpStream{
@@ -1111,6 +1302,8 @@ func (s *TCPSession) AcceptStream(ctx context.Context) (aether.Stream, error) {
 		if ts, ok := st.(*tcpStream); ok {
 			dbgTCP.Printf("AcceptStream: got stream=%d", ts.streamID)
 		}
+	} else if werr := s.wireRefusal(); werr != nil {
+		return nil, werr
 	}
 	return st, err
 }
@@ -1121,7 +1314,13 @@ func (s *TCPSession) AcceptStream(ctx context.Context) (aether.Stream, error) {
 // root aether package so the Noise, TCP, and QUIC adapters share one
 // implementation rather than each maintaining its own copy.
 func (s *TCPSession) AcceptStreamByID(ctx context.Context, streamID uint64) (aether.Stream, error) {
-	return s.acceptor.AcceptByID(ctx, streamID)
+	st, err := s.acceptor.AcceptByID(ctx, streamID)
+	if err != nil {
+		if werr := s.wireRefusal(); werr != nil {
+			return nil, werr
+		}
+	}
+	return st, err
 }
 
 // Identity / Capabilities / Protocol accessors are promoted from the
@@ -1158,6 +1357,9 @@ func (s *TCPSession) CloseWithError(err error) error {
 	if err != nil {
 		s.SetCloseErr(err)
 	}
+	// A close before the preface exchange ended ends it, releasing every
+	// waiter and stopping the deadline timer.
+	s.finishWireVersions(aether.NegotiatedWireVersions{}, aether.ErrSessionClosed)
 	// Capture the caller chain so the FIRST closer in a close
 	// cascade is identifiable. Frame 0 is this closure, 1 is
 	// CloseWithError; frames 2-5 are the actual callers — readLoop
@@ -1527,6 +1729,7 @@ func (st *tcpStream) AvailableCredit() int64 {
 var _ aether.Session = (*TCPSession)(nil)
 var _ aether.AbuseScoreCapable = (*TCPSession)(nil)
 var _ aether.IdleEvictable = (*TCPSession)(nil)
+var _ aether.WireVersionsReporter = (*TCPSession)(nil)
 var _ aether.Stream = (*tcpStream)(nil)
 
 // Suppress unused import warnings for packages used in struct fields.

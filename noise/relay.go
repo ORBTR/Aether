@@ -274,8 +274,18 @@ func (l *noiseListener) handleRelayedHandshake(relayConn *noiseConn, sourceNodeI
 		l.mu.Unlock()
 		return err
 	}
-	remoteNode, _, remoteCaps, remoteMaxAckDelayUS, err := l.transport.verifyNodeInfo(state.PeerStatic(), payload, "")
+	remote, err := l.transport.verifyNodeInfo(state.PeerStatic(), payload, "")
 	if err != nil {
+		delete(l.handshakes, sourceNodeID)
+		l.mu.Unlock()
+		return err
+	}
+	remoteNode, remoteCaps, remoteMaxAckDelayUS := remote.NodeID, remote.Caps, remote.MaxAckDelayUS
+	// A relayed handshake chooses from the same two offers as a direct one,
+	// before the relayed conn is built or registered.
+	chosen, err := l.transport.chooseWireVersions(remote.WireVersions)
+	if err != nil {
+		l.drops.count(DropWireVersionMismatch)
 		delete(l.handshakes, sourceNodeID)
 		l.mu.Unlock()
 		return err
@@ -306,6 +316,7 @@ func (l *noiseListener) handleRelayedHandshake(relayConn *noiseConn, sourceNodeI
 	// Set scope from the relay connection's scope (relayed sessions inherit scope)
 	nc.scopeID = relayConn.scopeID
 	nc.peerMaxAckDelay = decodeMaxAckDelay(remoteMaxAckDelayUS)
+	nc.wireVersions, nc.peerWireVersions = chosen, remote.WireVersions
 
 	// Negotiate explicit nonce mode if both sides support it
 	if remoteCaps&capExplicitNonce != 0 {

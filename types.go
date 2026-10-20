@@ -217,6 +217,14 @@ type SessionOptions struct {
 	// 0 = use DefaultSessionWarmupGrace. Set to a negative value to
 	// disable warmup grace (immediate stall threshold from t=0).
 	SessionWarmupGrace time.Duration
+
+	// WireVersions are the application's entries of the wire version offer
+	// a byte-stream session (TCPSession, which serves TCP, WebSocket, gRPC and
+	// QUIC streams) sends in its preface, beside aether's own
+	// (LocalWireVersions). A Noise session negotiates in its handshake
+	// instead, from NoiseTransportConfig or the over-conn configs, and does
+	// not read this field.
+	WireVersions WireVersions
 }
 
 // DefaultMaxConcurrentStreams is the default per-session stream cap for

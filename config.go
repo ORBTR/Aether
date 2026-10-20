@@ -30,6 +30,12 @@ type Config struct {
 
 	// Platform
 	BindResolver BindAddressResolver // nil = use OS default bind addresses
+
+	// WireVersions are the application's entries of the wire version offer
+	// the transports built from this Config send in their handshakes, beside
+	// aether's own (LocalWireVersions). noise.NewNoiseTransportFromConfig
+	// passes them to the Noise transport.
+	WireVersions WireVersions
 }
 
 // NoiseConfig configures the Noise VL1 transport.
