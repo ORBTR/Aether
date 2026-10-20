@@ -6,6 +6,7 @@ package aether
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -42,28 +43,76 @@ func PutPayloadBuf(b []byte) {
 	payloadPool.Put(&b)
 }
 
-// EncodeFrame writes an Aether frame to w. Returns the total bytes written (header + payload).
-func EncodeFrame(w io.Writer, f *Frame) (int, error) {
-	var hdr [HeaderSize]byte
+// FullFrameDiscriminator is the first byte of every full frame in frame
+// grammar 2, the grammar WireVersionFrame names. The 50-byte header follows it
+// unchanged. ReadNextFrame tells a full frame from a short form by this byte
+// alone, so no header field, SenderID[0] included, is ever read as a form.
+const FullFrameDiscriminator byte = 0x01
 
-	// SenderID (offset 0, 8 bytes)
-	copy(hdr[0:8], f.SenderID[:])
-	// ReceiverID (offset 8, 8 bytes)
-	copy(hdr[8:16], f.ReceiverID[:])
-	// StreamID (offset 16, 8 bytes)
-	binary.BigEndian.PutUint64(hdr[16:24], f.StreamID)
-	// Type (offset 24, 1 byte)
-	hdr[24] = byte(f.Type)
-	// Flags (offset 25, 1 byte)
-	hdr[25] = byte(f.Flags)
-	// SeqNo (offset 26, 4 bytes)
-	binary.BigEndian.PutUint32(hdr[26:30], f.SeqNo)
-	// AckNo (offset 30, 4 bytes)
-	binary.BigEndian.PutUint32(hdr[30:34], f.AckNo)
-	// Length (offset 34, 4 bytes)
-	binary.BigEndian.PutUint32(hdr[34:38], f.Length)
-	// Nonce (offset 38, 12 bytes)
-	copy(hdr[38:50], f.Nonce[:])
+// FullFrameHeaderWireSize is the bytes a full frame occupies before its
+// payload: the discriminator and the header.
+const FullFrameHeaderWireSize = 1 + HeaderSize
+
+// ErrFrameDiscriminator is the refusal of a frame whose first byte is not a
+// form the session's grammar reads: anything but FullFrameDiscriminator, and
+// the short forms when the session did not choose WireVersionFrameShort.
+// errors.Is matches it on a *FrameDiscriminatorError.
+var ErrFrameDiscriminator = errors.New("aether: frame discriminator refused")
+
+// FrameDiscriminatorError names the first byte a decoder refused and whether
+// the session's grammar had the short forms at the time. The decoders return
+// it after reading only that byte. The TCP and Noise read loops end the
+// session with it.
+type FrameDiscriminatorError struct {
+	Discriminator byte
+	ShortForms    bool
+}
+
+func (e *FrameDiscriminatorError) Error() string {
+	return fmt.Sprintf("%v: first byte 0x%02x (short forms negotiated: %v)", ErrFrameDiscriminator, e.Discriminator, e.ShortForms)
+}
+
+// Is lets errors.Is(err, ErrFrameDiscriminator) match.
+func (e *FrameDiscriminatorError) Is(target error) bool { return target == ErrFrameDiscriminator }
+
+// putFullFrameHeader writes the discriminator and the header of f into
+// hdr, which must hold FullFrameHeaderWireSize bytes.
+func putFullFrameHeader(hdr []byte, f *Frame) {
+	hdr[0] = FullFrameDiscriminator
+	h := hdr[1:FullFrameHeaderWireSize]
+	copy(h[0:8], f.SenderID[:])
+	copy(h[8:16], f.ReceiverID[:])
+	binary.BigEndian.PutUint64(h[16:24], f.StreamID)
+	h[24] = byte(f.Type)
+	h[25] = byte(f.Flags)
+	binary.BigEndian.PutUint32(h[26:30], f.SeqNo)
+	binary.BigEndian.PutUint32(h[30:34], f.AckNo)
+	binary.BigEndian.PutUint32(h[34:38], f.Length)
+	copy(h[38:50], f.Nonce[:])
+}
+
+// parseHeader reads the 50 header bytes that follow a full frame's
+// discriminator into a new Frame, payload not yet read.
+func parseHeader(h []byte) *Frame {
+	f := &Frame{}
+	copy(f.SenderID[:], h[0:8])
+	copy(f.ReceiverID[:], h[8:16])
+	f.StreamID = binary.BigEndian.Uint64(h[16:24])
+	f.Type = FrameType(h[24])
+	f.Flags = FrameFlags(h[25])
+	f.SeqNo = binary.BigEndian.Uint32(h[26:30])
+	f.AckNo = binary.BigEndian.Uint32(h[30:34])
+	f.Length = binary.BigEndian.Uint32(h[34:38])
+	copy(f.Nonce[:], h[38:50])
+	return f
+}
+
+// EncodeFrame writes f as a full frame to w: FullFrameDiscriminator, the
+// header, then the payload. It returns the bytes written. The TCP and Noise
+// write paths, and EncodeBatch for a child no short form can carry, call it.
+func EncodeFrame(w io.Writer, f *Frame) (int, error) {
+	var hdr [FullFrameHeaderWireSize]byte
+	putFullFrameHeader(hdr[:], f)
 
 	n, err := w.Write(hdr[:])
 	if err != nil {
@@ -81,125 +130,73 @@ func EncodeFrame(w io.Writer, f *Frame) (int, error) {
 	return n, nil
 }
 
-// EncodeFrameToBytes serialises a frame to a byte slice.
-// Used by WASM adapter where io.Writer is not available.
+// EncodeFrameToBytes returns f as a full frame in one slice, the form
+// EncodeFrame writes. The Noise resume path sends it as one datagram.
 func EncodeFrameToBytes(f *Frame) []byte {
-	buf := make([]byte, HeaderSize+len(f.Payload))
-	copy(buf[0:8], f.SenderID[:])
-	copy(buf[8:16], f.ReceiverID[:])
-	binary.BigEndian.PutUint64(buf[16:24], f.StreamID)
-	buf[24] = byte(f.Type)
-	buf[25] = byte(f.Flags)
-	binary.BigEndian.PutUint32(buf[26:30], f.SeqNo)
-	binary.BigEndian.PutUint32(buf[30:34], f.AckNo)
-	binary.BigEndian.PutUint32(buf[34:38], f.Length)
-	copy(buf[38:50], f.Nonce[:])
-	copy(buf[50:], f.Payload)
+	buf := make([]byte, FullFrameHeaderWireSize+len(f.Payload))
+	putFullFrameHeader(buf, f)
+	copy(buf[FullFrameHeaderWireSize:], f.Payload)
 	return buf
 }
 
-// DecodeFrameFromBytes deserialises a frame from a byte slice.
-// Used by WASM adapter where io.Reader is not available.
+// DecodeFrameFromBytes reads one full frame from data, which must begin with
+// FullFrameDiscriminator; any other first byte is a *FrameDiscriminatorError.
+// The payload aliases data and holds exactly the header's Length; a Length
+// past MaxPayloadSize or past the bytes present is refused, so a consumer that
+// trusts Length never reads beyond the payload.
 func DecodeFrameFromBytes(data []byte) (*Frame, error) {
-	if len(data) < HeaderSize {
-		return nil, fmt.Errorf("aether: frame too short (%d < %d)", len(data), HeaderSize)
+	if len(data) > 0 && data[0] != FullFrameDiscriminator {
+		return nil, &FrameDiscriminatorError{Discriminator: data[0]}
 	}
-	f := &Frame{}
-	copy(f.SenderID[:], data[0:8])
-	copy(f.ReceiverID[:], data[8:16])
-	f.StreamID = binary.BigEndian.Uint64(data[16:24])
-	f.Type = FrameType(data[24])
-	f.Flags = FrameFlags(data[25])
-	f.SeqNo = binary.BigEndian.Uint32(data[26:30])
-	f.AckNo = binary.BigEndian.Uint32(data[30:34])
-	f.Length = binary.BigEndian.Uint32(data[34:38])
-	copy(f.Nonce[:], data[38:50])
-	// AER-055: validate Length and return a Payload consistent with it
-	// (mirrors DecodeFrame). Without this, attacker bytes with
-	// Length=0xFFFFFFFF and a short body panicked any Length-trusting
-	// consumer on re-encode/relay, and honest frames with trailing bytes
-	// failed Validate (len(Payload) != Length).
+	if len(data) < FullFrameHeaderWireSize {
+		return nil, fmt.Errorf("aether: frame too short (%d < %d)", len(data), FullFrameHeaderWireSize)
+	}
+	f := parseHeader(data[1:FullFrameHeaderWireSize])
 	if f.Length > MaxPayloadSize {
 		return nil, fmt.Errorf("aether: payload too large (%d > %d)", f.Length, MaxPayloadSize)
 	}
-	avail := len(data) - HeaderSize
+	avail := len(data) - FullFrameHeaderWireSize
 	if int(f.Length) > avail {
 		return nil, fmt.Errorf("aether: truncated payload (have %d, need %d)", avail, f.Length)
 	}
 	if f.Length > 0 {
-		f.Payload = data[HeaderSize : HeaderSize+int(f.Length)]
+		f.Payload = data[FullFrameHeaderWireSize : FullFrameHeaderWireSize+int(f.Length)]
 	}
 	return f, nil
 }
 
-// DecodeFrame reads an Aether frame from r.
+// DecodeFrame reads one full frame from r. A first byte other than
+// FullFrameDiscriminator is refused with a *FrameDiscriminatorError before
+// anything past it is read.
 func DecodeFrame(r io.Reader) (*Frame, error) {
+	var disc [1]byte
+	if _, err := io.ReadFull(r, disc[:]); err != nil {
+		return nil, fmt.Errorf("aether: read discriminator: %w", err)
+	}
+	return DecodeFrameWithFirstByte(r, disc[0])
+}
+
+// DecodeFrameWithFirstByte reads the rest of a full frame whose first byte, the
+// discriminator, the caller has already read. ReadNextFrame and DecodeBatch
+// call it once they have read that byte. A discriminator other than
+// FullFrameDiscriminator is refused with a *FrameDiscriminatorError and
+// nothing more is read; the payload is allocated only after its Length passes
+// MaxPayloadSize.
+func DecodeFrameWithFirstByte(r io.Reader, firstByte byte) (*Frame, error) {
+	if firstByte != FullFrameDiscriminator {
+		return nil, &FrameDiscriminatorError{Discriminator: firstByte}
+	}
 	var hdr [HeaderSize]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, fmt.Errorf("aether: read header: %w", err)
 	}
-
-	f := &Frame{}
-
-	// SenderID
-	copy(f.SenderID[:], hdr[0:8])
-	// ReceiverID
-	copy(f.ReceiverID[:], hdr[8:16])
-	// StreamID
-	f.StreamID = binary.BigEndian.Uint64(hdr[16:24])
-	// Type
-	f.Type = FrameType(hdr[24])
-	// Flags
-	f.Flags = FrameFlags(hdr[25])
-	// SeqNo
-	f.SeqNo = binary.BigEndian.Uint32(hdr[26:30])
-	// AckNo
-	f.AckNo = binary.BigEndian.Uint32(hdr[30:34])
-	// Length
-	f.Length = binary.BigEndian.Uint32(hdr[34:38])
-	// Nonce
-	copy(f.Nonce[:], hdr[38:50])
-
-	// Validate length before allocating
-	if f.Length > MaxPayloadSize {
-		return nil, fmt.Errorf("aether: payload too large (%d bytes, max %d)", f.Length, MaxPayloadSize)
-	}
-
-	// Read payload (uses pooled buffer to reduce GC pressure)
-	if f.Length > 0 {
-		f.Payload = GetPayloadBuf(int(f.Length))
-		if _, err := io.ReadFull(r, f.Payload); err != nil {
-			PutPayloadBuf(f.Payload)
-			return nil, fmt.Errorf("aether: read payload: %w", err)
-		}
-	}
-
-	return f, nil
-}
-
-// DecodeFrameWithFirstByte decodes a full Aether frame when the first byte of the
-// header has already been read (e.g., to distinguish short vs full headers).
-func DecodeFrameWithFirstByte(r io.Reader, firstByte byte) (*Frame, error) {
-	var hdr [HeaderSize]byte
-	hdr[0] = firstByte
-	if _, err := io.ReadFull(r, hdr[1:]); err != nil {
-		return nil, fmt.Errorf("aether: read header: %w", err)
-	}
-
-	f := &Frame{}
-	copy(f.SenderID[:], hdr[0:8])
-	copy(f.ReceiverID[:], hdr[8:16])
-	f.StreamID = binary.BigEndian.Uint64(hdr[16:24])
-	f.Type = FrameType(hdr[24])
-	f.Flags = FrameFlags(hdr[25])
-	f.SeqNo = binary.BigEndian.Uint32(hdr[26:30])
-	f.AckNo = binary.BigEndian.Uint32(hdr[30:34])
-	f.Length = binary.BigEndian.Uint32(hdr[34:38])
-	copy(f.Nonce[:], hdr[38:50])
+	f := parseHeader(hdr[:])
 
 	if f.Length > MaxPayloadSize {
 		return nil, fmt.Errorf("aether: payload too large (%d bytes, max %d)", f.Length, MaxPayloadSize)
 	}
+	// The payload buffer comes from the payload pool; a failed read returns
+	// it there.
 	if f.Length > 0 {
 		f.Payload = GetPayloadBuf(int(f.Length))
 		if _, err := io.ReadFull(r, f.Payload); err != nil {
@@ -210,19 +207,12 @@ func DecodeFrameWithFirstByte(r io.Reader, firstByte byte) (*Frame, error) {
 	return f, nil
 }
 
-// EncodeHeaderOnly writes just the 50-byte header without payload.
-// Useful for control frames where the payload is written separately.
+// EncodeHeaderOnly writes f's discriminator and header without its payload,
+// for a caller that writes the payload itself. It returns the
+// FullFrameHeaderWireSize bytes written.
 func EncodeHeaderOnly(w io.Writer, f *Frame) (int, error) {
-	var hdr [HeaderSize]byte
-	copy(hdr[0:8], f.SenderID[:])
-	copy(hdr[8:16], f.ReceiverID[:])
-	binary.BigEndian.PutUint64(hdr[16:24], f.StreamID)
-	hdr[24] = byte(f.Type)
-	hdr[25] = byte(f.Flags)
-	binary.BigEndian.PutUint32(hdr[26:30], f.SeqNo)
-	binary.BigEndian.PutUint32(hdr[30:34], f.AckNo)
-	binary.BigEndian.PutUint32(hdr[34:38], f.Length)
-	copy(hdr[38:50], f.Nonce[:])
+	var hdr [FullFrameHeaderWireSize]byte
+	putFullFrameHeader(hdr[:], f)
 	return w.Write(hdr[:])
 }
 

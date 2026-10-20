@@ -26,7 +26,7 @@ func TestAEL13_ControlShortIs8BytesAndRoundTripsSeqNo(t *testing.T) {
 	// (2) Encode writes exactly 8 bytes.
 	const wantSeqNo uint32 = 0x01020304
 	f := &Frame{StreamID: 7, Type: TypePING, SeqNo: wantSeqNo}
-	c := NewCompressor()
+	c := shortFormCompressor(t)
 	var buf bytes.Buffer
 	n, err := c.EncodeControlShort(&buf, f)
 	if err != nil {
@@ -47,7 +47,7 @@ func TestAEL13_ControlShortIs8BytesAndRoundTripsSeqNo(t *testing.T) {
 	if _, err := buf.ReadByte(); err != nil {
 		t.Fatalf("AE-L-13: reading indicator byte: %v", err)
 	}
-	dc := NewCompressor()
+	dc := shortFormCompressor(t)
 	got, err := dc.DecodeControlShort(&buf)
 	if err != nil {
 		t.Fatalf("AE-L-13: DecodeControlShort error: %v", err)

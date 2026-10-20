@@ -74,7 +74,9 @@ type TCPSession struct {
 	// shared instance flip-flopped the reconstructed identity with the
 	// direction of the most recent full header and cross-incremented the
 	// frameCount%64 resync cadence; splitting gives each directional flow
-	// dedicated state that tracks identically on both peers.
+	// dedicated state that tracks identically on both peers. Both write and
+	// read full frames only until readPreface applies the chosen set, so a
+	// frame written before the peer's preface is read is a full frame.
 	txCompressor *aether.Compressor
 	rxCompressor *aether.Compressor
 
@@ -471,6 +473,11 @@ func (s *TCPSession) readPreface() error {
 	if err != nil {
 		return err
 	}
+	// The grammar is set before readLoop decodes the peer's first frame,
+	// which follows its preface on the conn, and before this side's writers
+	// can choose a short form.
+	s.rxCompressor.UseWireVersions(chosen)
+	s.txCompressor.UseWireVersions(chosen)
 	if !s.finishWireVersions(chosen, nil) {
 		// The deadline or a close ended the exchange first.
 		if r := s.wireResult.Load(); r != nil && r.err != nil {
@@ -1056,7 +1063,9 @@ func (s *TCPSession) writeLoop() {
 		// converts the shared writeMu into per-frame fairness without
 		// requiring the per-class writeLoop split that F8's larger
 		// refactor would entail.
-		if s.opts.HeaderComp && frame.StreamID != 0 && s.sched.Len() > 0 {
+		// A batch is itself a short form (0x85), so only a session whose
+		// grammar has the short forms coalesces.
+		if s.opts.HeaderComp && s.txCompressor.ShortForms() && frame.StreamID != 0 && s.sched.Len() > 0 {
 			batch := []*aether.Frame{frame}
 			for s.sched.Len() > 0 && len(batch) < 16 {
 				next, _ := s.sched.Dequeue()
@@ -1141,7 +1150,8 @@ func isTemporaryNetError(err error) bool {
 }
 
 // writeFrame serializes and writes a single frame to the TCP connection.
-// Uses v2 short header compression when enabled by kill switch.
+// With opts.HeaderComp it takes a short form when the TX Compressor admits
+// one, which it does only on a session whose chosen set has frame.short.
 func (s *TCPSession) writeFrame(frame *aether.Frame) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -1169,7 +1179,7 @@ func (s *TCPSession) writeFrame(frame *aether.Frame) error {
 		}
 	}
 
-	// Full 50-byte header (fallback)
+	// Full frame: discriminator and 50-byte header.
 	_, err := aether.EncodeFrame(s.conn, frame)
 	if err == nil {
 		s.txCompressor.RecordFullHeader(frame) // AE-P-05: TX state

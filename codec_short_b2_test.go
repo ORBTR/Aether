@@ -20,7 +20,7 @@ import (
 //
 // Same gate as B3's on the DATA path: refuse the flag, take the full header.
 func TestB2_ShouldCompressACK_RefusesFlagCOMPRESSED(t *testing.T) {
-	c := NewCompressor()
+	c := shortFormCompressor(t)
 	// Pin identity so the frame is short-eligible on every axis but the flag.
 	c.RecordFullHeader(&Frame{Type: TypeACK, StreamID: 1})
 
@@ -50,8 +50,8 @@ func TestB2_ShouldCompressACK_RefusesFlagCOMPRESSED(t *testing.T) {
 // decoder asserts a flag value of its own. That is legitimate for the composite
 // marker but means ANY other flag on the frame is destroyed in transit.
 func TestB2_DecodeACKShortFull_OverwritesFlags(t *testing.T) {
-	tx := NewCompressor()
-	rx := NewCompressor()
+	tx := shortFormCompressor(t)
+	rx := shortFormCompressor(t)
 	primer := &Frame{Type: TypeACK, StreamID: 1}
 	tx.RecordFullHeader(primer)
 	rx.RecordFullHeader(primer)

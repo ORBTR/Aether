@@ -6,6 +6,7 @@ package aether
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 )
 
@@ -57,8 +58,8 @@ func TestEncodeDecodeFrame_RoundTrip(t *testing.T) {
 			if err != nil {
 				t.Fatalf("encode: %v", err)
 			}
-			if n != int(HeaderSize)+int(c.frame.Length) {
-				t.Fatalf("bytes written: got %d want %d", n, HeaderSize+int(c.frame.Length))
+			if n != FullFrameHeaderWireSize+int(c.frame.Length) {
+				t.Fatalf("bytes written: got %d want %d", n, FullFrameHeaderWireSize+int(c.frame.Length))
 			}
 			decoded, err := DecodeFrame(&buf)
 			if err != nil {
@@ -93,7 +94,9 @@ func TestEncodeDecodeFrame_RoundTrip(t *testing.T) {
 // a length field exceeding MaxPayloadSize before allocating.
 func TestDecodeFrame_RejectsOversizedPayload(t *testing.T) {
 	var buf bytes.Buffer
-	// Build a header with Length = MaxPayloadSize + 1.
+	// Build a full frame's discriminator and a header with
+	// Length = MaxPayloadSize + 1, then no payload.
+	buf.WriteByte(FullFrameDiscriminator)
 	var hdr [HeaderSize]byte
 	hdr[24] = byte(TypeDATA)
 	// Length at offset 34 (big-endian uint32) — cast through uint32 so
@@ -106,8 +109,8 @@ func TestDecodeFrame_RejectsOversizedPayload(t *testing.T) {
 	buf.Write(hdr[:])
 
 	_, err := DecodeFrame(&buf)
-	if err == nil {
-		t.Fatal("expected oversize rejection")
+	if err == nil || !strings.Contains(err.Error(), "payload too large") {
+		t.Fatalf("err = %v, want the oversize refusal", err)
 	}
 }
 

@@ -37,7 +37,7 @@ func TestAEP27_BatchedEncryptedSubFrameRejected(t *testing.T) {
 		}
 	})
 
-	dec := NewCompressor()
+	dec := shortFormCompressor(t)
 	frames, err := dec.DecodeBatch(bytes.NewReader(body))
 	if err == nil {
 		t.Fatalf("AE-P-27 regressed: batched 0x87 sub-frame accepted (got %d frame(s)); "+
@@ -65,7 +65,7 @@ func TestAEP27_BatchedPlainDataStillDecodes(t *testing.T) {
 		}
 	})
 
-	dec := NewCompressor()
+	dec := shortFormCompressor(t)
 	frames, err := dec.DecodeBatch(bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("AE-P-27 control: plain-DATA batch failed to decode: %v", err)
@@ -80,7 +80,7 @@ func TestAEP27_BatchedPlainDataStillDecodes(t *testing.T) {
 // indicator is consumed by the caller before DecodeBatch, so it is omitted.
 func aep27BatchBody(t *testing.T, writeSub func(enc *Compressor, w *bytes.Buffer)) []byte {
 	t.Helper()
-	enc := NewCompressor()
+	enc := shortFormCompressor(t)
 	var sub bytes.Buffer
 	writeSub(enc, &sub)
 

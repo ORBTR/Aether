@@ -56,7 +56,7 @@ func TestAEP31_DecodeDataShort_NoBody_BoundedAlloc(t *testing.T) {
 	const declared = uint32(0x00FFFFFF) // 16 MB - 1
 	hdr := aep31shortHeader(0, 0, declared)
 
-	c := NewCompressor()
+	c := shortFormCompressor(t)
 	var err error
 	delta := aep31allocDelta(func() {
 		_, err = c.DecodeDataShort(bytes.NewReader(hdr))
@@ -82,7 +82,7 @@ func TestAEP31_DecodeDataShortVar_NoBody_BoundedAlloc(t *testing.T) {
 	}
 	// No body follows.
 
-	c := NewCompressor()
+	c := shortFormCompressor(t)
 	var err error
 	delta := aep31allocDelta(func() {
 		_, err = c.DecodeDataShortVar(bytes.NewReader(b.Bytes()))
@@ -110,13 +110,13 @@ func TestAEP31_RoundTrip_CapabilityPreserved(t *testing.T) {
 		payload := aep31payload(sz)
 
 		// Fixed-width uint32 short header (0x82).
-		encShort := NewCompressor()
+		encShort := shortFormCompressor(t)
 		var bufShort bytes.Buffer
 		fShort := &Frame{StreamID: 7, Type: TypeDATA, SeqNo: 0, Length: sz, Payload: payload}
 		if _, err := encShort.EncodeDataShort(&bufShort, fShort); err != nil {
 			t.Fatalf("EncodeDataShort(sz=%d): %v", sz, err)
 		}
-		decShort := NewCompressor()
+		decShort := shortFormCompressor(t)
 		gotShort, err := decShort.DecodeDataShort(bytes.NewReader(bufShort.Bytes()[1:])) // strip indicator
 		if err != nil {
 			t.Fatalf("DecodeDataShort(sz=%d): %v", sz, err)
@@ -129,13 +129,13 @@ func TestAEP31_RoundTrip_CapabilityPreserved(t *testing.T) {
 		}
 
 		// Varint short header (0x86).
-		encVar := NewCompressor()
+		encVar := shortFormCompressor(t)
 		var bufVar bytes.Buffer
 		fVar := &Frame{StreamID: 7, Type: TypeDATA, SeqNo: 0, Length: sz, Payload: payload}
 		if _, err := encVar.EncodeDataShortVar(&bufVar, fVar); err != nil {
 			t.Fatalf("EncodeDataShortVar(sz=%d): %v", sz, err)
 		}
-		decVar := NewCompressor()
+		decVar := shortFormCompressor(t)
 		gotVar, err := decVar.DecodeDataShortVar(bytes.NewReader(bufVar.Bytes()[1:])) // strip indicator
 		if err != nil {
 			t.Fatalf("DecodeDataShortVar(sz=%d): %v", sz, err)
@@ -155,7 +155,7 @@ func TestAEP31_OversizeGuardUnchanged(t *testing.T) {
 	const declared = uint32(MaxPayloadSize) + 1
 	hdr := aep31shortHeader(0, 0, declared)
 
-	c := NewCompressor()
+	c := shortFormCompressor(t)
 	var err error
 	delta := aep31allocDelta(func() {
 		_, err = c.DecodeDataShort(bytes.NewReader(hdr))
@@ -180,7 +180,7 @@ func TestAEP31_PartialBody_ErrorsCleanly(t *testing.T) {
 	body := aep31payload(maxShortPayloadPrealloc)
 
 	r := bytes.NewReader(append(append([]byte{}, hdr...), body...))
-	c := NewCompressor()
+	c := shortFormCompressor(t)
 	got, err := c.DecodeDataShort(r)
 	if err == nil {
 		t.Fatalf("DecodeDataShort: expected error for truncated body (declared %d, body %d)", declared, len(body))

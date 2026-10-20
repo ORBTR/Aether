@@ -17,18 +17,22 @@ package aether
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 )
 
 // ────────────────────────────────────────────────────────────────────────────
-// Indicator bytes — first byte of every frame determines the format
+// Indicator bytes — the first byte of every frame names its form
 // ────────────────────────────────────────────────────────────────────────────
 
+// The short forms of the table WireVersionFrameShort version 1 names. A
+// session writes and reads them only when it chose that entry
+// (Compressor.UseWireVersions); every full frame begins with
+// FullFrameDiscriminator instead, and every other first byte is refused.
 const (
-	// 0x00-0x7F: Full 50-byte header (SenderID[0] is always < 0x80 for VL1 NodeIDs)
-
 	ShortDataIndicator      byte = 0x82 // DATA frames, 9 bytes, uint32 Length
 	ShortControlIndicator   byte = 0x83 // PING/PONG/CLOSE/RESET, 8 bytes
 	ShortACKIndicator       byte = 0x84 // Composite ACK-lite, 11 bytes
@@ -54,10 +58,19 @@ const (
 	MaxShortHeaderStreamID = 0xFFFF
 )
 
-// IsShortHeader returns true if the first byte indicates any v2 short header.
+// IsShortHeader reports whether firstByte lies in 0x82-0x8F, the range the
+// short-form table occupies and grows into. It is not the test of a frame's
+// form: ReadNextFrame reads FullFrameDiscriminator as a full frame, the
+// short forms the session chose as short, and refuses the rest.
 func IsShortHeader(firstByte byte) bool {
 	return firstByte >= 0x82 && firstByte <= 0x8F
 }
+
+// ErrShortFormsNotNegotiated is the refusal of a short-form encode on a
+// session that did not choose WireVersionFrameShort; nothing is written. The
+// ShouldCompress checks admit no frame on such a session, so the TCP and
+// Noise write paths never reach it.
+var ErrShortFormsNotNegotiated = errors.New("aether: short forms not negotiated for this session")
 
 // ────────────────────────────────────────────────────────────────────────────
 // Per-stream and session state
@@ -81,14 +94,44 @@ type SessionCompState struct {
 
 // Compressor manages short header compression for a session.
 // Combines session-level identity with per-stream SeqNo tracking.
+//
+// shortForms is the session's grammar: whether it chose WireVersionFrameShort.
+// Until UseWireVersions sets it the Compressor writes and reads full frames
+// only, so a session that has not finished negotiating, or chose no short
+// forms, can neither emit nor accept one. It is atomic because TCPSession sets
+// it from its read loop while its writers consult it.
 type Compressor struct {
-	Session *SessionCompState
-	streams sync.Map // map[uint64]*StreamCompState
+	Session    *SessionCompState
+	streams    sync.Map // map[uint64]*StreamCompState
+	shortForms atomic.Bool
 }
 
-// NewCompressor creates a new v2 compressor.
+// NewCompressor creates a compressor for full frames only; UseWireVersions
+// admits the short forms.
 func NewCompressor() *Compressor {
 	return &Compressor{Session: &SessionCompState{}}
+}
+
+// UseWireVersions sets the grammar from the set the session chose: the short
+// forms are admitted when chosen names WireVersionFrameShort at the version
+// this build speaks, and refused otherwise. NoiseSession applies its
+// handshake's set at construction and TCPSession its preface exchange's set
+// before its first frame decode, to both its encode and decode Compressor,
+// so the two ends of a session hold the same grammar.
+func (c *Compressor) UseWireVersions(chosen NegotiatedWireVersions) {
+	v, ok := chosen.Version(WireVersionFrameShort)
+	c.shortForms.Store(ok && v == wireVersionFrameShortCurrent)
+}
+
+// ShortForms reports whether the session's grammar admits the short forms.
+func (c *Compressor) ShortForms() bool {
+	return c.shortForms.Load()
+}
+
+// refuseShort returns the read-side refusal of a short form on a session
+// whose grammar has none; the decoders return it before reading anything.
+func (c *Compressor) refuseShort(indicator byte) error {
+	return &FrameDiscriminatorError{Discriminator: indicator}
 }
 
 // GetOrCreateStream returns per-stream state, creating if needed.
@@ -136,6 +179,9 @@ func (c *Compressor) RecordFullHeader(f *Frame) {
 // means FlagENCRYPTED and FlagCOMPRESSED; a new flag that changes how the payload
 // is read must be added here too, or it will be lost on the wire in silence.
 func (c *Compressor) ShouldCompressData(f *Frame) bool {
+	if !c.ShortForms() {
+		return false
+	}
 	if f.Type != TypeDATA {
 		return false
 	}
@@ -187,6 +233,9 @@ func (c *Compressor) ShouldCompressData(f *Frame) bool {
 
 // ShouldCompressControl returns true if a control frame can use 0x83.
 func (c *Compressor) ShouldCompressControl(f *Frame) bool {
+	if !c.ShortForms() {
+		return false
+	}
 	switch f.Type {
 	case TypePING, TypePONG, TypeCLOSE, TypeRESET:
 	default:
@@ -212,6 +261,9 @@ func (c *Compressor) ShouldCompressControl(f *Frame) bool {
 // Flags field, so a frame whose interpretation depends on a flag must take the
 // full header.
 func (c *Compressor) ShouldCompressACK(f *Frame) bool {
+	if !c.ShortForms() {
+		return false
+	}
 	if f.Type != TypeACK {
 		return false
 	}
@@ -276,6 +328,9 @@ func reconstructSeqNo(expected uint32, low uint16) uint32 {
 
 // EncodeDataShort writes a 9-byte data short header + payload.
 func (c *Compressor) EncodeDataShort(w io.Writer, f *Frame) (int, error) {
+	if !c.ShortForms() {
+		return 0, ErrShortFormsNotNegotiated
+	}
 	s := c.GetOrCreateStream(f.StreamID)
 	s.mu.Lock()
 	seqLow := uint16(f.SeqNo) // AER-047: absolute low 16 bits, not a delta
@@ -342,6 +397,9 @@ func readShortPayload(r io.Reader, length uint32) ([]byte, error) {
 
 // DecodeDataShort reads a 9-byte data short header (indicator already consumed).
 func (c *Compressor) DecodeDataShort(r io.Reader) (*Frame, error) {
+	if !c.ShortForms() {
+		return nil, c.refuseShort(ShortDataIndicator)
+	}
 	var hdr [ShortDataSize - 1]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, fmt.Errorf("aether: read data short header: %w", err)
@@ -404,6 +462,9 @@ func (c *Compressor) DecodeDataShort(r io.Reader) (*Frame, error) {
 // Same wire format as 0x82 but the indicator tells the decoder to extract
 // the Nonce from the payload prefix before decryption.
 func (c *Compressor) EncodeEncryptedDataShort(w io.Writer, f *Frame) (int, error) {
+	if !c.ShortForms() {
+		return 0, ErrShortFormsNotNegotiated
+	}
 	s := c.GetOrCreateStream(f.StreamID)
 	s.mu.Lock()
 	seqLow := uint16(f.SeqNo) // AER-047: absolute low 16 bits, not a delta
@@ -438,6 +499,9 @@ func (c *Compressor) EncodeEncryptedDataShort(w io.Writer, f *Frame) (int, error
 // The returned Frame has the raw encrypted payload including Nonce prefix.
 // The caller must extract Nonce from payload[:12] before decryption.
 func (c *Compressor) DecodeEncryptedDataShort(r io.Reader) (*Frame, error) {
+	if !c.ShortForms() {
+		return nil, c.refuseShort(ShortEncryptedIndicator)
+	}
 	// Same wire layout as 0x82 — reuse DecodeDataShort logic
 	return c.DecodeDataShort(r)
 }
@@ -457,6 +521,9 @@ func (c *Compressor) DecodeEncryptedDataShort(r io.Reader) (*Frame, error) {
 // to the RFC 6298 estimator. Earlier 4-byte revisions dropped seqNo on
 // the wire, leaving the estimator permanently at its InitialRTO seed.
 func (c *Compressor) EncodeControlShort(w io.Writer, f *Frame) (int, error) {
+	if !c.ShortForms() {
+		return 0, ErrShortFormsNotNegotiated
+	}
 	var hdr [ShortControlSize]byte
 	hdr[0] = ShortControlIndicator
 	hdr[1] = byte(f.Type)
@@ -469,6 +536,9 @@ func (c *Compressor) EncodeControlShort(w io.Writer, f *Frame) (int, error) {
 // consumed). Layout: [type:1][streamID:2][seqNo:4]. SeqNo is preserved
 // so RecordPongRecv can match the inbound PONG against pendingPingSeq.
 func (c *Compressor) DecodeControlShort(r io.Reader) (*Frame, error) {
+	if !c.ShortForms() {
+		return nil, c.refuseShort(ShortControlIndicator)
+	}
 	var hdr [ShortControlSize - 1]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, fmt.Errorf("aether: read control short header: %w", err)
@@ -496,6 +566,9 @@ func (c *Compressor) DecodeControlShort(r io.Reader) (*Frame, error) {
 // ACK-lite (BitmapLen=0, Flags=0): inlined at 11 bytes.
 // ACK-full: 3-byte header + payload.
 func (c *Compressor) EncodeACKShort(w io.Writer, f *Frame) (int, error) {
+	if !c.ShortForms() {
+		return 0, ErrShortFormsNotNegotiated
+	}
 	// Check if ACK-lite (payload is exactly CompositeACKMinSize = 8 bytes
 	// and last two bytes are both 0 = BitmapLen=0, Flags=0)
 	if f.Length == CompositeACKMinSize && len(f.Payload) >= 8 &&
@@ -529,6 +602,9 @@ func (c *Compressor) EncodeACKShort(w io.Writer, f *Frame) (int, error) {
 // bytes — a full ACK with AckDelay==0 previously matched the lite
 // discriminator here and desynced the byte stream.
 func (c *Compressor) DecodeACKShort(r io.Reader) (*Frame, error) {
+	if !c.ShortForms() {
+		return nil, c.refuseShort(ShortACKIndicator)
+	}
 	var hdr [ShortACKLiteSize - 1]byte // streamID(2) + payload(8)
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, fmt.Errorf("aether: read ACK short header: %w", err)
@@ -557,6 +633,9 @@ func (c *Compressor) DecodeACKShort(r io.Reader) (*Frame, error) {
 // dedicated indicator removes the lite/full ambiguity, so the decoder no
 // longer guesses the layout from AckDelay/BitmapLen/Flags byte values.
 func (c *Compressor) DecodeACKShortFull(r io.Reader) (*Frame, error) {
+	if !c.ShortForms() {
+		return nil, c.refuseShort(ShortACKFullIndicator)
+	}
 	var hdr [4]byte // streamID(2) + length(2)
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, fmt.Errorf("aether: read ACK full short header: %w", err)
@@ -649,6 +728,9 @@ func VarLengthSize(v uint32) int {
 
 // EncodeDataShortVar writes a varint-length data short header + payload.
 func (c *Compressor) EncodeDataShortVar(w io.Writer, f *Frame) (int, error) {
+	if !c.ShortForms() {
+		return 0, ErrShortFormsNotNegotiated
+	}
 	s := c.GetOrCreateStream(f.StreamID)
 	s.mu.Lock()
 	seqLow := uint16(f.SeqNo) // AER-047: absolute low 16 bits, not a delta
@@ -685,6 +767,9 @@ func (c *Compressor) EncodeDataShortVar(w io.Writer, f *Frame) (int, error) {
 
 // DecodeDataShortVar reads a varint-length data short header (indicator consumed).
 func (c *Compressor) DecodeDataShortVar(r io.Reader) (*Frame, error) {
+	if !c.ShortForms() {
+		return nil, c.refuseShort(ShortDataVarIndicator)
+	}
 	var hdr [4]byte // streamID + seqDelta
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, err
@@ -745,8 +830,15 @@ func (c *Compressor) DecodeDataShortVar(r io.Reader) (*Frame, error) {
 // Batch Header (0x85): 2 + N×(sub-header + payload)
 // ────────────────────────────────────────────────────────────────────────────
 
-// EncodeBatch writes multiple frames as a single batch.
+// EncodeBatch writes multiple frames as a single batch: 0x85, the count, then
+// each child in the first short form it qualifies for, or as a full frame
+// behind FullFrameDiscriminator when none admits it. TCPSession's writeLoop
+// calls it only on a session whose grammar has the short forms; on any other
+// it writes nothing and returns ErrShortFormsNotNegotiated.
 func (c *Compressor) EncodeBatch(w io.Writer, frames []*Frame) (int, error) {
+	if !c.ShortForms() {
+		return 0, ErrShortFormsNotNegotiated
+	}
 	if len(frames) == 0 || len(frames) > 255 {
 		return 0, fmt.Errorf("aether: invalid batch size %d", len(frames))
 	}
@@ -783,6 +875,9 @@ func (c *Compressor) EncodeBatch(w io.Writer, frames []*Frame) (int, error) {
 
 // DecodeBatch reads a batch of sub-frames (indicator already consumed).
 func (c *Compressor) DecodeBatch(r io.Reader) ([]*Frame, error) {
+	if !c.ShortForms() {
+		return nil, c.refuseShort(ShortBatchIndicator)
+	}
 	var countBuf [1]byte
 	if _, err := io.ReadFull(r, countBuf[:]); err != nil {
 		return nil, err
@@ -821,11 +916,15 @@ func (c *Compressor) DecodeBatch(r io.Reader) ([]*Frame, error) {
 			// payload would be delivered undecrypted. Fail closed rather than
 			// surface un-decrypted bytes to the app.
 			return frames, fmt.Errorf("aether: encrypted-data-short (0x87) sub-frame not allowed in batch")
-		default:
+		case FullFrameDiscriminator:
 			f, err = DecodeFrameWithFirstByte(r, peek[0])
 			if err == nil {
 				c.RecordFullHeader(f)
 			}
+		default:
+			// A nested batch, an unassigned short value or any other first
+			// byte has no reading inside a batch.
+			return frames, &FrameDiscriminatorError{Discriminator: peek[0], ShortForms: true}
 		}
 		if err != nil {
 			return frames, err

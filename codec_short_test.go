@@ -30,7 +30,7 @@ func TestEncodeDecodeACKShort_FullFormZeroAckDelay_NoDesync(t *testing.T) {
 		Length: uint32(len(payload)), Payload: payload,
 	}
 
-	c := NewCompressor()
+	c := shortFormCompressor(t)
 	var buf bytes.Buffer
 	if _, err := c.EncodeACKShort(&buf, full); err != nil {
 		t.Fatalf("EncodeACKShort(full): %v", err)
@@ -45,7 +45,7 @@ func TestEncodeDecodeACKShort_FullFormZeroAckDelay_NoDesync(t *testing.T) {
 		t.Fatalf("full ACK indicator: got 0x%02x want 0x%02x (ShortACKFullIndicator)", got, ShortACKFullIndicator)
 	}
 
-	dc := NewCompressor()
+	dc := shortFormCompressor(t)
 	frame, indicator, batch, err := ReadNextFrame(&buf, dc)
 	if err != nil {
 		t.Fatalf("ReadNextFrame(full ACK): %v", err)
@@ -85,7 +85,7 @@ func TestEncodeDecodeACKShort_LiteForm_RoundTrip(t *testing.T) {
 		Length: CompositeACKMinSize, Payload: payload,
 	}
 
-	c := NewCompressor()
+	c := shortFormCompressor(t)
 	var buf bytes.Buffer
 	n, err := c.EncodeACKShort(&buf, lite)
 	if err != nil {
@@ -98,7 +98,7 @@ func TestEncodeDecodeACKShort_LiteForm_RoundTrip(t *testing.T) {
 		t.Fatalf("lite ACK indicator: got 0x%02x want 0x%02x (ShortACKIndicator)", got, ShortACKIndicator)
 	}
 
-	dc := NewCompressor()
+	dc := shortFormCompressor(t)
 	frame, indicator, batch, err := ReadNextFrame(&buf, dc)
 	if err != nil {
 		t.Fatalf("ReadNextFrame(lite ACK): %v", err)
@@ -137,7 +137,7 @@ func TestShouldCompress_OversizedStreamIDFallsBackToFullHeader(t *testing.T) {
 	sender := PeerID{1, 2, 3, 4, 5, 6, 7, 8}
 	receiver := PeerID{9, 10, 11, 12, 13, 14, 15, 16}
 
-	c := NewCompressor()
+	c := shortFormCompressor(t)
 
 	// Establish identity + stream state for the oversized stream.
 	f0 := &Frame{
@@ -202,7 +202,7 @@ func TestShouldCompress_OversizedStreamIDFallsBackToFullHeader(t *testing.T) {
 	}
 	// Consume the batch indicator, then decode the batch body.
 	buf.Next(1)
-	dc := NewCompressor()
+	dc := shortFormCompressor(t)
 	frames, err := dc.DecodeBatch(&buf)
 	if err != nil {
 		t.Fatalf("DecodeBatch: %v", err)
@@ -221,8 +221,8 @@ func TestShouldCompress_OversizedStreamIDFallsBackToFullHeader(t *testing.T) {
 // delta chaining, losing frame 2 made frame 3 decode as seq 2 (payload
 // transposition) and the real frame 2's retransmit was dropped as a dup.
 func TestDataShort_AbsoluteSeq_SurvivesLoss(t *testing.T) {
-	tx := NewCompressor()
-	rx := NewCompressor()
+	tx := shortFormCompressor(t)
+	rx := shortFormCompressor(t)
 	const streamID = uint64(1)
 
 	enc := func(seq uint32) []byte {

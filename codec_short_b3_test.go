@@ -36,7 +36,7 @@ func b3deflate(t *testing.T, in []byte) []byte {
 // every axis except the flag — so a gate failure is attributable to the flag alone.
 func b3compressedDataFrame(t *testing.T) (*Compressor, *Frame, []byte) {
 	t.Helper()
-	tx := NewCompressor()
+	tx := shortFormCompressor(t)
 	const streamID = uint64(7)
 
 	// A stream's first frame always takes the full header; prime past that.
@@ -105,7 +105,7 @@ func TestB3_ShouldCompressData_RefusesFlagCOMPRESSED(t *testing.T) {
 // longer be necessary.
 func TestB3_ShortDataWireForm_CannotCarryFlags(t *testing.T) {
 	tx, frame, original := b3compressedDataFrame(t)
-	rx := NewCompressor()
+	rx := shortFormCompressor(t)
 	rx.RecordFullHeader(&Frame{StreamID: frame.StreamID, Type: TypeDATA, SeqNo: 1})
 
 	var buf bytes.Buffer
