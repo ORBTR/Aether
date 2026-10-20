@@ -9,7 +9,6 @@ package noise
 import (
 	"bytes"
 	"context"
-	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
@@ -158,12 +157,21 @@ func (t *NoiseTransport) performInitiatorHandshakeAttempt(ctx context.Context, u
 		dbgHandshake.Printf("Failed to read message 2: %v", err)
 		return nil, fmt.Errorf("%w: %v", aether.ErrHandshakeFailed, err)
 	}
-	remoteNode, _, remoteCaps, remoteMaxAckDelayUS, err := t.verifyNodeInfo(hs.PeerStatic(), payload, path.NodeID)
+	remote, err := t.verifyNodeInfo(hs.PeerStatic(), payload, path.NodeID)
 	if err != nil {
 		dbgHandshake.Printf("Failed to verify remote node: %v", err)
-		return nil, fmt.Errorf("%w: %v", aether.ErrHandshakeFailed, err)
+		return nil, fmt.Errorf("%w: %w", aether.ErrHandshakeFailed, err)
 	}
+	remoteNode, remoteCaps, remoteMaxAckDelayUS := remote.NodeID, remote.Caps, remote.MaxAckDelayUS
 	dbgHandshake.Printf("Verified remote node: %s", remoteNode.Short())
+	// The choice runs before msg3 is written and before anything is cached
+	// for the peer: a refused responder never receives this side's NodeInfo
+	// and no conn is built.
+	chosen, err := t.chooseWireVersions(remote.WireVersions)
+	if err != nil {
+		dbgHandshake.Printf("Refused %s: %v", remoteNode.Short(), err)
+		return nil, fmt.Errorf("%w: %w", aether.ErrHandshakeFailed, err)
+	}
 
 	// Cache the peer's static key for future XK reconnections
 	t.cachePeerKey(remoteNode, hs.PeerStatic())
@@ -186,6 +194,7 @@ func (t *NoiseTransport) performInitiatorHandshakeAttempt(ctx context.Context, u
 	nc := newNoiseConnDial(udpConn, path.Address, remoteNode, sendCS, recvCS, t.maxPacket, t)
 	nc.scopeID = preamblePartitionID
 	nc.peerMaxAckDelay = decodeMaxAckDelay(remoteMaxAckDelayUS)
+	nc.wireVersions, nc.peerWireVersions = chosen, remote.WireVersions
 
 	// Negotiate explicit nonce mode if both sides support it
 	if remoteCaps&capExplicitNonce != 0 {
@@ -444,9 +453,19 @@ recvLoop:
 		}
 		return nil, fmt.Errorf("%w: msg2 read: %v", aether.ErrHandshakeFailed, err)
 	}
-	remoteNode, remoteIdentity, remoteCaps, remoteMaxAckDelayUS, err := t.verifyNodeInfo(hs.PeerStatic(), payload, path.NodeID)
+	remote, err := t.verifyNodeInfo(hs.PeerStatic(), payload, path.NodeID)
 	if err != nil {
-		return nil, fmt.Errorf("%w: verify: %v", aether.ErrHandshakeFailed, err)
+		return nil, fmt.Errorf("%w: verify: %w", aether.ErrHandshakeFailed, err)
+	}
+	remoteNode, remoteIdentity := remote.NodeID, remote.PubKey
+	remoteCaps, remoteMaxAckDelayUS := remote.Caps, remote.MaxAckDelayUS
+	// The choice runs before msg3 is written and before anything is cached
+	// for the peer: a refused responder never completes its handshake and
+	// prunes it, and no conn exists on either side.
+	chosen, err := t.chooseWireVersions(remote.WireVersions)
+	if err != nil {
+		dbgHandshake.Printf("Shared-socket: refused %s: %v", remoteNode.Short(), err)
+		return nil, fmt.Errorf("%w: %w", aether.ErrHandshakeFailed, err)
 	}
 
 	// Cache the peer's static key for future XK reconnections
@@ -506,6 +525,7 @@ recvLoop:
 	nc := newNoiseConnListener(listener, sendCS, recvCS, addr, remoteNode, remoteIdentity)
 	nc.scopeID = preamblePartitionID
 	nc.peerMaxAckDelay = decodeMaxAckDelay(remoteMaxAckDelayUS)
+	nc.wireVersions, nc.peerWireVersions = chosen, remote.WireVersions
 	// Cross-origin: persist the preamble target on the noiseConn so the
 	// writeFunc continues to prepend it on every post-handshake send.
 	// Without this, data packets from initiator → cross-origin peer land
@@ -669,11 +689,11 @@ const (
 
 // encodeNodeInfo returns the signed NodeInfo payload advertised in the
 // handshake. AE-P-20: the payload is constant for the transport's lifetime
-// (identity key, caps, and advertised max_ack_delay are all fixed after
-// construction — ticketStore is assigned once in NewNoiseTransport and never
-// mutated), yet the responder previously recomputed a fresh ed25519.Sign +
-// json.Marshal on EVERY inbound msg1 while holding the listener-wide l.mu on
-// the single read-loop goroutine. Memoize it once so first-contact
+// (identity key, caps, advertised max_ack_delay and the wire version offer are
+// all fixed after construction — ticketStore is assigned once in
+// NewNoiseTransport and never mutated), yet the responder previously
+// recomputed a fresh ed25519.Sign + json.Marshal on EVERY inbound msg1 while
+// holding the listener-wide l.mu on the single read-loop goroutine. Memoize it once so first-contact
 // handshakes reuse the cached bytes instead of re-signing per handshake.
 // Callers MUST treat the returned slice as read-only — it is shared across
 // handshakes; every caller passes it as the read-only plaintext argument to
@@ -684,7 +704,7 @@ func (t *NoiseTransport) encodeNodeInfo() ([]byte, error) {
 		if t.ticketStore != nil {
 			caps |= capSessionTicket
 		}
-		t.nodeInfoBytes, t.nodeInfoErr = t.identity.EncodeNodeInfo(caps, t.initialMaxAckDelayUS())
+		t.nodeInfoBytes, t.nodeInfoErr = t.identity.EncodeNodeInfo(caps, t.initialMaxAckDelayUS(), t.wireVersions)
 	})
 	return t.nodeInfoBytes, t.nodeInfoErr
 }
@@ -732,8 +752,16 @@ func decodeMaxAckDelay(us uint32) time.Duration {
 	return time.Duration(us) * time.Microsecond
 }
 
-func (t *NoiseTransport) verifyNodeInfo(peerStatic []byte, payload []byte, expected aether.NodeID) (aether.NodeID, ed25519.PublicKey, uint32, uint32, error) {
+func (t *NoiseTransport) verifyNodeInfo(peerStatic []byte, payload []byte, expected aether.NodeID) (transportCrypto.VerifiedNodeInfo, error) {
 	return transportCrypto.VerifyNodeInfo(peerStatic, payload, expected)
+}
+
+// chooseWireVersions is the choice every handshake path of this transport
+// makes from its own offer and the peer's verified NodeInfo offer, before any
+// conn exists. The choice is symmetric, so the peer reaches the same set or
+// the same refusal from the same two offers.
+func (t *NoiseTransport) chooseWireVersions(peer aether.WireVersions) (aether.NegotiatedWireVersions, error) {
+	return aether.ChooseWireVersions(t.wireVersions, peer)
 }
 
 type listenerHandshake struct {
@@ -991,8 +1019,22 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 		l.mu.Unlock()
 		return
 	}
-	remoteNode, remoteIdentity, remoteCaps, remoteMaxAckDelayUS, err := l.transport.verifyNodeInfo(state.PeerStatic(), payload, "")
+	remote, err := l.transport.verifyNodeInfo(state.PeerStatic(), payload, "")
 	if err != nil {
+		delete(l.handshakes, key)
+		l.mu.Unlock()
+		return
+	}
+	remoteNode, remoteIdentity := remote.NodeID, remote.PubKey
+	remoteCaps, remoteMaxAckDelayUS := remote.Caps, remote.MaxAckDelayUS
+	// An initiator chooses from the same two offers before it writes msg3,
+	// so a msg3 refused here comes from one that did not make that choice,
+	// such as one whose NodeInfo carries no versions field. No conn,
+	// session-map entry or ticket is created for it.
+	chosen, err := l.transport.chooseWireVersions(remote.WireVersions)
+	if err != nil {
+		dbgHandshake.Printf("refused %s from %s: %v", remoteNode.Short(), addr, err)
+		l.drops.count(DropWireVersionMismatch)
 		delete(l.handshakes, key)
 		l.mu.Unlock()
 		return
@@ -1007,6 +1049,7 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 	nc := newNoiseConnListener(l, cs2, cs1, addr, remoteNode, remoteIdentity)
 	nc.scopeID = scopeID
 	nc.peerMaxAckDelay = decodeMaxAckDelay(remoteMaxAckDelayUS)
+	nc.wireVersions, nc.peerWireVersions = chosen, remote.WireVersions
 
 	// Negotiate explicit nonce mode if both sides support it
 	if remoteCaps&capExplicitNonce != 0 {
@@ -1077,23 +1120,33 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 	// wants to resume dialing A), B needs the material delivered over
 	// the wire — see TODO below for the 0xFA delivery packet.
 	if l.transport.ticketStore != nil {
-		if ticket, err := l.transport.ticketStore.IssueTicket(remoteNode, cs2, cs1, remoteCaps, scopeID); err == nil {
+		if ticket, err := l.transport.ticketStore.IssueTicket(remoteNode, cs2, cs1, remoteCaps, scopeID, remote.WireVersions, chosen); err == nil {
 			dbgHandshake.Printf("Issued session ticket for %s (%d bytes)", remoteNode.Short(), len(ticket))
 			// Build the resume material from the responder's perspective
 			// captured pre-session. Initiator needs swapped keys: their
-			// send = our recv (cs1), their recv = our send (cs2).
+			// send = our recv (cs1), their recv = our send (cs2). The
+			// material's PeerOffer is the offer of the side its holder will
+			// resume to: this node's own offer for the material delivered to
+			// the remote initiator, the remote's offer for the copy this node
+			// keeps for its own re-dials. tryResumeDial chooses again from
+			// its offer and PeerOffer and skips the resume when the result is
+			// not Chosen.
 			material := &resumeMaterial{
 				Opaque:    ticket,
 				SendKey:   cs1.UnsafeKey(),
 				RecvKey:   cs2.UnsafeKey(),
 				Caps:      remoteCaps,
 				ExpiresAt: time.Now().Add(l.transport.ticketStore.ttl),
+				PeerOffer: l.transport.wireVersions,
+				Chosen:    chosen,
 			}
 			// Populate initiator-side cache for the co-located case.
 			// Node that's both responder + initiator (typical mesh)
 			// has the material ready for its own re-dials.
 			if l.transport.initiatorTickets != nil {
-				l.transport.initiatorTickets.Store(remoteNode, material)
+				own := *material
+				own.PeerOffer = remote.WireVersions
+				l.transport.initiatorTickets.Store(remoteNode, &own)
 			}
 			// Cross-host delivery: send resume material to the remote
 			// initiator as the first encrypted frame on the new

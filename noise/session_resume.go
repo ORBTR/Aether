@@ -95,6 +95,12 @@ type resumeMaterial struct {
 	RecvKey   [32]byte  // initiator's recv key (= responder's send)
 	Caps      uint32    // capabilities negotiated in the original session
 	ExpiresAt time.Time // copied from ticket; initiator enforces locally too
+	// PeerOffer is the wire version offer of the node this material resumes
+	// to, and Chosen the set the original handshake chose. tryResumeDial
+	// chooses again from this transport's offer and PeerOffer and skips the
+	// resume when the result is not Chosen; a resumed conn reports Chosen.
+	PeerOffer aether.WireVersions
+	Chosen    aether.NegotiatedWireVersions
 }
 
 // initiatorTicketCache is the initiator-side ticket cache. Separate from
@@ -176,8 +182,19 @@ func (c *initiatorTicketCache) evictLocked(peerID aether.NodeID) {
 // HANDSHAKE frame). Format:
 //
 //	[2B opaqueLen][opaque...][32B SendKey][32B RecvKey][4B Caps][8B ExpiresUnixNano]
+//	[2B peerOfferLen][peer offer][2B chosenLen][chosen set]
+//
+// The two wire version fields are in the aether.WireVersions and
+// aether.NegotiatedWireVersions encodings. The material is built only from a
+// handshake's own validated offers, so the offer always encodes; one that did
+// not would be written empty and refused by the initiator's resume check.
 func encodeResumeMaterial(m *resumeMaterial) []byte {
-	buf := make([]byte, 0, 2+len(m.Opaque)+32+32+4+8)
+	offer, err := m.PeerOffer.Encode()
+	if err != nil {
+		offer = nil
+	}
+	chosen := m.Chosen.Encode()
+	buf := make([]byte, 0, 2+len(m.Opaque)+32+32+4+8+2+len(offer)+2+len(chosen))
 	lenBuf := make([]byte, 2)
 	binary.BigEndian.PutUint16(lenBuf, uint16(len(m.Opaque)))
 	buf = append(buf, lenBuf...)
@@ -190,11 +207,17 @@ func encodeResumeMaterial(m *resumeMaterial) []byte {
 	expBuf := make([]byte, 8)
 	binary.BigEndian.PutUint64(expBuf, uint64(m.ExpiresAt.UnixNano()))
 	buf = append(buf, expBuf...)
+	buf = binary.BigEndian.AppendUint16(buf, uint16(len(offer)))
+	buf = append(buf, offer...)
+	buf = binary.BigEndian.AppendUint16(buf, uint16(len(chosen)))
+	buf = append(buf, chosen...)
 	return buf
 }
 
 // decodeResumeMaterial parses the encoded resume material delivered
-// inside a HANDSHAKE_RESUME_MATERIAL control frame.
+// inside a HANDSHAKE_RESUME_MATERIAL control frame, refusing a truncated
+// field, a wire version field that is not a canonical encoding, and trailing
+// bytes.
 func decodeResumeMaterial(data []byte) (*resumeMaterial, error) {
 	if len(data) < 2 {
 		return nil, errors.New("resume material: short buffer")
@@ -214,6 +237,27 @@ func decodeResumeMaterial(data []byte) (*resumeMaterial, error) {
 	m.Caps = binary.BigEndian.Uint32(data[p : p+4])
 	p += 4
 	m.ExpiresAt = time.Unix(0, int64(binary.BigEndian.Uint64(data[p:p+8])))
+	p += 8
+	offerBytes, rest, ok := cutLengthPrefixed(data[p:])
+	if !ok {
+		return nil, errors.New("resume material: truncated peer offer")
+	}
+	chosenBytes, rest, ok := cutLengthPrefixed(rest)
+	if !ok {
+		return nil, errors.New("resume material: truncated chosen set")
+	}
+	if len(rest) != 0 {
+		return nil, errors.New("resume material: trailing bytes")
+	}
+	offer, err := aether.DecodeWireVersions(offerBytes)
+	if err != nil {
+		return nil, fmt.Errorf("resume material: peer offer: %w", err)
+	}
+	chosen, err := aether.DecodeNegotiatedWireVersions(chosenBytes)
+	if err != nil {
+		return nil, fmt.Errorf("resume material: chosen set: %w", err)
+	}
+	m.PeerOffer, m.Chosen = offer, chosen
 	return m, nil
 }
 
@@ -238,6 +282,14 @@ func (t *NoiseTransport) tryResumeDial(ctx interface{}, target aether.Target, ud
 	}
 	// Expired locally — evict and skip.
 	if !m.ExpiresAt.IsZero() && time.Now().After(m.ExpiresAt) {
+		t.initiatorTickets.Evict(target.NodeID)
+		return nil, nil
+	}
+	// A resume reuses the original handshake's wire version set. When
+	// choosing again from this transport's offer and the peer's recorded
+	// offer does not give that set, the material is dropped and Dial runs the
+	// full handshake, which negotiates the set this build chooses.
+	if again, err := t.chooseWireVersions(m.PeerOffer); err != nil || !again.Equal(m.Chosen) {
 		t.initiatorTickets.Evict(target.NodeID)
 		return nil, nil
 	}
@@ -320,6 +372,7 @@ func (t *NoiseTransport) tryResumeDial(ctx interface{}, target aether.Target, ud
 		}
 		// Resume confirmed — instantiate noiseConn with the fresh states.
 		nc := newNoiseConnDial(udp, remoteAddr, target.NodeID, send, recv, t.maxPacket, t)
+		nc.wireVersions, nc.peerWireVersions = m.Chosen, m.PeerOffer
 		return nc, nil
 	default:
 		return nil, fmt.Errorf("resume: unknown response prefix 0x%02x", readBuf[0])
@@ -430,6 +483,16 @@ func (l *noiseListener) handleResumePacket(ctx context.Context, conn *net.UDPCon
 		return
 	}
 
+	// The resumed session would run the set the original handshake chose.
+	// When choosing again from this transport's current offer and the
+	// initiator's recorded offer gives another set, or refuses, the resume is
+	// rejected and the initiator's full handshake negotiates afresh.
+	if again, err := l.transport.chooseWireVersions(ticket.PeerOffer); err != nil || !again.Equal(ticket.Chosen) {
+		dbgNoise.Printf("resume: ticket's wire version set %v is not this build's choice for %s", ticket.Chosen, addr)
+		sendReject()
+		return
+	}
+
 	// Replay protection: reject if the same ticket nonce has already been
 	// consumed. The first 12 bytes of the opaque blob (GCM nonce) are the cache
 	// key — unique per IssueTicket call (96 bits of rand entropy).
@@ -492,6 +555,7 @@ func (l *noiseListener) handleResumePacket(ctx context.Context, conn *net.UDPCon
 	// register scopeless (""), and resolveRelayTarget's cross-partition guard
 	// (relay.go) treats empty scope as unrestricted — bypassing partition isolation.
 	nc.scopeID = ticket.ScopeID
+	nc.wireVersions, nc.peerWireVersions = ticket.Chosen, ticket.PeerOffer
 	key := addr.String()
 	l.mu.Lock()
 	l.sessions.Put(ticket.PeerID, key, ticket.ScopeID, &noiseConnSession{conn: nc, nodeID: ticket.PeerID})

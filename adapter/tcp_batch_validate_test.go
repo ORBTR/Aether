@@ -52,6 +52,13 @@ func TestAEM17_TCPBatchSubFrameValidated(t *testing.T) {
 	wire = append(wire, aether.EncodeFrameToBytes(malformed)...)
 	wire = append(wire, aether.EncodeFrameToBytes(valid)...)
 
+	// The hand-built batch rides the client's conn, so it must follow the
+	// client's wire version preface: the server reads that preface before any
+	// frame and refuses a conn that starts with anything else. WireVersions
+	// returns once each side has read the other's preface.
+	client.WireVersions()
+	server.WireVersions()
+
 	// net.Pipe Write blocks until the server readLoop has consumed the bytes.
 	if _, err := clientConn.Write(wire); err != nil {
 		t.Fatalf("write batch to wire: %v", err)

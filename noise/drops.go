@@ -41,6 +41,7 @@ const (
 	DropHandshakeKeyUnresolved                   // resolveHandshakeKey rejected the inner msg1
 	DropHandshakeStateErr                        // could not build/advance the Noise handshake state
 	DropNodeInfoInvalid                          // peer NodeInfo failed verification
+	DropWireVersionMismatch                      // peer's wire version offer refused before a session existed
 	listenerDropReasonCount
 )
 
@@ -76,6 +77,8 @@ func (r DropReason) String() string {
 		return "handshake_state_err"
 	case DropNodeInfoInvalid:
 		return "nodeinfo_invalid"
+	case DropWireVersionMismatch:
+		return "wire_version_mismatch"
 	default:
 		return "unknown"
 	}

@@ -119,6 +119,15 @@ type NoiseTransportConfig struct {
 	// Leave the resume machinery uninitialized unless a caller explicitly
 	// enables it, so tryResumeDial and ticket issuance short-circuit.
 	EnableResume bool
+
+	// WireVersions are the application's entries of the wire version offer
+	// this transport's handshakes send; aether adds its own (see
+	// aether.LocalWireVersions) and never reads the application's. Every
+	// handshake chooses from this offer and the peer's and refuses before a
+	// connection exists when a required entry has no common version. An entry
+	// that names one of aether's or is not in canonical form fails
+	// NewNoiseTransport.
+	WireVersions aether.WireVersions
 }
 
 // BoolPtr returns a pointer to the given bool. Useful for explicitly
@@ -208,6 +217,12 @@ type NoiseTransport struct {
 	nodeInfoBytes []byte
 	nodeInfoErr   error
 
+	// wireVersions is the offer every handshake and resume check of this
+	// transport uses: aether's entries plus NoiseTransportConfig.WireVersions,
+	// fixed at construction, which is what lets encodeNodeInfo memoise the
+	// NodeInfo that carries it.
+	wireVersions aether.WireVersions
+
 	// Cross-origin anycast forwarder — the intra-origin noise-UDP hairpin
 	// in inner_relay.go, read by listener_forward.go on every inbound
 	// datagram and reply write. Nil = transport runs in non-forwarder mode
@@ -273,6 +288,11 @@ func NewNoiseTransport(cfg NoiseTransportConfig) (*NoiseTransport, error) {
 	}
 
 	pc := transportCrypto.NewPeerKeyCache(4 * time.Hour) // TTL-based eviction
+
+	wireVersions, err := aether.LocalWireVersions(cfg.WireVersions)
+	if err != nil {
+		return nil, fmt.Errorf("vl1: wire versions: %w", err)
+	}
 
 	// --- Config defaults ---
 	handshake := cfg.HandshakeTimeout
@@ -364,6 +384,7 @@ func NewNoiseTransport(cfg NoiseTransportConfig) (*NoiseTransport, error) {
 		nonceWindow:    nonceWin,
 		healthAlpha:    healthAlpha,
 		inboxSize:      inboxSize,
+		wireVersions:   wireVersions,
 	}
 
 	// Initialize relay service (external session management + forwarding).
@@ -413,6 +434,7 @@ func NewNoiseTransportFromConfig(cfg aether.Config) (*NoiseTransport, error) {
 		InboxSize:        nc.InboxSize,
 		STUNConfig:       cfg.STUN,
 		BindResolver:     cfg.BindResolver,
+		WireVersions:     cfg.WireVersions,
 	})
 }
 

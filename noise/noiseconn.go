@@ -148,6 +148,17 @@ type noiseConn struct {
 	// optional noiseConnAckDelay interface.
 	peerMaxAckDelay time.Duration
 
+	// wireVersions is the set the handshake that established this conn chose
+	// (aether.ChooseWireVersions over both offers), or the set a resumed
+	// conn's ticket recorded. peerWireVersions is the peer's offer from that
+	// handshake; ticket issuance records it so a resume can choose again and
+	// refuse when this build would choose differently. Both are written
+	// before the conn is handed to any reader and never change, so they are
+	// read without a lock. NoiseSession reports wireVersions through
+	// WireVersions().
+	wireVersions     aether.NegotiatedWireVersions
+	peerWireVersions aether.WireVersions
+
 	// Observability counters (Concerns #5, #6)
 	decryptErrors uint64 // atomic: failed decrypt attempts
 	inboxDrops    uint64 // atomic: inbox-full drops
@@ -207,6 +218,13 @@ func (c *noiseConn) nonceWindowSize() int {
 // so no synchronisation is required.
 func (c *noiseConn) PeerMaxAckDelay() time.Duration {
 	return c.peerMaxAckDelay
+}
+
+// WireVersions returns the wire version set this conn's handshake chose.
+// NoiseSession reads it at construction through its noiseConnWireVersions
+// probe and reports it as the session's set.
+func (c *noiseConn) WireVersions() aether.NegotiatedWireVersions {
+	return c.wireVersions
 }
 
 func (c *noiseConn) runReader() {

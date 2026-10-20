@@ -76,21 +76,34 @@ func SignatureMessage(staticPub []byte) [32]byte {
 // inbound CompositeACK arrives. Zero means "not advertised" — receivers fall
 // back to a receiver-side approximation max(ACKPolicy.MaxDelay, SRTT/4).
 //
-// `json:",omitempty"` keeps the wire compact when the field is zero (peer
-// from an older build that didn't stamp it). New initiator/responder paths
-// always stamp a non-zero value.
+// `json:",omitempty"` keeps the wire compact when the field is zero. New
+// initiator/responder paths always stamp a non-zero value.
+//
+// Versions is the sender's wire version offer in the canonical encoding of
+// aether.WireVersions.Encode. It travels inside the encrypted, authenticated
+// handshake message, so each side reads the other's offer before either
+// creates a session, and the noise handshake chooses from the two offers with
+// aether.ChooseWireVersions. An absent field decodes to the empty offer, which
+// that choice refuses on aether's required frame entry.
 type NodeInfo struct {
 	NodeID        string `json:"nodeId"`
 	PubKey        []byte `json:"ed25519Pub"`
 	Signature     []byte `json:"sig"`
 	Caps          uint32 `json:"caps,omitempty"`
 	MaxAckDelayUS uint32 `json:"maxAckDelayUs,omitempty"`
+	Versions      []byte `json:"versions,omitempty"`
 }
 
 // EncodeNodeInfo creates a signed NodeInfo payload for handshake exchange.
 // maxAckDelayUS is the sender's advertised max_ack_delay (RFC 9002 §6.2) in
-// microseconds; pass 0 if not advertising.
-func (id *Identity) EncodeNodeInfo(caps uint32, maxAckDelayUS uint32) ([]byte, error) {
+// microseconds; pass 0 if not advertising. versions is the sender's wire
+// version offer (aether.LocalWireVersions); an offer that is not in canonical
+// form is refused with aether.ErrWireVersionsMalformed.
+func (id *Identity) EncodeNodeInfo(caps uint32, maxAckDelayUS uint32, versions aether.WireVersions) ([]byte, error) {
+	encodedVersions, err := versions.Encode()
+	if err != nil {
+		return nil, err
+	}
 	msg := SignatureMessage(id.Curve25519Pub)
 	signature := ed25519.Sign(id.Ed25519Priv, msg[:])
 	info := NodeInfo{
@@ -99,42 +112,67 @@ func (id *Identity) EncodeNodeInfo(caps uint32, maxAckDelayUS uint32) ([]byte, e
 		Signature:     signature,
 		Caps:          caps,
 		MaxAckDelayUS: maxAckDelayUS,
+		Versions:      encodedVersions,
 	}
 	return json.Marshal(info)
 }
 
-// VerifyNodeInfo validates a received NodeInfo payload.
-// Returns the derived NodeID, Ed25519 public key, capabilities, and the
-// peer's advertised max_ack_delay in microseconds (0 = not advertised;
-// caller falls back to receiver-side approximation).
-func VerifyNodeInfo(peerStatic []byte, payload []byte, expected aether.NodeID) (aether.NodeID, ed25519.PublicKey, uint32, uint32, error) {
+// VerifiedNodeInfo is what VerifyNodeInfo establishes about the peer: its
+// node id and Ed25519 key (the signature over the handshake static key
+// checked), its capability bits, its advertised max_ack_delay in
+// microseconds (0 = not advertised; the caller falls back to the
+// receiver-side approximation) and its wire version offer, decoded strictly.
+type VerifiedNodeInfo struct {
+	NodeID        aether.NodeID
+	PubKey        ed25519.PublicKey
+	Caps          uint32
+	MaxAckDelayUS uint32
+	WireVersions  aether.WireVersions
+}
+
+// VerifyNodeInfo validates a received NodeInfo payload: the Ed25519 key
+// derives the expected node id (when one is given), converts to the static
+// key the handshake proved, and signed that static key. A versions field that
+// is not a canonical encoding fails verification with
+// aether.ErrWireVersionsMalformed.
+func VerifyNodeInfo(peerStatic []byte, payload []byte, expected aether.NodeID) (VerifiedNodeInfo, error) {
 	var info NodeInfo
 	if err := json.Unmarshal(payload, &info); err != nil {
-		return "", nil, 0, 0, err
+		return VerifiedNodeInfo{}, err
 	}
 	if len(info.PubKey) != ed25519.PublicKeySize {
-		return "", nil, 0, 0, errors.New("crypto: invalid ed25519 key")
+		return VerifiedNodeInfo{}, errors.New("crypto: invalid ed25519 key")
 	}
 	edPub := ed25519.PublicKey(info.PubKey)
 	derived, err := aether.NewNodeID(edPub)
 	if err != nil {
-		return "", nil, 0, 0, err
+		return VerifiedNodeInfo{}, err
 	}
 	if expected != "" && derived != expected {
-		return "", nil, 0, 0, errors.New("crypto: unexpected node id in handshake")
+		return VerifiedNodeInfo{}, errors.New("crypto: unexpected node id in handshake")
 	}
 	curve, err := Ed25519PublicKeyToCurve(edPub)
 	if err != nil {
-		return "", nil, 0, 0, err
+		return VerifiedNodeInfo{}, err
 	}
 	if len(peerStatic) != len(curve) || !equalBytes(peerStatic, curve[:]) {
-		return "", nil, 0, 0, errors.New("crypto: static key mismatch")
+		return VerifiedNodeInfo{}, errors.New("crypto: static key mismatch")
 	}
 	msg := SignatureMessage(peerStatic)
 	if !ed25519.Verify(edPub, msg[:], info.Signature) {
-		return "", nil, 0, 0, errors.New("crypto: handshake signature verification failed")
+		return VerifiedNodeInfo{}, errors.New("crypto: handshake signature verification failed")
 	}
-	return derived, edPub, info.Caps, info.MaxAckDelayUS, nil
+	versions, err := aether.DecodeWireVersions(info.Versions)
+	if err != nil {
+		return VerifiedNodeInfo{}, fmt.Errorf("crypto: NodeInfo versions: %w", err)
+	}
+	return VerifiedNodeInfo{
+		NodeID:        derived,
+		PubKey:        edPub,
+		Caps:          info.Caps,
+		MaxAckDelayUS: info.MaxAckDelayUS,
+		WireVersions:  versions,
+	}, nil
 }
 
 // --- Ed25519 → Curve25519 conversion ---

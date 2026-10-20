@@ -428,6 +428,13 @@ type NoiseSession struct {
 	// approximation in that case. Read lock-free since the field is
 	// frozen at construction.
 	peerMaxAckDelay time.Duration
+
+	// wireVersions is the wire version set the Noise handshake under conn
+	// chose, lifted at construction through the noiseConnWireVersions probe
+	// and reported by WireVersions. The empty set when conn carries none,
+	// which is the case only for a conn no Noise handshake produced. Frozen
+	// at construction, read lock-free.
+	wireVersions aether.NegotiatedWireVersions
 }
 
 // NewNoiseSession creates an Aether session over a Noise-encrypted
@@ -479,6 +486,9 @@ func NewNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 	// back to max(ACKPolicy.MaxDelay, SRTT/4).
 	if pmad, ok := conn.(noiseConnAckDelay); ok {
 		s.peerMaxAckDelay = pmad.PeerMaxAckDelay()
+	}
+	if wv, ok := conn.(noiseConnWireVersions); ok {
+		s.wireVersions = wv.WireVersions()
 	}
 
 	// Session-wide conn-level grant debouncer. Immediate-flush floor at
@@ -1046,6 +1056,24 @@ type noiseConnCE interface {
 type noiseConnAckDelay interface {
 	PeerMaxAckDelay() time.Duration
 }
+
+// noiseConnWireVersions is the surface *noiseConn exposes for the wire
+// version set its handshake chose (or its resume ticket recorded).
+// NewNoiseSession lifts the set through it; the handshake has already
+// refused a peer with no common required version, so a session never exists
+// for one.
+type noiseConnWireVersions interface {
+	WireVersions() aether.NegotiatedWireVersions
+}
+
+// WireVersions returns the wire version set the session's Noise handshake
+// chose. The layer that owns an entry reads its version from it and refuses
+// its own traffic when the entry is absent.
+func (s *NoiseSession) WireVersions() aether.NegotiatedWireVersions {
+	return s.wireVersions
+}
+
+var _ aether.WireVersionsReporter = (*NoiseSession)(nil)
 
 func (s *NoiseSession) Metrics() aether.SessionMetrics {
 	_, avg := s.Health().RTT()

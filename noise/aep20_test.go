@@ -85,7 +85,8 @@ func TestAEP20_EncodeNodeInfoCapsAndSignature(t *testing.T) {
 		t.Fatalf("AE-P-20: encodeNodeInfo: %v", err)
 	}
 
-	_, _, caps, _, verr := transportCrypto.VerifyNodeInfo(tr.staticPub, payload, tr.localNode)
+	info, verr := transportCrypto.VerifyNodeInfo(tr.staticPub, payload, tr.localNode)
+	caps := info.Caps
 	if verr != nil {
 		t.Fatalf("AE-P-20: cached payload failed verification: %v", verr)
 	}
@@ -102,7 +103,7 @@ func TestAEP20_EncodeNodeInfoCapsAndSignature(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AE-P-20: second encodeNodeInfo: %v", err)
 	}
-	if _, _, _, _, verr := transportCrypto.VerifyNodeInfo(tr.staticPub, payload2, tr.localNode); verr != nil {
+	if _, verr := transportCrypto.VerifyNodeInfo(tr.staticPub, payload2, tr.localNode); verr != nil {
 		t.Fatalf("AE-P-20: cached payload corrupted after reuse: %v", verr)
 	}
 }

@@ -46,8 +46,10 @@ const capSessionTicket uint32 = 1 << 1
 //	[8-byte send nonce]
 //	[32-byte recv key]
 //	[8-byte recv nonce]
-//	[1-byte caps flags]
+//	[4-byte caps flags]
 //	[2-byte scope len][scope ID]
+//	[2-byte peer offer len][peer offer, aether.WireVersions encoding]
+//	[2-byte chosen len][chosen set, aether.NegotiatedWireVersions encoding]
 type sessionTicket struct {
 	ExpiresAt time.Time
 	PeerID    aether.NodeID
@@ -60,15 +62,23 @@ type sessionTicket struct {
 	// a resumed session restores its relay isolation (AE-H-07); empty for
 	// dedicated (single-partition) transports.
 	ScopeID string
+	// PeerOffer and Chosen are the initiator's wire version offer and the
+	// set the handshake chose. handleResumePacket chooses again from the
+	// responder's current offer and PeerOffer and rejects the resume when
+	// the result is not Chosen, so a resumed session never runs a set this
+	// build would not choose; a resumed conn reports Chosen.
+	PeerOffer aether.WireVersions
+	Chosen    aether.NegotiatedWireVersions
 }
 
 const (
-	ticketPlaintextSize = 8 + 32 + 32 + 8 + 32 + 8 + 4 // 124-byte fixed prefix; AE-H-07 scope suffix follows
-	ticketScopeLenSize  = 2                            // AE-H-07: uint16 length prefix for the scope suffix
-	ticketNonceSize     = 12
-	ticketTagSize       = 16
-	ticketEncryptedSize = ticketNonceSize + ticketPlaintextSize + ticketTagSize // 152 bytes
-	ticketDefaultTTL    = 4 * time.Hour
+	ticketPlaintextSize   = 8 + 32 + 32 + 8 + 32 + 8 + 4 // 124-byte fixed prefix; AE-H-07 scope suffix follows
+	ticketScopeLenSize    = 2                            // AE-H-07: uint16 length prefix for the scope suffix
+	ticketVersionsLenSize = 2                            // uint16 length prefix of each wire version suffix
+	ticketNonceSize       = 12
+	ticketTagSize         = 16
+	ticketEncryptedSize   = ticketNonceSize + ticketPlaintextSize + ticketTagSize // 152 bytes
+	ticketDefaultTTL      = 4 * time.Hour
 
 	// DefaultTicketCacheSize bounds the client-side ticket cache. An
 	// initiator that dials many distinct peers would otherwise grow this
@@ -178,7 +188,11 @@ func (ts *TicketStore) RotateKey(newKey []byte) error {
 // Callers must only invoke IssueTicket BEFORE any messages have been sent
 // on the session — rekeying invalidates an earlier-issued ticket silently
 // at resumption time. The Nonce()==0 guard enforces this contract.
-func (ts *TicketStore) IssueTicket(peerID aether.NodeID, send, recv *fnoise.CipherState, caps uint32, scopeID string) ([]byte, error) {
+//
+// peerOffer and chosen are the initiator's wire version offer and the set
+// the handshake chose from it; they are sealed into the ticket for
+// handleResumePacket's check.
+func (ts *TicketStore) IssueTicket(peerID aether.NodeID, send, recv *fnoise.CipherState, caps uint32, scopeID string, peerOffer aether.WireVersions, chosen aether.NegotiatedWireVersions) ([]byte, error) {
 	ts.mu.RLock()
 	gcm := ts.gcm
 	ts.mu.RUnlock()
@@ -199,6 +213,8 @@ func (ts *TicketStore) IssueTicket(peerID aether.NodeID, send, recv *fnoise.Ciph
 		RecvNonce: recv.Nonce(),
 		Caps:      caps,
 		ScopeID:   scopeID,
+		PeerOffer: peerOffer,
+		Chosen:    chosen,
 	}
 	// UnsafeKey() returns a [32]byte value (by value, not by reference),
 	// so assigning it here takes a full copy. The "Unsafe" in the name
@@ -212,6 +228,11 @@ func (ts *TicketStore) IssueTicket(peerID aether.NodeID, send, recv *fnoise.Ciph
 	if len(scopeID) > MaxScopeIDLength {
 		return nil, ErrPartitionIDTooLong
 	}
+	offerBytes, err := peerOffer.Encode()
+	if err != nil {
+		return nil, err
+	}
+	chosenBytes := chosen.Encode()
 	plaintext := make([]byte, ticketPlaintextSize+ticketScopeLenSize+len(scopeID))
 	binary.BigEndian.PutUint64(plaintext[0:8], uint64(ticket.ExpiresAt.UnixNano()))
 	copy(plaintext[8:40], []byte(ticket.PeerID))
@@ -222,6 +243,12 @@ func (ts *TicketStore) IssueTicket(peerID aether.NodeID, send, recv *fnoise.Ciph
 	binary.BigEndian.PutUint32(plaintext[120:124], ticket.Caps)
 	binary.BigEndian.PutUint16(plaintext[124:126], uint16(len(scopeID)))
 	copy(plaintext[126:], scopeID)
+	// Each encoding is bounded by aether.MaxWireVersionsEncodedSize, so its
+	// uint16 length never truncates.
+	plaintext = binary.BigEndian.AppendUint16(plaintext, uint16(len(offerBytes)))
+	plaintext = append(plaintext, offerBytes...)
+	plaintext = binary.BigEndian.AppendUint16(plaintext, uint16(len(chosenBytes)))
+	plaintext = append(plaintext, chosenBytes...)
 
 	nonce := make([]byte, ticketNonceSize)
 	if _, err := rand.Read(nonce); err != nil {
@@ -266,13 +293,31 @@ func (ts *TicketStore) DecryptTicket(encrypted []byte) (*sessionTicket, error) {
 		return nil, ErrTicketDecrypt
 	}
 
-	// AE-H-07: fixed 124B prefix + [2B scopeLen][scopeID] suffix. An old
-	// (scopeless, 124B) ticket fails this and is rejected → full-handshake fallback.
+	// Fixed 124B prefix + [2B scopeLen][scopeID], then the two
+	// length-prefixed wire version suffixes. Any other length, or a suffix
+	// that is not a canonical encoding, is rejected → full-handshake fallback.
 	if len(plaintext) < ticketPlaintextSize+ticketScopeLenSize {
 		return nil, ErrTicketInvalid
 	}
 	scopeLen := int(binary.BigEndian.Uint16(plaintext[124:126]))
-	if scopeLen > MaxScopeIDLength || ticketPlaintextSize+ticketScopeLenSize+scopeLen != len(plaintext) {
+	if scopeLen > MaxScopeIDLength || ticketPlaintextSize+ticketScopeLenSize+scopeLen > len(plaintext) {
+		return nil, ErrTicketInvalid
+	}
+	rest := plaintext[ticketPlaintextSize+ticketScopeLenSize+scopeLen:]
+	offerBytes, rest, ok := cutLengthPrefixed(rest)
+	if !ok {
+		return nil, ErrTicketInvalid
+	}
+	chosenBytes, rest, ok := cutLengthPrefixed(rest)
+	if !ok || len(rest) != 0 {
+		return nil, ErrTicketInvalid
+	}
+	peerOffer, err := aether.DecodeWireVersions(offerBytes)
+	if err != nil {
+		return nil, ErrTicketInvalid
+	}
+	chosen, err := aether.DecodeNegotiatedWireVersions(chosenBytes)
+	if err != nil {
 		return nil, ErrTicketInvalid
 	}
 
@@ -283,6 +328,8 @@ func (ts *TicketStore) DecryptTicket(encrypted []byte) (*sessionTicket, error) {
 		RecvNonce: binary.BigEndian.Uint64(plaintext[112:120]),
 		Caps:      binary.BigEndian.Uint32(plaintext[120:124]),
 		ScopeID:   string(plaintext[126 : 126+scopeLen]),
+		PeerOffer: peerOffer,
+		Chosen:    chosen,
 	}
 	copy(ticket.SendKey[:], plaintext[40:72])
 	copy(ticket.RecvKey[:], plaintext[80:112])
@@ -292,6 +339,20 @@ func (ts *TicketStore) DecryptTicket(encrypted []byte) (*sessionTicket, error) {
 	}
 
 	return ticket, nil
+}
+
+// cutLengthPrefixed splits a [2-byte big-endian length][body] field off the
+// front of b, refusing a length past aether.MaxWireVersionsEncodedSize or past
+// the end of b. The ticket and resume material wire version suffixes use it.
+func cutLengthPrefixed(b []byte) (body, rest []byte, ok bool) {
+	if len(b) < ticketVersionsLenSize {
+		return nil, nil, false
+	}
+	n := int(binary.BigEndian.Uint16(b))
+	if n > aether.MaxWireVersionsEncodedSize || ticketVersionsLenSize+n > len(b) {
+		return nil, nil, false
+	}
+	return b[ticketVersionsLenSize : ticketVersionsLenSize+n], b[ticketVersionsLenSize+n:], true
 }
 
 // CacheTicket stores a ticket for a peer (client-side). Bounded by
@@ -367,7 +428,7 @@ func (t *NoiseTransport) IssueTicket(sess aether.Connection) ([]byte, error) {
 		return nil, err
 	}
 	caps := capExplicitNonce
-	return t.ticketStore.IssueTicket(nc.remoteNode, nc.send, nc.recv, caps, nc.scopeID)
+	return t.ticketStore.IssueTicket(nc.remoteNode, nc.send, nc.recv, caps, nc.scopeID, nc.peerWireVersions, nc.wireVersions)
 }
 
 // ResumeSession attempts to resume a session from an encrypted ticket.
