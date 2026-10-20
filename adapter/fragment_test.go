@@ -13,20 +13,20 @@ import (
 	"testing"
 )
 
-// TestSplitPayloadRejectsOversizedPayload guards AE-H-03: a payload that
-// would need more than MaxFragments (255) fragments must be rejected with
-// ErrPayloadTooLarge rather than silently truncated to its first 255
+// TestSplitMessageRejectsOversizedPayload: a payload that
+// would need more than MaxFragments fragments must be rejected with
+// ErrPayloadTooLarge rather than silently truncated to its first MaxFragments
 // fragments. It also pins the boundary (exactly MaxFragments fragments must
 // still succeed and round-trip losslessly) so an off-by-one can't wrongly
 // reject the largest legal message or drop a byte.
-func TestSplitPayloadRejectsOversizedPayload(t *testing.T) {
+func TestSplitMessageRejectsOversizedPayload(t *testing.T) {
 	const maxPayload = 1200
-	chunkSize := maxPayload - fragHeaderSize // 1196
+	chunkSize := maxPayload - FragmentEnvelopeSize
 
-	// 1) Oversize path: one byte past the 255-fragment ceiling must error
+	// 1) Oversize path: one byte past the MaxFragments ceiling must error
 	//    with ErrPayloadTooLarge and return no fragments (no truncation).
 	oversize := make([]byte, MaxFragments*chunkSize+1)
-	frags, err := SplitPayload(oversize, maxPayload)
+	frags, err := SplitMessage(fxBinding(), 1, oversize, maxPayload)
 	if err == nil {
 		t.Fatalf("oversize payload: expected error, got nil (frags=%d)", len(frags))
 	}
@@ -43,7 +43,7 @@ func TestSplitPayloadRejectsOversizedPayload(t *testing.T) {
 	for i := range boundary {
 		boundary[i] = byte(i * 31) // deterministic non-trivial content
 	}
-	frags, err = SplitPayload(boundary, maxPayload)
+	frags, err = SplitMessage(fxBinding(), 1, boundary, maxPayload)
 	if err != nil {
 		t.Fatalf("boundary payload: unexpected error: %v", err)
 	}
@@ -51,17 +51,11 @@ func TestSplitPayloadRejectsOversizedPayload(t *testing.T) {
 		t.Fatalf("boundary payload: expected %d fragments, got %d", MaxFragments, len(frags))
 	}
 
-	const streamID uint64 = 7
 	fb := NewFragmentBuffer()
+	r := fxReceiver()
 	var assembled []byte
 	for i, frag := range frags {
-		// The group key is seeded from the index=0 fragment's SeqNo; later
-		// fragments join the current group regardless of the SeqNo passed.
-		seqNo := uint32(0)
-		if i == 0 {
-			seqNo = 1
-		}
-		out, aerr := fb.Add(streamID, seqNo, frag)
+		out, _, aerr := fb.Add(r, 7, frag)
 		if aerr != nil {
 			t.Fatalf("boundary reassembly: Add(frag %d) error: %v", i, aerr)
 		}
@@ -73,9 +67,6 @@ func TestSplitPayloadRejectsOversizedPayload(t *testing.T) {
 		}
 		assembled = out
 	}
-	if assembled == nil {
-		t.Fatal("boundary reassembly: final Add returned nil payload")
-	}
 	if !bytes.Equal(assembled, boundary) {
 		t.Fatalf("boundary reassembly: round-trip mismatch (got %d bytes, want %d)",
 			len(assembled), len(boundary))
@@ -83,47 +74,11 @@ func TestSplitPayloadRejectsOversizedPayload(t *testing.T) {
 
 	// 3) Small payload: fits in a single frame → (nil, nil), no fragmentation.
 	small := make([]byte, 100)
-	frags, err = SplitPayload(small, maxPayload)
+	frags, err = SplitMessage(fxBinding(), 1, small, maxPayload)
 	if err != nil {
 		t.Fatalf("small payload: unexpected error: %v", err)
 	}
 	if frags != nil {
 		t.Fatalf("small payload: expected nil fragments, got %d", len(frags))
-	}
-}
-
-// TestSplitPayload_EscapesMagicPrefix is the AER-068 regression: a small
-// unfragmented payload that starts with the fragment magic must be escaped as
-// a single (0,1) fragment so the receiver's IsFragment gate stays authoritative
-// and the payload round-trips instead of being misread as a fragment header.
-func TestSplitPayload_EscapesMagicPrefix(t *testing.T) {
-	// A payload beginning with the fragment magic bytes ("FR"), short enough
-	// that it would normally be sent unfragmented.
-	msg := append([]byte{fragMagic0, fragMagic1}, []byte("hello world payload")...)
-
-	frags, err := SplitPayload(msg, 1200)
-	if err != nil {
-		t.Fatalf("SplitPayload: %v", err)
-	}
-	if len(frags) != 1 {
-		t.Fatalf("expected 1 escaped fragment, got %d", len(frags))
-	}
-	if !IsFragment(frags[0]) {
-		t.Fatal("escaped payload must be recognised as a fragment")
-	}
-
-	fb := NewFragmentBuffer()
-	assembled, err := fb.Add(1, 1, frags[0])
-	if err != nil {
-		t.Fatalf("FragmentBuffer.Add: %v", err)
-	}
-	if string(assembled) != string(msg) {
-		t.Fatalf("round-trip mismatch: got %q, want %q", assembled, msg)
-	}
-
-	// A normal small payload that does NOT start with the magic is still sent
-	// unfragmented (SplitPayload returns nil).
-	if frags, err := SplitPayload([]byte("plain small payload"), 1200); err != nil || frags != nil {
-		t.Fatalf("non-magic small payload: got frags=%v err=%v, want nil,nil", frags, err)
 	}
 }

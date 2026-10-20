@@ -201,6 +201,12 @@ func (c *Compressor) ShouldCompressData(f *Frame) bool {
 	if f.Flags.Has(FlagCOMPRESSED) {
 		return false
 	}
+	// A fragment is told from a whole message by FlagFRAGMENT alone, which the
+	// short DATA forms cannot carry; the receiver would deliver its envelope as
+	// message bytes. It keeps the full header.
+	if f.Flags.Has(FlagFRAGMENT) {
+		return false
+	}
 	// AE-H-14: the short-header StreamID field is uint16; a stream above
 	// MaxShortHeaderStreamID would truncate on the wire and misroute on decode.
 	// Fall back to the full 50-byte header (capability preserved) rather than

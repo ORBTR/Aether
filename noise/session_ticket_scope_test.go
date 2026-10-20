@@ -46,7 +46,7 @@ func TestTicketRoundTripPreservesScopeID(t *testing.T) {
 			t.Fatalf("buildResumeCipherStates: %v", err)
 		}
 
-		blob, err := ts.IssueTicket(peerID, send, recv, capExplicitNonce, scope, nil, aether.NegotiatedWireVersions{})
+		blob, err := ts.IssueTicket(peerID, send, recv, capExplicitNonce, scope, nil, aether.NegotiatedWireVersions{}, networkKeyBinding{})
 		if err != nil {
 			t.Fatalf("IssueTicket(scope=%q): %v", scope, err)
 		}
@@ -78,7 +78,7 @@ func TestTicketRoundTripPreservesScopeID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildResumeCipherStates: %v", err)
 	}
-	if _, err := ts.IssueTicket(peerID, send, recv, capExplicitNonce, strings.Repeat("x", MaxScopeIDLength+1), nil, aether.NegotiatedWireVersions{}); err != ErrPartitionIDTooLong {
+	if _, err := ts.IssueTicket(peerID, send, recv, capExplicitNonce, strings.Repeat("x", MaxScopeIDLength+1), nil, aether.NegotiatedWireVersions{}, networkKeyBinding{}); err != ErrPartitionIDTooLong {
 		t.Errorf("IssueTicket(over-length scope) err = %v, want ErrPartitionIDTooLong", err)
 	}
 

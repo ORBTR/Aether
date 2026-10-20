@@ -286,8 +286,20 @@ func DeliverToRecvChWithSignals(
 // Used only on the drop path. Successful deliveries let the reader's
 // debouncer handle grants.
 func dropGrantCredit(window *flow.StreamWindow, payload []byte, streamID uint64, sendUpdate WindowUpdater) {
+	releaseCredit(window, int64(len(payload)), streamID, sendUpdate)
+}
+
+// releaseCredit grants back n bytes that will never reach the application,
+// through ReceiverConsume and a WINDOW_UPDATE if a trigger fires. The drop path
+// above and the fragment reassembly paths (noiseStream.reassemble,
+// TCPSession.deliverToStream) use it for bytes the sender charged that the
+// reader's debouncer will never see.
+func releaseCredit(window *flow.StreamWindow, n int64, streamID uint64, sendUpdate WindowUpdater) {
+	if n <= 0 {
+		return
+	}
 	if window != nil && sendUpdate != nil {
-		if grant := window.ReceiverConsume(int64(len(payload))); grant > 0 {
+		if grant := window.ReceiverConsume(n); grant > 0 {
 			sendUpdate(streamID, uint64(grant))
 		}
 	}

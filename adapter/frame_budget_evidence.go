@@ -24,7 +24,7 @@ var ErrFrameBudgetEvidence = errors.New("aether/adapter: invalid frame-budget ev
 // transport class, each class's already-post-Aether application budget from
 // MaxAppMessageBudget (the class frame size minus the Aether header and Noise
 // AEAD tag), and their frozen minimum. A bounded encoder consumes Minimum() so a
-// message fits the SMALLEST eligible frame without reaching SplitPayload.
+// message fits the SMALLEST eligible frame without reaching SplitMessage.
 //
 // The only constructor validates the eligible class set, so a consumer cannot
 // fabricate a budget from a raw integer or a class-confused value: an unknown

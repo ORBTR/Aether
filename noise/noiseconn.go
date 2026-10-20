@@ -159,6 +159,13 @@ type noiseConn struct {
 	wireVersions     aether.NegotiatedWireVersions
 	peerWireVersions aether.WireVersions
 
+	// networkKey is the network key the handshake's Noise prologue bound this
+	// conn to, by its CRC32 fingerprint (the value msg1 names it by), or the
+	// key a resumed conn's ticket recorded. Unbound on an over-conn conn,
+	// whose handshake has no network-key prologue. Written before the conn is
+	// handed to any reader and never changed; NetworkKeyID reports it.
+	networkKey networkKeyBinding
+
 	// Observability counters (Concerns #5, #6)
 	decryptErrors uint64 // atomic: failed decrypt attempts
 	inboxDrops    uint64 // atomic: inbox-full drops
@@ -225,6 +232,14 @@ func (c *noiseConn) PeerMaxAckDelay() time.Duration {
 // probe and reports it as the session's set.
 func (c *noiseConn) WireVersions() aether.NegotiatedWireVersions {
 	return c.wireVersions
+}
+
+// NetworkKeyID returns the fingerprint (crypto.CRC32Hash) of the network key
+// this conn's handshake bound it to, and false when it bound none.
+// adapter.NewNoiseSession reads it through its noiseConnNetworkKey probe as the
+// mesh realm its fragment envelopes carry and check.
+func (c *noiseConn) NetworkKeyID() (uint32, bool) {
+	return c.networkKey.id, c.networkKey.bound
 }
 
 func (c *noiseConn) runReader() {

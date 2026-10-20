@@ -12,7 +12,7 @@ import "github.com/ORBTR/aether"
 // subtracts the per-frame overhead through MSSToMaxPayload, which is the sole
 // owner of the Aether-header + Noise-AEAD-tag figure, so that overhead is not
 // duplicated here. A caller that keeps every encoded message at or below the
-// budget for the class it actually rides never reaches SplitPayload, leaving
+// budget for the class it actually rides never reaches SplitMessage, leaving
 // fragmentation as anomaly-only defence.
 //
 // An unrecognised class resolves to the ClassSTREAM budget, matching

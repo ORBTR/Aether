@@ -385,7 +385,7 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 	// A capacity drop leaves it un-committed so its retransmit is still
 	// deliverable. Commit is idempotent and a no-op for below-floor/ancient
 	// SeqNos, so the ResultAncient-at/above-floor fall-through is safe.
-	delivered, accepted := st.recvWindow.InsertChecked(frame.SeqNo, frame.Payload)
+	delivered, accepted := st.recvWindow.InsertMarked(frame.SeqNo, frame.Payload, frame.IsFragment())
 	if accepted {
 		st.replay.Commit(frame.SeqNo)
 	}
@@ -416,7 +416,11 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 				dbgNoise.Printf("handleData: send-on-closed for stream %d (race with teardown): %v", frame.StreamID, r)
 			}
 		}()
-		for _, payload := range delivered {
+		for _, d := range delivered {
+			payload, whole := st.reassemble(d)
+			if !whole {
+				continue // a fragment of a message not yet complete, or refused
+			}
 			// AE-M-02: hand the payload to the stream's own deliverLoop
 			// goroutine (non-blocking enqueue) instead of blocking the shared
 			// readLoop up to stream1MaxBackpressure=1s on a full recvCh. A slow
@@ -817,7 +821,7 @@ func (s *NoiseSession) handleImplicitOpen(frame *aether.Frame) {
 	s.notifyStreamAccepted(st)
 
 	// Reliability: insert into recv window.
-	delivered := st.recvWindow.Insert(frame.SeqNo, frame.Payload)
+	delivered, _ := st.recvWindow.InsertMarked(frame.SeqNo, frame.Payload, frame.IsFragment())
 
 	// Prime the ACK engine for the implicit-open's first frame BEFORE
 	// the delivery loop — otherwise the first frame on a peer-initiated
@@ -834,7 +838,11 @@ func (s *NoiseSession) handleImplicitOpen(frame *aether.Frame) {
 				dbgNoise.Printf("handleImplicitOpen: send-on-closed for stream %d (race with teardown): %v", frame.StreamID, r)
 			}
 		}()
-		for _, payload := range delivered {
+		for _, d := range delivered {
+			payload, whole := st.reassemble(d)
+			if !whole {
+				continue
+			}
 			// AE-M-02: enqueue onto the per-stream deliverLoop (non-blocking)
 			// rather than block the readLoop on a full recvCh. See handleData.
 			ok := st.enqueueDelivery(payload)
@@ -870,7 +878,7 @@ func (s *NoiseSession) handleClose(frame *aether.Frame) {
 		st.ackEngine.Flush()
 		st.ackEngine.Stop()
 	}
-	remaining := st.recvWindow.Drain()
+	remaining := st.recvWindow.DrainMarked()
 	// recvCh-close is idempotent via closeRecvOnce, but a concurrent local
 	// Reset / streamGC sweep on the same streamID can close the channel
 	// between when this loop checks "ok" and when it sends. recover() turns
@@ -878,7 +886,11 @@ func (s *NoiseSession) handleClose(frame *aether.Frame) {
 	// deliverToStream defense (tcp.go:354-360).
 	func() {
 		defer func() { _ = recover() }()
-		for _, payload := range remaining {
+		for _, d := range remaining {
+			payload, whole := st.reassemble(d)
+			if !whole {
+				continue
+			}
 			select {
 			case st.recvCh <- payload:
 			default:

@@ -16,8 +16,9 @@ import (
 // WireVersion is one named wire grammar or envelope a peer offers in its
 // handshake: the versions it can speak, ascending, and whether a session may
 // exist without one of them chosen. aether names its own entries
-// (WireVersionFrame, WireVersionFrameShort); an application adds names of its
-// own, which aether negotiates and reports without reading.
+// (WireVersionFragment, WireVersionFrame, WireVersionFrameShort); an
+// application adds names of its own, which aether negotiates and reports
+// without reading.
 type WireVersion struct {
 	Name     string
 	Versions []uint16
@@ -31,14 +32,21 @@ type WireVersion struct {
 // encoding Encode writes.
 type WireVersions []WireVersion
 
-// The entries aether registers for itself. frame is the full-frame grammar a
-// session's frames are read and written in; it is required because no frame
-// can be read without it. frame.short is the short-frame table; it is
-// optional because a session that does not choose it writes full frames only.
+// The entries aether registers for itself. fragment is the envelope a message
+// larger than one frame travels in (adapter.FragmentEnvelope); it is required
+// because a session that cannot read its peer's fragments cannot carry the
+// messages they make up. frame is the full-frame grammar a session's frames are
+// read and written in; it is required because no frame can be read without it.
+// frame.short is the short-frame table; it is optional because a session that
+// does not choose it writes full frames only.
 const (
+	WireVersionFragment   = "fragment"
 	WireVersionFrame      = "frame"
 	WireVersionFrameShort = "frame.short"
 
+	// WireVersionFragmentCurrent is the fragment envelope version this build
+	// writes and reads; adapter.FragmentEnvelope's version byte carries it.
+	WireVersionFragmentCurrent   uint16 = 2
 	wireVersionFrameCurrent      uint16 = 2
 	wireVersionFrameShortCurrent uint16 = 1
 )
@@ -93,6 +101,7 @@ func (e *WireVersionMismatchError) Is(target error) bool { return target == ErrW
 // itself. LocalWireVersions adds them to every offer.
 func AetherWireVersions() WireVersions {
 	return WireVersions{
+		{Name: WireVersionFragment, Versions: []uint16{WireVersionFragmentCurrent}, Required: true},
 		{Name: WireVersionFrame, Versions: []uint16{wireVersionFrameCurrent}, Required: true},
 		{Name: WireVersionFrameShort, Versions: []uint16{wireVersionFrameShortCurrent}},
 	}
