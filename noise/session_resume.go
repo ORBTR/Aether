@@ -101,6 +101,9 @@ type resumeMaterial struct {
 	// resume when the result is not Chosen; a resumed conn reports Chosen.
 	PeerOffer aether.WireVersions
 	Chosen    aether.NegotiatedWireVersions
+	// NetworkKey is the network key the original session bound; the resumed
+	// conn reports it.
+	NetworkKey networkKeyBinding
 }
 
 // initiatorTicketCache is the initiator-side ticket cache. Separate from
@@ -183,6 +186,7 @@ func (c *initiatorTicketCache) evictLocked(peerID aether.NodeID) {
 //
 //	[2B opaqueLen][opaque...][32B SendKey][32B RecvKey][4B Caps][8B ExpiresUnixNano]
 //	[2B peerOfferLen][peer offer][2B chosenLen][chosen set]
+//	[5B network key binding, encodeNetworkKeyBinding]
 //
 // The two wire version fields are in the aether.WireVersions and
 // aether.NegotiatedWireVersions encodings. The material is built only from a
@@ -211,6 +215,7 @@ func encodeResumeMaterial(m *resumeMaterial) []byte {
 	buf = append(buf, offer...)
 	buf = binary.BigEndian.AppendUint16(buf, uint16(len(chosen)))
 	buf = append(buf, chosen...)
+	buf = append(buf, encodeNetworkKeyBinding(m.NetworkKey)...)
 	return buf
 }
 
@@ -246,8 +251,12 @@ func decodeResumeMaterial(data []byte) (*resumeMaterial, error) {
 	if !ok {
 		return nil, errors.New("resume material: truncated chosen set")
 	}
-	if len(rest) != 0 {
-		return nil, errors.New("resume material: trailing bytes")
+	if len(rest) != networkKeyBindingSize {
+		return nil, errors.New("resume material: network key binding is not 5 bytes")
+	}
+	networkKey, err := decodeNetworkKeyBinding(rest)
+	if err != nil {
+		return nil, fmt.Errorf("resume material: network key binding: %w", err)
 	}
 	offer, err := aether.DecodeWireVersions(offerBytes)
 	if err != nil {
@@ -258,6 +267,7 @@ func decodeResumeMaterial(data []byte) (*resumeMaterial, error) {
 		return nil, fmt.Errorf("resume material: chosen set: %w", err)
 	}
 	m.PeerOffer, m.Chosen = offer, chosen
+	m.NetworkKey = networkKey
 	return m, nil
 }
 
@@ -373,6 +383,7 @@ func (t *NoiseTransport) tryResumeDial(ctx interface{}, target aether.Target, ud
 		// Resume confirmed — instantiate noiseConn with the fresh states.
 		nc := newNoiseConnDial(udp, remoteAddr, target.NodeID, send, recv, t.maxPacket, t)
 		nc.wireVersions, nc.peerWireVersions = m.Chosen, m.PeerOffer
+		nc.networkKey = m.NetworkKey
 		return nc, nil
 	default:
 		return nil, fmt.Errorf("resume: unknown response prefix 0x%02x", readBuf[0])
@@ -556,6 +567,7 @@ func (l *noiseListener) handleResumePacket(ctx context.Context, conn *net.UDPCon
 	// (relay.go) treats empty scope as unrestricted — bypassing partition isolation.
 	nc.scopeID = ticket.ScopeID
 	nc.wireVersions, nc.peerWireVersions = ticket.Chosen, ticket.PeerOffer
+	nc.networkKey = ticket.NetworkKey
 	key := addr.String()
 	l.mu.Lock()
 	l.sessions.Put(ticket.PeerID, key, ticket.ScopeID, &noiseConnSession{conn: nc, nodeID: ticket.PeerID})

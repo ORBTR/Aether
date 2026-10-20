@@ -50,6 +50,7 @@ const capSessionTicket uint32 = 1 << 1
 //	[2-byte scope len][scope ID]
 //	[2-byte peer offer len][peer offer, aether.WireVersions encoding]
 //	[2-byte chosen len][chosen set, aether.NegotiatedWireVersions encoding]
+//	[5-byte network key binding, encodeNetworkKeyBinding]
 type sessionTicket struct {
 	ExpiresAt time.Time
 	PeerID    aether.NodeID
@@ -69,6 +70,10 @@ type sessionTicket struct {
 	// build would not choose; a resumed conn reports Chosen.
 	PeerOffer aether.WireVersions
 	Chosen    aether.NegotiatedWireVersions
+	// NetworkKey is the network key the original session's handshake bound
+	// it to; handleResumePacket gives it to the resumed conn, whose
+	// NetworkKeyID the fragment envelope's realm reads.
+	NetworkKey networkKeyBinding
 }
 
 const (
@@ -191,8 +196,9 @@ func (ts *TicketStore) RotateKey(newKey []byte) error {
 //
 // peerOffer and chosen are the initiator's wire version offer and the set
 // the handshake chose from it; they are sealed into the ticket for
-// handleResumePacket's check.
-func (ts *TicketStore) IssueTicket(peerID aether.NodeID, send, recv *fnoise.CipherState, caps uint32, scopeID string, peerOffer aether.WireVersions, chosen aether.NegotiatedWireVersions) ([]byte, error) {
+// handleResumePacket's check. networkKey is the key the session's handshake
+// bound, which the resumed conn reports.
+func (ts *TicketStore) IssueTicket(peerID aether.NodeID, send, recv *fnoise.CipherState, caps uint32, scopeID string, peerOffer aether.WireVersions, chosen aether.NegotiatedWireVersions, networkKey networkKeyBinding) ([]byte, error) {
 	ts.mu.RLock()
 	gcm := ts.gcm
 	ts.mu.RUnlock()
@@ -207,14 +213,15 @@ func (ts *TicketStore) IssueTicket(peerID aether.NodeID, send, recv *fnoise.Ciph
 	}
 
 	ticket := sessionTicket{
-		ExpiresAt: time.Now().Add(ts.ttl),
-		PeerID:    peerID,
-		SendNonce: send.Nonce(),
-		RecvNonce: recv.Nonce(),
-		Caps:      caps,
-		ScopeID:   scopeID,
-		PeerOffer: peerOffer,
-		Chosen:    chosen,
+		ExpiresAt:  time.Now().Add(ts.ttl),
+		PeerID:     peerID,
+		SendNonce:  send.Nonce(),
+		RecvNonce:  recv.Nonce(),
+		Caps:       caps,
+		ScopeID:    scopeID,
+		PeerOffer:  peerOffer,
+		Chosen:     chosen,
+		NetworkKey: networkKey,
 	}
 	// UnsafeKey() returns a [32]byte value (by value, not by reference),
 	// so assigning it here takes a full copy. The "Unsafe" in the name
@@ -249,6 +256,7 @@ func (ts *TicketStore) IssueTicket(peerID aether.NodeID, send, recv *fnoise.Ciph
 	plaintext = append(plaintext, offerBytes...)
 	plaintext = binary.BigEndian.AppendUint16(plaintext, uint16(len(chosenBytes)))
 	plaintext = append(plaintext, chosenBytes...)
+	plaintext = append(plaintext, encodeNetworkKeyBinding(networkKey)...)
 
 	nonce := make([]byte, ticketNonceSize)
 	if _, err := rand.Read(nonce); err != nil {
@@ -294,8 +302,9 @@ func (ts *TicketStore) DecryptTicket(encrypted []byte) (*sessionTicket, error) {
 	}
 
 	// Fixed 124B prefix + [2B scopeLen][scopeID], then the two
-	// length-prefixed wire version suffixes. Any other length, or a suffix
-	// that is not a canonical encoding, is rejected → full-handshake fallback.
+	// length-prefixed wire version suffixes and the network key binding. Any
+	// other length, or a suffix that is not a canonical encoding, is rejected
+	// → full-handshake fallback.
 	if len(plaintext) < ticketPlaintextSize+ticketScopeLenSize {
 		return nil, ErrTicketInvalid
 	}
@@ -309,7 +318,11 @@ func (ts *TicketStore) DecryptTicket(encrypted []byte) (*sessionTicket, error) {
 		return nil, ErrTicketInvalid
 	}
 	chosenBytes, rest, ok := cutLengthPrefixed(rest)
-	if !ok || len(rest) != 0 {
+	if !ok {
+		return nil, ErrTicketInvalid
+	}
+	networkKey, err := decodeNetworkKeyBinding(rest)
+	if err != nil {
 		return nil, ErrTicketInvalid
 	}
 	peerOffer, err := aether.DecodeWireVersions(offerBytes)
@@ -322,14 +335,15 @@ func (ts *TicketStore) DecryptTicket(encrypted []byte) (*sessionTicket, error) {
 	}
 
 	ticket := &sessionTicket{
-		ExpiresAt: time.Unix(0, int64(binary.BigEndian.Uint64(plaintext[0:8]))),
-		PeerID:    aether.NodeID(plaintext[8:40]),
-		SendNonce: binary.BigEndian.Uint64(plaintext[72:80]),
-		RecvNonce: binary.BigEndian.Uint64(plaintext[112:120]),
-		Caps:      binary.BigEndian.Uint32(plaintext[120:124]),
-		ScopeID:   string(plaintext[126 : 126+scopeLen]),
-		PeerOffer: peerOffer,
-		Chosen:    chosen,
+		ExpiresAt:  time.Unix(0, int64(binary.BigEndian.Uint64(plaintext[0:8]))),
+		PeerID:     aether.NodeID(plaintext[8:40]),
+		SendNonce:  binary.BigEndian.Uint64(plaintext[72:80]),
+		RecvNonce:  binary.BigEndian.Uint64(plaintext[112:120]),
+		Caps:       binary.BigEndian.Uint32(plaintext[120:124]),
+		ScopeID:    string(plaintext[126 : 126+scopeLen]),
+		PeerOffer:  peerOffer,
+		Chosen:     chosen,
+		NetworkKey: networkKey,
 	}
 	copy(ticket.SendKey[:], plaintext[40:72])
 	copy(ticket.RecvKey[:], plaintext[80:112])
@@ -428,7 +442,7 @@ func (t *NoiseTransport) IssueTicket(sess aether.Connection) ([]byte, error) {
 		return nil, err
 	}
 	caps := capExplicitNonce
-	return t.ticketStore.IssueTicket(nc.remoteNode, nc.send, nc.recv, caps, nc.scopeID, nc.peerWireVersions, nc.wireVersions)
+	return t.ticketStore.IssueTicket(nc.remoteNode, nc.send, nc.recv, caps, nc.scopeID, nc.peerWireVersions, nc.wireVersions, nc.networkKey)
 }
 
 // ResumeSession attempts to resume a session from an encrypted ticket.

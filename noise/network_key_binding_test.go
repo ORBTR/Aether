@@ -1,0 +1,191 @@
+//go:build !js
+
+/*
+ * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
+ * Queries: licensing@orbtr.io
+ */
+package noise
+
+import (
+	"context"
+	"net"
+	"testing"
+	"time"
+
+	aether "github.com/ORBTR/aether"
+	transportCrypto "github.com/ORBTR/aether/crypto/identity"
+)
+
+func networkKeyOn(t *testing.T, c aether.Connection) (uint32, bool) {
+	t.Helper()
+	nc, err := extractNoiseConn(c)
+	if err != nil {
+		t.Fatalf("extractNoiseConn: %v", err)
+	}
+	return nc.NetworkKeyID()
+}
+
+// TestNoiseConn_ReportsTheNetworkKeyItsHandshakeBound: the dialed and the
+// accepted conn of one handshake both report the fingerprint of the network key
+// the Noise prologue bound, which is the realm the fragment envelope names.
+func TestNoiseConn_ReportsTheNetworkKeyItsHandshakeBound(t *testing.T) {
+	p := newWVPair(t, nil, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	accepted := make(chan aether.Connection, 1)
+	go func() {
+		s, err := p.serverLn.Accept(ctx)
+		if err == nil {
+			accepted <- s
+		}
+		close(accepted)
+	}()
+	c, err := p.client.Dial(ctx, aether.Target{Address: p.serverAddr, NodeID: p.server.localNode})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+	s, ok := <-accepted
+	if !ok {
+		t.Fatalf("server accepted nothing")
+	}
+	defer s.Close()
+	want := transportCrypto.CRC32Hash([]byte(wvTestNetKey))
+	for name, conn := range map[string]aether.Connection{"dialer": c, "accepter": s} {
+		id, bound := networkKeyOn(t, conn)
+		if !bound || id != want {
+			t.Fatalf("%s conn network key = %08x, %v; want %08x, true", name, id, bound, want)
+		}
+	}
+}
+
+// TestOverConn_BindsNoNetworkKey: a conn from DialOverConn or AcceptOverConn
+// runs Noise without a network-key prologue, so it reports none.
+func TestOverConn_BindsNoNetworkKey(t *testing.T) {
+	dialed, accepted, dialErr, acceptErr := overConnPair(t, nil, nil)
+	if dialErr != nil || acceptErr != nil {
+		t.Fatalf("over-conn pair: dial %v accept %v", dialErr, acceptErr)
+	}
+	defer dialed.Close()
+	defer accepted.Close()
+	for name, conn := range map[string]aether.Connection{"dialer": dialed, "accepter": accepted} {
+		if id, bound := networkKeyOn(t, conn); bound {
+			t.Fatalf("%s over-conn reports network key %08x", name, id)
+		}
+	}
+}
+
+// TestTicket_CarriesNetworkKey: the network key a session bound survives a
+// ticket and its resume material, an unbound session's ticket stays unbound,
+// and a ticket or material cut inside the key field is refused.
+func TestTicket_CarriesNetworkKey(t *testing.T) {
+	ts, err := NewTicketStore()
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	offer, _ := aether.LocalWireVersions(nil)
+	chosen := mustChoose(t, offer, offer)
+	for _, key := range []networkKeyBinding{{id: 0x8badf00d, bound: true}, {}} {
+		send, recv := cipherPair(t)
+		blob, err := ts.IssueTicket("vl1_peer", send, recv, 0, "", offer, chosen, key)
+		if err != nil {
+			t.Fatalf("IssueTicket: %v", err)
+		}
+		tk, err := ts.DecryptTicket(blob)
+		if err != nil {
+			t.Fatalf("DecryptTicket: %v", err)
+		}
+		if tk.NetworkKey != key {
+			t.Fatalf("ticket network key %+v, want %+v", tk.NetworkKey, key)
+		}
+		m := &resumeMaterial{Opaque: blob, PeerOffer: offer, Chosen: chosen, ExpiresAt: time.Now().Add(time.Hour), NetworkKey: key}
+		enc := encodeResumeMaterial(m)
+		back, err := decodeResumeMaterial(enc)
+		if err != nil || back.NetworkKey != key {
+			t.Fatalf("material round trip: %+v, %v; want key %+v", back, err, key)
+		}
+		for cut := 1; cut <= networkKeyBindingSize; cut++ {
+			if _, err := decodeResumeMaterial(enc[:len(enc)-cut]); err == nil {
+				t.Fatalf("material cut by %d decoded", cut)
+			}
+		}
+	}
+	if _, err := decodeResumeMaterial(append(encodeResumeMaterial(&resumeMaterial{NetworkKey: networkKeyBinding{id: 1, bound: true}}), 0)); err == nil {
+		t.Fatalf("material with a byte past the key decoded")
+	}
+	bad := encodeNetworkKeyBinding(networkKeyBinding{id: 7, bound: true})
+	bad[0] = 2
+	if _, err := decodeNetworkKeyBinding(bad); err == nil {
+		t.Fatalf("a bound byte of 2 decoded")
+	}
+	if _, err := decodeNetworkKeyBinding([]byte{0, 0, 0, 0, 1}); err == nil {
+		t.Fatalf("an unbound binding with a non-zero id decoded")
+	}
+}
+
+// TestResume_InitiatorResumedConnBindsTheMaterialsNetworkKey: an initiator
+// that resumes from its cached material reports the network key the material
+// recorded, which the responder's resumed conn reports from the ticket.
+func TestResume_InitiatorResumedConnBindsTheMaterialsNetworkKey(t *testing.T) {
+	offer, _ := aether.LocalWireVersions(nil)
+	recorded := mustChoose(t, offer, offer)
+	key := networkKeyBinding{id: 0x0ddba11, bound: true}
+	resp := wvTransport(t, nil, func(c *NoiseTransportConfig) { c.EnableResume = true })
+	ini := wvTransport(t, nil, func(c *NoiseTransportConfig) { c.EnableResume = true })
+	send, recv := cipherPair(t)
+	opaque, err := resp.ticketStore.IssueTicket(ini.localNode, send, recv, capExplicitNonce, "", offer, recorded, key)
+	if err != nil {
+		t.Fatalf("IssueTicket: %v", err)
+	}
+	ini.initiatorTickets.Store(resp.localNode, &resumeMaterial{
+		Opaque:     opaque,
+		SendKey:    recv.UnsafeKey(),
+		RecvKey:    send.UnsafeKey(),
+		ExpiresAt:  time.Now().Add(time.Hour),
+		PeerOffer:  offer,
+		Chosen:     recorded,
+		NetworkKey: key,
+	})
+	respSock, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer respSock.Close()
+	iniSock, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer iniSock.Close()
+	l := &noiseListener{
+		transport: resp,
+		conn:      respSock,
+		sessions:  aether.NewConnectionMap(),
+		incoming:  make(chan aether.IncomingSession, 1),
+	}
+	go func() {
+		buf := make([]byte, 1024)
+		_ = respSock.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, src, err := respSock.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		l.handleResumePacket(context.Background(), respSock, buf[:n], src)
+	}()
+	nc, err := ini.tryResumeDial(context.Background(), aether.Target{NodeID: resp.localNode}, iniSock, respSock.LocalAddr().(*net.UDPAddr))
+	if err != nil || nc == nil {
+		t.Fatalf("resume: conn %v, %v", nc != nil, err)
+	}
+	defer nc.Close()
+	if id, bound := nc.NetworkKeyID(); !bound || id != key.id {
+		t.Fatalf("resumed initiator conn reports network key %08x, %v; want %08x", id, bound, key.id)
+	}
+	select {
+	case in := <-l.incoming:
+		defer in.Session.Close()
+		if id, bound := networkKeyOn(t, in.Session); !bound || id != key.id {
+			t.Fatalf("resumed responder conn reports network key %08x, %v; want %08x", id, bound, key.id)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("the responder delivered no resumed session")
+	}
+}

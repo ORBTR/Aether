@@ -28,10 +28,13 @@ func shortFormCompressor(t testing.TB) *Compressor {
 }
 
 // fullOnlyVersions is the set a session chooses with a peer that offers the
-// frame grammar and not the short-form table.
+// frame grammar and the fragment envelope and not the short-form table.
 func fullOnlyVersions(t testing.TB) NegotiatedWireVersions {
 	t.Helper()
-	peer := WireVersions{{Name: WireVersionFrame, Versions: []uint16{wireVersionFrameCurrent}, Required: true}}
+	peer := WireVersions{
+		{Name: WireVersionFragment, Versions: []uint16{WireVersionFragmentCurrent}, Required: true},
+		{Name: WireVersionFrame, Versions: []uint16{wireVersionFrameCurrent}, Required: true},
+	}
 	chosen, err := ChooseWireVersions(AetherWireVersions(), peer)
 	if err != nil {
 		t.Fatalf("ChooseWireVersions: %v", err)

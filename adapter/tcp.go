@@ -129,6 +129,14 @@ type TCPSession struct {
 	prefaceWritten chan struct{}
 	wireTimer      *time.Timer
 	prefaceTimeout time.Duration
+
+	// fragRecv is what a fragment this session receives must match. A
+	// TCPSession's identity is established by its caller before construction
+	// and binds it to no network key, so it has no realm: fragRecv refuses
+	// every fragment (FragmentNoRealm), and Send never splits a message.
+	// readPreface sets it from the chosen set before readLoop decodes a
+	// frame; only readLoop reads it.
+	fragRecv *FragmentReceiver
 }
 
 // tcpWireResult is the outcome of a TCPSession's preface exchange: the set
@@ -166,11 +174,9 @@ type tcpStream struct {
 	deliverCh        chan []byte
 	deliverOnce      sync.Once // closes deliverCh exactly once from teardown
 	deliverStartOnce sync.Once // starts deliverLoop exactly once
-	// fragBuf reassembles fragmented messages. AER-099: Send fragments a
-	// message larger than MaxFrameSize into fragment-headed DATA frames (with
-	// [magic|index|total] metadata) so the original message boundary is
-	// restored here instead of surfacing each chunk as its own Receive().
-	// Touched only by Receive (single-consumer per stream).
+	// fragBuf takes a peer's fragments (DATA frames flagged
+	// aether.FlagFRAGMENT) and refuses each against the session's fragRecv,
+	// which has no realm. Touched only by the readLoop (deliverToStream).
 	fragBuf *FragmentBuffer
 	window  *flow.StreamWindow
 	// grantDebouncer coalesces stream-level WINDOW_UPDATE emissions driven
@@ -478,6 +484,8 @@ func (s *TCPSession) readPreface() error {
 	// can choose a short form.
 	s.rxCompressor.UseWireVersions(chosen)
 	s.txCompressor.UseWireVersions(chosen)
+	fragmentVersion, _ := chosen.Version(aether.WireVersionFragment)
+	s.fragRecv = NewFragmentReceiver(fragmentVersion, 0, false, s.RemotePeerID())
 	if !s.finishWireVersions(chosen, nil) {
 		// The deadline or a close ended the exchange first.
 		if r := s.wireResult.Load(); r != nil && r.err != nil {
@@ -671,6 +679,18 @@ func (s *TCPSession) deliverToStream(frame *aether.Frame) {
 		}
 		dbgTCP.Printf("deliverToStream: no stream for ID=%d, dropping %d bytes", frame.StreamID, frame.Length)
 		return // unknown stream, drop
+	}
+	// A fragment is never delivered as message bytes: the session has no
+	// realm, so the buffer refuses it, and the bytes the sender charged for it
+	// are granted back at once.
+	if frame.IsFragment() {
+		if st.fragBuf == nil {
+			st.fragBuf = NewFragmentBuffer() // a stream built outside the open paths
+		}
+		_, released, err := st.fragBuf.Add(s.fragRecv, st.streamID, frame.Payload)
+		releaseCredit(st.window, released, st.streamID, s.sendWindowUpdateAgnostic)
+		dbgTCP.Printf("deliverToStream: stream %d fragment refused: %v", frame.StreamID, err)
+		return
 	}
 	// AER-033: hand the payload to the per-stream deliverLoop (non-blocking)
 	// rather than performing the up-to-1s backpressure inline on the shared
@@ -1583,47 +1603,32 @@ func (st *tcpStream) Send(ctx context.Context, data []byte) error {
 	// proceeds regardless of the return.
 	_ = st.window.TryConsume(int64(len(data)))
 
-	// MaxFrameSize enforcement (Task 15): split large payloads into
-	// MaxFrameSize-sized chunks so they interleave with other streams
-	// via the scheduler, avoiding head-of-line blocking.
-	maxFrame := st.session.classDefaults.MaxFrameSize
-	if maxFrame <= 0 {
-		maxFrame = 65536 // ClassSTREAM default
-	}
-
 	totalLen := len(data)
 
-	// AER-099: fragment WITH explicit header/reassembly metadata rather than
-	// chopping the message into unrelated DATA frames. The old loop split a
-	// payload > maxFrame into headerless chunks with no grouping, so a
-	// message-oriented peer saw the boundary silently change (its Receive()
-	// returned a truncated head followed by extra messages). SplitPayload tags
-	// each chunk [magic|index|total] so the receiver's FragmentBuffer restores
-	// the original message; the chunks are still separate DATA frames, so the
-	// scheduler interleaving that motivated chunking is preserved. It returns
-	// nil for a payload that fits one frame (fast path, no header overhead)
-	// except when the payload starts with the fragment magic, which it escapes
-	// as a single fragment so IsFragment stays authoritative (AER-068).
-	fragments, err := SplitPayload(data, maxFrame)
-	if err != nil {
-		// Payload exceeds the 255-fragment ceiling at this frame size — fail
-		// loudly rather than ship a silently-truncated message (AE-H-03).
-		return fmt.Errorf("stream %d: %w", st.streamID, err)
+	// A message keeps its boundary, arriving as one Receive(). The
+	// fragment envelope that would split one larger than the class
+	// MaxFrameSize into interleavable frames needs the session's realm, and a
+	// TCPSession has none (fragRecv), so every message travels as one DATA
+	// frame. The byte stream carries a frame of any length up to
+	// aether.MaxPayloadSize, which the peer's ReadNextFrame also enforces; a
+	// larger message fails loudly rather than ship truncated. A
+	// message above MaxFrameSize holds the write loop for its whole length.
+	// TODO: when a byte-stream session's identity binds a mesh realm, split a
+	// message above MaxFrameSize with SplitMessage as NoiseSession does, so
+	// other streams interleave with it.
+	if totalLen > aether.MaxPayloadSize {
+		return fmt.Errorf("stream %d: %w: %d bytes, one frame carries at most %d",
+			st.streamID, ErrPayloadTooLarge, totalLen, aether.MaxPayloadSize)
 	}
-	if fragments == nil {
-		fragments = [][]byte{data} // fits one frame — send verbatim
+	frame := &aether.Frame{
+		SenderID:   st.session.LocalPeerID(),
+		ReceiverID: st.session.RemotePeerID(),
+		StreamID:   st.streamID,
+		Type:       aether.TypeDATA,
+		Length:     uint32(totalLen),
+		Payload:    data,
 	}
-	for _, chunk := range fragments {
-		frame := &aether.Frame{
-			SenderID:   st.session.LocalPeerID(),
-			ReceiverID: st.session.RemotePeerID(),
-			StreamID:   st.streamID,
-			Type:       aether.TypeDATA,
-			Length:     uint32(len(chunk)),
-			Payload:    chunk,
-		}
-		st.session.sched.Enqueue(st.streamID, frame)
-	}
+	st.session.sched.Enqueue(st.streamID, frame)
 
 	if st.streamID == 0 {
 		dbgTCP.Printf("Send: enqueued %d bytes for stream 0 (gossip), schedLen=%d", totalLen, st.session.sched.QueueLen(0))
@@ -1640,33 +1645,10 @@ func (st *tcpStream) Receive(ctx context.Context) ([]byte, error) {
 			}
 			// Consume-driven grant: record the app-consumed bytes in the
 			// stream-level debouncer so WINDOW_UPDATE emission advances with
-			// application progress, not frame-receipt. Recorded on the raw
-			// bytes pulled off recvCh (including any fragment header) so the
-			// sender's window advances per fragment, not only on the final
-			// reassembly — otherwise a multi-fragment message would stall the
-			// sender for the whole reassembly span.
+			// application progress, not frame-receipt. recvCh holds whole
+			// messages only (deliverToStream keeps fragments out of it).
 			if st.grantDebouncer != nil {
 				st.grantDebouncer.Record(int64(len(data)))
-			}
-			// AER-099: reassemble fragmented messages so the original message
-			// boundary the Send side split is restored, instead of returning
-			// each chunk as its own Receive() result.
-			if IsFragment(data) {
-				if st.fragBuf == nil {
-					st.fragBuf = NewFragmentBuffer() // direct-construction fallback
-				}
-				// recvCh doesn't carry the frame SeqNo, so pass 0 — the
-				// per-stream FragmentBuffer uses its own monotonic counter for
-				// group keys, and TCP's in-order delivery keeps fragments
-				// contiguous within their group.
-				assembled, err := st.fragBuf.Add(st.streamID, 0, data)
-				if err != nil {
-					continue // corrupted/over-cap fragment — skip
-				}
-				if assembled == nil {
-					continue // more fragments needed — loop back to recvCh
-				}
-				return assembled, nil
 			}
 			return data, nil
 		case <-ctx.Done():

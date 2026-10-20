@@ -28,6 +28,7 @@ type RecvWindow struct {
 	expected      uint32               // next expected SeqNo (cumulative ACK point)
 	buffer        map[uint32][]byte    // out-of-order frames: SeqNo → payload
 	bufTime       map[uint32]time.Time // out-of-order frames: SeqNo → buffer arrival time
+	marked        map[uint32]bool      // out-of-order frames inserted marked (InsertMarked); absent = unmarked
 	maxGap        int                  // max reorder buffer size (frame count)
 	maxBytes      int64                // max total bytes buffered (0 = unlimited)
 	bufferedBytes int64                // current sum of buffered payload bytes
@@ -65,6 +66,7 @@ func NewRecvWindowWithCap(maxGap int, maxBytes int64) *RecvWindow {
 	return &RecvWindow{
 		buffer:   make(map[uint32][]byte),
 		bufTime:  make(map[uint32]time.Time),
+		marked:   make(map[uint32]bool),
 		maxGap:   maxGap,
 		maxBytes: maxBytes,
 	}
@@ -90,6 +92,16 @@ func (w *RecvWindow) SetHOLHist(h *metrics.DurationHist) {
 	w.holHist = h
 }
 
+// RecvDelivery is one in-order payload InsertMarked or DrainMarked hands
+// back, with the mark its frame was inserted under. The Noise adapter marks a
+// DATA frame that carries one fragment envelope (aether.Frame.IsFragment), so
+// the flag the frame header carried reaches reassembly after reordering, which
+// sees payloads only.
+type RecvDelivery struct {
+	Payload []byte
+	Marked  bool
+}
+
 // Insert records a received frame. Returns the list of in-order payloads
 // that can be delivered to the application (may be empty if the frame is
 // out-of-order, or multiple if this frame fills a gap).
@@ -104,6 +116,15 @@ func (w *RecvWindow) Insert(seqNo uint32, payload []byte) [][]byte {
 // buffering (AER-061) use this so a capacity-dropped frame's retransmit is
 // still deliverable later instead of being marked seen and discarded.
 func (w *RecvWindow) InsertChecked(seqNo uint32, payload []byte) (delivered [][]byte, accepted bool) {
+	marked, accepted := w.InsertMarked(seqNo, payload, false)
+	return payloadsOf(marked), accepted
+}
+
+// InsertMarked is InsertChecked for a caller that carries one bit per frame
+// through the reorder buffer: each delivered payload comes back with the mark
+// its own frame was inserted under. A re-insert of a still-buffered frame takes
+// the latest mark; a frame dropped for age drops its mark with it.
+func (w *RecvWindow) InsertMarked(seqNo uint32, payload []byte, mark bool) (delivered []RecvDelivery, accepted bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -115,7 +136,7 @@ func (w *RecvWindow) InsertChecked(seqNo uint32, payload []byte) (delivered [][]
 
 	if seqNo == w.expected {
 		// In-order: deliver immediately + flush any buffered successors
-		delivered := [][]byte{copyPayload(payload)}
+		delivered := []RecvDelivery{{Payload: copyPayload(payload), Marked: mark}}
 		w.expected++
 
 		// Flush buffered successors, skipping expired frames.
@@ -136,6 +157,7 @@ func (w *RecvWindow) InsertChecked(seqNo uint32, payload []byte) (delivered [][]
 					w.bufferedBytes -= int64(len(p))
 					delete(w.buffer, w.expected)
 					delete(w.bufTime, w.expected)
+					delete(w.marked, w.expected)
 					w.expected++
 					continue // skip expired frame
 				}
@@ -146,10 +168,11 @@ func (w *RecvWindow) InsertChecked(seqNo uint32, payload []byte) (delivered [][]
 					w.holHist.Record(now.Sub(arrived))
 				}
 			}
-			delivered = append(delivered, p)
+			delivered = append(delivered, RecvDelivery{Payload: p, Marked: w.marked[w.expected]})
 			w.bufferedBytes -= int64(len(p))
 			delete(w.buffer, w.expected)
 			delete(w.bufTime, w.expected)
+			delete(w.marked, w.expected)
 			w.expected++
 		}
 		if w.bufferedBytes < 0 {
@@ -185,8 +208,25 @@ func (w *RecvWindow) InsertChecked(seqNo uint32, payload []byte) (delivered [][]
 	}
 	w.buffer[seqNo] = copyPayload(payload)
 	w.bufTime[seqNo] = time.Now()
+	if mark {
+		w.marked[seqNo] = true
+	} else {
+		delete(w.marked, seqNo)
+	}
 	w.bufferedBytes += payloadLen
 	return nil, true
+}
+
+// payloadsOf strips the marks off deliveries for the unmarked entry points.
+func payloadsOf(d []RecvDelivery) [][]byte {
+	if d == nil {
+		return nil
+	}
+	out := make([][]byte, len(d))
+	for i := range d {
+		out[i] = d[i].Payload
+	}
+	return out
 }
 
 // DropsCount returns the total number of frames dropped by this receive
@@ -359,6 +399,11 @@ func (w *RecvWindow) Spread() int {
 // regardless of gaps. Used during stream close to deliver remaining data.
 // After drain, the buffer is empty and expected advances past all drained frames.
 func (w *RecvWindow) Drain() [][]byte {
+	return payloadsOf(w.DrainMarked())
+}
+
+// DrainMarked is Drain with each payload's mark (InsertMarked).
+func (w *RecvWindow) DrainMarked() []RecvDelivery {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -374,9 +419,9 @@ func (w *RecvWindow) Drain() [][]byte {
 	sortUint32(seqs)
 
 	// Deliver all in order
-	delivered := make([][]byte, 0, len(seqs))
+	delivered := make([]RecvDelivery, 0, len(seqs))
 	for _, seq := range seqs {
-		delivered = append(delivered, w.buffer[seq])
+		delivered = append(delivered, RecvDelivery{Payload: w.buffer[seq], Marked: w.marked[seq]})
 	}
 
 	// Clear buffer and advance expected
@@ -385,6 +430,7 @@ func (w *RecvWindow) Drain() [][]byte {
 	}
 	w.buffer = make(map[uint32][]byte)
 	w.bufTime = make(map[uint32]time.Time)
+	w.marked = make(map[uint32]bool)
 	w.bufferedBytes = 0
 
 	return delivered

@@ -77,7 +77,6 @@ type noiseStream struct {
 	retransmitQ *reliability.RetransmitQueue // alias: engine.RetransmitQ
 	rtt         *reliability.RTTEstimator    // alias: engine.RTT
 	replay      *reliability.ReplayWindow    // alias: engine.Replay
-	fragBuf     *FragmentBuffer              // reassembly buffer for fragmented payloads
 	connOnce    sync.Once                    // thread-safe Conn() init
 	conn        net.Conn                     // cached net.Conn wrapper
 
@@ -112,6 +111,22 @@ type noiseStream struct {
 	// aggressive enough to recover transient losses, while bounding the
 	// log/CPU cost when the path is durably broken.
 	lastStuckResetUnixNano atomic.Int64
+
+	// fragBuf reassembles the fragments of this stream's messages. Touched by
+	// the session's readLoop only (handleData, handleImplicitOpen,
+	// handleClose), which hands each completed message to deliverCh.
+	fragBuf *FragmentBuffer
+
+	// generation is this stream object's number among the session's streams
+	// (NoiseSession.streamGenerations), stamped on its fragments so the peer
+	// tells them from fragments of an earlier stream that used the same ID.
+	// Zero only for a stream built outside createStream, which then sends no
+	// fragments.
+	generation uint64
+
+	// messageIDs numbers the messages Send splits into fragments; the next ID
+	// is messageIDs.Add(1), so the first is 1 and none is 0.
+	messageIDs atomic.Uint64
 
 	// rack runs RFC 8985 time-based loss detection on this stream.
 	// Updated by handleACK on every successful ACK (Ack call), consulted
@@ -176,6 +191,7 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 		window:      flow.NewStreamWindowWithCap(cfg.InitialCredit, cfg.MaxCredit),
 		engine:      eng,
 		fragBuf:     NewFragmentBuffer(),
+		generation:  s.streamGenerations.Add(1),
 		sendWindow:  eng.SendWin,
 		recvWindow:  eng.RecvWin,
 		retransmitQ: eng.RetransmitQ,
@@ -447,20 +463,25 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 	// fragments so each fragment is a single UDP packet (no IP fragmentation).
 	// Lost fragments are individually retransmitted by the reliability engine.
 	maxPayload := MSSToMaxPayload(st.session.pmtuProber.MSS())
-	fragments, err := SplitPayload(data, maxPayload)
-	if err != nil {
-		// AE-H-03: payload exceeds the 255-fragment ceiling. Fail loudly
-		// instead of transmitting a silently-truncated message. Returning
-		// here (before streamCredited/connCredited are cleared) lets the
-		// deferred ReleaseUnsent guards return ALL consumed credit, since
-		// nothing reached the wire.
-		return fmt.Errorf("stream %d: %w", st.streamID, err)
+	var fragments [][]byte
+	if len(data) > maxPayload {
+		var err error
+		fragments, err = SplitMessage(st.session.fragmentBinding(st), st.messageIDs.Add(1), data, maxPayload)
+		if err != nil {
+			// A message past the fragment ceilings, or a session
+			// that cannot fragment (no realm, no negotiated envelope). Fail
+			// loudly instead of transmitting a silently-truncated message.
+			// Returning here (before streamCredited/connCredited are cleared)
+			// lets the deferred ReleaseUnsent guards return ALL consumed
+			// credit, since nothing reached the wire.
+			return fmt.Errorf("stream %d: %w", st.streamID, err)
+		}
 	}
 
 	if fragments != nil {
 		// Large payload — send as multiple fragments
 		for _, frag := range fragments {
-			if err := st.sendSingleFrame(ctx, frag); err != nil {
+			if err := st.sendSingleFrame(ctx, frag, aether.FlagFRAGMENT); err != nil {
 				return err
 			}
 		}
@@ -473,7 +494,7 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 	}
 
 	// Small payload — send as single frame (existing fast path)
-	if err := st.sendSingleFrame(ctx, data); err != nil {
+	if err := st.sendSingleFrame(ctx, data, 0); err != nil {
 		return err
 	}
 	streamCredited = false
@@ -482,14 +503,15 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 	return nil
 }
 
-// sendSingleFrame sends one frame (original small payload or one fragment).
-func (st *noiseStream) sendSingleFrame(ctx context.Context, data []byte) error {
+// sendSingleFrame sends one frame: a whole small message (extra 0) or one
+// fragment envelope (extra aether.FlagFRAGMENT).
+func (st *noiseStream) sendSingleFrame(ctx context.Context, data []byte, extra aether.FrameFlags) error {
 	frame := &aether.Frame{
 		SenderID:   st.session.LocalPeerID(),
 		ReceiverID: st.session.RemotePeerID(),
 		StreamID:   st.streamID,
 		Type:       aether.TypeDATA,
-		Flags:      aether.FlagANTIREPLAY, // enable anti-replay on all Noise-UDP frames
+		Flags:      aether.FlagANTIREPLAY | extra, // enable anti-replay on all Noise-UDP frames
 		Length:     uint32(len(data)),
 		Payload:    data,
 	}
@@ -566,36 +588,12 @@ func (st *noiseStream) Receive(ctx context.Context) ([]byte, error) {
 			if !ok {
 				return nil, io.EOF
 			}
-			// Fragment reassembly: if the payload starts with the fragment
-			// magic, buffer it and return the assembled payload only when
-			// all fragments have arrived.
-			if IsFragment(data) {
-				// Record credit for the raw fragment bytes even if the
-				// assembled payload isn't ready yet — the sender consumed
-				// window credit to transmit them and must get it back as
-				// the receiver progresses, not only on final reassembly.
-				// Otherwise a multi-fragment payload would stall the
-				// sender for the full reassembly span.
-				st.recordReceive(int64(len(data)))
-				// The receive channel does not carry the originating frame's
-				// SeqNo, so pass 0 — the per-stream FragmentBuffer will use
-				// its own monotonic counter to keep group keys unique.
-				// Stream-scoped FragmentBuffer state prevents cross-stream
-				// collisions; per-stream sequencing relies on the
-				// reliability layer delivering frames in order.
-				assembled, err := st.fragBuf.Add(st.streamID, 0, data)
-				if err != nil {
-					continue // skip corrupted fragment
-				}
-				if assembled == nil {
-					continue // more fragments needed — loop back to recvCh
-				}
-				return assembled, nil
-			}
-			// Non-fragmented payload — record credit for the bytes now
-			// that the application has received them. This advances both
-			// the stream-level and conn-level flow-control windows from
-			// the application's perspective (true consume-driven grants).
+			// recvCh holds whole messages only: the readLoop reassembles
+			// fragments (reassemble) before delivery. Record credit for the
+			// message now that the application has received it, which is the
+			// length the sender charged for it. This advances both the
+			// stream-level and conn-level flow-control windows from the
+			// application's perspective (true consume-driven grants).
 			st.recordReceive(int64(len(data)))
 			return data, nil
 		case <-ctx.Done():
@@ -604,6 +602,34 @@ func (st *noiseStream) Receive(ctx context.Context) ([]byte, error) {
 			return nil, fmt.Errorf("session closed")
 		}
 	}
+}
+
+// reassemble turns one in-order payload the receive window delivered into
+// what the stream's consumer receives. An unmarked payload is a whole message
+// and passes through. A marked one (its frame carried aether.FlagFRAGMENT) is a
+// fragment: it goes to fragBuf, and reassemble returns the message once its
+// last fragment arrives, and ok false until then or when the fragment is
+// refused. Bytes reassembly drops (a refused or duplicate fragment, a
+// discarded group) are granted back to the sender at once through both flow
+// windows, since the application will never read them. Called by the session's
+// readLoop only.
+func (st *noiseStream) reassemble(d reliability.RecvDelivery) (payload []byte, ok bool) {
+	if !d.Marked {
+		return d.Payload, true
+	}
+	s := st.session
+	msg, released, err := st.fragBuf.Add(s.fragRecv, st.streamID, d.Payload)
+	if released > 0 {
+		releaseCredit(st.window, released, st.streamID, s.sendWindowUpdateAgnostic)
+		if grant := s.connWindow.ReceiverConsume(released); grant > 0 {
+			s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
+		}
+	}
+	if err != nil {
+		dbgNoise.Printf("stream %d: fragment refused: %v", st.streamID, err)
+		return nil, false
+	}
+	return msg, msg != nil
 }
 
 // recordReceive advances flow-control credit accounting for bytes the

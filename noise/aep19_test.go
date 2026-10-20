@@ -47,7 +47,7 @@ func aep19IssueBlob(t *testing.T, ts *TicketStore) []byte {
 	if err != nil {
 		t.Fatalf("buildResumeCipherStates: %v", err)
 	}
-	blob, err := ts.IssueTicket(peerID, send, recv, capExplicitNonce, "", nil, aether.NegotiatedWireVersions{})
+	blob, err := ts.IssueTicket(peerID, send, recv, capExplicitNonce, "", nil, aether.NegotiatedWireVersions{}, networkKeyBinding{})
 	if err != nil {
 		t.Fatalf("IssueTicket: %v", err)
 	}

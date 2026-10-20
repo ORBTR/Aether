@@ -126,7 +126,14 @@ const (
 	FlagENCRYPTED  FrameFlags = 0x10 // Payload is AEAD encrypted
 	FlagCOMPRESSED FrameFlags = 0x20 // Payload is DEFLATE compressed
 	FlagANTIREPLAY FrameFlags = 0x40 // SeqNo doubles as anti-replay counter (sliding window)
-	// 0x80 is reserved for FlagCOMPOSITE_ACK (defined below with CompositeACK types)
+
+	// FlagFRAGMENT marks a TypeDATA frame whose payload is one fragment
+	// envelope (adapter.FragmentEnvelope) rather than a whole message, so the
+	// receiver tells the two apart from the frame and never from payload bytes.
+	// The bit is FlagCOMPOSITE_ACK's on TypeACK frames; the two never meet
+	// because each is read only on its own frame type (Frame.IsFragment). Only
+	// the full header carries it, so ShouldCompressData keeps such a frame full.
+	FlagFRAGMENT FrameFlags = 0x80
 )
 
 // Has returns true if the flag is set.
@@ -169,7 +176,9 @@ func (f FrameFlags) String() string {
 		parts = append(parts, "ANTIREPLAY")
 	}
 	if f.Has(FlagCOMPOSITE_ACK) {
-		parts = append(parts, "COMPOSITE_ACK")
+		// The bit is FlagCOMPOSITE_ACK on an ACK and FlagFRAGMENT on DATA; the
+		// flags alone do not say which.
+		parts = append(parts, "COMPOSITE_ACK|FRAGMENT")
 	}
 	if len(parts) == 0 {
 		return "0"
@@ -387,6 +396,14 @@ var minPayloadSizes = map[FrameType]uint32{
 // IsControl returns true if this is a control frame (not DATA).
 func (f *Frame) IsControl() bool {
 	return f.Type != TypeDATA
+}
+
+// IsFragment reports whether f is a DATA frame carrying one fragment envelope:
+// TypeDATA with FlagFRAGMENT. The session read paths (adapter NoiseSession and
+// TCPSession) route such a payload to reassembly and every other DATA payload
+// to the stream as a whole message.
+func (f *Frame) IsFragment() bool {
+	return f.Type == TypeDATA && f.Flags.Has(FlagFRAGMENT)
 }
 
 // ────────────────────────────────────────────────────────────────────────────

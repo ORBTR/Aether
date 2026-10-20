@@ -436,6 +436,26 @@ type NoiseSession struct {
 	// such a session writes and reads full frames only. Its compressors take
 	// their grammar from it. Frozen at construction, read lock-free.
 	wireVersions aether.NegotiatedWireVersions
+
+	// fragRecv is what every fragment this session receives must match: the
+	// chosen fragment envelope version, the network key conn's handshake bound
+	// (noiseConnNetworkKey), the remote PeerID and the peer's pinned
+	// incarnation. Every stream's FragmentBuffer checks against it. Set at
+	// construction, never replaced.
+	fragRecv *FragmentReceiver
+
+	// networkKeyID and networkKeyBound are the realm this session's fragment
+	// envelopes carry: the fingerprint of the network key conn's Noise
+	// handshake bound, unbound for a conn that reports none (an over-conn
+	// handshake or a test pipe), which then sends and receives no fragments.
+	// Frozen at construction, read lock-free.
+	networkKeyID    uint32
+	networkKeyBound bool
+
+	// streamGenerations numbers every stream object this session creates, so a
+	// stream ID opened again carries a higher generation on its fragments than
+	// the stream that used the ID before (FragmentBinding.Generation).
+	streamGenerations atomic.Uint64
 }
 
 // NewNoiseSession creates an Aether session over a Noise-encrypted
@@ -491,6 +511,11 @@ func NewNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 	if wv, ok := conn.(noiseConnWireVersions); ok {
 		s.wireVersions = wv.WireVersions()
 	}
+	if nk, ok := conn.(noiseConnNetworkKey); ok {
+		s.networkKeyID, s.networkKeyBound = nk.NetworkKeyID()
+	}
+	fragmentVersion, _ := s.wireVersions.Version(aether.WireVersionFragment)
+	s.fragRecv = NewFragmentReceiver(fragmentVersion, s.networkKeyID, s.networkKeyBound, s.RemotePeerID())
 	// The grammar both directions use: short forms only when the handshake
 	// chose frame.short. Set before readLoop and writeLoop start.
 	s.txCompressor.UseWireVersions(s.wireVersions)
@@ -1069,6 +1094,28 @@ type noiseConnAckDelay interface {
 // for one.
 type noiseConnWireVersions interface {
 	WireVersions() aether.NegotiatedWireVersions
+}
+
+// noiseConnNetworkKey is the surface *noiseConn exposes for the network key
+// its handshake's Noise prologue bound it to, by CRC32 fingerprint, or false
+// for a conn bound to none. NewNoiseSession reads it as the realm its fragment
+// envelopes carry and check.
+type noiseConnNetworkKey interface {
+	NetworkKeyID() (uint32, bool)
+}
+
+// fragmentBinding is what st stamps on the fragments of a message it splits.
+func (s *NoiseSession) fragmentBinding(st *noiseStream) FragmentBinding {
+	version, _ := s.wireVersions.Version(aether.WireVersionFragment)
+	return FragmentBinding{
+		Version:     version,
+		Realm:       s.networkKeyID,
+		RealmBound:  s.networkKeyBound,
+		Peer:        s.LocalPeerID(),
+		Incarnation: s.ConnectionID(),
+		StreamID:    st.streamID,
+		Generation:  st.generation,
+	}
 }
 
 // WireVersions returns the wire version set the session's Noise handshake

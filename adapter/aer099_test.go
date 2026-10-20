@@ -32,11 +32,9 @@ func aer099NewPair(t *testing.T) (client, server *TCPSession, cleanup func()) {
 	return client, server, cleanup
 }
 
-// TestAER099_LargeMessageRoundTripsAsOneReceive is the AER-099 regression: a
-// message larger than MaxFrameSize is fragmented on Send and MUST reassemble to
-// a SINGLE Receive() call with byte-identical content. Before the fix, Send
-// chopped the payload into headerless DATA frames with no grouping, so a
-// message-oriented peer saw a truncated head followed by extra Receive()
+// TestAER099_LargeMessageRoundTripsAsOneReceive: a
+// message larger than MaxFrameSize MUST arrive as a SINGLE Receive() call with
+// byte-identical content, not as a truncated head followed by extra Receive()
 // results — a silent message-boundary violation.
 func TestAER099_LargeMessageRoundTripsAsOneReceive(t *testing.T) {
 	client, server, cleanup := aer099NewPair(t)
@@ -56,9 +54,7 @@ func TestAER099_LargeMessageRoundTripsAsOneReceive(t *testing.T) {
 		t.Fatalf("accept stream: %v", err)
 	}
 
-	// 200 KB — comfortably above any class MaxFrameSize, so the payload must
-	// span several fragments (and stays under the 255-fragment ceiling even at
-	// a small 1200-byte MaxFrameSize: 200000/1196 ≈ 168 fragments).
+	// 200 KB — comfortably above any class MaxFrameSize.
 	msg := make([]byte, 200_000)
 	for i := range msg {
 		msg[i] = byte(i*31 + 7)
@@ -80,10 +76,9 @@ func TestAER099_LargeMessageRoundTripsAsOneReceive(t *testing.T) {
 	}
 }
 
-// TestAER099_MagicPrefixedSmallPayloadRoundTrips guards the AER-068/AER-099
-// interaction over TCP: a SMALL payload that happens to start with the fragment
-// magic ("FR") is escaped as a single fragment on Send and must still round-trip
-// intact — not be misread as a fragment header and lost/corrupted.
+// TestAER099_MagicPrefixedSmallPayloadRoundTrips: over TCP a SMALL payload that
+// starts with the bytes "FR" is ordinary data and must round-trip intact — not
+// be read as a fragment header and lost or corrupted.
 func TestAER099_MagicPrefixedSmallPayloadRoundTrips(t *testing.T) {
 	client, server, cleanup := aer099NewPair(t)
 	defer cleanup()
