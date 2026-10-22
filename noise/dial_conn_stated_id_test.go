@@ -42,6 +42,7 @@ func acceptFromDialerStating(t *testing.T, cfg AcceptConnConfig, priv, pub, tick
 		StaticPriv:       priv,
 		StaticPub:        pub,
 		Ticket:           ticket,
+		GrantRealmFn:     realmFromGrant,
 		HandshakeTimeout: 2 * time.Second,
 	}, clientConn)
 	a := <-out

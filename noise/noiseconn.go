@@ -159,12 +159,14 @@ type noiseConn struct {
 	wireVersions     aether.NegotiatedWireVersions
 	peerWireVersions aether.WireVersions
 
-	// networkKey is the network key the handshake's Noise prologue bound this
-	// conn to, by its CRC32 fingerprint (the value msg1 names it by), or the
-	// key a resumed conn's ticket recorded. Unbound on an over-conn conn,
-	// whose handshake has no network-key prologue. Written before the conn is
-	// handed to any reader and never changed; NetworkKeyID reports it.
-	networkKey networkKeyBinding
+	// realm is the mesh realm the handshake's Noise prologue bound this conn
+	// to, by the prologue's CRC32 fingerprint: on the mesh transport the
+	// network key id msg1 names it by, on an over-conn handshake with a grant
+	// the grant realm (GrantRealm.ID), or the binding a resumed conn's ticket
+	// recorded. Unbound on an over-conn conn whose handshake carried no grant.
+	// Written before the conn is handed to any reader and never changed;
+	// RealmID reports it.
+	realm realmBinding
 
 	// Observability counters (Concerns #5, #6)
 	decryptErrors uint64 // atomic: failed decrypt attempts
@@ -234,12 +236,12 @@ func (c *noiseConn) WireVersions() aether.NegotiatedWireVersions {
 	return c.wireVersions
 }
 
-// NetworkKeyID returns the fingerprint (crypto.CRC32Hash) of the network key
-// this conn's handshake bound it to, and false when it bound none.
-// adapter.NewNoiseSession reads it through its noiseConnNetworkKey probe as the
-// mesh realm its fragment envelopes carry and check.
-func (c *noiseConn) NetworkKeyID() (uint32, bool) {
-	return c.networkKey.id, c.networkKey.bound
+// RealmID returns the fingerprint (crypto/identity CRC32Hash of the Noise
+// prologue) of the mesh realm this conn's handshake bound it to, and false
+// when it bound none. adapter.NewNoiseSession reads it through its
+// noiseConnRealm probe as the realm its fragment envelopes carry and check.
+func (c *noiseConn) RealmID() (uint32, bool) {
+	return c.realm.id, c.realm.bound
 }
 
 func (c *noiseConn) runReader() {

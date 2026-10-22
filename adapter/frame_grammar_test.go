@@ -19,13 +19,14 @@ import (
 	"github.com/ORBTR/aether"
 )
 
-// frameOnlyOffer is a peer offer of the frame grammar and the fragment
-// envelope without the short-form table, so a session that negotiates with it
-// chooses no frame.short.
+// frameOnlyOffer is a peer offer of the frame grammar, the fragment envelope
+// and the reliability profile without the short-form table, so a session that
+// negotiates with it chooses no frame.short.
 func frameOnlyOffer() aether.WireVersions {
 	return aether.WireVersions{
 		{Name: aether.WireVersionFragment, Versions: []uint16{aether.WireVersionFragmentCurrent}, Required: true},
 		{Name: aether.WireVersionFrame, Versions: []uint16{2}, Required: true},
+		{Name: aether.WireVersionReliability, Versions: []uint16{1}, Required: true},
 	}
 }
 

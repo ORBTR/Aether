@@ -44,7 +44,7 @@ func TestAcceptOverConn_RefusesATicketSignerOfTheWrongLength(t *testing.T) {
 			}()
 			go func() {
 				_, _ = DialOverConn(ctx, DialConnConfig{LocalNodeID: "vl1_x", StaticPriv: dPriv, StaticPub: dPub,
-					Ticket: make([]byte, 64), HandshakeTimeout: 2 * time.Second}, clientConn)
+					Ticket: make([]byte, 64), GrantRealmFn: fixedRealm, HandshakeTimeout: 2 * time.Second}, clientConn)
 			}()
 
 			got := <-out

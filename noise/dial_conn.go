@@ -15,6 +15,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"time"
@@ -23,6 +24,12 @@ import (
 	transportHealth "github.com/ORBTR/aether/health"
 	"github.com/flynn/noise"
 )
+
+// ErrTicketWithoutGrantRealm refuses a DialConnConfig that carries a ticket
+// and no GrantRealmFn, and an AcceptConnConfig that verifies tickets and has
+// none: a session with a grant has the grant's realm, so an end that would
+// run the handshake without deriving it is misconfigured, not realmless.
+var ErrTicketWithoutGrantRealm = errors.New("noise: a ticket is carried or verified without GrantRealmFn")
 
 // dialConnHandshakeTimeout is the default deadline for a single
 // DialOverConn / AcceptOverConn operation. Short enough that a dead
@@ -57,6 +64,16 @@ type DialConnConfig struct {
 	RemotePeerHint   aether.NodeID // advisory; not a gate
 	HandshakeTimeout time.Duration
 	MaxPacket        int
+
+	// GrantRealmFn returns the realm Ticket's signed body binds the session to
+	// (GrantRealm), given the body without its 64-byte signature. DialOverConn
+	// sets GrantRealm.Prologue as the handshake's prologue and the conn reports
+	// GrantRealm.ID through RealmID, so an accepter that derives another realm
+	// from the same grant fails the handshake at msg2. It is required when
+	// Ticket is set and refused when Ticket is empty (ErrTicketWithoutGrantRealm
+	// either way): a dialer with a grant has the grant's realm, and one without
+	// a grant binds none and so neither sends nor admits fragments.
+	GrantRealmFn func(body []byte) (GrantRealm, error)
 
 	// WireVersions are the application's entries of the dialer's wire
 	// version offer, beside aether's own (aether.LocalWireVersions). The
@@ -109,6 +126,16 @@ type AcceptConnConfig struct {
 	// included: the cache forgets the nonce after it.
 	TicketNonceFn func(body []byte) (nonce []byte, expiresAt time.Time, err error)
 
+	// GrantRealmFn returns the realm the verified ticket body binds the
+	// session to (GrantRealm). It runs after the signature and ValidateTicketFn
+	// pass and before the handshake state is built, because GrantRealm.Prologue
+	// is that state's prologue; the conn reports GrantRealm.ID through RealmID.
+	// A dialer that derived another realm from the grant fails at msg3, before
+	// ValidatePeerStaticFn runs or the ticket's nonce is spent. It is required
+	// with a ticket signer and refused without one (ErrTicketWithoutGrantRealm,
+	// or the binding-without-signer refusal), like the other binding hooks.
+	GrantRealmFn func(body []byte) (GrantRealm, error)
+
 	// ExpectedNodeID, when non-empty, refuses a dialer whose stated node
 	// id is not this one. The dialer writes that id itself (see
 	// AcceptOverConn), so the check turns away a dial meant for another
@@ -135,6 +162,10 @@ type AcceptConnConfig struct {
 //	[uint16:ticketLen][ticketLen:ticket][uint32:noiseLen][noise msg1]
 //
 // Follow-up messages are [uint32:len][len:payload] framed.
+//
+// With a ticket, the handshake's prologue is the grant realm cfg.GrantRealmFn
+// reads from the ticket's body (GrantRealm), and the conn binds that realm;
+// without one the prologue is empty and the conn binds no realm.
 func DialOverConn(ctx context.Context, cfg DialConnConfig, conn net.Conn) (aether.Connection, error) {
 	if len(cfg.StaticPriv) == 0 || len(cfg.StaticPub) == 0 {
 		return nil, fmt.Errorf("noise: DialOverConn: StaticPriv/Pub required")
@@ -145,6 +176,26 @@ func DialOverConn(ctx context.Context, cfg DialConnConfig, conn net.Conn) (aethe
 	offer, err := aether.LocalWireVersions(cfg.WireVersions)
 	if err != nil {
 		return nil, fmt.Errorf("noise: DialOverConn: %w", err)
+	}
+	// The realm is derived before any byte moves, so a grant this side cannot
+	// read a realm from, or a config missing the reader, costs the accepter
+	// nothing.
+	var prologue []byte
+	var realm realmBinding
+	switch {
+	case len(cfg.Ticket) > 0 && cfg.GrantRealmFn == nil:
+		return nil, fmt.Errorf("noise: DialOverConn: %w", ErrTicketWithoutGrantRealm)
+	case len(cfg.Ticket) == 0 && cfg.GrantRealmFn != nil:
+		return nil, fmt.Errorf("noise: DialOverConn: GrantRealmFn set without a ticket")
+	case len(cfg.Ticket) > 0:
+		if len(cfg.Ticket) < ed25519.SignatureSize {
+			return nil, fmt.Errorf("noise: DialOverConn: ticket of %d bytes carries no %d-byte signature",
+				len(cfg.Ticket), ed25519.SignatureSize)
+		}
+		prologue, realm, err = grantRealmPrologue(cfg.GrantRealmFn, cfg.Ticket[:len(cfg.Ticket)-ed25519.SignatureSize])
+		if err != nil {
+			return nil, fmt.Errorf("noise: DialOverConn: %w", err)
+		}
 	}
 
 	timeout := cfg.HandshakeTimeout
@@ -166,6 +217,7 @@ func DialOverConn(ctx context.Context, cfg DialConnConfig, conn net.Conn) (aethe
 	hs, err := noise.NewHandshakeState(noise.Config{
 		Pattern:     noise.HandshakeXX,
 		Initiator:   true,
+		Prologue:    prologue,
 		CipherSuite: suite,
 		StaticKeypair: noise.DHKey{
 			Private: append([]byte(nil), cfg.StaticPriv...),
@@ -185,7 +237,9 @@ func DialOverConn(ctx context.Context, cfg DialConnConfig, conn net.Conn) (aethe
 		return nil, err
 	}
 
-	// Msg 2 — responder returns its NodeInfo payload.
+	// Msg 2 — responder returns its NodeInfo payload. Its ciphertext is bound
+	// to the prologue, so an accepter holding another realm for the grant
+	// fails here, and no msg3 is written.
 	msg2, err := readFrame(conn)
 	if err != nil {
 		return nil, fmt.Errorf("noise: read msg2: %w", err)
@@ -218,7 +272,7 @@ func DialOverConn(ctx context.Context, cfg DialConnConfig, conn net.Conn) (aethe
 		return nil, fmt.Errorf("noise: send msg3: %w", err)
 	}
 
-	return buildAetherConnectionOverConn(cfg.LocalNodeID, remoteNode, conn, sendCS, recvCS, maxPacket, chosen, remoteOffer), nil
+	return buildAetherConnectionOverConn(cfg.LocalNodeID, remoteNode, conn, sendCS, recvCS, maxPacket, chosen, remoteOffer, realm), nil
 }
 
 // AcceptOverConn is the responder-side counterpart of DialOverConn. It
@@ -259,8 +313,11 @@ func acceptOverConn(ctx context.Context, cfg AcceptConnConfig, conn net.Conn, dh
 			len(cfg.TrustedTicketSigner), ed25519.PublicKeySize)
 	}
 	ticketAuth := cfg.TrustedTicketSigner != nil || cfg.TrustedTicketSignerFn != nil
-	if !ticketAuth && (cfg.ValidatePeerStaticFn != nil || cfg.TicketNonces != nil || cfg.TicketNonceFn != nil) {
+	if !ticketAuth && (cfg.ValidatePeerStaticFn != nil || cfg.TicketNonces != nil || cfg.TicketNonceFn != nil || cfg.GrantRealmFn != nil) {
 		return nil, fmt.Errorf("noise: AcceptOverConn: ticket binding set without a ticket signer")
+	}
+	if ticketAuth && cfg.GrantRealmFn == nil {
+		return nil, fmt.Errorf("noise: AcceptOverConn: %w", ErrTicketWithoutGrantRealm)
 	}
 	if (cfg.TicketNonces == nil) != (cfg.TicketNonceFn == nil) {
 		return nil, fmt.Errorf("noise: AcceptOverConn: TicketNonces and TicketNonceFn are set together")
@@ -298,6 +355,8 @@ func acceptOverConn(ctx context.Context, cfg AcceptConnConfig, conn net.Conn, dh
 	var signer ed25519.PublicKey
 	var nonce []byte
 	var nonceExpires time.Time
+	var prologue []byte
+	var realm realmBinding
 	if ticketAuth {
 		if len(ticket) < ed25519.SignatureSize {
 			return nil, fmt.Errorf("noise: ticket required (got %d bytes, need >= %d)",
@@ -330,6 +389,13 @@ func acceptOverConn(ctx context.Context, cfg AcceptConnConfig, conn net.Conn, dh
 				return nil, fmt.Errorf("noise: ticket rejected: %w", err)
 			}
 		}
+		// The verified grant's realm is this handshake's prologue: a dialer
+		// that put another realm into its own fails at msg3 below, before
+		// ValidatePeerStaticFn runs or the nonce is spent.
+		prologue, realm, err = grantRealmPrologue(cfg.GrantRealmFn, body)
+		if err != nil {
+			return nil, fmt.Errorf("noise: AcceptOverConn: %w", err)
+		}
 		if cfg.TicketNonceFn != nil {
 			nonce, nonceExpires, err = cfg.TicketNonceFn(body)
 			if err != nil {
@@ -347,6 +413,7 @@ func acceptOverConn(ctx context.Context, cfg AcceptConnConfig, conn net.Conn, dh
 	hs, err := noise.NewHandshakeState(noise.Config{
 		Pattern:     noise.HandshakeXX,
 		Initiator:   false,
+		Prologue:    prologue,
 		CipherSuite: suite,
 		StaticKeypair: noise.DHKey{
 			Private: append([]byte(nil), cfg.StaticPriv...),
@@ -375,7 +442,9 @@ func acceptOverConn(ctx context.Context, cfg AcceptConnConfig, conn net.Conn, dh
 		return nil, fmt.Errorf("noise: send msg2: %w", err)
 	}
 
-	// Msg 3 — carries initiator's NodeInfo.
+	// Msg 3 — carries initiator's NodeInfo. A dialer whose prologue is another
+	// realm's never decrypts msg2, so no msg3 arrives from it, and one that
+	// writes msg3 under another prologue fails here.
 	msg3, err := readFrame(conn)
 	if err != nil {
 		return nil, fmt.Errorf("noise: read msg3: %w", err)
@@ -416,7 +485,7 @@ func acceptOverConn(ctx context.Context, cfg AcceptConnConfig, conn net.Conn, dh
 		}
 	}
 
-	return buildAetherConnectionOverConn(cfg.LocalNodeID, remoteNode, conn, sendCS, recvCS, maxPacket, chosen, remoteOffer), nil
+	return buildAetherConnectionOverConn(cfg.LocalNodeID, remoteNode, conn, sendCS, recvCS, maxPacket, chosen, remoteOffer, realm), nil
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────
@@ -492,7 +561,9 @@ func decodeMinimalNodeInfo(payload []byte) (aether.NodeID, aether.WireVersions, 
 // remote is the id decodeMinimalNodeInfo read from the peer's payload,
 // and the Connection reports it as RemoteNodeID unchecked. chosen and
 // peerOffer are the handshake's wire version set and the peer's offer; the
-// conn reports chosen through WireVersions.
+// conn reports chosen through WireVersions. realm is the grant realm the
+// handshake's prologue bound (grantRealmPrologue), unbound for a handshake
+// without a grant; the conn reports it through RealmID.
 func buildAetherConnectionOverConn(
 	local, remote aether.NodeID,
 	conn net.Conn,
@@ -500,6 +571,7 @@ func buildAetherConnectionOverConn(
 	maxPacket int,
 	chosen aether.NegotiatedWireVersions,
 	peerOffer aether.WireVersions,
+	realm realmBinding,
 ) aether.Connection {
 	cfg := aether.DefaultSessionConfig()
 	// remoteIdentity is intentionally left nil: this path exchanges a
@@ -521,6 +593,7 @@ func buildAetherConnectionOverConn(
 
 		wireVersions:     chosen,
 		peerWireVersions: peerOffer,
+		realm:            realm,
 	}
 	nc.parentStop = func() { _ = conn.Close() }
 	go nc.runReader()

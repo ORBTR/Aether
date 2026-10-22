@@ -38,6 +38,25 @@ func newTestKeypair(t *testing.T) ([]byte, []byte) {
 	return kp.Private, kp.Public
 }
 
+// realmFromGrant is the GrantRealmFn the tests give both ends: it reads the
+// partition and the target the test grants carry, as a consumer's reader of
+// the signaling DialTicketBody does.
+func realmFromGrant(body []byte) (GrantRealm, error) {
+	var g struct {
+		Scope  string `json:"scope"`
+		Target string `json:"target"`
+	}
+	if err := json.Unmarshal(body, &g); err != nil {
+		return GrantRealm{}, err
+	}
+	return GrantRealm{Partition: g.Scope, Target: g.Target}, nil
+}
+
+// fixedRealm is a GrantRealmFn for a grant whose body is not the test JSON.
+func fixedRealm([]byte) (GrantRealm, error) {
+	return GrantRealm{Partition: "tenant-42", Target: "vl1_bob"}, nil
+}
+
 // Round-trip: DialOverConn and AcceptOverConn against each other over a
 // net.Pipe must complete the handshake and produce sessions that each
 // believe the other to be the expected NodeID.
@@ -133,6 +152,7 @@ func TestAcceptOverConn_TicketGoodSignatureAccepted(t *testing.T) {
 				validated = true
 				return nil
 			},
+			GrantRealmFn:     realmFromGrant,
 			HandshakeTimeout: 2 * time.Second,
 		}, serverConn)
 	}()
@@ -142,6 +162,7 @@ func TestAcceptOverConn_TicketGoodSignatureAccepted(t *testing.T) {
 		StaticPriv:       aPriv,
 		StaticPub:        aPub,
 		Ticket:           ticket,
+		GrantRealmFn:     realmFromGrant,
 		HandshakeTimeout: 2 * time.Second,
 	}, clientConn); err != nil {
 		t.Fatalf("DialOverConn: %v", err)
@@ -187,6 +208,7 @@ func TestAcceptOverConn_TicketBadSignatureRejected(t *testing.T) {
 			StaticPriv:          bPriv,
 			StaticPub:           bPub,
 			TrustedTicketSigner: signerPub,
+			GrantRealmFn:        fixedRealm,
 			HandshakeTimeout:    2 * time.Second,
 		}, serverConn)
 	}()
@@ -196,6 +218,7 @@ func TestAcceptOverConn_TicketBadSignatureRejected(t *testing.T) {
 		StaticPriv:       aPriv,
 		StaticPub:        aPub,
 		Ticket:           ticket,
+		GrantRealmFn:     fixedRealm,
 		HandshakeTimeout: 2 * time.Second,
 	}, clientConn); err == nil {
 		t.Fatal("DialOverConn succeeded despite bad ticket sig on accept side")
@@ -244,6 +267,10 @@ func TestAcceptOverConn_EmptyTicketRejectedWhenSignerConfigured(t *testing.T) {
 				t.Error("ValidateTicketFn must not run for an empty ticket")
 				return nil
 			},
+			GrantRealmFn: func([]byte) (GrantRealm, error) {
+				t.Error("GrantRealmFn must not run for an empty ticket")
+				return GrantRealm{}, nil
+			},
 			HandshakeTimeout: 2 * time.Second,
 		}, serverConn)
 	}()
@@ -267,11 +294,13 @@ func TestAcceptOverConn_EmptyTicketRejectedWhenSignerConfigured(t *testing.T) {
 }
 
 // grantTicket signs a ticket body carrying the fields the binding hooks
-// below read: the initiator key the grant names, a nonce and an expiry.
+// below read: the target and partition the realm is derived from, the
+// initiator key the grant names, a nonce and an expiry.
 func grantTicket(t *testing.T, signer ed25519.PrivateKey, browserPub, nonce []byte, exp time.Time) []byte {
 	t.Helper()
 	body, err := json.Marshal(map[string]any{
 		"target":     "vl1_bob",
+		"scope":      "partition-A",
 		"browserPub": hex.EncodeToString(browserPub),
 		"nonce":      hex.EncodeToString(nonce),
 		"exp":        exp.Unix(),
@@ -326,6 +355,7 @@ func bindingAcceptConfig(t *testing.T, signerPub ed25519.PublicKey, cache *Ticke
 			_, nonce, exp, err := grantFields(body)
 			return nonce, exp, err
 		},
+		GrantRealmFn:     realmFromGrant,
 		HandshakeTimeout: 2 * time.Second,
 	}
 }
@@ -354,6 +384,7 @@ func acceptWithDialer(cfg AcceptConnConfig, priv, pub, ticket []byte) error {
 			StaticPriv:       priv,
 			StaticPub:        pub,
 			Ticket:           ticket,
+			GrantRealmFn:     realmFromGrant,
 			HandshakeTimeout: 2 * time.Second,
 		}, clientConn)
 		if err == nil {
@@ -446,6 +477,8 @@ func TestAcceptOverConn_NonceSpentPerSigner(t *testing.T) {
 	grant := func(signer string, key ed25519.PrivateKey) []byte {
 		body, err := json.Marshal(map[string]any{
 			"signer":     signer,
+			"target":     "vl1_bob",
+			"scope":      "partition-" + signer,
 			"browserPub": hex.EncodeToString(browserPub),
 			"nonce":      hex.EncodeToString([]byte("nonce-shared-0001")),
 			"exp":        exp.Unix(),
@@ -558,6 +591,7 @@ func TestAcceptOverConn_ReplayedNonceRefusedBeforeHandshake(t *testing.T) {
 				StaticPriv:       browserPriv,
 				StaticPub:        browserPub,
 				Ticket:           ticket,
+				GrantRealmFn:     realmFromGrant,
 				HandshakeTimeout: 2 * time.Second,
 			}, clientConn)
 			if err == nil {
@@ -638,13 +672,18 @@ func TestAcceptOverConn_TicketBindingConfigRefused(t *testing.T) {
 	cacheOnly.TicketNonceFn = nil
 	fnOnly := base
 	fnOnly.TicketNonces = nil
+	noRealm := base
+	noRealm.GrantRealmFn = nil
+	realmOnly := AcceptConnConfig{LocalNodeID: base.LocalNodeID, StaticPriv: base.StaticPriv, StaticPub: base.StaticPub, GrantRealmFn: realmFromGrant}
 	for name, tc := range map[string]struct {
 		cfg    AcceptConnConfig
 		reason string
 	}{
-		"binding without a signer":   {noSigner, "ticket binding set without a ticket signer"},
-		"nonce cache without reader": {cacheOnly, "TicketNonces and TicketNonceFn are set together"},
-		"nonce reader without cache": {fnOnly, "TicketNonces and TicketNonceFn are set together"},
+		"binding without a signer":      {noSigner, "ticket binding set without a ticket signer"},
+		"nonce cache without reader":    {cacheOnly, "TicketNonces and TicketNonceFn are set together"},
+		"nonce reader without cache":    {fnOnly, "TicketNonces and TicketNonceFn are set together"},
+		"signer without a realm reader": {noRealm, ErrTicketWithoutGrantRealm.Error()},
+		"realm reader without a signer": {realmOnly, "ticket binding set without a ticket signer"},
 	} {
 		_, serverConn := net.Pipe()
 		conn := &unreadConn{Conn: serverConn}
