@@ -72,7 +72,8 @@ func DialSessionOverConn(ctx context.Context, cfg noise.DialConnConfig, conn net
 // connection with the full session layer. The session's RemoteNodeID,
 // and the RemotePeerID cut from it, are the id the dialer stated for
 // itself, which nothing verifies (see noise.AcceptOverConn): identity,
-// partition and capabilities come from the verified ticket.
+// partition and capabilities come from the verified ticket, and so does the
+// session's realm (cfg.GrantRealmFn), which its fragment envelopes carry.
 func AcceptSessionOverConn(ctx context.Context, cfg noise.AcceptConnConfig, conn net.Conn, opts aether.SessionOptions) (*NoiseSession, error) {
 	aetherConn, err := noise.AcceptOverConn(ctx, cfg, conn)
 	if err != nil {
@@ -131,16 +132,20 @@ func DialSessionOverBrowserWS(ctx context.Context, localNodeID aether.NodeID, st
 // treats an empty ticket as "no ticket"; the responder enforces one ONLY when
 // its noise.AcceptConnConfig.TrustedTicketSigner is non-nil (otherwise the
 // ticket block is skipped and a ticketless conn is accepted). Pass a non-nil
-// ticket when the accept side sets TrustedTicketSigner.
-func DialSessionOverConnEphemeral(ctx context.Context, localNodeID aether.NodeID, ticket []byte, conn net.Conn, opts aether.SessionOptions) (*NoiseSession, error) {
+// ticket when the accept side sets TrustedTicketSigner, and with it
+// grantRealm, the reader of the grant's realm (noise.DialConnConfig.
+// GrantRealmFn); a session without a ticket has no realm and sends no message
+// larger than one frame, one with a ticket carries the grant's realm and does.
+func DialSessionOverConnEphemeral(ctx context.Context, localNodeID aether.NodeID, ticket []byte, grantRealm func(body []byte) (noise.GrantRealm, error), conn net.Conn, opts aether.SessionOptions) (*NoiseSession, error) {
 	kp, err := fnoise.DH25519.GenerateKeypair(rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("adapter: DialSessionOverConnEphemeral: generate ephemeral keypair: %w", err)
 	}
 	return DialSessionOverConn(ctx, noise.DialConnConfig{
-		LocalNodeID: localNodeID,
-		StaticPriv:  kp.Private,
-		StaticPub:   kp.Public,
-		Ticket:      ticket,
+		LocalNodeID:  localNodeID,
+		StaticPriv:   kp.Private,
+		StaticPub:    kp.Public,
+		Ticket:       ticket,
+		GrantRealmFn: grantRealm,
 	}, conn, opts)
 }

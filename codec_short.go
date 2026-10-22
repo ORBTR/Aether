@@ -676,7 +676,15 @@ func (c *Compressor) DecodeACKShortFull(r io.Reader) (*Frame, error) {
 // Varint helpers
 // ────────────────────────────────────────────────────────────────────────────
 
-// EncodeVarLength writes a variable-length uint32.
+// ErrVarLengthNoncanonical is the refusal of a variable-length integer whose
+// encoding is not the one EncodeVarLength writes for its value: a value below
+// 128 in two or five bytes, a value below 16384 in five bytes, or a two-byte
+// form whose value is 16384 or more. DecodeVarLength returns it before the
+// 0x86 decoder (DecodeDataShortVar) reads a payload, so a length that has two
+// readings never sizes a slice.
+var ErrVarLengthNoncanonical = errors.New("aether: variable-length integer not canonical")
+
+// EncodeVarLength writes a variable-length uint32 in its one canonical form:
 //
 //	0-127:     1 byte  (value literal)
 //	128-16383: 2 bytes (0x80|high, low)
@@ -694,7 +702,11 @@ func EncodeVarLength(w io.Writer, v uint32) (int, error) {
 	return w.Write(buf[:])
 }
 
-// DecodeVarLength reads a variable-length uint32.
+// DecodeVarLength reads a variable-length uint32 and the number of bytes it
+// occupied. An encoding longer than VarLengthSize gives for its value, or a
+// two-byte form carrying a value the two-byte form does not reach, is refused
+// with ErrVarLengthNoncanonical after its bytes are read and before the caller
+// reads anything the value would size; the count returned is the bytes read.
 func DecodeVarLength(r io.Reader) (uint32, int, error) {
 	var first [1]byte
 	if _, err := io.ReadFull(r, first[:]); err != nil {
@@ -708,16 +720,27 @@ func DecodeVarLength(r io.Reader) (uint32, int, error) {
 		if _, err := io.ReadFull(r, second[:]); err != nil {
 			return 0, 1, err
 		}
-		return uint32(first[0]&0x7F)<<8 | uint32(second[0]), 2, nil
+		v := uint32(first[0]&0x7F)<<8 | uint32(second[0])
+		if VarLengthSize(v) != 2 {
+			return 0, 2, fmt.Errorf("%w: value %d in 2 bytes (% x), canonical form is %d byte(s)",
+				ErrVarLengthNoncanonical, v, []byte{first[0], second[0]}, VarLengthSize(v))
+		}
+		return v, 2, nil
 	}
 	var buf [4]byte
 	if _, err := io.ReadFull(r, buf[:]); err != nil {
 		return 0, 1, err
 	}
-	return binary.BigEndian.Uint32(buf[:]), 5, nil
+	v := binary.BigEndian.Uint32(buf[:])
+	if VarLengthSize(v) != 5 {
+		return 0, 5, fmt.Errorf("%w: value %d in 5 bytes, canonical form is %d byte(s)",
+			ErrVarLengthNoncanonical, v, VarLengthSize(v))
+	}
+	return v, 5, nil
 }
 
-// VarLengthSize returns how many bytes a varint would use.
+// VarLengthSize returns the bytes of the one canonical encoding of v, which
+// DecodeVarLength holds every encoding it admits to.
 func VarLengthSize(v uint32) int {
 	if v <= 127 {
 		return 1

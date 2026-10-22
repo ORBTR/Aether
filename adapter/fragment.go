@@ -25,7 +25,7 @@ import (
 // Envelope layout (FragmentEnvelopeSize bytes, big-endian):
 //
 //	[1  version]          aether.WireVersionFragmentCurrent
-//	[4  realm]            network key id of the sending session
+//	[4  realm]            the sending session's realm (FragmentEnvelope.Realm)
 //	[8  peer]             the sender's PeerID
 //	[8  incarnation]      the sending session's ConnectionID
 //	[8  stream ID]
@@ -111,8 +111,8 @@ const (
 	// FragmentNotNegotiated: the session chose no fragment envelope version
 	// this build writes and reads.
 	FragmentNotNegotiated FragmentRefusal = "fragment envelope not negotiated"
-	// FragmentNoRealm: the session is bound to no network key, so a fragment
-	// would carry no realm.
+	// FragmentNoRealm: the session's handshake bound no realm (neither a
+	// network key nor a grant), so a fragment would carry none.
 	FragmentNoRealm FragmentRefusal = "session has no realm"
 	FragmentVersion FragmentRefusal = "unsupported envelope version"
 	// FragmentTruncated: fewer bytes than one envelope.
@@ -160,11 +160,14 @@ func refuse(reason FragmentRefusal, format string, args ...interface{}) error {
 // FragmentEnvelope is the header of one fragment (layout above).
 type FragmentEnvelope struct {
 	Version uint8
-	// Realm is the mesh realm the sending session's identity binds it to:
-	// the network key id, the CRC32 fingerprint (crypto/identity CRC32Hash) of
-	// the network key its Noise prologue bound, which noiseConn reports
-	// through NetworkKeyID. A session bound to no network key has no realm
-	// and neither sends nor admits fragments.
+	// Realm is the mesh realm the sending session's handshake bound it to, as
+	// the CRC32 fingerprint (crypto/identity CRC32Hash) of its Noise prologue,
+	// which noiseConn reports through RealmID: on a device-mesh or
+	// endpoint-mesh session the network key id, on an over-conn session (the
+	// browser's WebSocket, the agent's accept) the grant realm both ends
+	// derived from the grant's partition and target (noise.GrantRealm.ID). A
+	// session whose handshake bound neither has no realm and neither sends
+	// nor admits fragments.
 	Realm          uint32
 	Peer           aether.PeerID
 	Incarnation    aether.ConnectionID
@@ -221,8 +224,7 @@ func ParseFragment(b []byte) (FragmentEnvelope, []byte, error) {
 
 // FragmentBinding is what one sending stream stamps on its fragments.
 // NoiseSession and TCPSession build it from the session (chosen fragment
-// version, network key, own PeerID, ConnectionID) and the stream (ID,
-// generation).
+// version, realm, own PeerID, ConnectionID) and the stream (ID, generation).
 type FragmentBinding struct {
 	// Version is the session's chosen aether.WireVersionFragment version, 0
 	// when it chose none.
@@ -317,7 +319,8 @@ type FragmentReceiver struct {
 
 // NewFragmentReceiver returns the receiver side of a session: version is the
 // chosen aether.WireVersionFragment version (0 when none was chosen), realm
-// and realmBound the session's network key, peer the remote PeerID.
+// and realmBound the session's realm (FragmentEnvelope.Realm), peer the
+// remote PeerID.
 func NewFragmentReceiver(version uint16, realm uint32, realmBound bool, peer aether.PeerID) *FragmentReceiver {
 	return &FragmentReceiver{version: version, realm: realm, realmBound: realmBound, peer: peer}
 }

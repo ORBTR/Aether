@@ -440,7 +440,7 @@ func TestResume_ResponderRefusesTicketWhoseSetThisBuildWouldNotChoose(t *testing
 			recorded := mustChoose(t, peerOffer, peerOffer)
 			send, recv := cipherPair(t)
 			peer := aether.NodeID("vl1_resume_peer")
-			opaque, err := resp.ticketStore.IssueTicket(peer, send, recv, capExplicitNonce, "", peerOffer, recorded, networkKeyBinding{id: 0xfeedbeef, bound: true})
+			opaque, err := resp.ticketStore.IssueTicket(peer, send, recv, capExplicitNonce, "", peerOffer, recorded, realmBinding{id: 0xfeedbeef, bound: true})
 			if err != nil {
 				t.Fatalf("IssueTicket: %v", err)
 			}
@@ -477,8 +477,8 @@ func TestResume_ResponderRefusesTicketWhoseSetThisBuildWouldNotChoose(t *testing
 					if got := chosenOn(t, in.Session); !got.Equal(recorded) {
 						t.Fatalf("resumed session reports %v, want %v", got, recorded)
 					}
-					if id, bound := networkKeyOn(t, in.Session); !bound || id != 0xfeedbeef {
-						t.Fatalf("resumed session reports network key %08x, %v; want the ticket's feedbeef", id, bound)
+					if id, bound := realmOn(t, in.Session); !bound || id != 0xfeedbeef {
+						t.Fatalf("resumed session reports realm %08x, %v; want the ticket's feedbeef", id, bound)
 					}
 					_ = in.Session.Close()
 				case <-time.After(time.Second):
@@ -581,7 +581,7 @@ func TestTicket_CarriesWireVersions(t *testing.T) {
 	offer, _ := aether.LocalWireVersions(aether.WireVersions{{Name: "gossip.codec", Versions: []uint16{4}, Required: true}})
 	chosen := mustChoose(t, offer, offer)
 	send, recv := cipherPair(t)
-	blob, err := ts.IssueTicket("vl1_peer", send, recv, 0, "scope-a", offer, chosen, networkKeyBinding{})
+	blob, err := ts.IssueTicket("vl1_peer", send, recv, 0, "scope-a", offer, chosen, realmBinding{})
 	if err != nil {
 		t.Fatalf("IssueTicket: %v", err)
 	}

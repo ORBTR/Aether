@@ -66,6 +66,7 @@ func TestAcceptOverConn_PerPartitionSignerResolved(t *testing.T) {
 			StaticPriv:            bPriv,
 			StaticPub:             bPub,
 			TrustedTicketSignerFn: signerFor(keys),
+			GrantRealmFn:          realmFromGrant,
 			HandshakeTimeout:      2 * time.Second,
 		}, serverConn)
 	}()
@@ -75,6 +76,7 @@ func TestAcceptOverConn_PerPartitionSignerResolved(t *testing.T) {
 		StaticPriv:       aPriv,
 		StaticPub:        aPub,
 		Ticket:           ticket,
+		GrantRealmFn:     realmFromGrant,
 		HandshakeTimeout: 2 * time.Second,
 	}, clientConn); err != nil {
 		t.Fatalf("DialOverConn: %v", err)
@@ -124,6 +126,7 @@ func TestAcceptOverConn_PerPartitionCrossPartitionForgeryRejected(t *testing.T) 
 			StaticPriv:            bPriv,
 			StaticPub:             bPub,
 			TrustedTicketSignerFn: signerFor(keys),
+			GrantRealmFn:          realmFromGrant,
 			HandshakeTimeout:      2 * time.Second,
 		}, serverConn)
 	}()
@@ -134,6 +137,7 @@ func TestAcceptOverConn_PerPartitionCrossPartitionForgeryRejected(t *testing.T) 
 		StaticPriv:       aPriv,
 		StaticPub:        aPub,
 		Ticket:           ticket,
+		GrantRealmFn:     realmFromGrant,
 		HandshakeTimeout: 2 * time.Second,
 	}, clientConn)
 	wg.Wait()

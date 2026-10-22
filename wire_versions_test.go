@@ -328,7 +328,7 @@ func TestLocalWireVersions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LocalWireVersions(nil): %v", err)
 	}
-	want := WireVersions{wv(WireVersionFragment, true, 2), wv(WireVersionFrame, true, 2), wv(WireVersionFrameShort, false, 1)}
+	want := WireVersions{wv(WireVersionFragment, true, 2), wv(WireVersionFrame, true, 2), wv(WireVersionFrameShort, false, 1), wv(WireVersionReliability, true, 1)}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("aether entries = %+v, want %+v", got, want)
 	}
@@ -337,7 +337,7 @@ func TestLocalWireVersions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LocalWireVersions(app): %v", err)
 	}
-	want = WireVersions{wv("fragment", true, 2), wv("frame", true, 2), wv("frame.short", false, 1), wv("gossip.codec", true, 1), wv("streams.registry", true, 1)}
+	want = WireVersions{wv("fragment", true, 2), wv("frame", true, 2), wv("frame.short", false, 1), wv("gossip.codec", true, 1), wv("reliability", true, 1), wv("streams.registry", true, 1)}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("merged = %+v, want %+v", got, want)
 	}

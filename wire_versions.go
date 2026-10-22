@@ -38,17 +38,26 @@ type WireVersions []WireVersion
 // messages they make up. frame is the full-frame grammar a session's frames are
 // read and written in; it is required because no frame can be read without it.
 // frame.short is the short-frame table; it is optional because a session that
-// does not choose it writes full frames only.
+// does not choose it writes full frames only. reliability is the profile a
+// session's streams run: version 1 is the Full profile (adapter.NoiseSession's
+// reliability.Engine per stream, with its composite ACK, retransmit, flow and
+// congestion frames) and the Lite profile (adapter.TCPSession on a natively
+// reliable byte stream, observation only) as this build runs them. It is
+// required because a peer running another profile version reads the ACK,
+// retransmit and flow frames of this one differently, so no stream could be
+// published between the two.
 const (
-	WireVersionFragment   = "fragment"
-	WireVersionFrame      = "frame"
-	WireVersionFrameShort = "frame.short"
+	WireVersionFragment    = "fragment"
+	WireVersionFrame       = "frame"
+	WireVersionFrameShort  = "frame.short"
+	WireVersionReliability = "reliability"
 
 	// WireVersionFragmentCurrent is the fragment envelope version this build
 	// writes and reads; adapter.FragmentEnvelope's version byte carries it.
-	WireVersionFragmentCurrent   uint16 = 2
-	wireVersionFrameCurrent      uint16 = 2
-	wireVersionFrameShortCurrent uint16 = 1
+	WireVersionFragmentCurrent    uint16 = 2
+	wireVersionFrameCurrent       uint16 = 2
+	wireVersionFrameShortCurrent  uint16 = 1
+	wireVersionReliabilityCurrent uint16 = 1
 )
 
 // MaxWireVersionsEncodedSize bounds one encoded set. The preface reader and
@@ -98,12 +107,14 @@ func (e *WireVersionMismatchError) Error() string {
 func (e *WireVersionMismatchError) Is(target error) bool { return target == ErrWireVersionMismatch }
 
 // AetherWireVersions returns the entries this build of aether offers for
-// itself. LocalWireVersions adds them to every offer.
+// itself, in canonical (name) order. LocalWireVersions adds them to every
+// offer.
 func AetherWireVersions() WireVersions {
 	return WireVersions{
 		{Name: WireVersionFragment, Versions: []uint16{WireVersionFragmentCurrent}, Required: true},
 		{Name: WireVersionFrame, Versions: []uint16{wireVersionFrameCurrent}, Required: true},
 		{Name: WireVersionFrameShort, Versions: []uint16{wireVersionFrameShortCurrent}},
+		{Name: WireVersionReliability, Versions: []uint16{wireVersionReliabilityCurrent}, Required: true},
 	}
 }
 

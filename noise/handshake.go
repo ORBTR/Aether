@@ -195,7 +195,7 @@ func (t *NoiseTransport) performInitiatorHandshakeAttempt(ctx context.Context, u
 	nc.scopeID = preamblePartitionID
 	nc.peerMaxAckDelay = decodeMaxAckDelay(remoteMaxAckDelayUS)
 	nc.wireVersions, nc.peerWireVersions = chosen, remote.WireVersions
-	nc.networkKey = networkKeyBinding{id: fingerprint, bound: true}
+	nc.realm = realmBinding{id: fingerprint, bound: true}
 
 	// Negotiate explicit nonce mode if both sides support it
 	if remoteCaps&capExplicitNonce != 0 {
@@ -527,7 +527,7 @@ recvLoop:
 	nc.scopeID = preamblePartitionID
 	nc.peerMaxAckDelay = decodeMaxAckDelay(remoteMaxAckDelayUS)
 	nc.wireVersions, nc.peerWireVersions = chosen, remote.WireVersions
-	nc.networkKey = networkKeyBinding{id: fingerprint, bound: true}
+	nc.realm = realmBinding{id: fingerprint, bound: true}
 	// Cross-origin: persist the preamble target on the noiseConn so the
 	// writeFunc continues to prepend it on every post-handshake send.
 	// Without this, data packets from initiator → cross-origin peer land
@@ -776,9 +776,9 @@ type listenerHandshake struct {
 	// nonce is therefore applied per-send by wrapDialResponse, not cached.
 	response []byte
 	scopeID  string // Extracted from preamble (empty for dedicated transports)
-	// networkKey is the fingerprint of the prologue key resolveHandshakeKey
-	// chose for this handshake; the accepted conn reports it.
-	networkKey networkKeyBinding
+	// realm is the fingerprint of the network key resolveHandshakeKey chose as
+	// this handshake's prologue; the accepted conn reports it through RealmID.
+	realm realmBinding
 	// dialNonce is the nonce of the dial that CREATED this entry. Kept for
 	// diagnostics only — never use it to answer a later msg1, which may carry
 	// a newer nonce (see currentDialNonce).
@@ -933,7 +933,7 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 			return
 		}
 		hs = &listenerHandshake{state: state, created: time.Now(), scopeID: scopeID, dialNonce: dialNonce,
-			networkKey: networkKeyBinding{id: transportCrypto.CRC32Hash(prologue), bound: true}}
+			realm: realmBinding{id: transportCrypto.CRC32Hash(prologue), bound: true}}
 		l.evictOldestHandshakeLocked() // AE-P-21: hard cap on incomplete-handshake map
 		l.handshakes[key] = hs
 
@@ -1056,7 +1056,7 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 	nc.scopeID = scopeID
 	nc.peerMaxAckDelay = decodeMaxAckDelay(remoteMaxAckDelayUS)
 	nc.wireVersions, nc.peerWireVersions = chosen, remote.WireVersions
-	nc.networkKey = hs.networkKey
+	nc.realm = hs.realm
 
 	// Negotiate explicit nonce mode if both sides support it
 	if remoteCaps&capExplicitNonce != 0 {
@@ -1127,7 +1127,7 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 	// wants to resume dialing A), B needs the material delivered over
 	// the wire — see TODO below for the 0xFA delivery packet.
 	if l.transport.ticketStore != nil {
-		if ticket, err := l.transport.ticketStore.IssueTicket(remoteNode, cs2, cs1, remoteCaps, scopeID, remote.WireVersions, chosen, nc.networkKey); err == nil {
+		if ticket, err := l.transport.ticketStore.IssueTicket(remoteNode, cs2, cs1, remoteCaps, scopeID, remote.WireVersions, chosen, nc.realm); err == nil {
 			dbgHandshake.Printf("Issued session ticket for %s (%d bytes)", remoteNode.Short(), len(ticket))
 			// Build the resume material from the responder's perspective
 			// captured pre-session. Initiator needs swapped keys: their
@@ -1139,14 +1139,14 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 			// its offer and PeerOffer and skips the resume when the result is
 			// not Chosen.
 			material := &resumeMaterial{
-				Opaque:     ticket,
-				SendKey:    cs1.UnsafeKey(),
-				RecvKey:    cs2.UnsafeKey(),
-				Caps:       remoteCaps,
-				ExpiresAt:  time.Now().Add(l.transport.ticketStore.ttl),
-				PeerOffer:  l.transport.wireVersions,
-				Chosen:     chosen,
-				NetworkKey: nc.networkKey,
+				Opaque:    ticket,
+				SendKey:   cs1.UnsafeKey(),
+				RecvKey:   cs2.UnsafeKey(),
+				Caps:      remoteCaps,
+				ExpiresAt: time.Now().Add(l.transport.ticketStore.ttl),
+				PeerOffer: l.transport.wireVersions,
+				Chosen:    chosen,
+				Realm:     nc.realm,
 			}
 			// Populate initiator-side cache for the co-located case.
 			// Node that's both responder + initiator (typical mesh)
