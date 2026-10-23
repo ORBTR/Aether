@@ -72,6 +72,40 @@ func IsShortHeader(firstByte byte) bool {
 // Noise write paths never reach it.
 var ErrShortFormsNotNegotiated = errors.New("aether: short forms not negotiated for this session")
 
+// ErrShortFormOverflow is the refusal of a short-form encode whose frame holds
+// a value the form's narrowed field cannot carry: a StreamID above
+// MaxShortHeaderStreamID, or an ACK payload longer than the 0x88 form's u16
+// length. The encoder returns it before writing anything, so a narrowed field
+// is never truncated on the wire; the ShouldCompress checks refuse the same
+// frames, which is how the TCP and Noise write paths keep them full.
+var ErrShortFormOverflow = errors.New("aether: short form cannot carry the frame's field")
+
+// ErrShortFormInvalid is the refusal of a short-form value the table does not
+// admit: a control type outside PING, PONG, CLOSE and RESET, an ACK-lite whose
+// bitmap-length or flags byte is not zero (the form carries no bitmap and no
+// extension bytes, so a non-zero value has two lengths), or a batch of zero
+// frames. Encoders return it before writing; decoders after the fixed header
+// and before building a frame or reading a payload.
+var ErrShortFormInvalid = errors.New("aether: short form carries a value its table does not admit")
+
+// ErrSequenceWrap is the refusal of a short DATA form (0x82, 0x86, 0x87) whose
+// low 16 sequence bits, read against the stream's expected sequence, name a
+// sequence past MaxUint32. The decoders return it before the payload is read
+// and before the stream's recorded sequence moves. The encoder never writes
+// such a frame: ShouldCompressData keeps a frame whose SeqNo is below the
+// stream's last one, which is what a sequence wrap looks like to it, in the
+// full header.
+var ErrSequenceWrap = errors.New("aether: short form sequence wraps the sequence space")
+
+// shortStreamID narrows f's StreamID to the short-header field, refusing one
+// that does not fit.
+func shortStreamID(f *Frame) (uint16, error) {
+	if f.StreamID > MaxShortHeaderStreamID {
+		return 0, fmt.Errorf("%w: stream %d above %d", ErrShortFormOverflow, f.StreamID, MaxShortHeaderStreamID)
+	}
+	return uint16(f.StreamID), nil
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Per-stream and session state
 // ────────────────────────────────────────────────────────────────────────────
@@ -147,6 +181,30 @@ func (c *Compressor) GetOrCreateStream(streamID uint64) *StreamCompState {
 // RemoveStream cleans up state for a closed stream.
 func (c *Compressor) RemoveStream(streamID uint64) {
 	c.streams.Delete(streamID)
+}
+
+// recordedSeqNo returns the last sequence recorded on streamID, 0 for a stream
+// with no state, without creating any. The short DATA decoders read it before
+// they have admitted a frame, so a frame they refuse leaves no stream entry.
+func (c *Compressor) recordedSeqNo(streamID uint64) uint32 {
+	v, ok := c.streams.Load(streamID)
+	if !ok {
+		return 0
+	}
+	s := v.(*StreamCompState)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastSeqNo
+}
+
+// recordShortData records a decoded short DATA frame's sequence on its stream,
+// creating the stream's state on its first admitted frame.
+func (c *Compressor) recordShortData(streamID uint64, seqNo uint32) {
+	s := c.GetOrCreateStream(streamID)
+	s.mu.Lock()
+	s.lastSeqNo = seqNo
+	s.frameCount++
+	s.mu.Unlock()
 }
 
 // RecordFullHeader updates both session and stream state after a full header.
@@ -309,8 +367,12 @@ func (c *Compressor) ShouldCompressACK(f *Frame) bool {
 // ────────────────────────────────────────────────────────────────────────────
 
 // reconstructSeqNo recovers a full 32-bit sequence number from the low 16
-// bits carried on the wire, choosing the candidate closest to the expected
-// next sequence number (QUIC packet-number decoding, RFC 9000 §A.3).
+// bits carried on the wire, choosing the candidate closest to the sequence
+// expected after last, the stream's recorded sequence (QUIC packet-number
+// decoding, RFC 9000 §A.3). A candidate above MaxUint32 is refused with
+// ErrSequenceWrap: the short forms read sequences inside the 32-bit space and
+// never around its end, and the encoder puts a frame that would cross it in
+// the full header (ShouldCompressData's non-negative delta).
 //
 // AER-047: short DATA headers carry the low 16 bits of the ABSOLUTE SeqNo,
 // not a delta from the previously decoded frame. Delta chaining assumed
@@ -320,8 +382,11 @@ func (c *Compressor) ShouldCompressACK(f *Frame) bool {
 // under a lost frame's sequence number (silent transposition), while the real
 // frame's retransmit was then dropped as a duplicate. Absolute-low-bits +
 // closest-to-expected reconstruction tolerates any gap < 32768 with no chain.
-func reconstructSeqNo(expected uint32, low uint16) uint32 {
-	candidate := (expected & 0xFFFF0000) | uint32(low)
+func reconstructSeqNo(last uint32, low uint16) (uint32, error) {
+	// 64-bit arithmetic keeps expected and the candidate exact when last
+	// is near the top of the space, so the wrap is seen rather than taken.
+	expected := uint64(last) + 1
+	candidate := (expected &^ 0xFFFF) | uint64(low)
 	if candidate < expected {
 		if expected-candidate > 0x8000 {
 			candidate += 0x10000
@@ -329,13 +394,20 @@ func reconstructSeqNo(expected uint32, low uint16) uint32 {
 	} else if candidate-expected > 0x8000 && candidate >= 0x10000 {
 		candidate -= 0x10000
 	}
-	return candidate
+	if candidate > 0xFFFFFFFF {
+		return 0, fmt.Errorf("%w: low bits 0x%04x after sequence %d", ErrSequenceWrap, low, last)
+	}
+	return uint32(candidate), nil
 }
 
 // EncodeDataShort writes a 9-byte data short header + payload.
 func (c *Compressor) EncodeDataShort(w io.Writer, f *Frame) (int, error) {
 	if !c.ShortForms() {
 		return 0, ErrShortFormsNotNegotiated
+	}
+	streamID, err := shortStreamID(f)
+	if err != nil {
+		return 0, err
 	}
 	s := c.GetOrCreateStream(f.StreamID)
 	s.mu.Lock()
@@ -344,7 +416,7 @@ func (c *Compressor) EncodeDataShort(w io.Writer, f *Frame) (int, error) {
 
 	var hdr [ShortDataSize]byte
 	hdr[0] = ShortDataIndicator
-	binary.BigEndian.PutUint16(hdr[1:3], uint16(f.StreamID))
+	binary.BigEndian.PutUint16(hdr[1:3], streamID)
 	binary.BigEndian.PutUint16(hdr[3:5], seqLow)
 	binary.BigEndian.PutUint32(hdr[5:9], f.Length)
 
@@ -401,7 +473,11 @@ func readShortPayload(r io.Reader, length uint32) ([]byte, error) {
 	return buf, nil
 }
 
-// DecodeDataShort reads a 9-byte data short header (indicator already consumed).
+// DecodeDataShort reads a 9-byte data short header (indicator already
+// consumed). The header's length is checked against MaxPayloadSize and its
+// sequence bits against the stream's recorded sequence before a frame is
+// built, a payload read or any stream state created, so a refused header
+// leaves the decoder as it was.
 func (c *Compressor) DecodeDataShort(r io.Reader) (*Frame, error) {
 	if !c.ShortForms() {
 		return nil, c.refuseShort(ShortDataIndicator)
@@ -414,18 +490,20 @@ func (c *Compressor) DecodeDataShort(r io.Reader) (*Frame, error) {
 	streamID := uint64(binary.BigEndian.Uint16(hdr[0:2]))
 	seqLow := binary.BigEndian.Uint16(hdr[2:4])
 	length := binary.BigEndian.Uint32(hdr[4:8])
+	if length > MaxPayloadSize {
+		return nil, fmt.Errorf("%w: data short payload %d bytes, max %d", ErrPayloadTooLarge, length, MaxPayloadSize)
+	}
+	// AER-047: reconstruct the absolute seq from the low 16 bits + the
+	// expected next seq, rather than chaining a delta off lastSeqNo.
+	seqNo, err := reconstructSeqNo(c.recordedSeqNo(streamID), seqLow)
+	if err != nil {
+		return nil, fmt.Errorf("stream %d: %w", streamID, err)
+	}
 
 	c.Session.mu.RLock()
 	sender := c.Session.lastSender
 	receiver := c.Session.lastReceiver
 	c.Session.mu.RUnlock()
-
-	s := c.GetOrCreateStream(streamID)
-	s.mu.Lock()
-	// AER-047: reconstruct the absolute seq from the low 16 bits + the
-	// expected next seq, rather than chaining a delta off lastSeqNo.
-	seqNo := reconstructSeqNo(s.lastSeqNo+1, seqLow)
-	s.mu.Unlock()
 
 	f := &Frame{
 		SenderID: sender, ReceiverID: receiver,
@@ -440,9 +518,6 @@ func (c *Compressor) DecodeDataShort(r io.Reader) (*Frame, error) {
 		Flags: 0,
 	}
 	if length > 0 {
-		if length > MaxPayloadSize {
-			return nil, fmt.Errorf("aether: data short payload too large (%d)", length)
-		}
 		// AE-P-31: read incrementally so a 9-byte header declaring up to
 		// MaxPayloadSize cannot force a full-size allocation before the body exists.
 		p, err := readShortPayload(r, length)
@@ -452,10 +527,7 @@ func (c *Compressor) DecodeDataShort(r io.Reader) (*Frame, error) {
 		f.Payload = p
 	}
 
-	s.mu.Lock()
-	s.lastSeqNo = seqNo
-	s.frameCount++
-	s.mu.Unlock()
+	c.recordShortData(streamID, seqNo)
 	return f, nil
 }
 
@@ -471,6 +543,10 @@ func (c *Compressor) EncodeEncryptedDataShort(w io.Writer, f *Frame) (int, error
 	if !c.ShortForms() {
 		return 0, ErrShortFormsNotNegotiated
 	}
+	streamID, err := shortStreamID(f)
+	if err != nil {
+		return 0, err
+	}
 	s := c.GetOrCreateStream(f.StreamID)
 	s.mu.Lock()
 	seqLow := uint16(f.SeqNo) // AER-047: absolute low 16 bits, not a delta
@@ -478,7 +554,7 @@ func (c *Compressor) EncodeEncryptedDataShort(w io.Writer, f *Frame) (int, error
 
 	var hdr [ShortDataSize]byte
 	hdr[0] = ShortEncryptedIndicator
-	binary.BigEndian.PutUint16(hdr[1:3], uint16(f.StreamID))
+	binary.BigEndian.PutUint16(hdr[1:3], streamID)
 	binary.BigEndian.PutUint16(hdr[3:5], seqLow)
 	binary.BigEndian.PutUint32(hdr[5:9], f.Length)
 
@@ -530,17 +606,37 @@ func (c *Compressor) EncodeControlShort(w io.Writer, f *Frame) (int, error) {
 	if !c.ShortForms() {
 		return 0, ErrShortFormsNotNegotiated
 	}
+	if !isShortControlType(f.Type) {
+		return 0, fmt.Errorf("%w: control short type %s", ErrShortFormInvalid, f.Type)
+	}
+	streamID, err := shortStreamID(f)
+	if err != nil {
+		return 0, err
+	}
 	var hdr [ShortControlSize]byte
 	hdr[0] = ShortControlIndicator
 	hdr[1] = byte(f.Type)
-	binary.BigEndian.PutUint16(hdr[2:4], uint16(f.StreamID))
+	binary.BigEndian.PutUint16(hdr[2:4], streamID)
 	binary.BigEndian.PutUint32(hdr[4:8], f.SeqNo)
 	return w.Write(hdr[:])
 }
 
+// isShortControlType reports whether t is one of the four types the 0x83
+// form carries. Every other type has a payload the form cannot hold, or is
+// a DATA frame, which the form would give a second encoding beside 0x82.
+func isShortControlType(t FrameType) bool {
+	switch t {
+	case TypePING, TypePONG, TypeCLOSE, TypeRESET:
+		return true
+	}
+	return false
+}
+
 // DecodeControlShort reads an 8-byte control header (indicator already
 // consumed). Layout: [type:1][streamID:2][seqNo:4]. SeqNo is preserved
-// so RecordPongRecv can match the inbound PONG against pendingPingSeq.
+// so RecordPongRecv can match the inbound PONG against pendingPingSeq. A
+// type outside the form's four is refused with ErrShortFormInvalid before a
+// frame is built.
 func (c *Compressor) DecodeControlShort(r io.Reader) (*Frame, error) {
 	if !c.ShortForms() {
 		return nil, c.refuseShort(ShortControlIndicator)
@@ -548,6 +644,9 @@ func (c *Compressor) DecodeControlShort(r io.Reader) (*Frame, error) {
 	var hdr [ShortControlSize - 1]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, fmt.Errorf("aether: read control short header: %w", err)
+	}
+	if !isShortControlType(FrameType(hdr[0])) {
+		return nil, fmt.Errorf("%w: control short type 0x%02x", ErrShortFormInvalid, hdr[0])
 	}
 
 	c.Session.mu.RLock()
@@ -575,6 +674,10 @@ func (c *Compressor) EncodeACKShort(w io.Writer, f *Frame) (int, error) {
 	if !c.ShortForms() {
 		return 0, ErrShortFormsNotNegotiated
 	}
+	streamID, err := shortStreamID(f)
+	if err != nil {
+		return 0, err
+	}
 	// Check if ACK-lite (payload is exactly CompositeACKMinSize = 8 bytes
 	// and last two bytes are both 0 = BitmapLen=0, Flags=0)
 	if f.Length == CompositeACKMinSize && len(f.Payload) >= 8 &&
@@ -582,15 +685,20 @@ func (c *Compressor) EncodeACKShort(w io.Writer, f *Frame) (int, error) {
 		// ACK-lite: inline the 8-byte payload
 		var hdr [ShortACKLiteSize]byte
 		hdr[0] = ShortACKIndicator
-		binary.BigEndian.PutUint16(hdr[1:3], uint16(f.StreamID))
+		binary.BigEndian.PutUint16(hdr[1:3], streamID)
 		copy(hdr[3:11], f.Payload[:8])
 		return w.Write(hdr[:])
 	}
 
-	// ACK-full: distinct indicator (AE-H-13) + header + payload
+	// ACK-full: distinct indicator (AE-H-13) + header + payload. The form's
+	// length field is a u16; a longer payload is refused before any write
+	// (ShouldCompressACK keeps such a frame full on the session write paths).
+	if f.Length > 0xFFFF {
+		return 0, fmt.Errorf("%w: ACK payload %d bytes above the 0x88 form's %d", ErrShortFormOverflow, f.Length, 0xFFFF)
+	}
 	var hdr [5]byte
 	hdr[0] = ShortACKFullIndicator
-	binary.BigEndian.PutUint16(hdr[1:3], uint16(f.StreamID))
+	binary.BigEndian.PutUint16(hdr[1:3], streamID)
 	binary.BigEndian.PutUint16(hdr[3:5], uint16(f.Length))
 	n, err := w.Write(hdr[:])
 	if err != nil {
@@ -614,6 +722,13 @@ func (c *Compressor) DecodeACKShort(r io.Reader) (*Frame, error) {
 	var hdr [ShortACKLiteSize - 1]byte // streamID(2) + payload(8)
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, fmt.Errorf("aether: read ACK short header: %w", err)
+	}
+	// The lite form inlines an 8-byte CompositeACK with BitmapLen 0 and Flags
+	// 0; a non-zero byte in either position claims bitmap or extension bytes
+	// the form has no room for, so the frame has no one reading and is
+	// refused (the encoder writes such an ACK in the 0x88 form).
+	if hdr[8] != 0 || hdr[9] != 0 {
+		return nil, fmt.Errorf("%w: ACK-lite bitmap length %d, flags 0x%02x", ErrShortFormInvalid, hdr[8], hdr[9])
 	}
 
 	c.Session.mu.RLock()
@@ -655,7 +770,7 @@ func (c *Compressor) DecodeACKShortFull(r io.Reader) (*Frame, error) {
 	streamID := uint64(binary.BigEndian.Uint16(hdr[0:2]))
 	length := uint32(binary.BigEndian.Uint16(hdr[2:4]))
 	if length > MaxPayloadSize {
-		return nil, fmt.Errorf("aether: ACK short payload too large (%d)", length)
+		return nil, fmt.Errorf("%w: ACK short payload %d bytes", ErrPayloadTooLarge, length)
 	}
 
 	payload := make([]byte, length)
@@ -760,6 +875,10 @@ func (c *Compressor) EncodeDataShortVar(w io.Writer, f *Frame) (int, error) {
 	if !c.ShortForms() {
 		return 0, ErrShortFormsNotNegotiated
 	}
+	streamID, err := shortStreamID(f)
+	if err != nil {
+		return 0, err
+	}
 	s := c.GetOrCreateStream(f.StreamID)
 	s.mu.Lock()
 	seqLow := uint16(f.SeqNo) // AER-047: absolute low 16 bits, not a delta
@@ -767,7 +886,7 @@ func (c *Compressor) EncodeDataShortVar(w io.Writer, f *Frame) (int, error) {
 
 	var hdr [5]byte // indicator + streamID + seqLow
 	hdr[0] = ShortDataVarIndicator
-	binary.BigEndian.PutUint16(hdr[1:3], uint16(f.StreamID))
+	binary.BigEndian.PutUint16(hdr[1:3], streamID)
 	binary.BigEndian.PutUint16(hdr[3:5], seqLow)
 
 	n, err := w.Write(hdr[:])
@@ -794,7 +913,9 @@ func (c *Compressor) EncodeDataShortVar(w io.Writer, f *Frame) (int, error) {
 	return n, nil
 }
 
-// DecodeDataShortVar reads a varint-length data short header (indicator consumed).
+// DecodeDataShortVar reads a varint-length data short header (indicator
+// consumed). As DecodeDataShort, the length and the sequence bits are checked
+// before a frame is built, a payload read or any stream state created.
 func (c *Compressor) DecodeDataShortVar(r io.Reader) (*Frame, error) {
 	if !c.ShortForms() {
 		return nil, c.refuseShort(ShortDataVarIndicator)
@@ -811,17 +932,19 @@ func (c *Compressor) DecodeDataShortVar(r io.Reader) (*Frame, error) {
 	if err != nil {
 		return nil, err
 	}
+	if length > MaxPayloadSize {
+		return nil, fmt.Errorf("%w: varint payload %d bytes, max %d", ErrPayloadTooLarge, length, MaxPayloadSize)
+	}
+	// AER-047: reconstruct the absolute seq from the low 16 bits + expected.
+	seqNo, err := reconstructSeqNo(c.recordedSeqNo(streamID), seqLow)
+	if err != nil {
+		return nil, fmt.Errorf("stream %d: %w", streamID, err)
+	}
 
 	c.Session.mu.RLock()
 	sender := c.Session.lastSender
 	receiver := c.Session.lastReceiver
 	c.Session.mu.RUnlock()
-
-	s := c.GetOrCreateStream(streamID)
-	s.mu.Lock()
-	// AER-047: reconstruct the absolute seq from the low 16 bits + expected.
-	seqNo := reconstructSeqNo(s.lastSeqNo+1, seqLow)
-	s.mu.Unlock()
 
 	f := &Frame{
 		SenderID: sender, ReceiverID: receiver,
@@ -836,9 +959,6 @@ func (c *Compressor) DecodeDataShortVar(r io.Reader) (*Frame, error) {
 		Flags: 0,
 	}
 	if length > 0 {
-		if length > MaxPayloadSize {
-			return nil, fmt.Errorf("aether: varint payload too large (%d)", length)
-		}
 		// AE-P-31: read incrementally so a tiny varint header declaring up to
 		// MaxPayloadSize cannot force a full-size allocation before the body exists.
 		p, err := readShortPayload(r, length)
@@ -848,10 +968,7 @@ func (c *Compressor) DecodeDataShortVar(r io.Reader) (*Frame, error) {
 		f.Payload = p
 	}
 
-	s.mu.Lock()
-	s.lastSeqNo = seqNo
-	s.frameCount++
-	s.mu.Unlock()
+	c.recordShortData(streamID, seqNo)
 	return f, nil
 }
 
@@ -869,7 +986,7 @@ func (c *Compressor) EncodeBatch(w io.Writer, frames []*Frame) (int, error) {
 		return 0, ErrShortFormsNotNegotiated
 	}
 	if len(frames) == 0 || len(frames) > 255 {
-		return 0, fmt.Errorf("aether: invalid batch size %d", len(frames))
+		return 0, fmt.Errorf("%w: batch of %d frames, the count byte carries 1-255", ErrShortFormInvalid, len(frames))
 	}
 	hdr := [2]byte{ShortBatchIndicator, byte(len(frames))}
 	n, err := w.Write(hdr[:])
@@ -912,6 +1029,12 @@ func (c *Compressor) DecodeBatch(r io.Reader) ([]*Frame, error) {
 		return nil, err
 	}
 	count := int(countBuf[0])
+	// EncodeBatch writes 1-255 children; a count of zero is a form no
+	// encoder of this grammar produces and is refused as the encoder refuses
+	// it, before any child is read.
+	if count == 0 {
+		return nil, fmt.Errorf("%w: batch of 0 frames", ErrShortFormInvalid)
+	}
 	frames := make([]*Frame, 0, count)
 
 	for i := 0; i < count; i++ {
