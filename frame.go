@@ -5,6 +5,7 @@
 package aether
 
 import (
+	"errors"
 	"fmt"
 )
 
@@ -13,6 +14,13 @@ const HeaderSize = 50
 
 // MaxPayloadSize is the maximum allowed payload size (16 MB).
 const MaxPayloadSize = 16 << 20 // 16,777,216 bytes
+
+// ErrPayloadTooLarge is the refusal of a frame whose header declares a payload
+// longer than MaxPayloadSize. Every decoder returns it before it allocates or
+// reads the payload and before it records any stream state for the frame, so a
+// header is the only thing a peer can make a receiver read for such a frame;
+// Validate returns it for a frame built in memory. errors.Is matches it.
+var ErrPayloadTooLarge = errors.New("aether: payload too large")
 
 // ────────────────────────────────────────────────────────────────────────────
 // Frame Types
@@ -344,7 +352,7 @@ func (f *Frame) Validate() error {
 		return fmt.Errorf("aether: invalid frame type 0x%02X", byte(f.Type))
 	}
 	if f.Length > MaxPayloadSize {
-		return fmt.Errorf("aether: payload too large (%d bytes, max %d)", f.Length, MaxPayloadSize)
+		return fmt.Errorf("%w (%d bytes, max %d)", ErrPayloadTooLarge, f.Length, MaxPayloadSize)
 	}
 	if uint32(len(f.Payload)) != f.Length {
 		return fmt.Errorf("aether: payload length mismatch (header=%d, actual=%d)", f.Length, len(f.Payload))

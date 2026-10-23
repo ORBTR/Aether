@@ -153,7 +153,7 @@ func DecodeFrameFromBytes(data []byte) (*Frame, error) {
 	}
 	f := parseHeader(data[1:FullFrameHeaderWireSize])
 	if f.Length > MaxPayloadSize {
-		return nil, fmt.Errorf("aether: payload too large (%d > %d)", f.Length, MaxPayloadSize)
+		return nil, fmt.Errorf("%w (%d > %d)", ErrPayloadTooLarge, f.Length, MaxPayloadSize)
 	}
 	avail := len(data) - FullFrameHeaderWireSize
 	if int(f.Length) > avail {
@@ -193,7 +193,7 @@ func DecodeFrameWithFirstByte(r io.Reader, firstByte byte) (*Frame, error) {
 	f := parseHeader(hdr[:])
 
 	if f.Length > MaxPayloadSize {
-		return nil, fmt.Errorf("aether: payload too large (%d bytes, max %d)", f.Length, MaxPayloadSize)
+		return nil, fmt.Errorf("%w (%d bytes, max %d)", ErrPayloadTooLarge, f.Length, MaxPayloadSize)
 	}
 	// The payload buffer comes from the payload pool; a failed read returns
 	// it there.
