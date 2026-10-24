@@ -283,3 +283,205 @@ func TestDialOverConn_RefusesAccepterWithoutVersions(t *testing.T) {
 		t.Fatalf("dialer wrote msg3 after refusing the accepter's payload")
 	}
 }
+
+// grantDialerWithoutChoice drives DialOverConn's handshake by hand under the
+// grant ticket and the static key (priv, pub), with the dialer's own wire
+// version choice left out: it writes msg3 whatever the accepter offered, as a
+// peer of another build or a hostile one would, and reports whether msg3 was
+// written. Every other message is DialOverConn's (the grant realm prologue through
+// realmFromGrant, the ticket beside msg1, the minimal NodeInfo in msg3), so the
+// accepter's own choice is the only thing between this dialer and a conn.
+func grantDialerWithoutChoice(t *testing.T, conn net.Conn, priv, pub, ticket []byte, app aether.WireVersions) (wroteMsg3 bool, err error) {
+	t.Helper()
+	offer, err := aether.LocalWireVersions(app)
+	if err != nil {
+		return false, err
+	}
+	prologue, _, err := grantRealmPrologue(realmFromGrant, ticket[:len(ticket)-64])
+	if err != nil {
+		return false, err
+	}
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	hs, err := noise.NewHandshakeState(noise.Config{
+		Pattern:       noise.HandshakeXX,
+		Initiator:     true,
+		Prologue:      prologue,
+		CipherSuite:   noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA256),
+		StaticKeypair: noise.DHKey{Private: priv, Public: pub},
+	})
+	if err != nil {
+		return false, err
+	}
+	msg1, _, _, err := hs.WriteMessage(nil, nil)
+	if err != nil {
+		return false, err
+	}
+	if err := WriteTicketAndFrame(conn, ticket, msg1); err != nil {
+		return false, err
+	}
+	msg2, err := readFrame(conn)
+	if err != nil {
+		return false, err
+	}
+	payload, _, _, err := hs.ReadMessage(nil, msg2)
+	if err != nil {
+		return false, err
+	}
+	if _, _, err := decodeMinimalNodeInfo(payload); err != nil {
+		return false, err
+	}
+	mine, err := encodeMinimalNodeInfo("vl1_alice", pub, offer)
+	if err != nil {
+		return false, err
+	}
+	msg3, _, _, err := hs.WriteMessage(nil, mine)
+	if err != nil {
+		return false, err
+	}
+	if err := writeFrame(conn, msg3); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// acceptInBackground runs AcceptOverConn under cfg on conn and returns the
+// channel its result arrives on.
+func acceptInBackground(cfg AcceptConnConfig, conn net.Conn) <-chan struct {
+	conn aether.Connection
+	err  error
+} {
+	out := make(chan struct {
+		conn aether.Connection
+		err  error
+	}, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		c, err := AcceptOverConn(ctx, cfg, conn)
+		out <- struct {
+			conn aether.Connection
+			err  error
+		}{c, err}
+	}()
+	return out
+}
+
+// TestAcceptOverConn_RefusesADialerThatSkippedItsChoiceAndSpendsNoNonce: a
+// dialer under the grant's own key that makes no choice of its own and writes
+// msg3 offering a required entry the accepter lacks is refused by the
+// accepter's ChooseWireVersions with the typed mismatch naming that entry,
+// after msg3 and before any connection, and the grant's nonce is not spent on
+// it: a conforming dialer then opens on the same grant, both ends bound to the
+// grant's realm, after which the grant is spent and a further dial is refused
+// on the nonce before any handshake crypto. This is the accepter's half of the
+// over-conn refusal; the dialer's half is
+// TestDialOverConn_RefusesBeforeMsg3AndSpendsNoNonce.
+func TestAcceptOverConn_RefusesADialerThatSkippedItsChoiceAndSpendsNoNonce(t *testing.T) {
+	signerPub, signerPriv, err := generateTestEd25519(t)
+	if err != nil {
+		t.Fatalf("gen signer: %v", err)
+	}
+	cfg := bindingAcceptConfig(t, signerPub, NewTicketNonceCache(16))
+	browserPriv, browserPub := newTestKeypair(t)
+	ticket := grantTicket(t, signerPriv, browserPub, []byte("nonce-0123456789"), time.Now().Add(time.Minute))
+
+	// 1. The dialer that skipped its choice writes msg3 anyway.
+	clientConn, serverConn := net.Pipe()
+	accepted := acceptInBackground(cfg, serverConn)
+	wrote, derr := grantDialerWithoutChoice(t, clientConn, browserPriv, browserPub, ticket,
+		aether.WireVersions{{Name: "zz.dialer-only", Versions: []uint16{1}, Required: true}})
+	if !wrote || derr != nil {
+		t.Fatalf("the dialer did not reach msg3: wrote=%v err=%v", wrote, derr)
+	}
+	res := <-accepted
+	_ = clientConn.Close()
+	_ = serverConn.Close()
+	if res.conn != nil {
+		_ = res.conn.Close()
+		t.Fatalf("the accepter built a connection for a dialer whose offer requires an entry it lacks")
+	}
+	var mm *aether.WireVersionMismatchError
+	if !errors.Is(res.err, aether.ErrWireVersionMismatch) || !errors.As(res.err, &mm) || mm.Name != "zz.dialer-only" {
+		t.Fatalf("accept err = %v, want the mismatch naming zz.dialer-only", res.err)
+	}
+
+	// 2. The nonce is unspent: a conforming dialer opens on the same grant and
+	// both ends report the grant's realm.
+	clientConn, serverConn = net.Pipe()
+	accepted = acceptInBackground(cfg, serverConn)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	dialed, derr := DialOverConn(ctx, DialConnConfig{
+		LocalNodeID: "vl1_alice", StaticPriv: browserPriv, StaticPub: browserPub,
+		Ticket: ticket, GrantRealmFn: realmFromGrant, HandshakeTimeout: 2 * time.Second,
+	}, clientConn)
+	res = <-accepted
+	if derr != nil || res.err != nil || dialed == nil || res.conn == nil {
+		t.Fatalf("the grant after the refusal: dial %v accept %v", derr, res.err)
+	}
+	want, _ := GrantRealm{Partition: "partition-A", Target: "vl1_bob"}.ID()
+	for name, c := range map[string]aether.Connection{"dialer": dialed, "accepter": res.conn} {
+		if got, bound := realmOn(t, c); !bound || got != want {
+			t.Fatalf("%s realm %08x %v, want the grant's %08x bound", name, got, bound, want)
+		}
+	}
+	_ = dialed.Close()
+	_ = res.conn.Close()
+
+	// 3. The nonce is spent: the grant is refused before any handshake crypto.
+	if err := acceptWithDialer(cfg, browserPriv, browserPub, ticket); !errors.Is(err, ErrTicketNonceReplayed) {
+		t.Fatalf("the grant after its admitted use: err = %v, want ErrTicketNonceReplayed", err)
+	}
+}
+
+// TestDialOverConn_RefusesBeforeMsg3AndSpendsNoNonce: a dialer requiring an
+// entry the accepter lacks refuses after msg2 with the typed mismatch and
+// writes nothing after msg1, so the accepter's read of msg3 ends with the
+// dialer's close and builds no connection; the grant's nonce is unspent, so the
+// same grant then opens between a conforming pair.
+func TestDialOverConn_RefusesBeforeMsg3AndSpendsNoNonce(t *testing.T) {
+	signerPub, signerPriv, err := generateTestEd25519(t)
+	if err != nil {
+		t.Fatalf("gen signer: %v", err)
+	}
+	cfg := bindingAcceptConfig(t, signerPub, NewTicketNonceCache(16))
+	browserPriv, browserPub := newTestKeypair(t)
+	ticket := grantTicket(t, signerPriv, browserPub, []byte("nonce-0123456789"), time.Now().Add(time.Minute))
+
+	clientConn, serverConn := net.Pipe()
+	counted := &writeCountConn{Conn: clientConn}
+	accepted := acceptInBackground(cfg, serverConn)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	dialed, derr := DialOverConn(ctx, DialConnConfig{
+		LocalNodeID: "vl1_alice", StaticPriv: browserPriv, StaticPub: browserPub,
+		Ticket: ticket, GrantRealmFn: realmFromGrant, HandshakeTimeout: 2 * time.Second,
+		WireVersions: aether.WireVersions{{Name: "zz.dialer-only", Versions: []uint16{1}, Required: true}},
+	}, counted)
+	if dialed != nil {
+		_ = dialed.Close()
+		t.Fatalf("a dialer requiring an entry the accepter lacks built a connection")
+	}
+	var mm *aether.WireVersionMismatchError
+	if !errors.Is(derr, aether.ErrWireVersionMismatch) || !errors.As(derr, &mm) || mm.Name != "zz.dialer-only" {
+		t.Fatalf("dial err = %v, want the mismatch naming zz.dialer-only", derr)
+	}
+	if n := counted.count(); n != 1 {
+		t.Fatalf("the dialer wrote %d frames, want only msg1", n)
+	}
+	_ = clientConn.Close()
+	res := <-accepted
+	_ = serverConn.Close()
+	if res.conn != nil {
+		_ = res.conn.Close()
+		t.Fatalf("the accepter built a connection for a dialer that refused at msg2")
+	}
+	if res.err == nil {
+		t.Fatalf("the accepter returned no error for a dialer that sent no msg3")
+	}
+
+	// The nonce is unspent: the grant opens between a conforming pair.
+	if err := acceptWithDialer(cfg, browserPriv, browserPub, ticket); err != nil {
+		t.Fatalf("the grant after the dialer's refusal: %v", err)
+	}
+}
