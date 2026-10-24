@@ -689,17 +689,20 @@ const (
 	patternFlagXK byte = 0x01 // Noise XK (initiator has responder's static key)
 )
 
-// encodeNodeInfo returns the signed NodeInfo payload advertised in the
-// handshake. AE-P-20: the payload is constant for the transport's lifetime
-// (identity key, caps, advertised max_ack_delay and the wire version offer are
-// all fixed after construction — ticketStore is assigned once in
-// NewNoiseTransport and never mutated), yet the responder previously
-// recomputed a fresh ed25519.Sign + json.Marshal on EVERY inbound msg1 while
-// holding the listener-wide l.mu on the single read-loop goroutine. Memoize it once so first-contact
-// handshakes reuse the cached bytes instead of re-signing per handshake.
-// Callers MUST treat the returned slice as read-only — it is shared across
-// handshakes; every caller passes it as the read-only plaintext argument to
-// state.WriteMessage, which never mutates it.
+// encodeNodeInfo returns the signed NodeInfo payload this transport sends in
+// its handshakes: the initiator paths put it in msg3
+// (performInitiatorHandshakeAttempt, performInitiatorHandshakeSharedAttempt)
+// and the responder paths in msg2 (handleHandshake, handleRelayedHandshake).
+// It is built from the identity key, the capability bits (capSessionTicket
+// when ticketStore is set), initialMaxAckDelayUS and the wire version offer
+// t.wireVersions, each fixed when NewNoiseTransport returns, so one payload
+// serves every handshake and is signed and marshalled once under nodeInfoOnce.
+// The once matters on the responder paths, which call this under l.mu on the
+// listener's single read-loop goroutine: an ed25519.Sign and json.Marshal per
+// inbound msg1 there holds every other datagram of the socket for its
+// duration. The returned slice is shared across handshakes and is read-only:
+// every caller passes it as the plaintext argument of state.WriteMessage,
+// which does not write to it.
 func (t *NoiseTransport) encodeNodeInfo() ([]byte, error) {
 	t.nodeInfoOnce.Do(func() {
 		caps := capExplicitNonce

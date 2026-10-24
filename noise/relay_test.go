@@ -7,10 +7,17 @@
 package noise
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/binary"
+	"errors"
 	"testing"
+	"time"
 
 	aether "github.com/ORBTR/aether"
+	transportCrypto "github.com/ORBTR/aether/crypto/identity"
 	"github.com/ORBTR/aether/relay"
+	"github.com/flynn/noise"
 )
 
 // ---------- test helpers ----------
@@ -298,5 +305,227 @@ func TestResolveRelayTarget_OutgoingSession_SamePartition(t *testing.T) {
 	}
 	if target != targetConn {
 		t.Fatal("expected target to be the outgoing session conn")
+	}
+}
+
+// ---------- relayed handshake: the responder's wire-version choice ----------
+
+// relayedResponder is a listener with no socket of its own, which is every
+// input handleRelayedHandshake reads: the transport (its offer, static key,
+// network keys and NodeInfo), the pending handshakes, the session map, the
+// accept queue and the drop counters. The test builds it without Listen so the
+// msg2 the responder writes goes nowhere but the relay conn's writeFunc.
+type relayedResponder struct {
+	transport *NoiseTransport
+	listener  *noiseListener
+	// relayConn stands for the Noise session to the relay node through which
+	// the initiator's packets arrive. Its send cipher is matched by decrypt, so
+	// the test can read the msg2 the responder hands sendRelayRequest.
+	relayConn *noiseConn
+	decrypt   *noise.CipherState
+	// written receives every ciphertext the responder writes to the relay conn.
+	written chan []byte
+}
+
+func newRelayedResponder(t *testing.T, app aether.WireVersions) *relayedResponder {
+	t.Helper()
+	tr := wvTransport(t, app, nil)
+	l := &noiseListener{
+		transport:  tr,
+		handshakes: make(map[string]*listenerHandshake),
+		sessions:   aether.NewConnectionMap(),
+		incoming:   make(chan aether.IncomingSession, 1),
+	}
+	suite := noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA256)
+	var key [32]byte
+	if _, err := rand.Read(key[:]); err != nil {
+		t.Fatalf("key: %v", err)
+	}
+	r := &relayedResponder{transport: tr, listener: l, decrypt: noise.UnsafeNewCipherState(suite, key, 0), written: make(chan []byte, 4)}
+	cfg := aether.DefaultSessionConfig()
+	r.relayConn = &noiseConn{
+		send:      noise.UnsafeNewCipherState(suite, key, 0),
+		closed:    make(chan struct{}),
+		transport: tr,
+		rekey:     NewRekeyTracker(cfg.RekeyAfterBytes, cfg.RekeyAfterDuration),
+		writeFunc: func(ct []byte) (int, error) { r.written <- append([]byte(nil), ct...); return len(ct), nil },
+	}
+	return r
+}
+
+// readRelayed returns the payload of the one relay request the responder wrote
+// for source: the frame it asked the relay to forward.
+func (r *relayedResponder) readRelayed(t *testing.T, source aether.NodeID) []byte {
+	t.Helper()
+	var ct []byte
+	select {
+	case ct = <-r.written:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("the responder wrote nothing to the relay")
+	}
+	pt, err := r.decrypt.Decrypt(nil, nil, ct)
+	if err != nil {
+		t.Fatalf("decrypt the responder's relay frame: %v", err)
+	}
+	if len(pt) < 1+relay.RelayHeaderSize || pt[0] != relay.PacketTypeRelayRequest || aether.NodeID(pt[1:1+relay.RelayHeaderSize]) != source {
+		t.Fatalf("the responder wrote %d bytes of type 0x%02x for %q, want a relay request for %q",
+			len(pt), pt[0], pt[1:1+relay.RelayHeaderSize], source)
+	}
+	return pt[1+relay.RelayHeaderSize:]
+}
+
+// wroteNothingMore reports whether the responder wrote no second frame.
+func (r *relayedResponder) wroteNothingMore() bool {
+	select {
+	case <-r.written:
+		return false
+	case <-time.After(100 * time.Millisecond):
+		return true
+	}
+}
+
+// relayedInitiator drives the initiator's side of a relayed handshake by hand,
+// as a peer whose packets reach the responder through a relay node: msg1 as
+// the relay delivers it, then msg3 carrying the signed NodeInfo payload3. It
+// makes no choice of its own, so the responder's choice is the only one
+// between its msg3 and a relayed conn, which is what the tests below need.
+func relayedInitiator(t *testing.T, r *relayedResponder, source aether.NodeID, id *transportCrypto.Identity, payload3 []byte) error {
+	t.Helper()
+	hs, err := noise.NewHandshakeState(noise.Config{
+		Pattern:       noise.HandshakeXX,
+		Initiator:     true,
+		Prologue:      []byte(wvTestNetKey),
+		CipherSuite:   noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA256),
+		StaticKeypair: noise.DHKey{Private: id.Curve25519Priv, Public: id.Curve25519Pub},
+		Random:        rand.Reader,
+	})
+	if err != nil {
+		t.Fatalf("handshake state: %v", err)
+	}
+	msg1, _, _, err := hs.WriteMessage(nil, nil)
+	if err != nil {
+		t.Fatalf("msg1: %v", err)
+	}
+	pkt := make([]byte, 5, 5+len(msg1))
+	binary.BigEndian.PutUint32(pkt, transportCrypto.CRC32Hash([]byte(wvTestNetKey)))
+	pkt[4] = patternFlagXX
+	pkt = append(pkt, msg1...)
+	if err := r.listener.handleRelayedHandshake(r.relayConn, string(source), pkt); err != nil {
+		t.Fatalf("relayed msg1: %v", err)
+	}
+	msg2 := r.readRelayed(t, source)
+	if _, _, _, err := hs.ReadMessage(nil, msg2); err != nil {
+		t.Fatalf("msg2: %v", err)
+	}
+	msg3, _, _, err := hs.WriteMessage(nil, payload3)
+	if err != nil {
+		t.Fatalf("msg3: %v", err)
+	}
+	return r.listener.handleRelayedHandshake(r.relayConn, string(source), msg3)
+}
+
+// TestRelayedResponder_RefusesAMismatchedOfferBeforeAnyState: a relayed
+// initiator whose offer requires an entry the responder lacks, and one that
+// lacks an entry the responder requires, are each refused at msg3 with the
+// typed mismatch naming that entry, counted under wire_version_mismatch, and
+// leave the responder as it was: no relayed conn, no session-map entry, no
+// pending handshake, nothing on the accept queue, no peer key cached for the
+// initiator and no second frame written to the relay. The control arm, an
+// initiator offering what this build offers, is admitted through the same
+// harness and reports the chosen set, so the refusals are the entry's.
+func TestRelayedResponder_RefusesAMismatchedOfferBeforeAnyState(t *testing.T) {
+	codec := aether.WireVersions{{Name: "gossip.codec", Versions: []uint16{1}, Required: true}}
+	for _, tc := range []struct {
+		name         string
+		responderApp aether.WireVersions
+		initiatorApp aether.WireVersions
+		entry        string
+	}{
+		{
+			name:         "the initiator requires an entry the responder lacks",
+			responderApp: codec,
+			initiatorApp: append(aether.WireVersions{}, codec[0], aether.WireVersion{Name: "zz.initiator-only", Versions: []uint16{1}, Required: true}),
+			entry:        "zz.initiator-only",
+		},
+		{
+			name:         "the responder requires an entry the initiator lacks",
+			responderApp: append(aether.WireVersions{}, codec[0], aether.WireVersion{Name: "zz.responder-only", Versions: []uint16{1}, Required: true}),
+			initiatorApp: codec,
+			entry:        "zz.responder-only",
+		},
+		{
+			name:         "both offer the same entries",
+			responderApp: codec,
+			initiatorApp: codec,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRelayedResponder(t, tc.responderApp)
+			_, priv, _ := ed25519.GenerateKey(rand.Reader)
+			id, err := transportCrypto.NewIdentity(priv)
+			if err != nil {
+				t.Fatalf("identity: %v", err)
+			}
+			offer, err := aether.LocalWireVersions(tc.initiatorApp)
+			if err != nil {
+				t.Fatalf("offer: %v", err)
+			}
+			payload3, err := id.EncodeNodeInfo(capExplicitNonce, 0, offer)
+			if err != nil {
+				t.Fatalf("NodeInfo: %v", err)
+			}
+			source := testNodeID("relayed-initiator")
+			err = relayedInitiator(t, r, source, id, payload3)
+			l := r.listener
+
+			if tc.entry == "" {
+				if err != nil {
+					t.Fatalf("control arm refused: %v", err)
+				}
+				if l.sessions.Get(id.NodeID) == nil {
+					t.Fatalf("control arm registered no session")
+				}
+				select {
+				case in := <-l.incoming:
+					want := mustChoose(t, r.transport.wireVersions, offer)
+					if got := chosenOn(t, in.Session); !got.Equal(want) {
+						t.Fatalf("control arm chose %v, want %v", got, want)
+					}
+					_ = in.Session.Close()
+				case <-time.After(time.Second):
+					t.Fatalf("control arm delivered no session to the accept queue")
+				}
+				if len(l.handshakes) != 0 {
+					t.Fatalf("control arm left %d pending handshake(s)", len(l.handshakes))
+				}
+				return
+			}
+
+			var mm *aether.WireVersionMismatchError
+			if !errors.Is(err, aether.ErrWireVersionMismatch) || !errors.As(err, &mm) || mm.Name != tc.entry {
+				t.Fatalf("relayed msg3 err = %v, want the mismatch naming %q", err, tc.entry)
+			}
+			if got := l.DropSnapshot()[DropWireVersionMismatch.String()]; got != 1 {
+				t.Fatalf("wire_version_mismatch counted %d times, want 1", got)
+			}
+			if l.sessions.Get(id.NodeID) != nil {
+				t.Fatalf("a session is registered for the refused initiator")
+			}
+			if _, pending := l.handshakes[string(source)]; pending {
+				t.Fatalf("the refused handshake is still pending")
+			}
+			select {
+			case in := <-l.incoming:
+				_ = in.Session.Close()
+				t.Fatalf("a relayed conn reached the accept queue after the refusal")
+			case <-time.After(100 * time.Millisecond):
+			}
+			if key := r.transport.lookupPeerKey(id.NodeID); key != nil {
+				t.Fatalf("the refused initiator's static key is cached")
+			}
+			if !r.wroteNothingMore() {
+				t.Fatalf("the responder wrote to the relay after refusing msg3")
+			}
+		})
 	}
 }
