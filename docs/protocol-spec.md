@@ -1602,7 +1602,7 @@ The retry token is a QUIC-style stateless cookie that forces unverified initiato
 1. Receives msg1 without retry prefix → replies with a RETRY packet and discards the msg1 (zero state committed)
 2. Receives msg1 with retry prefix → validates + strips + processes the inner msg1
 
-The initiator's handshake loop handles both paths transparently (`performInitiatorHandshake*` retries once on retry-prefix response). Sessions are never killed by retry round-trips; only the latency is paid.
+The initiator's handshake loop handles both paths transparently (`performInitiatorHandshakeSharedAttempt` retries once on retry-prefix response). Sessions are never killed by retry round-trips; only the latency is paid.
 
 Implementation: `noise/retry.go`, `noise/handshake.go`, `noise/transport.go:RequireRetryToken`.
 

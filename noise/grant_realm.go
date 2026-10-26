@@ -42,7 +42,7 @@ const grantRealmMeshKind = "device"
 
 // grantRealmPrologueLabel opens every over-conn prologue, so the prologue a
 // grant realm gives is never the bytes of a network key, which is the mesh
-// transport's prologue (performInitiatorHandshakeAttempt, handleHandshake).
+// transport's prologue (performInitiatorHandshakeSharedAttempt, handleHandshake).
 const grantRealmPrologueLabel = "aether/over-conn/grant-realm/1"
 
 // ErrGrantRealmIncomplete refuses a GrantRealm with an empty partition or
