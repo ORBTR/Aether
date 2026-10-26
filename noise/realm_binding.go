@@ -17,7 +17,7 @@ var errRealmBindingMalformed = errors.New("vl1: realm binding malformed")
 // realmBinding is the mesh realm a conn's handshake bound it to, as the CRC32
 // fingerprint (crypto/identity CRC32Hash) of its Noise prologue, and whether
 // one was bound at all. On the mesh transport the prologue is the network key
-// (performInitiatorHandshakeAttempt, handleHandshake), so the fingerprint is
+// (performInitiatorHandshakeSharedAttempt, handleHandshake), so the fingerprint is
 // the network key id msg1 names; on an over-conn handshake it is the grant
 // realm (GrantRealm.Prologue in DialOverConn and acceptOverConn). An over-conn
 // conn whose handshake had no grant is unbound. noiseConn holds it and reports

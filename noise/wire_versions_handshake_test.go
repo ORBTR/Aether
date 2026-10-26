@@ -620,97 +620,16 @@ func mustEncode(t *testing.T, w aether.WireVersions) []byte {
 	return b
 }
 
-// bareResponder answers one bare msg1, the packet performInitiatorHandshake
-// writes ([4 fingerprint][1 pattern flag][msg1], no dial-nonce envelope), with
-// a msg2 carrying a signed NodeInfo of this build's offer plus app, then reads
-// for a msg3 and reports whether one arrived. It stands in for a listener
-// because the listener's run loop classifies a packet by its first byte
-// (ClassifyPacket), and a bare msg1 begins with the network key's fingerprint,
-// which for most keys lies in the QUIC or STUN range and is never handed to
-// handleHandshake; the dedicated-socket path is reached only through this
-// function's own answer.
-func bareResponder(t *testing.T, id *transportCrypto.Identity, app aether.WireVersions) (addr *net.UDPAddr, msg3Seen <-chan bool) {
-	t.Helper()
-	sock, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatalf("responder socket: %v", err)
-	}
-	t.Cleanup(func() { _ = sock.Close() })
-	offer, err := aether.LocalWireVersions(app)
-	if err != nil {
-		t.Fatalf("offer: %v", err)
-	}
-	seen := make(chan bool, 1)
-	go func() {
-		defer close(seen)
-		buf := make([]byte, 4096)
-		_ = sock.SetReadDeadline(time.Now().Add(3 * time.Second))
-		n, src, err := sock.ReadFromUDP(buf)
-		if err != nil || n < 5 {
-			return
-		}
-		hs, err := noise.NewHandshakeState(noise.Config{
-			Pattern:       noise.HandshakeXX,
-			Prologue:      []byte(wvTestNetKey),
-			CipherSuite:   noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA256),
-			StaticKeypair: noise.DHKey{Private: id.Curve25519Priv, Public: id.Curve25519Pub},
-			Random:        rand.Reader,
-		})
-		if err != nil {
-			return
-		}
-		if _, _, _, err := hs.ReadMessage(nil, buf[5:n]); err != nil {
-			return
-		}
-		payload, err := id.EncodeNodeInfo(capExplicitNonce, 0, offer)
-		if err != nil {
-			return
-		}
-		msg2, _, _, err := hs.WriteMessage(nil, payload)
-		if err != nil {
-			return
-		}
-		if _, err := sock.WriteToUDP(msg2, src); err != nil {
-			return
-		}
-		_ = sock.SetReadDeadline(time.Now().Add(700 * time.Millisecond))
-		n, _, err = sock.ReadFromUDP(buf)
-		seen <- err == nil && n > 5+32
-	}()
-	return sock.LocalAddr().(*net.UDPAddr), seen
-}
-
-// dedicatedDial runs the dedicated-socket initiator path
-// (performInitiatorHandshake) from client to the responder at addr over a
-// connected UDP socket the test owns. The returned connection owns the socket
-// when the handshake completes.
-func dedicatedDial(t *testing.T, client *NoiseTransport, addr *net.UDPAddr, responder aether.NodeID) (aether.Connection, error) {
-	t.Helper()
-	conn, err := net.DialUDP("udp4", nil, addr)
-	if err != nil {
-		t.Fatalf("dial udp: %v", err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	c, err := client.performInitiatorHandshake(ctx, conn, aether.Path{Address: addr, NodeID: responder})
-	if err != nil {
-		_ = conn.Close()
-	}
-	return c, err
-}
-
 // TestNoiseInitiator_CachesNoPeerKeyForARefusedResponder: on the shared-socket
-// path Dial runs and on the dedicated-socket path, an initiator that refuses the
-// responder's msg2 offer (an entry the responder requires and the initiator
-// lacks) holds no cached static key for that responder, and the responder,
-// which saw no msg3, holds none for the initiator. The cache is what sends the
-// next dial to the same node over XK (lookupPeerKey in both initiator paths),
-// so a key cached for a refused peer would re-dial it under the key of a
-// handshake that produced no session. The control arm, the same pair with
-// compatible offers, caches the responder's static key on the dial, so the
-// absence after the refusal is of a key the path does record. The shared path
-// runs against a listening transport; the dedicated path runs against
-// bareResponder, for the reason stated on it.
+// path Dial runs (performInitiatorHandshakeSharedAttempt), an initiator that
+// refuses the responder's msg2 offer (an entry the responder requires and the
+// initiator lacks) holds no cached static key for that responder, and the
+// responder, which saw no msg3, holds none for the initiator. The cache is what
+// sends the next dial to the same node over XK (lookupPeerKey on that path), so
+// a key cached for a refused peer would re-dial it under the key of a handshake
+// that produced no session. The control arm, the same pair with compatible
+// offers, caches the responder's static key on the dial, so the absence after
+// the refusal is of a key the path does record.
 func TestNoiseInitiator_CachesNoPeerKeyForARefusedResponder(t *testing.T) {
 	responderOnly := aether.WireVersions{{Name: "zz.responder-only", Versions: []uint16{1}, Required: true}}
 
@@ -753,52 +672,6 @@ func TestNoiseInitiator_CachesNoPeerKeyForARefusedResponder(t *testing.T) {
 			defer c.Close()
 			if key := p.client.lookupPeerKey(p.server.localNode); !bytes.Equal(key, p.server.staticPub) {
 				t.Fatalf("after an admitted handshake the initiator holds %x for the responder, want its static key %x", key, p.server.staticPub)
-			}
-		})
-	})
-
-	t.Run("dedicated socket", func(t *testing.T) {
-		newResponderID := func() *transportCrypto.Identity {
-			_, priv, _ := ed25519.GenerateKey(rand.Reader)
-			id, err := transportCrypto.NewIdentity(priv)
-			if err != nil {
-				t.Fatalf("identity: %v", err)
-			}
-			return id
-		}
-		t.Run("refused responder", func(t *testing.T) {
-			client := wvTransport(t, nil, nil)
-			respID := newResponderID()
-			addr, msg3Seen := bareResponder(t, respID, responderOnly)
-			c, err := dedicatedDial(t, client, addr, respID.NodeID)
-			if c != nil {
-				_ = c.Close()
-				t.Fatalf("a refused handshake returned a connection")
-			}
-			if !errors.Is(err, aether.ErrWireVersionMismatch) {
-				t.Fatalf("dial err = %v, want ErrWireVersionMismatch", err)
-			}
-			if <-msg3Seen {
-				t.Fatalf("the initiator wrote msg3 after refusing msg2")
-			}
-			if key := client.lookupPeerKey(respID.NodeID); key != nil {
-				t.Fatalf("the initiator cached the refused responder's static key")
-			}
-		})
-		t.Run("admitted responder", func(t *testing.T) {
-			client := wvTransport(t, nil, nil)
-			respID := newResponderID()
-			addr, msg3Seen := bareResponder(t, respID, nil)
-			c, err := dedicatedDial(t, client, addr, respID.NodeID)
-			if err != nil {
-				t.Fatalf("dial: %v", err)
-			}
-			defer c.Close()
-			if !<-msg3Seen {
-				t.Fatalf("the responder read no msg3 from an admitted handshake")
-			}
-			if key := client.lookupPeerKey(respID.NodeID); !bytes.Equal(key, respID.Curve25519Pub) {
-				t.Fatalf("after an admitted handshake the initiator holds %x for the responder, want its static key %x", key, respID.Curve25519Pub)
 			}
 		})
 	})

@@ -20,209 +20,6 @@ import (
 	"github.com/flynn/noise"
 )
 
-func (t *NoiseTransport) performInitiatorHandshake(ctx context.Context, udpConn *net.UDPConn, path aether.Path) (aether.Connection, error) {
-	return t.performInitiatorHandshakeAttempt(ctx, udpConn, path, false)
-}
-
-// performInitiatorHandshakeAttempt runs one handshake attempt. When
-// `xxOnly` is true, the XK-cached-key fast path is bypassed even if a
-// key is cached — the attempt forces XX. This lets the XK failure path
-// retry exactly once, on XX, without recursing back into itself (which
-// was formerly possible if evictPeerKey raced with another cacher).
-func (t *NoiseTransport) performInitiatorHandshakeAttempt(ctx context.Context, udpConn *net.UDPConn, path aether.Path, xxOnly bool) (aether.Connection, error) {
-	dbgHandshake.Printf("Starting initiator handshake to %s (xxOnly=%v)", path.NodeID.Short(), xxOnly)
-
-	// Determine active key and scope context.
-	// If a dial override is present (SharedTransport), use the scope's keys
-	// and prepend a preamble. Otherwise use the transport's own keys.
-	var activeKey []byte
-	var preamblePartitionID string
-	if override := getDialOverride(ctx); override != nil && len(override.Keys) > 0 {
-		activeKey = override.Keys[0]
-		preamblePartitionID = override.ScopeID
-		dbgHandshake.Printf("Using dial override for scope %q", preamblePartitionID)
-	} else {
-		activeKey = t.keyManager.ActiveKey()
-	}
-	fingerprint := transportCrypto.CRC32Hash(activeKey)
-
-	// Check peer key cache — use XK if we have the responder's static key,
-	// fall back to XX for first contact or after key eviction. Retries
-	// force-XX via xxOnly to avoid recursing back into a stale-key loop.
-	var cachedPeerKey []byte
-	if !xxOnly {
-		cachedPeerKey = t.lookupPeerKey(path.NodeID)
-	}
-	pattern := noise.HandshakeXX
-	if cachedPeerKey != nil {
-		pattern = noise.HandshakeXK
-		dbgHandshake.Printf("Using XK handshake (cached peer key for %s)", path.NodeID.Short())
-	} else {
-		dbgHandshake.Printf("Using XX handshake (no cached key for %s)", path.NodeID.Short())
-	}
-
-	suite := noise.NewCipherSuite(noise.DH25519, noise.CipherChaChaPoly, noise.HashSHA256)
-	hsCfg := noise.Config{
-		Pattern:     pattern,
-		Initiator:   true,
-		Prologue:    activeKey,
-		CipherSuite: suite,
-		StaticKeypair: noise.DHKey{
-			Private: append([]byte(nil), t.staticPriv...),
-			Public:  append([]byte(nil), t.staticPub...),
-		},
-		Random: rand.Reader,
-	}
-	if cachedPeerKey != nil {
-		hsCfg.PeerStatic = append([]byte(nil), cachedPeerKey...)
-	}
-	hs, err := noise.NewHandshakeState(hsCfg)
-	if err != nil {
-		dbgHandshake.Printf("Failed to create handshake state: %v", err)
-		return nil, err
-	}
-	msg1, _, _, err := hs.WriteMessage(nil, nil)
-	if err != nil {
-		dbgHandshake.Printf("Failed to write message 1: %v", err)
-		return nil, err
-	}
-
-	// Build packet: [optional preamble][CRC32 fingerprint][pattern flag][noise msg1]
-	fpBuf := make([]byte, 4)
-	binary.BigEndian.PutUint32(fpBuf, fingerprint)
-	var patFlag byte = patternFlagXX
-	if cachedPeerKey != nil {
-		patFlag = patternFlagXK
-	}
-
-	var packet []byte
-	if preamblePartitionID != "" {
-		preamble, pErr := EncodePreamble(preamblePartitionID)
-		if pErr != nil {
-			return nil, pErr
-		}
-		packet = make([]byte, 0, len(preamble)+5+len(msg1))
-		packet = append(packet, preamble...)
-		packet = append(packet, fpBuf...)
-		packet = append(packet, patFlag)
-		packet = append(packet, msg1...)
-	} else {
-		packet = make([]byte, 5+len(msg1))
-		copy(packet[:4], fpBuf)
-		packet[4] = patFlag
-		copy(packet[5:], msg1)
-	}
-
-	if _, err = udpConn.Write(packet); err != nil {
-		dbgHandshake.Printf("Failed to send message 1: %v", err)
-		return nil, err
-	}
-	dbgHandshake.Printf("Sent message 1 (fingerprint: %x, preamble: %v, pattern: %s)", fingerprint, preamblePartitionID != "", pattern.Name)
-
-	deadline := t.handshakeDeadline(ctx)
-	if err := udpConn.SetReadDeadline(deadline); err != nil {
-		return nil, err
-	}
-	buf := make([]byte, t.maxPacket)
-
-	// msg1/msg2 retransmit loop: on raw UDP, a single dropped datagram
-	// fails the whole handshake (was H-Handshake-Retx). Retry msg1 every
-	// initiatorRetryInterval until either msg2 arrives, the per-attempt
-	// deadline fires, or the caller's ctx cancels. Each retry uses the
-	// same handshake packet — Noise XX/XK msg1 carries no nonce so
-	// receiver-side dedup is the responder's responsibility (it tolerates
-	// duplicates by ignoring msg1 after it's started building msg2).
-	n, err := readWithMsg1Retry(udpConn, packet, buf, deadline)
-	if err != nil {
-		// If XK failed (peer key rotated), evict cache and retry with XX
-		if cachedPeerKey != nil {
-			dbgHandshake.Printf("XK handshake failed with %s, evicting cache and retrying XX: %v", path.NodeID.Short(), err)
-			t.evictPeerKey(path.NodeID)
-			return t.performInitiatorHandshakeAttempt(ctx, udpConn, path, true /* xxOnly */)
-		}
-		dbgHandshake.Printf("Failed to receive message 2: %v", err)
-		return nil, fmt.Errorf("%w: %v", aether.ErrHandshakeFailed, err)
-	}
-	dbgHandshake.Printf("Received message 2 (%d bytes)", n)
-
-	// Response does not have fingerprint
-	payload, _, _, err := hs.ReadMessage(nil, buf[:n])
-	if err != nil {
-		// XK decryption failure = stale cached key. Evict and retry XX.
-		if cachedPeerKey != nil {
-			dbgHandshake.Printf("XK msg2 decrypt failed with %s, evicting cache and retrying XX: %v", path.NodeID.Short(), err)
-			t.evictPeerKey(path.NodeID)
-			return t.performInitiatorHandshakeAttempt(ctx, udpConn, path, true /* xxOnly */)
-		}
-		dbgHandshake.Printf("Failed to read message 2: %v", err)
-		return nil, fmt.Errorf("%w: %v", aether.ErrHandshakeFailed, err)
-	}
-	remote, err := t.verifyNodeInfo(hs.PeerStatic(), payload, path.NodeID)
-	if err != nil {
-		dbgHandshake.Printf("Failed to verify remote node: %v", err)
-		return nil, fmt.Errorf("%w: %w", aether.ErrHandshakeFailed, err)
-	}
-	remoteNode, remoteCaps, remoteMaxAckDelayUS := remote.NodeID, remote.Caps, remote.MaxAckDelayUS
-	dbgHandshake.Printf("Verified remote node: %s", remoteNode.Short())
-	// The choice runs before msg3 is written and before anything is cached
-	// for the peer: a refused responder never receives this side's NodeInfo
-	// and no conn is built.
-	chosen, err := t.chooseWireVersions(remote.WireVersions)
-	if err != nil {
-		dbgHandshake.Printf("Refused %s: %v", remoteNode.Short(), err)
-		return nil, fmt.Errorf("%w: %w", aether.ErrHandshakeFailed, err)
-	}
-
-	// Cache the peer's static key for future XK reconnections
-	t.cachePeerKey(remoteNode, hs.PeerStatic())
-
-	nodePayload, err := t.encodeNodeInfo()
-	if err != nil {
-		return nil, err
-	}
-	msg3, sendCS, recvCS, err := hs.WriteMessage(nil, nodePayload)
-	if err != nil {
-		dbgHandshake.Printf("Failed to write message 3: %v", err)
-		return nil, err
-	}
-	if _, err = udpConn.Write(msg3); err != nil {
-		dbgHandshake.Printf("Failed to send message 3: %v", err)
-		return nil, err
-	}
-	dbgHandshake.Printf("Handshake complete with %s (pattern: %s)", remoteNode.Short(), pattern.Name)
-	_ = udpConn.SetReadDeadline(time.Time{})
-	nc := newNoiseConnDial(udpConn, path.Address, remoteNode, sendCS, recvCS, t.maxPacket, t)
-	nc.scopeID = preamblePartitionID
-	nc.peerMaxAckDelay = decodeMaxAckDelay(remoteMaxAckDelayUS)
-	nc.wireVersions, nc.peerWireVersions = chosen, remote.WireVersions
-	nc.realm = realmBinding{id: fingerprint, bound: true}
-
-	// Negotiate explicit nonce mode if both sides support it
-	if remoteCaps&capExplicitNonce != 0 {
-		nc.enableExplicitNonce()
-		dbgHandshake.Printf("Explicit nonce mode enabled with %s", remoteNode.Short())
-	}
-
-	// Register outgoing session
-	t.outgoingMu.Lock()
-	t.outgoingSessions[string(remoteNode)] = nc
-	t.outgoingMu.Unlock()
-
-	// Ensure cleanup on close
-	originalStop := nc.parentStop
-	nc.parentStop = func() {
-		t.outgoingMu.Lock()
-		delete(t.outgoingSessions, string(remoteNode))
-		t.outgoingMu.Unlock()
-		originalStop()
-	}
-
-	go nc.runReader()
-	s := aether.NewConnection(t.localNode, remoteNode, nc, aether.ProtoNoise)
-	s.OnClose(func() { nc.Close() })
-	return s, nil
-}
-
 // performInitiatorHandshakeShared performs a Noise handshake using the listener's
 // shared UDP socket. Handshake responses are received via the listener's
 // pendingDials channel dispatch. After completion, the session is registered
@@ -245,7 +42,10 @@ func (t *NoiseTransport) performInitiatorHandshakeSharedAttempt(ctx context.Cont
 	nonce, responseCh := listener.registerPendingDial()
 	defer listener.unregisterPendingDial(nonce)
 
-	// Key selection (same as performInitiatorHandshake)
+	// The prologue key: a dial override's first key, with its scope id as the
+	// preamble resolveHandshakeKey reads on the responder, when the caller set
+	// one (getDialOverride); otherwise the key manager's active key, which the
+	// responder finds by the fingerprint msg1 carries.
 	var activeKey []byte
 	var preamblePartitionID string
 	if override := getDialOverride(ctx); override != nil && len(override.Keys) > 0 {
@@ -690,9 +490,9 @@ const (
 )
 
 // encodeNodeInfo returns the signed NodeInfo payload this transport sends in
-// its handshakes: the initiator paths put it in msg3
-// (performInitiatorHandshakeAttempt, performInitiatorHandshakeSharedAttempt)
-// and the responder paths in msg2 (handleHandshake, handleRelayedHandshake).
+// its handshakes: the initiator path puts it in msg3
+// (performInitiatorHandshakeSharedAttempt) and the responder paths in msg2
+// (handleHandshake, handleRelayedHandshake).
 // It is built from the identity key, the capability bits (capSessionTicket
 // when ticketStore is set), initialMaxAckDelayUS and the wire version offer
 // t.wireVersions, each fixed when NewNoiseTransport returns, so one payload
@@ -1231,58 +1031,4 @@ func (l *noiseListener) resolveHandshakeKey(msg []byte) (prologue []byte, scopeI
 		return nil, "", 0, nil, false
 	}
 	return prologue, "", msg[4], msg[5:], true
-}
-
-// initiatorRetryInterval is how often performInitiatorHandshakeAttempt
-// retransmits msg1 while waiting for msg2 on a raw UDP socket. 800ms is
-// short enough to recover from a single drop within a 5s handshake
-// budget (gives ~6 attempts) and long enough that a slow responder isn't
-// flooded with duplicates. The responder ignores msg1 once it's already
-// started building msg2 so duplicates are harmless.
-const initiatorRetryInterval = 800 * time.Millisecond
-
-// readWithMsg1Retry reads from udpConn while periodically resending the
-// msg1 packet. Returns the number of bytes read on success, or an error
-// if the deadline elapses before any msg2 arrives.
-//
-// The strategy: set a short per-read deadline (initiatorRetryInterval),
-// then loop: try read → on timeout re-send msg1 + set a fresh short
-// deadline → on any other error or success return. The cumulative budget
-// is the supplied 'deadline' (passed by the caller); we never poll past
-// it. Was H-Handshake-Retx — a single dropped msg1 OR msg2 datagram
-// caused the entire 5s handshake budget to spin idle waiting for a
-// reply that the responder never knew to send.
-func readWithMsg1Retry(udpConn *net.UDPConn, msg1 []byte, buf []byte, deadline time.Time) (int, error) {
-	for {
-		now := time.Now()
-		if !now.Before(deadline) {
-			return 0, fmt.Errorf("handshake deadline exceeded")
-		}
-		nextDeadline := now.Add(initiatorRetryInterval)
-		if nextDeadline.After(deadline) {
-			nextDeadline = deadline
-		}
-		if err := udpConn.SetReadDeadline(nextDeadline); err != nil {
-			return 0, err
-		}
-		n, err := udpConn.Read(buf)
-		if err == nil {
-			return n, nil
-		}
-		// time.Now() crossing the per-read deadline triggers net.Error
-		// with Timeout()=true. Any other error (closed conn, refused,
-		// etc.) is terminal.
-		if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
-			return 0, err
-		}
-		if time.Now().Before(deadline) {
-			// Resend msg1 and loop.
-			if _, werr := udpConn.Write(msg1); werr != nil {
-				return 0, werr
-			}
-			dbgHandshake.Printf("Retransmitting msg1 (no msg2 within %v)", initiatorRetryInterval)
-			continue
-		}
-		return 0, err
-	}
 }
