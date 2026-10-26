@@ -257,11 +257,10 @@ func (s *NoiseSession) DeliveryStats() *DeliveryStats {
 }
 
 func (s *NoiseSession) handleData(frame *aether.Frame) {
-	// Recover from a `send on closed channel` panic is scoped to the
-	// delivery loop below — a broad function-wide recover would
-	// silently swallow unrelated bugs (nil deref, internal state
-	// corruption) and turn correctness regressions into invisible
-	// drops.
+	// The stream looked up here may be torn down by another goroutine
+	// (Reset, the stream GC) before the delivery below runs; enqueueDelivery
+	// handles that by selecting on the stream's end, and no recover is
+	// needed here, which keeps an unrelated panic visible.
 	s.mu.Lock()
 	st, ok := s.streams[frame.StreamID]
 	s.mu.Unlock()
@@ -406,49 +405,42 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 		st.ackEngine.OnDataReceived(frame.SeqNo, s.isAckImmediateStream(frame.StreamID))
 	}
 
-	// Delivery loop: handleReset / local Reset / streamGC sweep can run
-	// closeRecvOnce after this goroutine cached `st`, racing with the
-	// channel-send inside DeliverToRecvChWithSignals. Recover is
-	// narrowly scoped to that send only.
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				dbgNoise.Printf("handleData: send-on-closed for stream %d (race with teardown): %v", frame.StreamID, r)
-			}
-		}()
-		for _, d := range delivered {
-			payload, whole := st.reassemble(d)
-			if !whole {
-				continue // a fragment of a message not yet complete, or refused
-			}
-			// AE-M-02: hand the payload to the stream's own deliverLoop
-			// goroutine (non-blocking enqueue) instead of blocking the shared
-			// readLoop up to stream1MaxBackpressure=1s on a full recvCh. A slow
-			// stream-1 consumer must not stall the readLoop, which would stop
-			// draining the noiseConn inbox and silently drop inbound ACKs for
-			// every other stream (noise/session.go:296-312).
-			ok := st.enqueueDelivery(payload)
-			// Conn-level flow control: successful delivery grants credit at
-			// application-read time via the session debouncer (Receive →
-			// connGrantDebouncer.Record). On drop, the debouncer will never
-			// see these bytes so we must grant directly here to prevent a
-			// permanent conn-level stall.
-			if ok {
-				// AER-074 T2 discriminator (M-105/M-106): count ONLY bytes
-				// admitted IN-ORDER (delivered) AND successfully enqueued to
-				// the app stream. A replay/OOO/malformed flooder produces an
-				// empty `delivered` or a failed enqueue, so it never accrues —
-				// it can never shelter into reportAbuse's forensic-only tier.
-				// This is the un-gameable "genuine delivering mesh member"
-				// signal, NOT s.bytesRecv (dispatch-path, floodable — R-842).
-				s.appBytesDelivered.Add(uint64(len(payload)))
-			} else {
-				if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
-					s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
-				}
+	// Delivery: each whole in-order message goes to the stream's deliverLoop
+	// through enqueueDelivery. A Reset or stream GC sweep on another goroutine
+	// may tear the stream down after the lookup above; enqueueDelivery then
+	// drops the payload, since the queue's end is a channel it selects on and
+	// nothing it sends on is ever closed.
+	for _, d := range delivered {
+		payload, whole := st.reassemble(d)
+		if !whole {
+			continue // a fragment of a message not yet complete, or refused
+		}
+		// Hand the payload to the stream's own deliverLoop goroutine without
+		// blocking instead of holding the shared readLoop up to
+		// stream1MaxBackpressure on a full recvCh. A slow stream-1 consumer
+		// must not stall the readLoop, which would stop draining the noiseConn
+		// inbox and silently drop inbound ACKs for every other stream.
+		ok := st.enqueueDelivery(payload)
+		// Conn-level flow control: successful delivery grants credit at
+		// application-read time via the session debouncer (Receive →
+		// connGrantDebouncer.Record). On drop, the debouncer will never
+		// see these bytes so we must grant directly here to prevent a
+		// permanent conn-level stall.
+		if ok {
+			// Count only bytes admitted in order (delivered) and handed to the
+			// app stream: reportAbuse reads appBytesDelivered to tell an
+			// established, delivering peer (its forensic-only tier) from one
+			// that only ever sends garbage. A replay, out-of-order or
+			// malformed flooder produces an empty delivered or a failed
+			// enqueue, so it never accrues here, where s.bytesRecv (counted at
+			// dispatch, before any check) would.
+			s.appBytesDelivered.Add(uint64(len(payload)))
+		} else {
+			if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
+				s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
 			}
 		}
-	}()
+	}
 
 	// AE-M-03: Do NOT feed inbound DATA bytes into congestion().OnAck here.
 	// handleData processes DATA frames arriving FROM the peer; OnAck is the
@@ -809,9 +801,6 @@ func (s *NoiseSession) handleOpen(frame *aether.Frame) {
 }
 
 func (s *NoiseSession) handleImplicitOpen(frame *aether.Frame) {
-	// Recover scoped to the delivery-loop channel-send only (same
-	// reasoning as handleData). Any panic outside the channel-send is
-	// a real bug and must not be silently swallowed.
 	st := s.createStream(frame.StreamID, aether.DefaultStreamConfig(frame.StreamID), true /* enforceRemoteCap */)
 	if st == nil {
 		return
@@ -832,28 +821,22 @@ func (s *NoiseSession) handleImplicitOpen(frame *aether.Frame) {
 		st.ackEngine.OnDataReceived(frame.SeqNo, s.isAckImmediateStream(frame.StreamID))
 	}
 
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				dbgNoise.Printf("handleImplicitOpen: send-on-closed for stream %d (race with teardown): %v", frame.StreamID, r)
-			}
-		}()
-		for _, d := range delivered {
-			payload, whole := st.reassemble(d)
-			if !whole {
-				continue
-			}
-			// AE-M-02: enqueue onto the per-stream deliverLoop (non-blocking)
-			// rather than block the readLoop on a full recvCh. See handleData.
-			ok := st.enqueueDelivery(payload)
-			// Drop-only conn-level credit: see handleData.
-			if !ok {
-				if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
-					s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
-				}
+	// Delivery through the stream's deliverLoop, as handleData: a teardown on
+	// another goroutine makes enqueueDelivery drop the payload, and nothing it
+	// sends on is ever closed.
+	for _, d := range delivered {
+		payload, whole := st.reassemble(d)
+		if !whole {
+			continue
+		}
+		ok := st.enqueueDelivery(payload)
+		// Drop-only conn-level credit: see handleData.
+		if !ok {
+			if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
+				s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
 			}
 		}
-	}()
+	}
 }
 
 func (s *NoiseSession) handleClose(frame *aether.Frame) {
@@ -879,24 +862,22 @@ func (s *NoiseSession) handleClose(frame *aether.Frame) {
 		st.ackEngine.Stop()
 	}
 	remaining := st.recvWindow.DrainMarked()
-	// recvCh-close is idempotent via closeRecvOnce, but a concurrent local
-	// Reset / streamGC sweep on the same streamID can close the channel
-	// between when this loop checks "ok" and when it sends. recover() turns
-	// the panic into a benign drop — matching the TCP adapter's
-	// deliverToStream defense (tcp.go:354-360).
-	func() {
-		defer func() { _ = recover() }()
-		for _, d := range remaining {
-			payload, whole := st.reassemble(d)
-			if !whole {
-				continue
-			}
-			select {
-			case st.recvCh <- payload:
-			default:
-			}
+	// The messages the receive window still held in order go straight to
+	// recvCh without waiting: the stream ends on this frame, so there is no
+	// consumer to backpressure for and what does not fit is dropped with the
+	// stream. recvCh is never closed (closeRecvOnce closes recvDone), so a
+	// Reset or stream GC sweep on another goroutine cannot make this send meet
+	// a closed channel.
+	for _, d := range remaining {
+		payload, whole := st.reassemble(d)
+		if !whole {
+			continue
 		}
-	}()
+		select {
+		case st.recvCh <- payload:
+		default:
+		}
+	}
 	st.closeRecvOnce()
 	st.teardown()
 	s.mu.Lock()
@@ -1101,18 +1082,10 @@ func (s *NoiseSession) deliverToStream(streamID uint64, payload []byte) {
 	if !ok {
 		return
 	}
-	// Recover narrowly scoped to the channel-send only. handleReset /
-	// local Reset / streamGC sweep can run closeRecvOnce after the
-	// lookup above, racing the send on the recv channel.
-	defer func() {
-		if r := recover(); r != nil {
-			dbgNoise.Printf("deliverToStream: send-on-closed for stream %d (race with teardown): %v", streamID, r)
-		}
-	}()
-	// AE-M-02: enqueue onto the per-stream deliverLoop (non-blocking) rather
-	// than block the readLoop on a full recvCh. See handleData. The enqueue
-	// send-on-closed race (teardown closes deliverCh) is caught by this
-	// function's deferred recover, same benign-drop semantics as before.
+	// Enqueue onto the per-stream deliverLoop without blocking rather than
+	// hold the readLoop on a full recvCh, as handleData. A Reset or stream GC
+	// sweep on another goroutine after the lookup above makes enqueueDelivery
+	// drop the payload; nothing it sends on is ever closed.
 	delivered := st.enqueueDelivery(payload)
 	// Drop-only conn-level credit: see handleData.
 	if !delivered {

@@ -163,16 +163,34 @@ type tcpStream struct {
 	config   aether.StreamConfig
 	session  *TCPSession
 	state    *aether.StreamStateMachine
+	// recvCh holds the whole messages deliverLoop has handed to the
+	// application; Receive reads it. It is never closed: its end is recvDone,
+	// which closeRecvOnce closes exactly once (recvOnce) and Receive selects
+	// on, draining what recvCh still holds before it returns io.EOF. A close
+	// of recvCh would race deliverLoop's send into it, since closeRecvOnce
+	// runs on the readLoop (handleClose, handleReset) and on application
+	// goroutines (Reset) while deliverLoop runs on its own. recvDone is made
+	// in the struct literal with recvCh (handleOpen, handleImplicitOpen,
+	// OpenStream); a stream built outside those paths has neither recvDone
+	// nor deliverCh, and closeRecvOnce closes its recvCh instead.
 	recvCh   chan []byte
-	// deliverCh feeds this stream's deliverLoop goroutine. AER-033: the
-	// shared readLoop hands each in-order payload here (non-blocking) instead
-	// of performing the up-to-1s stream-1 backpressure inline, so a slow
-	// consumer on ONE stream can no longer park the readLoop and freeze
-	// gossip/keepalive/control/ACK for the whole session. Created in the
-	// struct literal (before the stream is visible in s.streams, so the
-	// readLoop never races the field); the loop is started post-registration.
+	recvDone chan struct{}
+	// deliverCh carries each in-order payload from the readLoop
+	// (deliverToStream, through enqueueDelivery) to this stream's deliverLoop,
+	// which performs the send into recvCh with its bounded backpressure off
+	// the readLoop, so a slow consumer on one stream holds only its own
+	// deliverLoop and the readLoop keeps serving every other stream. It is
+	// never closed: its end is deliverDone, which teardown closes exactly once
+	// (deliverOnce); enqueueDelivery and deliverLoop select on it. A close of
+	// deliverCh would race enqueueDelivery's send, since teardown runs on
+	// application goroutines (Close, Reset), the stream GC and CloseWithError
+	// while the readLoop is still dispatching DATA for the stream. Both are
+	// made in the struct literal before the stream is visible in s.streams;
+	// deliverLoop is started by attachGrantDebouncer after registration
+	// (deliverStartOnce).
 	deliverCh        chan []byte
-	deliverOnce      sync.Once // closes deliverCh exactly once from teardown
+	deliverDone      chan struct{}
+	deliverOnce      sync.Once // closes deliverDone exactly once
 	deliverStartOnce sync.Once // starts deliverLoop exactly once
 	// fragBuf takes a peer's fragments (DATA frames flagged
 	// aether.FlagFRAGMENT) and refuses each against the session's fragRecv,
@@ -195,13 +213,21 @@ type tcpStream struct {
 	recvOnce       sync.Once
 }
 
-// closeRecvOnce closes st.recvCh exactly once. Multiple teardown paths
-// (handleReset, local Reset, handleClose, streamGC callback) may race
-// to release the stream; recvOnce makes the channel-close idempotent so
-// none of them panic with `send on closed channel` or `close of closed
-// channel`. Any in-flight Receive() returns io.EOF.
+// closeRecvOnce ends the stream's receive side exactly once: it closes
+// recvDone, on which Receive returns what recvCh still holds and then io.EOF.
+// Every termination path calls it (handleClose, handleReset, Reset, the
+// OpenStream rollback, the stream GC through Reset), from the readLoop and
+// from application goroutines, so recvOnce keeps the close idempotent.
+// recvCh itself is never closed here because deliverLoop may be sending into
+// it on another goroutine; a stream built without recvDone (outside the open
+// paths, with no deliverLoop) has its recvCh closed instead, which Receive
+// reads as the same end.
 func (st *tcpStream) closeRecvOnce() {
 	st.recvOnce.Do(func() {
+		if st.recvDone != nil {
+			close(st.recvDone)
+			return
+		}
 		close(st.recvCh)
 	})
 }
@@ -214,11 +240,12 @@ func (st *tcpStream) attachGrantDebouncer() {
 	if st.window == nil || st.session == nil {
 		return
 	}
-	// AER-033: start the per-stream delivery goroutine. deliverCh was created
-	// in the struct literal before the stream became visible in s.streams, so
-	// starting the drain here (post-registration) is race-free. Guarded so a
-	// second attachGrantDebouncer never spawns a second draining goroutine
-	// (two rangers on one channel would double-deliver).
+	// Start the per-stream delivery goroutine. deliverCh and deliverDone come
+	// from the struct literal, ahead of the stream's insertion into s.streams,
+	// so the readLoop never reads a field being written here.
+	// deliverStartOnce keeps a second attachGrantDebouncer from starting a
+	// second deliverLoop, which would take payloads from deliverCh out of
+	// order.
 	if st.deliverCh != nil {
 		st.deliverStartOnce.Do(func() { go st.deliverLoop() })
 	}
@@ -238,76 +265,86 @@ func (st *tcpStream) attachGrantDebouncer() {
 }
 
 // teardown releases per-stream resources that must not outlive the
-// stream itself. Idempotent.
+// stream itself. Idempotent: every termination path calls it (Close, Reset,
+// handleClose, handleReset, the OpenStream rollback), from the readLoop and
+// from application goroutines.
 func (st *tcpStream) teardown() {
 	if st.grantDebouncer != nil {
 		st.grantDebouncer.Close()
 	}
-	// AER-033: stop the delivery goroutine. Closing deliverCh ends
-	// deliverLoop's range; deliverOnce keeps concurrent teardown paths
-	// idempotent. The nil guard covers streams constructed outside the
-	// normal paths (direct unit-test construction) where deliverCh is nil.
-	if st.deliverCh != nil {
-		st.deliverOnce.Do(func() { close(st.deliverCh) })
+	// End delivery: closing deliverDone makes deliverLoop hand over what
+	// deliverCh still holds and return, and makes enqueueDelivery drop what
+	// the readLoop dispatches from now on. deliverCh is not closed because the
+	// readLoop may be sending into it at this moment (enqueueDelivery). The
+	// nil guard covers a stream built outside the open paths, which has no
+	// deliverCh and no deliverLoop.
+	if st.deliverDone != nil {
+		st.deliverOnce.Do(func() { close(st.deliverDone) })
 	}
 }
 
-// deliverLoop is the per-stream delivery goroutine. AER-033: it drains
-// deliverCh (fed in-order by the single readLoop) and performs the actual
-// send into recvCh — including the up-to-1s stream-1 backpressure — OFF the
-// readLoop, so a slow application consumer blocks only this goroutine, never
-// the shared readLoop / control path. Exits when teardown closes deliverCh.
+// deliverLoop is the per-stream delivery goroutine: it takes each in-order
+// payload the readLoop put on deliverCh and performs the send into recvCh,
+// with the bounded backpressure DeliverToRecvChWithSignals applies, off the
+// readLoop, so a slow application consumer holds only this goroutine while
+// the readLoop keeps serving every other stream. It returns when teardown
+// closes deliverDone, after handing over what deliverCh still holds, each
+// payload within the same bound, so a message that arrived before a CLOSE
+// reaches recvCh ahead of the end Receive reports. Nothing closes recvCh
+// while this goroutine runs (closeRecvOnce closes recvDone), so the send
+// never meets a closed channel.
 func (st *tcpStream) deliverLoop() {
 	s := st.session
-	defer func() {
-		// recvCh may be closed by closeRecvOnce (teardown race); recover so a
-		// send-on-closed is a benign drop, matching deliverToStream's guard.
-		if r := recover(); r != nil {
-			dbgTCP.Printf("deliverLoop: send-on-closed for stream %d (race with teardown): %v", st.streamID, r)
-		}
-	}()
-	for payload := range st.deliverCh {
+	deliver := func(payload []byte) {
 		// The drop accounting (credit grant, congestion signal) lives inside
 		// DeliverToRecvChWithSignals' timeout path, so the bool is advisory.
 		DeliverToRecvChWithSignals(st.recvCh, payload, st.window, st.streamID, s.sendWindowUpdateAgnostic, s.SendCongestion, &s.deliveryStats)
 	}
+	for {
+		select {
+		case payload := <-st.deliverCh:
+			deliver(payload)
+		case <-st.deliverDone:
+			for {
+				select {
+				case payload := <-st.deliverCh:
+					deliver(payload)
+				default:
+					return
+				}
+			}
+		}
+	}
 }
 
-// enqueueDelivery hands one in-order payload to deliverLoop. AER-033:
-// non-blocking — the readLoop must never block here. Returns false only when
-// deliverCh is full (deliverCh AND recvCh saturated == genuine sustained
-// overload); the payload is then dropped with the SAME accounting
-// DeliverToRecvChWithSignals' drop path uses (backpressure+dropped stats,
-// stream-window grant, CONGESTION signal) so the sender is throttled and never
-// stalls on lost credit.
+// enqueueDelivery hands one in-order payload to deliverLoop without
+// blocking: the readLoop (deliverToStream) calls it and must never wait on a
+// stream's consumer. It returns false when it does not hand the payload over:
+// deliverCh is full (deliverCh and recvCh both saturated, a sustained
+// overload), in which case the payload is dropped with the accounting
+// DeliverToRecvChWithSignals' drop path uses (backpressure and dropped
+// stats, stream-window grant, CONGESTION signal) so the sender is throttled
+// and never stalls on lost credit; or the stream has been torn down
+// (deliverDone closed), in which case the payload is dropped without
+// accounting, since the stream's window and its peer's view of it end with
+// the RESET or CLOSE teardown sent or received. deliverCh is never closed,
+// so the send cannot meet a closed channel; selecting on deliverDone is what
+// keeps a torn-down stream from filling its buffer and then signalling
+// congestion for bytes no one will read.
 //
-// deliverCh is nil only for streams built by direct construction outside the
-// normal open paths (unit tests); those fall back to inline delivery so the
-// contract still holds, just without the HOL isolation.
-func (st *tcpStream) enqueueDelivery(payload []byte) (accepted bool) {
+// deliverCh is nil only for a stream built outside the open paths (no
+// deliverLoop); that stream is delivered inline, without the readLoop
+// isolation.
+func (st *tcpStream) enqueueDelivery(payload []byte) bool {
 	s := st.session
 	if st.deliverCh == nil {
 		return DeliverToRecvChWithSignals(st.recvCh, payload, st.window, st.streamID, s.sendWindowUpdateAgnostic, s.SendCongestion, &s.deliveryStats)
 	}
-	// deliverCh can be closed by a CONCURRENT teardown (deliverOnce in
-	// stopDelivery, driven by housekeepingTick stream-GC or an external
-	// session Close) while this readLoop is still dispatching a DATA frame for
-	// the stream. A select send on a closed channel is "ready" and PANICS —
-	// it does NOT fall through to default — so guard the sole deliverCh sender
-	// and treat send-on-closed as a benign drop (the session is going away, so
-	// the payload is moot). Mirrors deliverLoop's recover for the symmetric
-	// recvCh-close race (AER-033). Under heavy session churn this race fires
-	// constantly; without the guard it crashes the process (send on closed
-	// channel -> exit 2).
-	defer func() {
-		if r := recover(); r != nil {
-			dbgTCP.Printf("enqueueDelivery: send-on-closed deliverCh for stream %d (teardown race): %v", st.streamID, r)
-			accepted = false
-		}
-	}()
 	select {
 	case st.deliverCh <- payload:
 		return true
+	case <-st.deliverDone:
+		return false
 	default:
 	}
 	s.deliveryStats.recordBackpressure(st.streamID)
@@ -400,7 +437,7 @@ func NewTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 		if !ok {
 			return
 		}
-		// st.Reset deletes from s.streams, closes recvCh, releaseStream.
+		// st.Reset deletes from s.streams, ends the receive side, releaseStream.
 		_ = st.Reset(aether.ResetTimeout)
 	})
 	go s.streamGC.Start()
@@ -692,13 +729,14 @@ func (s *TCPSession) deliverToStream(frame *aether.Frame) {
 		dbgTCP.Printf("deliverToStream: stream %d fragment refused: %v", frame.StreamID, err)
 		return
 	}
-	// AER-033: hand the payload to the per-stream deliverLoop (non-blocking)
-	// rather than performing the up-to-1s backpressure inline on the shared
-	// readLoop. A slow consumer on this stream then blocks only its own
-	// deliverLoop; the readLoop keeps servicing gossip/keepalive/control/ACK
-	// for every other stream. enqueueDelivery only sends into a buffered
-	// channel here, so the send-on-closed race window (recvCh closed by a
-	// concurrent handleClose) moved into deliverLoop, which recovers there.
+	// Hand the payload to the per-stream deliverLoop without blocking rather
+	// than perform the bounded backpressure inline on the shared readLoop: a
+	// slow consumer on this stream then holds only its own deliverLoop, and
+	// the readLoop keeps serving gossip, keepalive, control and ACK for every
+	// other stream. A stream torn down between the lookup above and this call
+	// (Reset on another goroutine) drops the payload here, since the queue's
+	// end is a channel both sides select on and nothing is closed under this
+	// send.
 	accepted := st.enqueueDelivery(frame.Payload)
 	if accepted {
 		// ACK-observe: track metrics (no wire ACK, no retransmit). Runs on the
@@ -716,7 +754,7 @@ func (s *TCPSession) deliverToStream(frame *aether.Frame) {
 			dbgTCP.Printf("deliverToStream: enqueued %d bytes for stream 0 (gossip)", len(frame.Payload))
 		}
 	} else {
-		dbgTCP.Printf("deliverToStream: DROPPED frame for stream %d (%d bytes, deliverCh full)", frame.StreamID, len(frame.Payload))
+		dbgTCP.Printf("deliverToStream: DROPPED frame for stream %d (%d bytes, deliverCh full or stream torn down)", frame.StreamID, len(frame.Payload))
 	}
 }
 
@@ -812,13 +850,15 @@ func (s *TCPSession) handleOpen(frame *aether.Frame) {
 			Priority:    payload.Priority,
 			Dependency:  payload.Dependency,
 		},
-		session:   s,
-		state:     aether.NewStreamStateMachine(),
-		recvCh:    make(chan []byte, recvChCapacity(frame.StreamID)),
-		deliverCh: make(chan []byte, recvChCapacity(frame.StreamID)),
-		fragBuf:   NewFragmentBuffer(),
-		window:    flow.NewStreamWindowWithCap(0, 0),
-		observe:   reliability.NewObserveEngine(),
+		session:     s,
+		state:       aether.NewStreamStateMachine(),
+		recvCh:      make(chan []byte, recvChCapacity(frame.StreamID)),
+		recvDone:    make(chan struct{}),
+		deliverCh:   make(chan []byte, recvChCapacity(frame.StreamID)),
+		deliverDone: make(chan struct{}),
+		fragBuf:     NewFragmentBuffer(),
+		window:      flow.NewStreamWindowWithCap(0, 0),
+		observe:     reliability.NewObserveEngine(),
 	}
 	st := s.registerStream(candidate, true /* enforceRemoteCap */)
 	if st == nil {
@@ -866,15 +906,17 @@ func (s *TCPSession) handleImplicitOpen(frame *aether.Frame) {
 	}
 
 	candidate := &tcpStream{
-		streamID:  frame.StreamID,
-		config:    cfg,
-		session:   s,
-		state:     aether.NewStreamStateMachine(),
-		recvCh:    make(chan []byte, recvChCapacity(frame.StreamID)),
-		deliverCh: make(chan []byte, recvChCapacity(frame.StreamID)),
-		fragBuf:   NewFragmentBuffer(),
-		window:    flow.NewStreamWindowWithCap(cfg.InitialCredit, cfg.MaxCredit),
-		observe:   reliability.NewObserveEngine(),
+		streamID:    frame.StreamID,
+		config:      cfg,
+		session:     s,
+		state:       aether.NewStreamStateMachine(),
+		recvCh:      make(chan []byte, recvChCapacity(frame.StreamID)),
+		recvDone:    make(chan struct{}),
+		deliverCh:   make(chan []byte, recvChCapacity(frame.StreamID)),
+		deliverDone: make(chan struct{}),
+		fragBuf:     NewFragmentBuffer(),
+		window:      flow.NewStreamWindowWithCap(cfg.InitialCredit, cfg.MaxCredit),
+		observe:     reliability.NewObserveEngine(),
 	}
 	st := s.registerStream(candidate, true /* enforceRemoteCap */)
 	if st == nil {
@@ -1227,15 +1269,17 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 	}
 
 	st := &tcpStream{
-		streamID:  cfg.StreamID,
-		config:    cfg,
-		session:   s,
-		state:     aether.NewStreamStateMachine(),
-		recvCh:    make(chan []byte, recvChCapacity(cfg.StreamID)),
-		deliverCh: make(chan []byte, recvChCapacity(cfg.StreamID)),
-		fragBuf:   NewFragmentBuffer(),
-		window:    flow.NewStreamWindowWithCap(cfg.InitialCredit, cfg.MaxCredit),
-		observe:   reliability.NewObserveEngine(),
+		streamID:    cfg.StreamID,
+		config:      cfg,
+		session:     s,
+		state:       aether.NewStreamStateMachine(),
+		recvCh:      make(chan []byte, recvChCapacity(cfg.StreamID)),
+		recvDone:    make(chan struct{}),
+		deliverCh:   make(chan []byte, recvChCapacity(cfg.StreamID)),
+		deliverDone: make(chan struct{}),
+		fragBuf:     NewFragmentBuffer(),
+		window:      flow.NewStreamWindowWithCap(cfg.InitialCredit, cfg.MaxCredit),
+		observe:     reliability.NewObserveEngine(),
 	}
 	st.state.Transition(aether.EventSendOpen)
 
@@ -1636,21 +1680,41 @@ func (st *tcpStream) Send(ctx context.Context, data []byte) error {
 	return nil
 }
 
+// Receive returns the next whole message deliverLoop handed to recvCh.
+// After closeRecvOnce has closed recvDone it still returns what recvCh holds,
+// one message per call, and then io.EOF; the drain comes first because a
+// select with both recvCh and recvDone ready picks either, and a message
+// delivered before the CLOSE or RESET must not be lost behind the end. A
+// stream built without recvDone reports the same end through its closed
+// recvCh.
 func (st *tcpStream) Receive(ctx context.Context) ([]byte, error) {
+	consumed := func(data []byte) ([]byte, error) {
+		// Consume-driven grant: record the app-consumed bytes in the
+		// stream-level debouncer so WINDOW_UPDATE emission advances with
+		// application progress, not frame-receipt. recvCh holds whole
+		// messages only (deliverToStream keeps fragments out of it).
+		if st.grantDebouncer != nil {
+			st.grantDebouncer.Record(int64(len(data)))
+		}
+		return data, nil
+	}
 	for {
 		select {
 		case data, ok := <-st.recvCh:
 			if !ok {
 				return nil, io.EOF
 			}
-			// Consume-driven grant: record the app-consumed bytes in the
-			// stream-level debouncer so WINDOW_UPDATE emission advances with
-			// application progress, not frame-receipt. recvCh holds whole
-			// messages only (deliverToStream keeps fragments out of it).
-			if st.grantDebouncer != nil {
-				st.grantDebouncer.Record(int64(len(data)))
+			return consumed(data)
+		case <-st.recvDone:
+			select {
+			case data, ok := <-st.recvCh:
+				if !ok {
+					return nil, io.EOF
+				}
+				return consumed(data)
+			default:
+				return nil, io.EOF
 			}
-			return data, nil
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-st.session.CloseSignal():
