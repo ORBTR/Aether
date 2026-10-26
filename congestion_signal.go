@@ -52,7 +52,7 @@ func (t *CongestionThrottle) Apply(p CongestionPayload) {
 	}
 
 	t.reason = p.Reason
-	// AE-P-10: Severity is peer-controlled and physically 0-255, but the wire
+	// Severity is peer-controlled and physically 0-255, but the wire
 	// contract and RateFactor's documented [0,1] range require 0-100. Clamp an
 	// out-of-range hint UP to 100 (full congestion) rather than trusting it, so
 	// RateFactor never yields a negative multiplier and ShouldStall stays correct.

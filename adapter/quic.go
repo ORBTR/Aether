@@ -119,12 +119,12 @@ func (s *QUICSession) acceptLoop() {
 		}
 		st.state.Transition(aether.EventRecvOpen)
 
-		// AE-P-06: an aether StreamID must be unique per live session. A
-		// second QUIC stream presenting an already-registered StreamID is
-		// a protocol violation — refuse the DUPLICATE transport stream
+		// An aether StreamID must be unique per live session. A second
+		// QUIC stream presenting an already-registered StreamID is a
+		// protocol violation — refuse the DUPLICATE transport stream
 		// rather than silently overwriting the map entry. Overwriting
-		// corrupts Metrics().ActiveStreams and, via dropStream (AE-H-01),
-		// lets either stream's close evict the survivor's slot. The first
+		// corrupts Metrics().ActiveStreams and, via dropStream, lets
+		// either stream's close evict the survivor's slot. The first
 		// stream keeps its mapping; quic-go's MaxIncomingStreams still
 		// bounds total concurrent streams, so no limit is lowered. Mirrors
 		// tcp.go registerStream's duplicate handling.
@@ -187,12 +187,11 @@ func (s *QUICSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (
 	s.mu.Lock()
 	if existing, dup := s.streams[cfg.StreamID]; dup {
 		s.mu.Unlock()
-		// AER-036: reject a duplicate local StreamID instead of overwriting.
-		// The accept path enforces this (AE-P-06); the local OpenStream path
-		// did not, so recycling an ID before the prior stream closed orphaned
-		// the old quic.Stream (never CancelRead/Write'd) and a later dropStream
-		// on the stale entry evicted the survivor. Cancel the just-created QUIC
-		// stream we won't be tracking.
+		// Reject a duplicate local StreamID instead of overwriting, as
+		// acceptLoop does: recycling an ID before the prior stream closed
+		// would orphan the old quic.Stream (never CancelRead/Write'd) and let
+		// a later dropStream on the stale entry evict the survivor. Cancel the
+		// just-created QUIC stream we won't be tracking.
 		_ = existing
 		qs.CancelRead(0)
 		qs.CancelWrite(0)
@@ -204,8 +203,8 @@ func (s *QUICSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (
 	return st, nil
 }
 
-// AcceptStream delegates to the shared aether.StreamAcceptor — the
-// adapter no longer owns the FIFO channel + per-transport select. See
+// AcceptStream delegates to the shared aether.StreamAcceptor, which owns
+// the FIFO channel and the per-StreamID dispatch for every adapter. See
 // stream_acceptor.go for the underlying drain order (waiter → backlog
 // → FIFO).
 func (s *QUICSession) AcceptStream(ctx context.Context) (aether.Stream, error) {
@@ -449,7 +448,7 @@ func (f *quicFrameRead) fill(r io.Reader, buf []byte) error {
 // the ActiveStreams count), so without this eviction it grows by one
 // pinned *quicStream — and the quic.Stream handle each retains — for
 // every stream ever created on a long-lived connection: an unbounded
-// leak. Mirrors the tcp/noise adapters' teardown discipline. AE-H-01.
+// leak. Mirrors the tcp/noise adapters' teardown discipline.
 func (st *quicStream) dropStream() {
 	st.session.mu.Lock()
 	delete(st.session.streams, st.streamID)

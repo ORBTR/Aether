@@ -166,13 +166,13 @@ func (s *NoiseSession) processIncomingFrame(frame *aether.Frame, indicator byte)
 
 // dispatchFrame routes an incoming frame to the appropriate handler.
 func (s *NoiseSession) dispatchFrame(frame *aether.Frame) {
-	// AE-H-10: refresh stream-GC activity for ANY frame type on a
-	// non-control stream — ACK / WINDOW_UPDATE are liveness just like
-	// DATA. Recording only on inbound DATA (handleData) let StreamGC
-	// reset a live upload-only stream: an uploader sees only ACK/WINDOW
-	// returning on its app stream, so after the 5-min idle timeout the
-	// sweep RESET its own actively-transmitting stream mid-transfer.
-	// Mirrors adapter/tcp.go dispatchFrame.
+	// Refresh stream-GC activity for ANY frame type on a non-control
+	// stream — ACK / WINDOW_UPDATE are liveness just like DATA. Recorded
+	// only on inbound DATA (handleData), StreamGC would reset a live
+	// upload-only stream: an uploader sees only ACK/WINDOW returning on
+	// its app stream, so after the idle timeout the sweep would RESET its
+	// own actively-transmitting stream mid-transfer. Mirrors
+	// adapter/tcp.go dispatchFrame.
 	if s.streamGC != nil && frame.StreamID != 0 {
 		s.streamGC.RecordActivity(frame.StreamID)
 	}
@@ -293,7 +293,7 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 	// half the uint32 space, impossible in a single rekey window) are
 	// reported as abuse. Duplicate is the protocol-correct behaviour of
 	// a working reliability layer under loss.
-	// AER-061: Classify is read-only — it does NOT mark the SeqNo seen.
+	// Classify is read-only — it does NOT mark the SeqNo seen.
 	// We commit the replay window (st.replay.Commit) only AFTER the frame is
 	// durably buffered by recvWindow below. If we marked it seen here and the
 	// reorder buffer then dropped it for capacity, every retransmit would
@@ -332,8 +332,8 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 		s.reportAbuse(abuse.ReasonReplayDetected)
 		return
 	case reliability.ResultAncient:
-		// AE-P-04: a SeqNo more than ReplayWindowSize(64) below topSeq is
-		// NOT necessarily an adversarial replay. In-flight frame count is
+		// A SeqNo more than ReplayWindowSize(64) below topSeq is NOT
+		// necessarily an adversarial replay. In-flight frame count is
 		// bounded by CUBIC cwnd + byte-based flow-control credit (default
 		// 1 MiB, growable to 8 MiB, and frames <= MinGuaranteedWindow=1KiB
 		// bypass credit entirely -- flow/stream_window.go), NOT by the
@@ -359,11 +359,11 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 			// ResultDuplicate at OnDuplicateReceived) so the storm stops in
 			// one round-trip.
 			//
-			// AER-023: do NOT charge abuse here. A below-floor frame is the
-			// same class of legitimate lost-ACK retransmit as an in-window
+			// Do NOT charge abuse here. A below-floor frame is the same
+			// class of legitimate lost-ACK retransmit as an in-window
 			// ResultDuplicate (which is never charged); on a lossy path a
-			// >64-frame burst with a lost cumulative ACK produced ~13 of
-			// these inside one RTT and tripped the abuse threshold, killing a
+			// >64-frame burst with a lost cumulative ACK yields ~13 of these
+			// inside one RTT, enough to trip the abuse threshold and kill a
 			// healthy session. Genuine forgeries are still caught by
 			// ResultWrapAttack; a genuine replay flood is bounded by the
 			// eager-ACK cost, not an abuse kill.
@@ -379,8 +379,8 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 		return
 	}
 
-	// Reliability: insert into receive window for reordering. AER-061:
-	// only mark the replay window seen once the frame is durably buffered.
+	// Reliability: insert into receive window for reordering. The replay
+	// window is marked seen only once the frame is durably buffered.
 	// A capacity drop leaves it un-committed so its retransmit is still
 	// deliverable. Commit is idempotent and a no-op for below-floor/ancient
 	// SeqNos, so the ResultAncient-at/above-floor fall-through is safe.
@@ -442,7 +442,7 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 		}
 	}
 
-	// AE-M-03: Do NOT feed inbound DATA bytes into congestion().OnAck here.
+	// Do NOT feed inbound DATA bytes into congestion().OnAck here.
 	// handleData processes DATA frames arriving FROM the peer; OnAck is the
 	// acknowledgement-of-OUR-sent-data hook and grows the send-side cwnd
 	// (CUBIC slow-start does cwnd += ackedBytes, cubic.go:115). Counting
@@ -465,11 +465,10 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	// Decode Composite ACK
 	ack := aether.DecodeCompositeACK(frame.Payload)
 	if ack == nil {
-		// AER-074 (B) diagnostic (env-gated AETHER_DEBUG_ACKDECODE=1): legit
-		// v0.0.114 CompositeACKs are decode-failing between two v0.0.114 peers
-		// (same-version runtime bug — the codec is byte-symmetric per
-		// M-100/M-104). Log the RAW failing payload to fork the cause from
-		// ground truth: frameLen!=payloadLen or payloadLen<8 ⇒ truncation /
+		// Diagnostic (env-gated AETHER_DEBUG_ACKDECODE=1) for a CompositeACK
+		// that fails to decode between two peers of one build, whose codec is
+		// byte-symmetric: log the RAW failing payload so the cause can be read
+		// from the bytes. frameLen!=payloadLen or payloadLen<8 ⇒ truncation /
 		// sizing / pool; otherwise a full-length garbage hex ⇒ buffer aliasing
 		// / multipath corruption AFTER Validate but BEFORE this decode.
 		if os.Getenv("AETHER_DEBUG_ACKDECODE") == "1" {
@@ -488,8 +487,8 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	// cadence instead of over- or under-shooting. AckDelay is encoded
 	// in AckDelayGranularity (8us) units on the wire.
 	if st.tlp != nil {
-		// AE-M-01: scale by time.Microsecond so the 8-unit (8µs) granularity
-		// lands in Duration (ns); matches the sibling RTT-sample decode below
+		// Scale by time.Microsecond so the 8-unit (8µs) granularity lands in
+		// Duration (ns); matches the sibling RTT-sample decode below
 		// and the encoder (ack_engine.go: ackDelayUs / AckDelayGranularity).
 		// Without it the value is 1000x too small and TLP's max_ack_delay EWMA
 		// decays PTO below the peer's real ACK cadence, firing spurious probes.
@@ -512,14 +511,15 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	}
 
 	// RTT sample from the LARGEST-acked non-retransmitted entry.
-	// AER-064: RFC 9002 §5.1 requires sampling the largest acked packet,
-	// not the oldest. `acked` is lowest-seq-first, so the previous "first
-	// Retries==0 entry" sampled the OLDEST frame while AckDelay is measured
-	// against the newest received frame — every sample then included the
-	// inter-frame send gap (≥2 frames per ACK under MaxPackets=2) and, after
-	// an ACK loss, the whole lost-ACK interval, systematically inflating
-	// SRTT/RTO/RACK/TLP. Pick the most-recently-sent unretransmitted entry
-	// so the sample and AckDelay refer to the same frame.
+	// RFC 9002 §5.1 requires sampling the largest acked packet, not the
+	// oldest. `acked` is lowest-seq-first, so taking the first Retries==0
+	// entry would sample the OLDEST frame while AckDelay is measured
+	// against the newest received frame — every sample would then include
+	// the inter-frame send gap (≥2 frames per ACK under MaxPackets=2) and,
+	// after an ACK loss, the whole lost-ACK interval, systematically
+	// inflating SRTT/RTO/RACK/TLP. Pick the most-recently-sent
+	// unretransmitted entry so the sample and AckDelay refer to the same
+	// frame.
 	maxDelay := s.classDefaults.KeepaliveInterval // use keepalive interval as max ACK delay clamp
 	if maxDelay <= 0 {
 		maxDelay = 25 * time.Millisecond
@@ -541,7 +541,7 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 		// reporting AckDelay=0 or AckDelay>elapsed can drive SRTT to
 		// absurdly low values, shrinking RTO and triggering spurious
 		// retransmits. UpdateWithDelay additionally floors the adjusted
-		// sample at min_rtt (AER-074).
+		// sample at min_rtt.
 		if ackDelay >= 0 && ackDelay < elapsed {
 			st.rtt.UpdateWithDelay(elapsed, ackDelay)
 		}
@@ -606,8 +606,8 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	// below and for the ACK-driven flow-control credit release that
 	// happens regardless of congestion controller choice.
 	//
-	// AER-081: track metered acked bytes separately. Frames <=
-	// MinGuaranteedWindow bypass StreamWindow.Consume (never acquire credit),
+	// Track metered acked bytes separately. Frames <= MinGuaranteedWindow
+	// bypass StreamWindow.Consume (never acquire credit),
 	// so releasing credit for their ACKs drains dataOutstanding that a
 	// different (large) frame consumed — over-admitting in-flight and, on the
 	// connection window, releasing one stream's credit for another's ACK.
@@ -633,17 +633,17 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 			}
 		}
 	} else if cubic, ok := s.congestion().(*congestion.CUBICController); ok {
-		// AER-077: thread current in-flight bytes into CUBIC so Proportional
-		// Rate Reduction runs during fast recovery. With pipe=0 the PRR branch
-		// was dead code and recovery exited after the FIRST ACK, so a
-		// multi-packet loss burst compounded ×0.7 per tick instead of one
+		// Thread the current in-flight bytes into CUBIC (OnAckWithPipe) so
+		// Proportional Rate Reduction runs during fast recovery: with pipe=0
+		// the PRR branch never runs and recovery exits after the FIRST ACK, so
+		// a multi-packet loss burst compounds ×0.7 per tick instead of one
 		// reduction per RTT. totalInFlightBytes() here is the post-ACK pipe.
 		cubic.OnAckWithPipe(ackedBytes, srtt, s.totalInFlightBytes())
 	} else {
 		s.congestion().OnAck(ackedBytes, srtt)
 	}
 	// ACK-driven flow-control credit release. Every byte the peer has
-	// acknowledged is no longer in-flight on this stream, so credit can
+	// acknowledged has left flight on this stream, so credit can
 	// be returned to the sender NOW regardless of whether a matching
 	// WINDOW_UPDATE frame has arrived. This closes the stuck-credit gap
 	// on lossy Noise-UDP paths where WINDOW_UPDATE packets can be
@@ -721,7 +721,7 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	// holding s.mu.
 	for {
 		prev := st.lastBaseACKSeen.Load()
-		// AE-P-08: wrap-safe serial-number comparison (RFC 1982). A plain
+		// Wrap-safe serial-number comparison (RFC 1982). A plain
 		// `ack.BaseACK <= prev` freezes progress tracking for a full ~4B-frame
 		// cycle after BaseACK wraps past 2^32 — the small post-wrap value
 		// compares <= the near-2^32 prev, so lastProgressAtUnixNano (and the

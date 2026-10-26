@@ -270,7 +270,7 @@ func (e *Estimator) Update(sample time.Duration) {
 // Update. Avoids inflating SRTT by time the receiver held the ACK
 // before transmitting it.
 //
-// AER-074 / RFC 9002 §5.3: the ack-delay adjustment is applied only when it
+// RFC 9002 §5.3: the ack-delay adjustment is applied only when it
 // does not pull the sample below min_rtt. A hostile or buggy peer reporting
 // ackDelay ≈ rawRTT would otherwise collapse SRTT toward the 1µs floor,
 // shrinking the RTO/RACK reorder window and triggering spurious-retransmit

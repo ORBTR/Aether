@@ -14,7 +14,7 @@ import (
 const DefaultStreamIdleTimeout = 5 * time.Minute
 
 // StreamGCExemptBelow is the exclusive upper bound of stream IDs exempt from idle GC.
-// AE-I-02: single source of truth for the sweep() exemption boundary so the code and
+// The single source of truth for the sweep() exemption boundary so the code and
 // docs cannot drift. Streams with ID < StreamGCExemptBelow (0-9) are well-known protocol
 // streams (gossip, RPC, keepalive, control) and are never idle-reset; dynamic application
 // streams use higher IDs.
@@ -96,7 +96,7 @@ func (g *StreamGC) sweep() {
 	now := time.Now()
 	var expired []uint64
 	for streamID, lastSeen := range g.lastActivity {
-		// AE-I-02: exempt well-known low stream IDs (gossip, RPC, keepalive,
+		// Exempt well-known low stream IDs (gossip, RPC, keepalive,
 		// control). Boundary lives in StreamGCExemptBelow so sweep() and the
 		// type/const docs stay in sync. Dynamic application streams use higher IDs.
 		if streamID < StreamGCExemptBelow {

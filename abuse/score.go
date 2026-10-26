@@ -169,19 +169,18 @@ func (s *Score[K]) Record(peer K, r Reason) (current float64, justExceeded bool)
 	p.lastUpdate = now
 	p.hits++
 
-	// AE-P-09: re-arm the breaker on current state, not just the rising
-	// edge. The old guard blacklisted only on a below->over transition
-	// (!wasOver && nowOver) using a pre-decay wasOver snapshot. A peer
-	// whose score stayed >= threshold across a cool-off kept wasOver==true
-	// forever, so once IsBlacklisted auto-cleared the flag at TTL expiry
-	// (without resetting the score) the breaker never re-fired and the
-	// accept gate re-admitted a still-abusive peer permanently. Clear an
-	// expired cool-off here first (so re-arming does not depend on
+	// Re-arm the breaker on current state, not just the rising edge. A
+	// guard that blacklists only on a below->over transition from a
+	// pre-decay snapshot never re-fires for a peer whose score stays >=
+	// threshold across a cool-off: once IsBlacklisted auto-clears the flag
+	// at TTL expiry (without resetting the score) the accept gate re-admits
+	// a still-abusive peer for good. Clear an expired cool-off here first
+	// (so re-arming does not depend on
 	// IsBlacklisted having been polled), then re-blacklist whenever the
 	// post-decay score is over threshold and the peer is not already
 	// serving a cool-off. This fires at most one GoAway per BlacklistTTL
 	// for a sustained abuser and never resets the accumulated score, so no
-	// misbehaviour evidence is lost (capability preserved).
+	// misbehaviour evidence is lost.
 	if p.blacklisted && now.After(p.blacklistEnd) {
 		p.blacklisted = false
 	}
@@ -209,19 +208,18 @@ func (s *Score[K]) Current(peer K) float64 {
 // IsBlacklisted reports whether the peer is currently in the cool-off
 // window. Auto-clears once the TTL expires.
 //
-// AE-M-04 caveat: this predicate is what the responder-side accept gate
+// This predicate is what the responder-side accept gate
 // (adapter.AcceptSessionOverConn) consults to refuse a peer for its
 // BlacklistTTL cool-off, rather than letting the peer reset its score to
 // 0 by reconnecting. That protection only holds when callers share ONE
 // node-scoped registry across sessions; a fresh per-session registry
 // carries no prior blacklist. Auto-clear here only ungates the accept
 // path once the TTL lapses; it deliberately does NOT reset the score
-// (a still-misbehaving peer keeps its accumulated evidence). AE-P-09:
-// re-arming no longer depends on a HalfLife≈BlacklistTTL decay
-// coincidence — Record re-arms the breaker on the peer's current
-// post-decay state regardless of peak, so a peer that stays >= threshold
-// across the cool-off is re-blacklisted on its next event instead of
-// staying latched open.
+// (a still-misbehaving peer keeps its accumulated evidence). Record
+// re-arms the breaker on the peer's current post-decay state regardless
+// of peak, not on a HalfLife≈BlacklistTTL decay coincidence, so a peer
+// that stays >= threshold across the cool-off is re-blacklisted on its
+// next event instead of staying latched open.
 func (s *Score[K]) IsBlacklisted(peer K) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -255,9 +253,9 @@ func (s *Score[K]) Prune(maxIdle time.Duration) {
 	defer s.mu.Unlock()
 	now := time.Now()
 	for k, p := range s.peers {
-		// AER-052: capture the idle duration BEFORE decayLocked resets
-		// p.lastUpdate to now — otherwise now.Sub(p.lastUpdate) was always 0
-		// and nothing was ever pruned, so a shared registry grew without bound.
+		// Capture the idle duration BEFORE decayLocked resets p.lastUpdate to
+		// now — read after it, now.Sub(p.lastUpdate) is always 0, nothing is
+		// ever pruned, and a shared registry grows without bound.
 		idle := now.Sub(p.lastUpdate)
 		s.decayLocked(p, now)
 		if !p.blacklisted && p.score < 1 && idle > maxIdle {
@@ -288,10 +286,10 @@ func (s *Score[K]) decayLocked(p *PeerScore, now time.Time) {
 
 // pow2neg returns 2^-n for n ≥ 0.
 //
-// AER-092: use the exact math.Exp2 rather than a linear interpolation of the
-// fractional part. The convex 2^-frac was over-estimated by `1 - 0.5*frac`
-// (~6% high at frac=0.5), so misbehaviour scores decayed measurably slower
-// than the configured half-life.
+// The exact math.Exp2, not a linear interpolation of the fractional part:
+// `1 - 0.5*frac` over-estimates the convex 2^-frac (~6% high at frac=0.5),
+// and misbehaviour scores would then decay measurably slower than the
+// configured half-life (decayLocked).
 func pow2neg(n float64) float64 {
 	if n <= 0 {
 		return 1

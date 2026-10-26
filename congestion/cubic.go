@@ -122,15 +122,15 @@ func (c *CUBICController) OnAckWithPipe(ackedBytes int64, rtt time.Duration, pip
 	case cubicCongestionAvoidance:
 		// CUBIC function W(t) = C·(t-K)³ + W_max, in the BYTE domain.
 		//
-		// AER-075: RFC 8312 defines C, K, and W_max in SEGMENT (MSS) units.
-		// This controller keeps cwnd/wMax in BYTES, so the RFC formulas must
-		// be re-expressed: with W_max_seg = wMax/MSS,
+		// RFC 8312 defines C, K, and W_max in SEGMENT (MSS) units. This
+		// controller keeps cwnd/wMax in BYTES, so the RFC formulas are
+		// re-expressed: with W_max_seg = wMax/MSS,
 		//   K       = cbrt( (wMax/MSS)·(1-β)/C )
 		//   W(t)_by = MSS·C·(t-K)³ + wMax
-		// The old code plugged byte-domain wMax straight into the segment
-		// formulas, inflating K by ~cbrt(MSS)≈11× and deflating the growth
-		// term by MSS — so after any loss cwnd effectively never regrew and
-		// ratcheted to the floor on lossy paths.
+		// Byte-domain wMax put straight into the segment formulas would
+		// inflate K by ~cbrt(MSS)≈11× and deflate the growth term by MSS —
+		// after any loss cwnd would never regrow and would ratchet to the
+		// floor on lossy paths.
 		mss := float64(c.mss)
 		if mss <= 0 {
 			mss = float64(defaultMSS)
@@ -140,8 +140,8 @@ func (c *CUBICController) OnAckWithPipe(ackedBytes int64, rtt time.Duration, pip
 		wCubic := mss*cubicC*math.Pow(t-k, 3) + c.wMax
 
 		// TCP-friendly estimate: per-ACK additive increase (RFC 8312 §4.2).
-		// W_est increases by alpha_aimd·MSS·ackedBytes/cwnd per ACK. The MSS
-		// factor was missing, making the increase ~1/MSS (≈1400×) too small.
+		// W_est increases by alpha_aimd·MSS·ackedBytes/cwnd per ACK. Without
+		// the MSS factor the increase is ~1/MSS (≈1400×) too small.
 		alphaAIMD := 3 * (1 - cubicBeta) / (1 + cubicBeta)
 		wEst := c.cwnd + alphaAIMD*mss*(float64(ackedBytes)/c.cwnd)
 
@@ -155,7 +155,7 @@ func (c *CUBICController) OnAckWithPipe(ackedBytes int64, rtt time.Duration, pip
 	case cubicFastRecovery:
 		// PRR (RFC 6937) — proportional rate reduction during recovery.
 		// pipeBytes == 0 means caller didn't supply the flight size,
-		// fall back to legacy linear growth so we don't starve the
+		// fall back to plain linear growth so we don't starve the
 		// connection. recoverFS == 0 same fallback (no recovery state
 		// captured).
 		if pipeBytes > 0 && c.recoverFS > 0 {
@@ -183,13 +183,13 @@ func (c *CUBICController) OnAckWithPipe(ackedBytes int64, rtt time.Duration, pip
 			// Effective cwnd = current pipe + sndcnt budget.
 			c.cwnd = pipe + sndcnt
 			// Exit recovery once the inflight pipe is back to the
-			// post-loss target (≥ ssthresh). The previous condition
-			// (cwnd >= ssthresh && pipe < ssthresh) tripped at the
+			// post-loss target (≥ ssthresh). A condition on cwnd
+			// (cwnd >= ssthresh && pipe < ssthresh) trips at the
 			// PRR boundary case cwnd == ssthresh + pipe slightly
 			// below ssthresh, which RFC 6937 considers the SAME state
-			// as "still in recovery, growing pipe". Exiting early
-			// jumped to congestion avoidance before all losses had
-			// been repaired (was M-CUBIC-PRR-Exit). Using pipe alone
+			// as "still in recovery, growing pipe", and would jump to
+			// congestion avoidance before all losses are repaired.
+			// Using pipe alone
 			// matches RFC 6937 §3.2 "recovery completes when ack
 			// reaches recovery_point" since pipe-recovery and ack-
 			// reaching-recovery-point are coincident.
@@ -201,7 +201,7 @@ func (c *CUBICController) OnAckWithPipe(ackedBytes int64, rtt time.Duration, pip
 				c.prrOut = 0
 			}
 		} else {
-			// Legacy fallback (no pipe supplied): grow cwnd by ackedBytes/cwnd.
+			// No pipe supplied: grow cwnd by ackedBytes/cwnd.
 			c.cwnd += float64(ackedBytes) * float64(c.mss) / c.cwnd
 			if c.cwnd >= c.ssthresh {
 				c.state = cubicCongestionAvoidance

@@ -94,7 +94,7 @@ func (h *ControlFrameHandler) HandlePong(frame *Frame) {
 // originally inlined the two-line body each, but every transport
 // handles PRIORITY the same way so it belongs here.
 func (h *ControlFrameHandler) HandlePriority(frame *Frame) {
-	// AER-089: a peer must not set the scheduling weight of our own keepalive
+	// A peer must not set the scheduling weight of our own keepalive
 	// stream. A hostile peer could otherwise send PRIORITY(keepalive, weight=1)
 	// to down-weight our liveness traffic within its latency class. Class-based
 	// dequeue bounds the impact, but the peer should have no influence over our
@@ -109,8 +109,8 @@ func (h *ControlFrameHandler) HandlePriority(frame *Frame) {
 // HandleWindowUpdate applies an inbound credit grant to the
 // connection-level window or to the per-stream window identified by
 // frame.StreamID. Unknown stream IDs are dropped (matches pre-refactor
-// behaviour — receiving a WINDOW_UPDATE for a stream that no longer
-// exists is a benign late grant). When WakeScheduler is true and the
+// behaviour — receiving a WINDOW_UPDATE for a stream that is gone is a
+// benign late grant). When WakeScheduler is true and the
 // applied credit > 0, the scheduler is woken so a writeLoop stalled on
 // Consume re-evaluates immediately.
 func (h *ControlFrameHandler) HandleWindowUpdate(frame *Frame) {

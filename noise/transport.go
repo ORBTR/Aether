@@ -106,18 +106,19 @@ type NoiseTransportConfig struct {
 	//
 	// The field is a *bool so the zero-value (nil) distinguishes "caller
 	// left it unset" (→ default = ON) from "caller explicitly turned it off"
-	// (→ false). Set to `BoolPtr(false)` if you need to disable for interop
-	// with legacy initiators that don't handle 0xFE retry prefix.
+	// (→ false). Set to `BoolPtr(false)` to disable it for an initiator that
+	// does not read the 0xFE retry prefix (handleHandshake issues the token
+	// only while requireRetryToken is set).
 	RequireRetryToken *bool
 
 	// EnableResume opts in to 0.5-RTT session resumption (ticket store +
-	// initiator cache + 0xFA resume packets). AER-006/097: default OFF. The
-	// initiator resume path (tryResumeDial) reads/arms a deadline on the
-	// SHARED listener socket, which can deafen the whole transport, and the
-	// resumed conn's write/close targets that shared socket — plus the ticket
-	// identity/scope/nonce handling has open defects (AER-013/027/093-096).
-	// Leave the resume machinery uninitialized unless a caller explicitly
-	// enables it, so tryResumeDial and ticket issuance short-circuit.
+	// initiator cache + 0xFA resume packets). Off by default: the initiator
+	// resume path (tryResumeDial) reads and arms a deadline on the SHARED
+	// listener socket, which deafens the whole transport while it waits, and
+	// the resumed conn's write and close target that shared socket. While it
+	// is off NewNoiseTransport leaves the resume machinery nil, so
+	// tryResumeDial and ticket issuance short-circuit.
+	// TODO: route the resume path through the listener demux.
 	EnableResume bool
 
 	// WireVersions are the application's entries of the wire version offer
@@ -209,10 +210,14 @@ type NoiseTransport struct {
 	initiatorTickets *initiatorTicketCache // initiator-side resume cache
 	seenTickets      *seenTicketCache      // responder-side replay guard
 
-	// AE-P-20: memoized signed NodeInfo handshake payload. Constant for the
-	// transport's lifetime (see encodeNodeInfo), so the per-handshake
-	// ed25519.Sign + json.Marshal that ran under the listener-wide l.mu on
-	// the read-loop goroutine is computed exactly once here.
+	// nodeInfoOnce, nodeInfoBytes and nodeInfoErr memoise the signed NodeInfo
+	// handshake payload encodeNodeInfo returns. Every input to it (the identity
+	// key, the capability bits, initialMaxAckDelayUS, wireVersions) is fixed
+	// when NewNoiseTransport returns, so the ed25519.Sign and json.Marshal run
+	// once. handleHandshake and handleRelayedHandshake call encodeNodeInfo
+	// under the listener-wide l.mu on the read-loop goroutine, where a sign
+	// and marshal per inbound msg1 would hold every other datagram of the
+	// socket.
 	nodeInfoOnce  sync.Once
 	nodeInfoBytes []byte
 	nodeInfoErr   error
@@ -369,8 +374,8 @@ func NewNoiseTransport(cfg NoiseTransportConfig) (*NoiseTransport, error) {
 
 		// Source-validation cookies (S3) — guard always exists so peers
 		// can opt in by sending cookies; enforcement gated on the flag.
-		// Tri-state nil → default (on); explicit *false disables for
-		// legacy-initiator interop.
+		// Tri-state nil → default (on); explicit *false disables it for an
+		// initiator that does not read the retry prefix.
 		retryGuard:        newRetryGuard(),
 		requireRetryToken: resolveRetryTokenDefault(cfg.RequireRetryToken),
 
@@ -393,12 +398,13 @@ func NewNoiseTransport(cfg NoiseTransportConfig) (*NoiseTransport, error) {
 	t.relayService = relay.NewRelayService(cfg.RelayConfig, nil)
 	t.relayService.SetSessionIndex(t)
 
-	// AER-006/097: 0.5-RTT resumption is OPT-IN. When disabled (the default),
-	// leave ticketStore / initiatorTickets / seenTickets nil so tryResumeDial
-	// (transport.go Dial), responder ticket issuance (handshake.go), and the
-	// 0xFA resume packet path all short-circuit — closing the listener-death
-	// footgun and the ticket identity/scope defects until that path is
-	// reworked to route through the listener demux.
+	// 0.5-RTT resumption is opt-in. While cfg.EnableResume is false (the
+	// default) ticketStore, initiatorTickets and seenTickets stay nil, so
+	// tryResumeDial (Dial), the responder's ticket issuance (handleHandshake)
+	// and the 0xFA resume packet path (handleResumePacket) all short-circuit;
+	// NoiseTransportConfig.EnableResume states what the path does to the
+	// shared listener socket.
+	// TODO: route the resume path through the listener demux.
 	if cfg.EnableResume {
 		if ticketStore, ticketErr := NewTicketStore(); ticketErr == nil {
 			t.ticketStore = ticketStore
@@ -639,7 +645,7 @@ const (
 // responder half of a coordinated hole-punch: at the agreed T0 the
 // initiator dials this node while this node probes the initiator, so
 // both NATs install an outbound mapping for the other side at once and
-// the initiator's inbound handshake is no longer filtered.
+// the initiator's inbound handshake passes the filter.
 //
 // PunchProbe never reads — it only opens the mapping. The actual Noise
 // handshake arrives on the initiator's dial and is accepted by the

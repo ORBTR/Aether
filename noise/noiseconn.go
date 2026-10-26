@@ -97,9 +97,9 @@ type noiseConn struct {
 	recv           *noise.CipherState
 	sendMu         sync.Mutex
 	recvMu         sync.Mutex
-	// rekeying guards the send-side rekey sequence so only one goroutine
-	// ratchets. AER-008: ShouldRekey stays true until ResetSend at the end of
-	// the sequence and the explicit-nonce send path is lock-free, so two
+	// rekeying guards the send-side rekey sequence (maybeInitiateRekey) so only
+	// one goroutine ratchets: ShouldRekey stays true until ResetSend at the end
+	// of the sequence and the explicit-nonce send path is lock-free, so two
 	// concurrent senders could both ratchet and end two keys ahead of the
 	// receiver — a silent one-way blackhole.
 	rekeying   atomic.Bool
@@ -118,7 +118,7 @@ type noiseConn struct {
 
 	// Explicit nonce mode (if both sides support capExplicitNonce)
 	explicitNonce bool
-	encryptor     atomic.Pointer[nonceEncryptor] // AE-M-12: atomic swap; Load() on concurrent sends, Store() on rekey. Load()!=nil when explicitNonce=true
+	encryptor     atomic.Pointer[nonceEncryptor] // atomic: Load() on concurrent sends (sendPacket, maybeInitiateRekey), Store() on rekey (rekeySendCipher); non-nil when explicitNonce
 	window        *nonceWindow                   // non-nil when explicitNonce=true
 
 	// Health tracking
@@ -136,16 +136,15 @@ type noiseConn struct {
 	crossOriginPreambleTarget aether.NodeID
 
 	// peerMaxAckDelay is the peer's advertised max_ack_delay (RFC 9002
-	// §6.2) extracted from the handshake NodeInfo payload. Used by the
-	// adapter layer to seed TLP's PTO calculation at session-open —
-	// previously the adapter had only a receiver-side approximation
-	// max(ACKPolicy.MaxDelay, SRTT/4) because the handshake didn't
-	// carry the peer's actual value. Zero means "peer did not
-	// advertise" (older build) — adapter falls back to the
-	// approximation. Set once in the handshake completion path before
-	// the adapter ever reads it; exposed to the adapter via the
-	// PeerMaxAckDelay() method, probed by NoiseSession via the
-	// optional noiseConnAckDelay interface.
+	// §6.2) extracted from the handshake NodeInfo payload. The adapter's
+	// createStream seeds each stream's TLP PTO from it at session-open.
+	// Zero means the peer did not advertise (a NodeInfo without the
+	// field, as the over-conn minimal encoding), and createStream falls
+	// back to its receiver-side approximation max(ACKPolicy.MaxDelay,
+	// SRTT/4). Set once in the handshake completion path before the
+	// adapter ever reads it; exposed to the adapter via the
+	// PeerMaxAckDelay() method, probed by NoiseSession via the optional
+	// noiseConnAckDelay interface.
 	peerMaxAckDelay time.Duration
 
 	// wireVersions is the set the handshake that established this conn chose
@@ -201,7 +200,7 @@ func (c *noiseConn) enableExplicitNonce() {
 	sendCipher := c.send.Cipher() // marks CipherState as invalid
 	recvCipher := c.recv.Cipher()
 	c.encryptor.Store(newNonceEncryptor(sendCipher))
-	c.window = newNonceWindow(recvCipher, c.nonceWindowSize()) // AE-L-12: honour configured NonceWindowSize
+	c.window = newNonceWindow(recvCipher, c.nonceWindowSize()) // the configured NonceWindowSize
 	c.explicitNonce = true
 }
 
@@ -210,8 +209,9 @@ func (c *noiseConn) enableExplicitNonce() {
 // to the safe default of 64 when the transport is unset - c.transport is nil on
 // test-constructed conns and on any path that builds a noiseConn without a
 // parent transport. newNonceWindow additionally clamps the result to 1..64.
-// AE-L-12: both enableExplicitNonce and rekeyRecvCipher previously passed a
-// hardcoded literal 64, silently ignoring the configured NonceWindowSize knob.
+// enableExplicitNonce and rekeyRecvCipher both size their window through
+// here, so the configured NonceWindowSize reaches every window the conn
+// builds.
 func (c *noiseConn) nonceWindowSize() int {
 	if c.transport != nil && c.transport.hostNonceWindow() > 0 {
 		return c.transport.hostNonceWindow()
@@ -391,10 +391,10 @@ func (c *noiseConn) sendPacket(packetType byte, payload []byte) error {
 
 	if c.explicitNonce {
 		// Explicit nonce mode: the nonceEncryptor's own atomic counter makes
-		// concurrent Encrypt calls safe with no mutex. AE-M-12: Load() the
-		// encryptor pointer atomically so a concurrent rekeySendCipher Store()
-		// can't race this read (Go-memory-model data race); the encryptor
-		// itself stays lock-free, so concurrent sends are unaffected.
+		// concurrent Encrypt calls safe with no mutex. Load() the encryptor
+		// pointer atomically so a concurrent rekeySendCipher Store() cannot
+		// race this read; the encryptor itself stays lock-free, so concurrent
+		// sends are unaffected.
 		ct := c.encryptor.Load().Encrypt(nil, nil, data)
 		c.rekey.AddBytesSent(uint64(len(ct)))
 		_, err := c.writeFunc(ct)
@@ -420,12 +420,12 @@ func (c *noiseConn) sendPacket(packetType byte, payload []byte) error {
 }
 
 // rekeySignalSpacing is the schedule of DELAYS between successive rekey-signal
-// copies, AFTER the first (immediate) copy. AER-014: the previous design fired
-// all copies back-to-back in the same instant, so a single correlated UDP loss
-// burst (the ~200ms blackouts documented for this path) took every copy at
-// once — the receiver then never ratcheted its recv cipher, and that direction
-// blackholed under the sender's new send key until the idle timeout, with only
-// a confusing decryptErrors climb to show for it.
+// copies, AFTER the first (immediate) copy (spaceRekeySignals). Copies fired
+// back-to-back in one instant share one correlated UDP loss burst (the ~200ms
+// blackouts this path sees): if every copy is lost the receiver never
+// ratchets its recv cipher, and that direction blackholes under the sender's
+// new send key until the idle timeout, with only a decryptErrors climb to
+// show for it.
 //
 // De-correlating the copies across a window WIDER than a typical burst means
 // no single blackout can swallow all of them: copies land at t=0 (immediate),
@@ -433,7 +433,7 @@ func (c *noiseConn) sendPacket(packetType byte, payload []byte) error {
 // OLD send key, so spacing them is independent of when the send cipher
 // ratchets (which still happens promptly, below); a copy that arrives after
 // the receiver has already ratcheted on an earlier copy fails AEAD and is
-// dropped harmlessly (AER-029). Total extra cost: three datagrams dribbled out
+// dropped harmlessly. Total extra cost: three datagrams dribbled out
 // over 350ms every rekeyByteThreshold (~64 MiB) — negligible.
 var rekeySignalSpacing = []time.Duration{
 	50 * time.Millisecond,
@@ -449,27 +449,27 @@ var rekeySignalSpacing = []time.Duration{
 // then re-sent on the rekeySignalSpacing schedule (t=0/+50/+150/+350ms) before
 // and after we ratchet our send cipher. On the receive side the FIRST signal
 // observed ratchets the recv cipher.
-// AER-029: the duplicate copies do NOT decrypt successfully after that — they
-// were encrypted under the OLD key, and once the receiver has ratcheted to the
+// The duplicate copies do NOT decrypt successfully after that — they were
+// encrypted under the OLD key, and once the receiver has ratcheted to the
 // new recv key its AEAD open of those copies fails and they are dropped as
 // ordinary undecryptable datagrams. The net effect (idempotent rekey, extra
-// copies discarded) is the same, but via AEAD failure, not a successful
+// copies discarded) comes from the AEAD failure, not from a successful
 // decrypt.
-// AER-014: spreading the copies over a >200ms window de-correlates them from
-// the ~200ms loss bursts documented for this path, so a single blackout can no
-// longer drop every copy and blackhole the direction until idle timeout.
-// Costs three extra datagrams every rekeyByteThreshold (~64 MiB by
-// default) — negligible amortized overhead in exchange for closing
-// the C2 silent-decryption-failure window.
+// Spreading the copies over a >200ms window de-correlates them from the
+// ~200ms loss bursts this path sees, so no single blackout drops every copy
+// and blackholes the direction until idle timeout. Costs three extra
+// datagrams every rekeyByteThreshold (~64 MiB by default) — negligible
+// amortized overhead in exchange for closing the silent-decryption-failure
+// window.
 func (c *noiseConn) maybeInitiateRekey() {
 	if !c.rekey.ShouldRekey() {
 		return
 	}
-	// AER-008: only one goroutine may run the rekey sequence. Without this,
-	// two concurrent senders both pass ShouldRekey (true until ResetSend at
-	// the very end), both call rekeySendCipher, and the sender ends at K2
-	// while the receiver ratcheted once to K1 — every later frame then fails
-	// AEAD and the session is reaped ~2 min later.
+	// Only one goroutine may run the rekey sequence (the rekeying flag).
+	// Otherwise two concurrent senders both pass ShouldRekey (true until
+	// ResetSend at the very end), both call rekeySendCipher, and the sender
+	// ends at K2 while the receiver ratcheted once to K1 — every later frame
+	// then fails AEAD and the session is reaped at the idle timeout.
 	if !c.rekeying.CompareAndSwap(false, true) {
 		return
 	}
@@ -490,7 +490,7 @@ func (c *noiseConn) maybeInitiateRekey() {
 	data := []byte{relay.PacketTypeRekey}
 	var ct []byte
 	if c.explicitNonce {
-		ct = c.encryptor.Load().Encrypt(nil, nil, data) // AE-M-12: atomic load pairs with rekeySendCipher's Store
+		ct = c.encryptor.Load().Encrypt(nil, nil, data) // atomic load pairs with rekeySendCipher's Store
 	} else {
 		c.sendMu.Lock()
 		var err error
@@ -504,7 +504,7 @@ func (c *noiseConn) maybeInitiateRekey() {
 	// common (lossless) case the receiver ratchets its recv cipher before it
 	// sees any new-key data frame. The remaining copies are dribbled out on a
 	// widening schedule from a background goroutine to escape correlated loss
-	// bursts (AER-014); they carry the same old-key ciphertext.
+	// bursts (rekeySignalSpacing); they carry the same old-key ciphertext.
 	_, _ = c.writeFunc(ct)
 	go c.spaceRekeySignals(ct)
 
@@ -514,10 +514,10 @@ func (c *noiseConn) maybeInitiateRekey() {
 
 // spaceRekeySignals retransmits the pre-encrypted rekey-signal ciphertext on
 // the rekeySignalSpacing schedule, exiting early if the connection closes or a
-// write fails. AER-014: this is the loss-de-correlation half of the rekey
-// signal — see rekeySignalSpacing. The ciphertext was sealed under the old
-// send key at rekey time; the receiver ratchets on the first copy it sees and
-// silently drops the rest via AEAD failure (AER-029).
+// write fails. It is the loss-de-correlation half of the rekey signal — see
+// rekeySignalSpacing. The ciphertext was sealed under the old send key at
+// rekey time; the receiver ratchets on the first copy it sees and silently
+// drops the rest via AEAD failure.
 func (c *noiseConn) spaceRekeySignals(ct []byte) {
 	for _, d := range rekeySignalSpacing {
 		select {
@@ -539,7 +539,7 @@ func (c *noiseConn) rekeySendCipher() {
 		// the underlying CipherState and re-extract
 		c.sendMu.Lock()
 		c.send.Rekey()
-		// AE-M-12: atomic Store pairs with the atomic Load in sendPacket/
+		// The atomic Store pairs with the atomic Load in sendPacket and
 		// maybeInitiateRekey. sendMu still serialises Rekey()+re-extract.
 		c.encryptor.Store(newNonceEncryptor(c.send.Cipher()))
 		c.sendMu.Unlock()
@@ -557,7 +557,7 @@ func (c *noiseConn) rekeyRecvCipher() {
 	if c.explicitNonce {
 		c.recvMu.Lock()
 		c.recv.Rekey()
-		c.window = newNonceWindow(c.recv.Cipher(), c.nonceWindowSize()) // AE-L-12: honour configured NonceWindowSize
+		c.window = newNonceWindow(c.recv.Cipher(), c.nonceWindowSize()) // the configured NonceWindowSize
 		c.recvMu.Unlock()
 	} else {
 		c.recvMu.Lock()

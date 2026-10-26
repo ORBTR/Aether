@@ -113,7 +113,7 @@ func (w *RecvWindow) Insert(seqNo uint32, payload []byte) [][]byte {
 // InsertChecked is Insert plus an accepted flag. accepted is false only
 // when the frame was dropped because the reorder buffer was full (frame-
 // count or byte cap). Callers that gate a replay-window commit on durable
-// buffering (AER-061) use this so a capacity-dropped frame's retransmit is
+// buffering (the adapter's handleData) use this so a capacity-dropped frame's retransmit is
 // still deliverable later instead of being marked seen and discarded.
 func (w *RecvWindow) InsertChecked(seqNo uint32, payload []byte) (delivered [][]byte, accepted bool) {
 	marked, accepted := w.InsertMarked(seqNo, payload, false)
@@ -185,12 +185,12 @@ func (w *RecvWindow) InsertMarked(seqNo uint32, payload []byte, mark bool) (deli
 	// the frame-count cap and the byte cap. A byte cap breach is treated
 	// the same as a frame-count breach — drop with dropCount++.
 	//
-	// AER-067: a re-inserted still-buffered seq (reachable via the dispatch
-	// layer's ResultAncient at/above-floor fall-through) must not double-
-	// count bufferedBytes. Discount the existing entry's length up front so
-	// the cap checks and the accumulator both see a replace, not an add.
-	// Left uncorrected, bufferedBytes inflated forever (reset only by Drain)
-	// until it neared maxBytes and the window degraded to strict in-order.
+	// A re-inserted still-buffered seq (reachable via the dispatch layer's
+	// ResultAncient at/above-floor fall-through) must not double-count
+	// bufferedBytes. Discount the existing entry's length up front so the
+	// cap checks and the accumulator both see a replace, not an add;
+	// otherwise bufferedBytes inflates (reset only by Drain) until it nears
+	// maxBytes and the window degrades to strict in-order.
 	payloadLen := int64(len(payload))
 	if old, exists := w.buffer[seqNo]; exists {
 		w.bufferedBytes -= int64(len(old))

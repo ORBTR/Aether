@@ -17,11 +17,11 @@ import (
 //
 // When enqueued via EnqueueFromSend, Send points at the shared
 // *SendEntry owned by the SendWindow so updates to Retries / Frame are
-// visible to both sides without duplicating fields. The legacy Enqueue
+// visible to both sides without duplicating fields. The Enqueue
 // path leaves Send nil and keeps the per-entry Retries counter local.
 type RetransmitEntry struct {
 	Frame      *aether.Frame
-	Send       *SendEntry // optional shared send-side entry; nil for legacy callers
+	Send       *SendEntry // optional shared send-side entry; nil for Enqueue callers
 	NextRetry  time.Time
 	EnqueuedAt time.Time // original enqueue time (for accurate MaxAge check)
 	Retries    int
@@ -146,7 +146,7 @@ func (q *RetransmitQueue) removeBySeq(seqNo uint32) bool {
 // to fire) is dropped to make room. Callers relying on the retransmit
 // queue for guaranteed delivery should set maxRetries + maxAge at the
 // session layer so the caller notices the shortfall, since a dropped
-// retransmit entry is no longer retried by this queue.
+// retransmit entry is not retried by this queue again.
 func (q *RetransmitQueue) Enqueue(frame *aether.Frame) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -225,8 +225,7 @@ func (q *RetransmitQueue) EnqueueFromSend(se *SendEntry) {
 // firing in that TOCTOU window would otherwise replay an already-
 // delivered frame. Silently dropping just the heap top would block the
 // next legitimately-due entry behind it for one tick; loop so callers
-// always see the freshest unACKed due frame in a single call (A5
-// security audit fix).
+// always see the freshest unACKed due frame in a single call.
 func (q *RetransmitQueue) Dequeue() *aether.Frame {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -247,9 +246,9 @@ func (q *RetransmitQueue) Dequeue() *aether.Frame {
 		entryBytes := frameBytes(entry.Frame)
 
 		// Drop entries whose underlying SendWindow entry was already ACKed.
-		// Send is nil for callers that use the legacy Enqueue path
-		// without a shared *SendEntry — the check is gated so it stays
-		// back-compatible. Counter surfaces the drop so post-ACK RTO
+		// Send is nil for callers that use Enqueue without a shared
+		// *SendEntry — the check is gated on it. Counter surfaces the
+		// drop so post-ACK RTO
 		// races don't manifest as silent retransmit suppression.
 		if entry.Send != nil && entry.Send.Acked {
 			q.bufferedBytes -= entryBytes
@@ -283,9 +282,9 @@ func (q *RetransmitQueue) advanceEntryLocked(entry *RetransmitEntry, entryBytes 
 			if q.bufferedBytes < 0 {
 				q.bufferedBytes = 0
 			}
-			// AER-066: honour the onEvict contract on the deadline drop path
-			// too (evictForRoomLocked already does). Without this an expired
-			// frame vanished with no credit release / metric / stream signal.
+			// Honour the onEvict contract on the deadline drop path too (as
+			// evictForRoomLocked does); without it an expired frame vanishes
+			// with no credit release, metric or stream signal.
 			if q.onEvict != nil {
 				q.onEvict(entry)
 			}
@@ -299,7 +298,7 @@ func (q *RetransmitQueue) advanceEntryLocked(entry *RetransmitEntry, entryBytes 
 		if q.bufferedBytes < 0 {
 			q.bufferedBytes = 0
 		}
-		// AER-066: notify onEvict on the max-retries drop as well.
+		// Notify onEvict on the max-retries drop as well.
 		if q.onEvict != nil {
 			q.onEvict(entry)
 		}
@@ -313,10 +312,10 @@ func (q *RetransmitQueue) advanceEntryLocked(entry *RetransmitEntry, entryBytes 
 	// entry never retransmits earlier than the path's current RTT, and
 	// never stays stuck at a stale-high value after the estimator recovers:
 	//   - live > doubled  → RTT spiked above our backoff; take the live RTO
-	//     (AER-070: the old code KEPT the smaller doubled value here and
-	//     retransmitted early, producing spurious duplicates after a spike).
+	//     (keeping the smaller doubled value here would retransmit early
+	//     and produce spurious duplicates after a spike).
 	//   - live*2 < doubled → estimator recovered well below; catch down to
-	//     live*2 so a historical backoff doesn't stay pinned (M-RTO-Stuck).
+	//     live*2 so an earlier backoff doesn't stay pinned.
 	//   - otherwise        → keep the doubled value.
 	entry.RTO *= 2
 	if live := q.rtt.RTO(); live > 0 {

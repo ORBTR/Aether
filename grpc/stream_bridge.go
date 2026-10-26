@@ -103,7 +103,7 @@ func (s *transportServer) Stream(stream pb.TransportService_StreamServer) error 
 	// first ends the session's write half here as well, because after the
 	// peer's CloseSend the receive pump has already returned without
 	// closing outPump, and the send pump would otherwise wait in its Read
-	// for a Write it can no longer deliver.
+	// for a Write it cannot deliver.
 	select {
 	case <-stream.Context().Done():
 		_ = outPump.Close()

@@ -30,7 +30,7 @@ import (
 // method on this type so the tracker stays uncoupled from the adapter's
 // GoAway implementation (which differs across Noise / TCP / QUIC).
 type AbuseTracker struct {
-	// AE-P-01: atomic.Pointer so SetRegistry can swap the registry
+	// score is an atomic.Pointer so SetRegistry can swap the registry
 	// concurrently with Report/PeerScore on the read/deliver hot path
 	// without a data race on the pointer field. Load once per call.
 	score    atomic.Pointer[abuse.Score[NodeID]]
@@ -61,7 +61,7 @@ func NewAbuseTracker(
 		closeErr: closeErr,
 		dbgLog:   dbgLog,
 	}
-	t.score.Store(registry) // AE-P-01: publish registry via atomic store
+	t.score.Store(registry) // published by atomic store; Report and PeerScore Load it
 	return t
 }
 
@@ -78,7 +78,7 @@ func (t *AbuseTracker) Report(r abuse.Reason) float64 {
 	if t == nil {
 		return 0
 	}
-	score := t.score.Load() // AE-P-01: single atomic load per call
+	score := t.score.Load() // single atomic load per call
 	if score == nil {
 		return 0
 	}
@@ -105,7 +105,7 @@ func (t *AbuseTracker) PeerScore() (float64, bool) {
 	if t == nil {
 		return 0, false
 	}
-	score := t.score.Load() // AE-P-01: single atomic load per call
+	score := t.score.Load() // single atomic load per call
 	if score == nil {
 		return 0, false
 	}
@@ -122,6 +122,6 @@ func (t *AbuseTracker) SetRegistry(r interface{}) bool {
 	if !ok {
 		return false
 	}
-	t.score.Store(registry) // AE-P-01: atomic swap, race-free vs Report/PeerScore
+	t.score.Store(registry) // atomic swap, race-free against Report and PeerScore
 	return true
 }

@@ -37,7 +37,7 @@ func NewNodeID(pub ed25519.PublicKey) (NodeID, error) {
 }
 
 // ParseNodeID validates the textual form and returns a NodeID instance.
-// Accepts both legacy (52-char) and new (26-char) encoded formats.
+// Accepts both the 52-char and the 26-char encoded formats.
 func ParseNodeID(value string) (NodeID, error) {
 	if !strings.HasPrefix(value, nodeIDPrefix) {
 		return "", ErrInvalidNodeID
@@ -76,9 +76,9 @@ func MustParseNodeID(value string) NodeID {
 // (HTTP headers, LAD records) should pass through here before map storage or
 // lookup.
 //
-// AER-059: NewNodeID emits an all-lowercase form, but ParseNodeID accepts the
-// case-insensitive base32 body in any case and previously preserved it. Two
-// textual variants of the same fingerprint then compared unequal as map keys,
+// NewNodeID emits an all-lowercase form, but ParseNodeID accepts the
+// case-insensitive base32 body in any case; a form kept as received would let
+// two textual variants of the same fingerprint compare unequal as map keys,
 // creating duplicate ConnectionMap/abuse entries for one peer. Lowercasing
 // here makes the canonical form match NewNodeID's output. The base32 alphabet
 // is case-insensitive, so this never collides two distinct identities.
@@ -117,16 +117,16 @@ func (id NodeID) Short() string {
 // than each adapter) so the Noise, TCP and QUIC sessions all derive the
 // same value from the same input.
 //
-// AE-L-04: derive from the decoded fingerprint (64 bits), not the textual
+// Derived from the decoded fingerprint (64 bits), not the textual
 // canonical string. The canonical form is nodeIDPrefix ("vl1_") + base32, so
 // its first eight bytes are the constant "vl1_" plus only four base32 chars
 // (~20 bits) — a near-total PeerID collision across the mesh (birthday
 // collisions at ~1000 nodes). A malformed NodeID (Fingerprint error) falls
-// back to the textual bytes, matching the prior behaviour for that edge.
+// back to the textual bytes, the only value such an id has.
 func (id NodeID) ToPeerID() PeerID {
 	var pid PeerID
 	if fp, err := id.Fingerprint(); err == nil {
-		copy(pid[:], fp) // AE-L-04: first 8 of the 16-byte SHA-256 fingerprint
+		copy(pid[:], fp) // first 8 of the 16-byte SHA-256 fingerprint
 		return pid
 	}
 	copy(pid[:], []byte(string(id)))

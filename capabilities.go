@@ -89,7 +89,7 @@ func (c Capabilities) String() string {
 }
 
 // CapabilitiesForConnection is like CapabilitiesForProtocol but accounts for
-// whether the concrete connection is actually secured. AER-102: the protocol
+// whether the concrete connection is actually secured. The protocol
 // alone does NOT imply encryption for WS/TCP/gRPC — the built-in WebSocket
 // server can listen over plain HTTP (ws://), TCP can wrap any plaintext conn,
 // and gRPC defaults to insecure credentials. Advertising CapNativeEncryption /
@@ -113,7 +113,7 @@ func CapabilitiesForConnection(proto Protocol, secure bool) Capabilities {
 // CapabilitiesForProtocol returns the native capabilities for a given transport
 // protocol, assuming a SECURE endpoint. For WS/TCP/gRPC — which can run
 // plaintext — prefer CapabilitiesForConnection so a plaintext connection does
-// not falsely advertise native encryption/identity (AER-102).
+// not falsely advertise native encryption/identity.
 // This determines which Aether layers are activated vs skipped for each
 func CapabilitiesForProtocol(proto Protocol) Capabilities {
 	switch proto {

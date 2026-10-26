@@ -15,9 +15,9 @@ import (
 )
 
 // QualityConfig governs how the manager uses quality scores. Optional —
-// callers that don't set this fall back to the legacy integer-Quality
-// path (computePathWeight + setPrimary by integer comparison) for back-
-// compat with code not yet migrated to the score-driven plane.
+// callers that don't set this run the integer-Quality path
+// (computePathWeight + setPrimary by integer comparison), which AddPath
+// and PrimarySession callers use.
 type QualityConfig struct {
 	// Tracker holds longer-window state shared across paths in this
 	// manager. One Tracker per ConnectionManager (the Library passes
@@ -51,7 +51,7 @@ type QualityConfig struct {
 }
 
 // PathMeta holds per-path metadata that's needed for score computation
-// but isn't part of the legacy Path struct (which is wire-stable for
+// but isn't part of the Path struct (which is wire-stable for
 // debug snapshots). Stored side-by-side with paths in a parallel map.
 type PathMeta struct {
 	RemoteRegion string
@@ -60,15 +60,15 @@ type PathMeta struct {
 	LastScore    quality.Score
 	LastScoreAt  time.Time
 
-	// LastTrackerUpdate throttles the side-effect that PickByQuality
-	// (via computeScoreLocked) used to do on every dispatch call:
-	// UpdateRTT + UpdateThroughput on the Tracker. At dispatch rates
-	// of hundreds per second, that collapsed the baselineRTT EMA to
-	// instantaneous SRTT in ~60 calls (α=0.05 × 60 samples) instead
-	// of the intended ~60 seconds — killing the RTT-spike signal the
-	// quality.Inputs.BaselineRTT field is supposed to provide.
-	// L4 #3 fix: only refresh the tracker EMAs once per
-	// trackerUpdateMinInterval per path.
+	// LastTrackerUpdate throttles the Tracker side-effect of
+	// PickByQuality (via computeScoreLocked): UpdateRTT +
+	// UpdateThroughput on every dispatch call, at hundreds per
+	// second, would collapse the baselineRTT EMA to instantaneous
+	// SRTT in ~60 calls (α=0.05 × 60 samples) instead of the intended
+	// ~60 seconds — killing the RTT-spike signal the
+	// quality.Inputs.BaselineRTT field provides. computeScoreLocked
+	// refreshes the tracker EMAs once per trackerUpdateMinInterval per
+	// path.
 	LastTrackerUpdate time.Time
 }
 
@@ -78,8 +78,8 @@ type PathMeta struct {
 const trackerUpdateMinInterval = 1 * time.Second
 
 // addQualityState extends Manager with quality-aware bookkeeping.
-// Held in a separate struct so legacy callers don't need to know about
-// it. Lookup is by Path pointer identity.
+// Held in a separate struct so AddPath / PrimarySession callers don't
+// need it. Lookup is by Path pointer identity.
 type qualityState struct {
 	mu      sync.Mutex
 	cfg     QualityConfig
@@ -173,17 +173,17 @@ func (m *Manager) Stop() {
 	q.mu.Unlock()
 }
 
-// gradeQualityForProto maps an aether.Protocol to the legacy integer
-// `Quality` used by setPrimary / promotebestStandby / computePathWeight.
+// gradeQualityForProto maps an aether.Protocol to the integer `Quality`
+// setPrimary / promotebestStandby / computePathWeight compare.
 // Higher = better. Mirrors the Grade A/B/C hierarchy in
-// the consuming mesh grade layer so the legacy WDRR scheduler picks the
+// the consuming mesh grade layer so the WDRR scheduler picks the
 // SAME path the grade-aware scaler would.
 //
-// Cascade A.2 fix (L4 #1): AddPathQA previously passed Quality=0 for
-// every path, leaving setPrimary/promotebestStandby blind to grade —
-// whichever path was registered first became permanent primary even
-// when a higher-grade path arrived later. With this mapping, a noise
-// path arriving after a WS path actually displaces it.
+// AddPathQA registers every path through it: one constant Quality for
+// every path would leave setPrimary/promotebestStandby blind to grade,
+// so whichever path registered first would stay primary even when a
+// higher-grade path arrived later. With this mapping, a noise path
+// arriving after a WS path displaces it.
 func gradeQualityForProto(proto aether.Protocol) int {
 	switch proto {
 	case aether.ProtoNoise:
@@ -202,9 +202,9 @@ func gradeQualityForProto(proto aether.Protocol) int {
 // to AddPath but also records the remote region so the path can be
 // classified by RouteClass for score normalisation. Callers that
 // don't pass a region or quality config can keep using AddPath; the
-// two coexist so the legacy WDRR scheduler keeps working alongside.
+// two coexist so the WDRR scheduler keeps working alongside.
 //
-// Audit M11: AddPath is invoked through the lock-already-held
+// AddPath is invoked through the lock-already-held
 // addPathLocked variant so the qstate.meta entry is attached to the
 // path returned in the SAME critical section — closes the race where
 // a concurrent AddPath could insert between AddPathQA's
@@ -244,7 +244,7 @@ func (m *Manager) AddPathQA(session aether.Session, proto aether.Protocol, remot
 
 // PickByQuality returns the highest-DispatchRank alive session for the
 // given op class. Falls back to PrimarySession if no quality-aware paths
-// exist yet (legacy callers).
+// exist yet (AddPath callers).
 //
 // This is the score-driven replacement for PrimarySession + PickPath.
 // Unlike those, it doesn't need an explicit "primary" — selection is
@@ -258,7 +258,7 @@ func (m *Manager) PickByQuality(op quality.DispatchOp) (aether.Session, bool) {
 	m.resurrectExpiredDeadPathsLocked()
 	m.resurrectExpiredFlappingPathsLocked()
 	if m.qstate == nil || m.qstate.cfg.Tracker == nil {
-		// No quality config; fall back to legacy primary selection.
+		// No quality config; fall back to primary selection by integer Quality.
 		if len(m.paths) == 0 || m.primary >= len(m.paths) {
 			return nil, false
 		}
@@ -271,7 +271,7 @@ func (m *Manager) PickByQuality(op quality.DispatchOp) (aether.Session, bool) {
 		if p.Session == nil || p.Session.IsClosed() {
 			continue
 		}
-		// AE-M-10: exclude PathDead / PathFlapping from quality-aware
+		// Exclude PathDead / PathFlapping from quality-aware
 		// selection, mirroring PickPath and promotebestStandby
 		// (manager.go). A flapping path's session is still alive (its
 		// Ping succeeds — the RecordTLPReset premise) and a dead path
@@ -391,10 +391,10 @@ func (m *Manager) computeScoreLocked(p *Path) quality.Score {
 	// Most fields read directly; baseline RTT and throughput come from
 	// the Tracker's longer-window EMAs.
 	//
-	// L4 #3 throttle: only push fresh samples into the Tracker EMAs
-	// once per trackerUpdateMinInterval. PickByQuality fires on every
-	// dispatch decision; without throttling, hundreds of calls per
-	// second collapsed the baseline RTT EMA to instantaneous SRTT.
+	// Push fresh samples into the Tracker EMAs once per
+	// trackerUpdateMinInterval only (meta.LastTrackerUpdate). PickByQuality
+	// fires on every dispatch decision; unthrottled, hundreds of calls per
+	// second would collapse the baseline RTT EMA to instantaneous SRTT.
 	now := time.Now()
 	if now.Sub(meta.LastTrackerUpdate) >= trackerUpdateMinInterval {
 		cfg.Tracker.UpdateRTT(meta.TrackerKey, health.SRTT())
@@ -562,9 +562,8 @@ func (m *Manager) aliveCount() int {
 // zeroing the Aggregate score). Use CreatedAt for sessionAge, not
 // LastSuccess.
 //
-// LastSuccess fallback covers paths constructed before the CreatedAt
-// field existed (zero-value CreatedAt) so a rolling upgrade doesn't
-// briefly score every legacy path at AgeGrace=0.
+// The LastSuccess fallback covers a Path with a zero CreatedAt (one
+// built outside addPathLocked) so it is not scored at AgeGrace=0.
 func sessionAge(p *Path) time.Duration {
 	if !p.CreatedAt.IsZero() {
 		return time.Since(p.CreatedAt)

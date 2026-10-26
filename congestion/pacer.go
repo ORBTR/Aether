@@ -79,7 +79,7 @@ func (p *Pacer) Consume(n int) bool {
 // 1400 B/s pre-converge) and n is large (~10 MB), the naive nanosecond
 // product overflows int64 (~292 years cap) and wraps to a negative
 // time.Duration, which the caller's timer.Reset interprets as "fire
-// immediately" — defeating pacing entirely (was M-Pacer-Overflow).
+// immediately" — defeating pacing entirely.
 // Compute in float, clamp to maxPacerWait when the deficit exceeds
 // what int64 nanoseconds can represent.
 func (p *Pacer) TimeUntilSend(n int) time.Duration {
@@ -90,15 +90,15 @@ func (p *Pacer) TimeUntilSend(n int) time.Duration {
 		return 0
 	}
 	deficit := float64(n) - p.tokens
-	// AE-H-04: rate <= 0 means the active controller has no pacing model —
+	// rate <= 0 means the active controller has no pacing model —
 	// CUBIC.PacingRate() always returns 0, so the writeLoop's `pacingRate > 0`
 	// guard never calls SetRate for the default (CUBIC) session and this
 	// Pacer's rate stays 0 forever. Treat that as "pacing disabled" and send
 	// immediately, mirroring SendTimePacer.TimeUntilSend (which returns 0 for
-	// rate <= 0). Returning maxPacerWait here parked the burst-drained CUBIC
-	// writeLoop for an hour per frame — refill() never restores tokens while
-	// rate == 0. Congestion control is unaffected: the cwnd gate lives in
-	// CUBIC.CanSend, not the pacer.
+	// rate <= 0). Returning maxPacerWait here would park the burst-drained
+	// CUBIC writeLoop for an hour per frame — refill() never restores tokens
+	// while rate == 0. Congestion control is unaffected: the cwnd gate lives
+	// in CUBIC.CanSend, not the pacer.
 	if p.rate <= 0 {
 		return 0 // pacing disabled — no rate configured
 	}
@@ -166,9 +166,9 @@ var _ PacingPolicy = (*SendTimePacer)(nil)
 // smoother packet spacing than token-bucket pacing because there is no
 // burst credit to accumulate.
 //
-// Use SendTimePacer when the congestion controller is BBR; the legacy
-// token-bucket Pacer remains the right choice for CUBIC, which has no
-// pacing model.
+// Use SendTimePacer when the congestion controller is BBR; the
+// token-bucket Pacer is the one for CUBIC, which has no pacing model
+// (the adapter's selectPacer).
 type SendTimePacer struct {
 	mu       sync.Mutex
 	rate     float64   // bytes/sec (set by congestion controller)

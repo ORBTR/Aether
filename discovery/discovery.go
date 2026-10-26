@@ -21,7 +21,7 @@ type PeerAddress struct {
 
 // String returns a host:port representation.
 func (p PeerAddress) String() string {
-	// AER-101: use net.JoinHostPort so IPv6 hosts are bracketed
+	// net.JoinHostPort so IPv6 hosts are bracketed
 	// ("[::1]:443") rather than the invalid unbracketed "%s:%d" form.
 	return net.JoinHostPort(p.Host, strconv.Itoa(int(p.Port)))
 }
@@ -97,10 +97,10 @@ func (md *MultiDiscoverer) Discover(ctx context.Context) ([]PeerAddress, error) 
 
 		added := 0
 		for _, p := range peers {
-			// AER-101: dedup by (NodeID, address), NOT NodeID alone. A NodeID
-			// can be reachable at multiple addresses (dual-stack v4+v6,
-			// multipath); keying on NodeID collapsed them to the first result
-			// and defeated fallback/multipath discovery.
+			// Dedup by (NodeID, address), NOT NodeID alone. A NodeID can be
+			// reachable at multiple addresses (dual-stack v4+v6, multipath);
+			// keying on NodeID would collapse them to the first result and
+			// defeat fallback/multipath discovery.
 			key := p.String()
 			if p.NodeID != "" {
 				key = string(p.NodeID) + "|" + p.String()

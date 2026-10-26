@@ -43,15 +43,14 @@ const (
 	AddressDeadCooldown = 30 * time.Minute
 
 	// AddressFailuresBeforeDead is the consecutive failure count that
-	// flips an address into the dead-cooldown window. Three matches
-	// the legacy PathScorer threshold.
+	// flips an address into the dead-cooldown window.
 	AddressFailuresBeforeDead = 3
 )
 
 // AddressTracker tracks dial-level success and RTT per
 // (peer, transport, address) so the connect path can pick the address
 // most likely to work, demote permanently-broken endpoints, and forget
-// data for peers we no longer talk to.
+// data for peers we have stopped talking to.
 //
 // Distinct from Tracker (session-level health EMA) because the unit of
 // work is different: AddressTracker scores attempts to *establish* a

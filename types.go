@@ -56,7 +56,7 @@ func (p Protocol) String() string {
 }
 
 // ParseProtocol converts a string name to a Protocol enum value.
-// Recognises both legacy names ("vl1") and new names ("noise").
+// Recognises both the "vl1" alias and the "noise" name.
 func ParseProtocol(s string) Protocol {
 	switch s {
 	case "noise", "noise-udp", "vl1":

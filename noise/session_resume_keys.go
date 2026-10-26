@@ -5,20 +5,21 @@
  * Queries: licensing@orbtr.io
  */
 
-// Forward-secret 0.5-RTT resumption key schedule (AE-C-01 fix).
+// Forward-secret 0.5-RTT resumption key schedule.
 //
-// Pre-fix, resumption reinstalled the ORIGINAL session's transport keys at
-// nonce 0 on every resume. The live session kept advancing those same keys
-// (nonce 1,2,3…) while each resumed session restarted them at nonce 0 — so
-// (key,nonce) pairs repeated between the original and every resume. For
-// ChaCha20-Poly1305 that is catastrophic: identical keystream XORed with two
-// plaintexts (recoverable by any passive eavesdropper) plus Poly1305 one-time
-// key reuse (forgery).
+// A resumed session starts its CipherStates at nonce 0
+// (buildResumeCipherStates) while the original session keeps advancing its
+// own transport keys (nonce 1,2,3…), so a resume that reinstalled the
+// original keys would repeat (key,nonce) pairs between the original and
+// every resume. For ChaCha20-Poly1305 that is catastrophic: identical
+// keystream XORed with two plaintexts (recoverable by any passive
+// eavesdropper) plus Poly1305 one-time key reuse (forgery).
 //
-// This schedule replaces that. Every resume performs a fresh ephemeral X25519
-// exchange and mixes the DH shared secret with the ticket PSK, so each resumed
-// session derives UNIQUE, FORWARD-SECRET traffic keys that share no (key,nonce)
-// with the original session or any other resume — the TLS 1.3 psk_dhe_ke shape.
+// So every resume performs a fresh ephemeral X25519 exchange and mixes the
+// DH shared secret with the ticket PSK (deriveResumeKeys), and each resumed
+// session derives UNIQUE, FORWARD-SECRET traffic keys that share no
+// (key,nonce) with the original session or any other resume — the TLS 1.3
+// psk_dhe_ke shape. tryResumeDial and handleResumePacket are its callers.
 package noise
 
 import (

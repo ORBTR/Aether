@@ -61,7 +61,7 @@ func (c *WSConn) Read(p []byte) (int, error) {
 			return 0, err
 		}
 
-		// AE-H-11: cap the peer-advertised frame length before allocating.
+		// Cap the peer-advertised frame length before allocating.
 		// header.Length is an int64 read straight off the wire (gobwas/ws does
 		// not bound it); an oversized value would OOM or panic 'makeslice: len
 		// out of range' in the single-goroutine gossip read loop. Reject at

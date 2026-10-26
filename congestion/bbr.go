@@ -62,7 +62,7 @@ const (
 	bbrInflightHiHeadroom      = 0.85 // CWND clamp = inflightHi * (1 - headroom)
 
 	// bbrMinSampleInterval is the shortest delivery-clock interval over which
-	// the degraded OnAck path will derive a bandwidth sample (AE-M-07). A
+	// the degraded OnAck path will derive a bandwidth sample. A
 	// composite ACK that acks many nil-sample entries makes the adapter call
 	// OnAck once per entry in a tight loop (adapter/noise_dispatch.go), and
 	// b.deliveredTime is advanced to now on every call — so the 2nd..Nth calls
@@ -80,8 +80,8 @@ const (
 	// rtPropResetDefault is the rtProp seeded by ResetCWND when no
 	// previous measurement survives. 100 ms is the conventional "first
 	// RTT" assumption — close to LAN+1 hop, lets BBR converge on real
-	// path RTT within a few rounds. Was the H-BBR-ResetCWND-DivZero fix:
-	// seeding zero produced bdp=0 and an unhelpful pacing-floor stall.
+	// path RTT within a few rounds. Seeding zero would give bdp=0 and a
+	// pacing-floor stall.
 	rtPropResetDefault = 100 * time.Millisecond
 
 	// btlBwResetDefault is the bandwidth seeded by ResetCWND. 1 MB/s
@@ -158,7 +158,7 @@ type BBRController struct {
 	fullBwLastVal float64
 
 	// lastCEReduction rate-limits OnCE's CE-driven cwnd cut to one per
-	// rtProp window (AE-M-06). Zero value means no CE reduction yet.
+	// rtProp window. Zero value means no CE reduction yet.
 	lastCEReduction time.Time
 
 	// Outputs.
@@ -203,13 +203,13 @@ func (b *BBRController) OnSend(n int64) DeliveryRateSample {
 }
 
 // StampSample captures a DeliveryRateSample from the current model state
-// WITHOUT mutating inflight. AER-076: the send path stamped a sample at
-// frame-build time via OnSend AND incremented inflight again at actual
-// transmission via the writeLoop's OnSend — double-counting every frame so
-// inflight grew without bound, the Drain-exit test (inflight <= max(bdp,
-// 4·mss)) never passed, and BBR pinned pacing at 0.35× and decayed to the
-// floor. The build-time stamp now uses StampSample (no increment); the
-// writeLoop's OnSend remains the single authoritative on-wire increment.
+// WITHOUT mutating inflight. The adapter stamps a sample at frame-build
+// time (noiseStream.sendSingleFrame) and increments inflight at actual
+// transmission through the writeLoop's OnSend; a build-time OnSend would
+// count every frame twice, so inflight grows without bound, the Drain-exit
+// test (inflight <= max(bdp, 4·mss)) never passes, and BBR pins pacing at
+// 0.35× and decays to the floor. The writeLoop's OnSend is the single
+// authoritative on-wire increment.
 func (b *BBRController) StampSample() DeliveryRateSample {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -251,7 +251,7 @@ func (b *BBRController) OnAckSampled(ackedBytes int64, rtt time.Duration, sample
 	}
 
 	// MinRTT update: the lower of current rtt or the RTPropagation
-	// estimate, refreshed every 10 s of staleness. AE-M-05: capture the
+	// estimate, refreshed every 10 s of staleness. Capture the
 	// staleness verdict BEFORE the refresh overwrites rtPropStamp, then
 	// hand it to runStateMachine. Otherwise the refresh resets the stamp
 	// and the ProbeBW→ProbeRTT trigger — which keys off the SAME staleness
@@ -283,7 +283,7 @@ func (b *BBRController) OnAck(ackedBytes int64, rtt time.Duration) {
 	now := time.Now()
 	b.delivered += ackedBytes
 	if !b.deliveredTime.IsZero() {
-		// AE-M-07: only derive a bandwidth sample over an interval at least
+		// Only derive a bandwidth sample over an interval at least
 		// bbrMinSampleInterval long. A composite ACK acking many nil-sample
 		// entries drives the adapter to call OnAck once per entry in a tight
 		// loop (adapter/noise_dispatch.go), and b.deliveredTime is advanced to
@@ -304,7 +304,7 @@ func (b *BBRController) OnAck(ackedBytes int64, rtt time.Duration) {
 	if b.inflight < 0 {
 		b.inflight = 0
 	}
-	// AER-085: advance the round counter in the degraded path too. Without a
+	// Advance the round counter in the degraded path too. Without a
 	// per-packet delivered-at-send sample we approximate a round as one BDP of
 	// new delivery — advance once b.delivered passes NextRoundDelivered, then
 	// re-seed it a flight ahead. Otherwise RoundStart never fires and the
@@ -321,7 +321,7 @@ func (b *BBRController) OnAck(ackedBytes int64, rtt time.Duration) {
 	} else {
 		b.rounds.RoundStart = false
 	}
-	// AE-M-05: capture staleness before the refresh resets rtPropStamp; see OnAckSampled.
+	// Capture staleness before the refresh resets rtPropStamp; see OnAckSampled.
 	rtPropExpired := now.Sub(b.rtPropStamp) > bbrProbeRTTInterval
 	if rtt > 0 && (rtt < b.rtProp || rtPropExpired) {
 		b.rtProp = rtt
@@ -403,14 +403,13 @@ func (b *BBRController) OnCE(bytesMarked int64) {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	// AE-M-06: rate-limit CE-driven reductions to one per rtProp window.
-	// The adapter calls OnCE once per CE-bearing composite ACK, and a
-	// peer (or a compliant receiver reporting CE on multiple ACKs per
-	// RTT) can drive back-to-back calls while data is in flight; without
-	// this gate each one applies another 0.85× cut plus a forced ProbeRTT
-	// re-entry, collapsing throughput. The doc comment above already
-	// promises "One RTT-bounded reduction" but nothing enforced it. This
-	// mirrors CUBIC's recovery-epoch idempotence (OnLossWithPipe
+	// Rate-limit CE-driven reductions to one per rtProp window
+	// (lastCEReduction). The adapter calls OnCE once per CE-bearing
+	// composite ACK, and a peer (or a compliant receiver reporting CE on
+	// multiple ACKs per RTT) can drive back-to-back calls while data is in
+	// flight; without this gate each one applies another 0.85× cut plus a
+	// forced ProbeRTT re-entry, collapsing throughput. This mirrors CUBIC's
+	// recovery-epoch idempotence (OnLossWithPipe
 	// early-returns while already in fastRecovery), coalescing repeated CE
 	// marks within one RTT into a single reduction. The reaction magnitude
 	// is unchanged — the full 0.85× cut and ProbeRTT re-entry still fire on
@@ -493,8 +492,8 @@ func (b *BBRController) runStateMachine(now time.Time, rtPropExpired bool) {
 		// because Startup exited without ever updating the filter
 		// (entirely-app-limited stream) — bdp would be 0 and Drain
 		// could only exit when inflight reaches 0. With any data in
-		// flight, the controller would be permanently stuck (was
-		// H-BBR-Drain-Deadlock). Apply a floor on the exit threshold
+		// flight, the controller would be permanently stuck. Apply a
+		// floor on the exit threshold
 		// so Drain can always reach ProbeBW within bounded time even
 		// when the bandwidth filter has nothing to anchor on.
 		bdp := int64(b.btlBw * b.rtProp.Seconds())
@@ -514,7 +513,7 @@ func (b *BBRController) runStateMachine(now time.Time, rtPropExpired bool) {
 			b.cycleIndex = (b.cycleIndex + 1) % len(bbrProbeBWGains)
 			b.cycleStamp = now
 		}
-		// Periodic ProbeRTT entry. AE-M-05: key off the pre-refresh
+		// Periodic ProbeRTT entry. Key off the pre-refresh
 		// staleness verdict rtPropExpired, NOT now.Sub(rtPropStamp) — the
 		// ack-path refresh already reset rtPropStamp to now, so re-reading
 		// it here is always ≈0 and ProbeRTT would never be entered.

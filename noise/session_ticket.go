@@ -60,8 +60,8 @@ type sessionTicket struct {
 	RecvNonce uint64
 	Caps      uint32
 	// ScopeID is the partition scope the original session was bound to. Carried so
-	// a resumed session restores its relay isolation (AE-H-07); empty for
-	// dedicated (single-partition) transports.
+	// a resumed session restores its relay isolation (handleResumePacket gives it
+	// to the resumed conn); empty for dedicated (single-partition) transports.
 	ScopeID string
 	// PeerOffer and Chosen are the initiator's wire version offer and the
 	// set the handshake chose. handleResumePacket chooses again from the
@@ -77,8 +77,8 @@ type sessionTicket struct {
 }
 
 const (
-	ticketPlaintextSize   = 8 + 32 + 32 + 8 + 32 + 8 + 4 // 124-byte fixed prefix; AE-H-07 scope suffix follows
-	ticketScopeLenSize    = 2                            // AE-H-07: uint16 length prefix for the scope suffix
+	ticketPlaintextSize   = 8 + 32 + 32 + 8 + 32 + 8 + 4 // 124-byte fixed prefix; the scope suffix follows
+	ticketScopeLenSize    = 2                            // uint16 length prefix for the scope suffix
 	ticketVersionsLenSize = 2                            // uint16 length prefix of each wire version suffix
 	ticketNonceSize       = 12
 	ticketTagSize         = 16
@@ -102,9 +102,10 @@ type TicketStore struct {
 	gcm     cipher.AEAD
 	prevGCM cipher.AEAD
 
-	// AE-P-19: install time of prevGCM. Lets DecryptTicket retire the previous
-	// key one ticket TTL after rotation rather than only on the next RotateKey
-	// call, so a single rotation actually drops a compromised key.
+	// prevInstalledAt is the install time of prevGCM (RotateKey). DecryptTicket
+	// stops consulting the previous key one ticket TTL after that, rather than
+	// only on the next RotateKey call, so a single rotation drops a compromised
+	// key.
 	prevInstalledAt time.Time
 
 	// Client-side ticket cache: peerNodeID → encrypted ticket bytes.
@@ -158,7 +159,7 @@ func NewTicketStoreWithKey(key []byte, ttl time.Duration) (*TicketStore, error) 
 
 // RotateKey replaces the ticket encryption key. The previous key is kept for
 // one ticket TTL after rotation to decrypt tickets issued before the rotation
-// (AE-P-19: DecryptTicket retires it once that window elapses).
+// (DecryptTicket stops consulting it once that window elapses).
 func (ts *TicketStore) RotateKey(newKey []byte) error {
 	if len(newKey) != 32 {
 		return errors.New("vl1: ticket key must be 32 bytes")
@@ -174,7 +175,7 @@ func (ts *TicketStore) RotateKey(newKey []byte) error {
 	ts.mu.Lock()
 	ts.prevKey = ts.key
 	ts.prevGCM = ts.gcm
-	ts.prevInstalledAt = time.Now() // AE-P-19: bound the prev-key overlap to one TTL
+	ts.prevInstalledAt = time.Now() // DecryptTicket bounds the prev-key overlap to one TTL from here
 	ts.key = append([]byte(nil), newKey...)
 	ts.gcm = gcm
 	ts.mu.Unlock()
@@ -230,7 +231,7 @@ func (ts *TicketStore) IssueTicket(peerID aether.NodeID, send, recv *fnoise.Ciph
 	ticket.SendKey = send.UnsafeKey()
 	ticket.RecvKey = recv.UnsafeKey()
 
-	// AE-H-07: fixed 124B prefix + [2B scopeLen][scopeID]. Scope validated to
+	// Fixed 124B prefix + [2B scopeLen][scopeID]. Scope validated to
 	// MaxScopeIDLength (matches the preamble bound) so the uint16 never truncates.
 	if len(scopeID) > MaxScopeIDLength {
 		return nil, ErrPartitionIDTooLong
@@ -281,7 +282,7 @@ func (ts *TicketStore) DecryptTicket(encrypted []byte) (*sessionTicket, error) {
 	ts.mu.RLock()
 	gcm := ts.gcm
 	prevGCM := ts.prevGCM
-	// AE-P-19: only consult the previous key for one ticket TTL after rotation.
+	// Consult the previous key only for one ticket TTL after rotation.
 	// Any ticket legitimately minted before the rotation self-expires within
 	// TTL (the ExpiresAt check below), so beyond this window prevGCM would only
 	// ever accept a FORGED ticket built with a stolen prev key and an

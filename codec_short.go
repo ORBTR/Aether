@@ -39,9 +39,9 @@ const (
 	ShortBatchIndicator     byte = 0x85 // Batch of sub-frames, 2 + N×sub
 	ShortDataVarIndicator   byte = 0x86 // DATA frames, varint Length, 6-10 bytes
 	ShortEncryptedIndicator byte = 0x87 // Encrypted DATA, 9 bytes, Nonce-in-payload
-	// AE-H-13: ACK-full carries its own indicator so the decoder never has
-	// to infer lite-vs-full from payload bytes (a full ACK with AckDelay==0
-	// was mis-decoded as lite and desynced the stream).
+	// ACK-full carries its own indicator so DecodeACKShort never infers
+	// lite-vs-full from payload bytes: a full ACK with AckDelay==0 read as
+	// lite would desync the stream.
 	ShortACKFullIndicator byte = 0x88 // Composite ACK-full, 5-byte hdr + payload
 
 	ShortDataSize    = 9  // [indicator:1][streamID:2][seqDelta:2][length:4]
@@ -54,7 +54,8 @@ const (
 	// MaxShortHeaderStreamID is the largest StreamID representable in the uint16
 	// short-header StreamID field. Streams above it must use the full 50-byte
 	// header, else the ID truncates on the wire and the decoder misroutes the
-	// frame to the wrong stream (AE-H-14).
+	// frame to the wrong stream (ShouldCompressData, ShouldCompressControl and
+	// ShouldCompressACK keep such a stream on the full header).
 	MaxShortHeaderStreamID = 0xFFFF
 )
 
@@ -246,16 +247,15 @@ func (c *Compressor) ShouldCompressData(f *Frame) bool {
 	if f.Flags.Has(FlagENCRYPTED) {
 		return false
 	}
-	// B3: the short DATA forms (0x82/0x86) carry NO Flags field, so a frame whose
+	// The short DATA forms (0x82/0x86) carry NO Flags field, so a frame whose
 	// payload is only interpretable WITH a flag cannot be expressed in them. The
 	// receiver decompresses solely on FlagCOMPRESSED, so encoding a deflated
 	// payload short drops the flag and hands the application raw DEFLATE bytes —
 	// and because Length matches the compressed length, Validate() passes, no
 	// guard trips and no abuse counter increments, making the corruption silent
 	// (it surfaces downstream as an unmarshal error blamed on the consumer's
-	// decoder). Fall back to the full header, which carries flags — same
-	// capability-preserving fallback as AE-H-14 below. See M-108 (root cause),
-	// M-134 (fix), and codec_short_b3_test.go (executable reproduction).
+	// decoder). Fall back to the full header, which carries flags — the same
+	// fallback the StreamID check below takes. codec_short_b3_test.go holds it.
 	if f.Flags.Has(FlagCOMPRESSED) {
 		return false
 	}
@@ -265,7 +265,7 @@ func (c *Compressor) ShouldCompressData(f *Frame) bool {
 	if f.Flags.Has(FlagFRAGMENT) {
 		return false
 	}
-	// AE-H-14: the short-header StreamID field is uint16; a stream above
+	// The short-header StreamID field is uint16; a stream above
 	// MaxShortHeaderStreamID would truncate on the wire and misroute on decode.
 	// Fall back to the full 50-byte header (capability preserved) rather than
 	// compress and corrupt routing.
@@ -308,7 +308,7 @@ func (c *Compressor) ShouldCompressControl(f *Frame) bool {
 	if f.Length > 0 {
 		return false // has payload — use full header
 	}
-	// AE-H-14: uint16 short-header StreamID — oversized streams need the full header.
+	// uint16 short-header StreamID — a stream above it needs the full header.
 	if f.StreamID > MaxShortHeaderStreamID {
 		return false
 	}
@@ -331,24 +331,24 @@ func (c *Compressor) ShouldCompressACK(f *Frame) bool {
 	if f.Type != TypeACK {
 		return false
 	}
-	// B2: the ACK short forms carry no Flags field, and DecodeACKShortFull
+	// The ACK short forms carry no Flags field, and DecodeACKShortFull
 	// reconstructs the Frame with Flags HARDCODED to FlagCOMPOSITE_ACK — so
-	// FlagCOMPRESSED is not merely absent, it is overwritten. The receiver then
-	// parses a raw DEFLATE stream as a CompositeACK: the high-entropy byte at the
-	// BitmapLen offset usually exceeds the remaining length, DecodeCompositeACK
-	// returns nil, and the peer is charged ReasonACKValidation for a well-formed
-	// ACK. The v0.0.114 SACK fix made this reachable in the steady state by
-	// routing mid-stream-gap recovery through bitmap-bearing ACKs, which are the
-	// ones large enough to cross the 64-byte compression gate. Fall back to the
-	// full header, which carries flags. See M-108 (root cause), M-111 (mapping).
+	// FlagCOMPRESSED is not merely absent, it is overwritten. The receiver would
+	// then parse a raw DEFLATE stream as a CompositeACK: the high-entropy byte at
+	// the BitmapLen offset usually exceeds the remaining length,
+	// DecodeCompositeACK returns nil, and the peer is charged ReasonACKValidation
+	// for a well-formed ACK. Mid-stream-gap recovery runs through bitmap-bearing
+	// ACKs, which are the ones large enough to cross the 64-byte compression
+	// gate, so this is steady-state traffic. Fall back to the full header, which
+	// carries flags.
 	if f.Flags.Has(FlagCOMPRESSED) {
 		return false
 	}
-	// AE-H-14: uint16 short-header StreamID — oversized streams need the full header.
+	// uint16 short-header StreamID — a stream above it needs the full header.
 	if f.StreamID > MaxShortHeaderStreamID {
 		return false
 	}
-	// AER-053: the ACK-full short form carries a 2-byte length. A frame whose
+	// The ACK-full short form carries a 2-byte length. A frame whose
 	// Length exceeds 65535 would wrap that field while its full payload was
 	// still written, desyncing the decoder byte stream. Fall back to the full
 	// header for such frames (today's CompositeACK is <= ~375 B, so latent).
@@ -374,14 +374,14 @@ func (c *Compressor) ShouldCompressACK(f *Frame) bool {
 // never around its end, and the encoder puts a frame that would cross it in
 // the full header (ShouldCompressData's non-negative delta).
 //
-// AER-047: short DATA headers carry the low 16 bits of the ABSOLUTE SeqNo,
-// not a delta from the previously decoded frame. Delta chaining assumed
-// every short frame arrived in order — on lossy/reordering Noise-UDP a single
-// dropped datagram left the decoder's reference stale, so the next frame's
-// delta reconstructed the WRONG absolute seq and its payload was delivered
+// Short DATA headers carry the low 16 bits of the ABSOLUTE SeqNo, not a
+// delta from the frame decoded before it. A delta chain holds only while
+// every short frame arrives in order — on lossy or reordering Noise-UDP one
+// dropped datagram leaves the decoder's reference stale, the next frame's
+// delta reconstructs the WRONG absolute seq and its payload is delivered
 // under a lost frame's sequence number (silent transposition), while the real
-// frame's retransmit was then dropped as a duplicate. Absolute-low-bits +
-// closest-to-expected reconstruction tolerates any gap < 32768 with no chain.
+// frame's retransmit is dropped as a duplicate. Absolute low bits with
+// closest-to-expected reconstruction tolerate any gap < 32768 with no chain.
 func reconstructSeqNo(last uint32, low uint16) (uint32, error) {
 	// 64-bit arithmetic keeps expected and the candidate exact when last
 	// is near the top of the space, so the wrap is seen rather than taken.
@@ -411,7 +411,7 @@ func (c *Compressor) EncodeDataShort(w io.Writer, f *Frame) (int, error) {
 	}
 	s := c.GetOrCreateStream(f.StreamID)
 	s.mu.Lock()
-	seqLow := uint16(f.SeqNo) // AER-047: absolute low 16 bits, not a delta
+	seqLow := uint16(f.SeqNo) // absolute low 16 bits, not a delta (reconstructSeqNo)
 	s.mu.Unlock()
 
 	var hdr [ShortDataSize]byte
@@ -444,13 +444,13 @@ func (c *Compressor) EncodeDataShort(w io.Writer, f *Frame) (int, error) {
 // delivering the body. The declared length (up to MaxPayloadSize) is honoured in
 // full only after a first chunk of this size has been read, so a tiny header
 // claiming MaxPayloadSize that never sends a body cannot force a transient
-// full-size heap allocation (AE-P-31). Capability preserved: payloads up to
-// MaxPayloadSize still decode in full.
+// full-size heap allocation (readShortPayload). Capability preserved: payloads
+// up to MaxPayloadSize still decode in full.
 const maxShortPayloadPrealloc = 64 * 1024
 
 // readShortPayload reads exactly length bytes from r. For a declared length above
 // maxShortPayloadPrealloc it first reads a bounded chunk into a small buffer as
-// proof of delivery before allocating the full declared size (AE-P-31), so a peer
+// proof of delivery before allocating the full declared size, so a peer
 // that streams tiny headers declaring huge lengths cannot drive repeated 16 MB
 // allocations at negligible cost.
 func readShortPayload(r io.Reader, length uint32) ([]byte, error) {
@@ -493,8 +493,8 @@ func (c *Compressor) DecodeDataShort(r io.Reader) (*Frame, error) {
 	if length > MaxPayloadSize {
 		return nil, fmt.Errorf("%w: data short payload %d bytes, max %d", ErrPayloadTooLarge, length, MaxPayloadSize)
 	}
-	// AER-047: reconstruct the absolute seq from the low 16 bits + the
-	// expected next seq, rather than chaining a delta off lastSeqNo.
+	// Reconstruct the absolute seq from the low 16 bits and the expected
+	// next seq (reconstructSeqNo), not from a delta chained off lastSeqNo.
 	seqNo, err := reconstructSeqNo(c.recordedSeqNo(streamID), seqLow)
 	if err != nil {
 		return nil, fmt.Errorf("stream %d: %w", streamID, err)
@@ -509,16 +509,16 @@ func (c *Compressor) DecodeDataShort(r io.Reader) (*Frame, error) {
 		SenderID: sender, ReceiverID: receiver,
 		StreamID: streamID, Type: TypeDATA,
 		SeqNo: seqNo, Length: length,
-		// B3: Flags is set EXPLICITLY to zero, not left implicit. The short DATA
+		// Flags is set EXPLICITLY to zero, not left implicit. The short DATA
 		// forms carry no Flags field, so zero is the only honest value — and
-		// ShouldCompressData now refuses any flag-dependent frame onto this path,
+		// ShouldCompressData refuses any flag-dependent frame onto this path,
 		// so a payload arriving here is plaintext by construction. Do NOT hardcode
-		// a flag here: DecodeACKShortFull hardcodes FlagCOMPOSITE_ACK and that is
-		// exactly how B2 loses FlagCOMPRESSED. See M-108/M-134.
+		// a flag here: DecodeACKShortFull hardcodes FlagCOMPOSITE_ACK, which is
+		// why ShouldCompressACK keeps a compressed ACK on the full header.
 		Flags: 0,
 	}
 	if length > 0 {
-		// AE-P-31: read incrementally so a 9-byte header declaring up to
+		// Read incrementally so a 9-byte header declaring up to
 		// MaxPayloadSize cannot force a full-size allocation before the body exists.
 		p, err := readShortPayload(r, length)
 		if err != nil {
@@ -549,7 +549,7 @@ func (c *Compressor) EncodeEncryptedDataShort(w io.Writer, f *Frame) (int, error
 	}
 	s := c.GetOrCreateStream(f.StreamID)
 	s.mu.Lock()
-	seqLow := uint16(f.SeqNo) // AER-047: absolute low 16 bits, not a delta
+	seqLow := uint16(f.SeqNo) // absolute low 16 bits, not a delta (reconstructSeqNo)
 	s.mu.Unlock()
 
 	var hdr [ShortDataSize]byte
@@ -589,11 +589,10 @@ func (c *Compressor) DecodeEncryptedDataShort(r io.Reader) (*Frame, error) {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Control Short Header (0x83): 8 bytes — AE-L-13
+// Control Short Header (0x83): 8 bytes
 // Layout: [indicator:1][type:1][streamID:2][seqNo:4] (see ShortControlSize=8).
-// This banner previously claimed 4 bytes, diverging from the constant and the
-// encode/decode path. SeqNo is carried on the wire so PING<->PONG RTT
-// correlation works; do NOT drop it back to 4 bytes (freezes the RTO estimator).
+// SeqNo is carried on the wire so PING<->PONG RTT correlation works; a 4-byte
+// form without it would freeze the RTO estimator.
 // ────────────────────────────────────────────────────────────────────────────
 
 // EncodeControlShort writes an 8-byte control short header (no payload).
@@ -690,7 +689,7 @@ func (c *Compressor) EncodeACKShort(w io.Writer, f *Frame) (int, error) {
 		return w.Write(hdr[:])
 	}
 
-	// ACK-full: distinct indicator (AE-H-13) + header + payload. The form's
+	// ACK-full: distinct indicator + header + payload. The form's
 	// length field is a u16; a longer payload is refused before any write
 	// (ShouldCompressACK keeps such a frame full on the session write paths).
 	if f.Length > 0xFFFF {
@@ -710,11 +709,10 @@ func (c *Compressor) EncodeACKShort(w io.Writer, f *Frame) (int, error) {
 }
 
 // DecodeACKShort reads an ACK-lite short header (0x84 indicator already
-// consumed). AE-H-13: lite and full ACKs now use distinct indicators
-// (0x84 vs ShortACKFullIndicator 0x88), so this path unconditionally
-// decodes the 11-byte lite form and never infers the layout from payload
-// bytes — a full ACK with AckDelay==0 previously matched the lite
-// discriminator here and desynced the byte stream.
+// consumed). Lite and full ACKs use distinct indicators (0x84 vs
+// ShortACKFullIndicator 0x88), so this path unconditionally decodes the
+// 11-byte lite form and never infers the layout from payload bytes — a
+// full ACK with AckDelay==0 inferred as lite would desync the byte stream.
 func (c *Compressor) DecodeACKShort(r io.Reader) (*Frame, error) {
 	if !c.ShortForms() {
 		return nil, c.refuseShort(ShortACKIndicator)
@@ -750,9 +748,9 @@ func (c *Compressor) DecodeACKShort(r io.Reader) (*Frame, error) {
 }
 
 // DecodeACKShortFull reads an ACK-full short header (0x88 indicator already
-// consumed). Layout: [streamID:2][length:2][payload:length]. AE-H-13: the
-// dedicated indicator removes the lite/full ambiguity, so the decoder no
-// longer guesses the layout from AckDelay/BitmapLen/Flags byte values.
+// consumed). Layout: [streamID:2][length:2][payload:length]. The dedicated
+// indicator removes the lite/full ambiguity, so the decoder never guesses
+// the layout from AckDelay/BitmapLen/Flags byte values.
 func (c *Compressor) DecodeACKShortFull(r io.Reader) (*Frame, error) {
 	if !c.ShortForms() {
 		return nil, c.refuseShort(ShortACKFullIndicator)
@@ -881,7 +879,7 @@ func (c *Compressor) EncodeDataShortVar(w io.Writer, f *Frame) (int, error) {
 	}
 	s := c.GetOrCreateStream(f.StreamID)
 	s.mu.Lock()
-	seqLow := uint16(f.SeqNo) // AER-047: absolute low 16 bits, not a delta
+	seqLow := uint16(f.SeqNo) // absolute low 16 bits, not a delta (reconstructSeqNo)
 	s.mu.Unlock()
 
 	var hdr [5]byte // indicator + streamID + seqLow
@@ -935,7 +933,8 @@ func (c *Compressor) DecodeDataShortVar(r io.Reader) (*Frame, error) {
 	if length > MaxPayloadSize {
 		return nil, fmt.Errorf("%w: varint payload %d bytes, max %d", ErrPayloadTooLarge, length, MaxPayloadSize)
 	}
-	// AER-047: reconstruct the absolute seq from the low 16 bits + expected.
+	// Reconstruct the absolute seq from the low 16 bits and the expected next
+	// seq (reconstructSeqNo).
 	seqNo, err := reconstructSeqNo(c.recordedSeqNo(streamID), seqLow)
 	if err != nil {
 		return nil, fmt.Errorf("stream %d: %w", streamID, err)
@@ -950,16 +949,16 @@ func (c *Compressor) DecodeDataShortVar(r io.Reader) (*Frame, error) {
 		SenderID: sender, ReceiverID: receiver,
 		StreamID: streamID, Type: TypeDATA,
 		SeqNo: seqNo, Length: length,
-		// B3: Flags is set EXPLICITLY to zero, not left implicit. The short DATA
+		// Flags is set EXPLICITLY to zero, not left implicit. The short DATA
 		// forms carry no Flags field, so zero is the only honest value — and
-		// ShouldCompressData now refuses any flag-dependent frame onto this path,
+		// ShouldCompressData refuses any flag-dependent frame onto this path,
 		// so a payload arriving here is plaintext by construction. Do NOT hardcode
-		// a flag here: DecodeACKShortFull hardcodes FlagCOMPOSITE_ACK and that is
-		// exactly how B2 loses FlagCOMPRESSED. See M-108/M-134.
+		// a flag here: DecodeACKShortFull hardcodes FlagCOMPOSITE_ACK, which is
+		// why ShouldCompressACK keeps a compressed ACK on the full header.
 		Flags: 0,
 	}
 	if length > 0 {
-		// AE-P-31: read incrementally so a tiny varint header declaring up to
+		// Read incrementally so a tiny varint header declaring up to
 		// MaxPayloadSize cannot force a full-size allocation before the body exists.
 		p, err := readShortPayload(r, length)
 		if err != nil {
@@ -1056,8 +1055,8 @@ func (c *Compressor) DecodeBatch(r io.Reader) ([]*Frame, error) {
 		case ShortDataVarIndicator:
 			f, err = c.DecodeDataShortVar(r)
 		case ShortEncryptedIndicator:
-			// AE-P-27: reject 0x87 encrypted-data-short sub-frames inside a
-			// batch. The honest encoder never batches encrypted frames —
+			// Reject 0x87 encrypted-data-short sub-frames inside a batch.
+			// The honest encoder never batches encrypted frames —
 			// EncodeBatch routes DATA through ShouldCompressData, which
 			// excludes FlagENCRYPTED (see ShouldCompressData) — so a batched
 			// 0x87 can only come from a crafted or buggy peer. If decoded it

@@ -80,7 +80,7 @@ func DecodeToken(data []byte) (*Token, error) {
 
 // Validate checks the token's HMAC and age ONLY.
 //
-// AE-P-29: Validate does NOT provide replay / single-use protection — a
+// Validate does NOT provide replay / single-use protection — a
 // captured, still-valid token passes Validate on every presentation for the
 // full MaxTokenAge window. Any 0-RTT path that wires this Store/Token
 // mechanism MUST call ValidateOnce with a shared SeenTokenSet instead, so a
@@ -108,7 +108,7 @@ func (t *Token) Validate(sessionKey []byte) error {
 // (a replay) is rejected. The SessionID is a fresh 8-byte random value per
 // GenerateToken, so it serves as the de-dup nonce without a wire-format change.
 //
-// AE-P-29: this is the replay-safe entry point wired 0-RTT resumption must use.
+// This is the replay-safe entry point a wired 0-RTT resumption must use.
 // seen is retained/pruned by token expiry (created+MaxTokenAge), never by a
 // blind count, so the 24h capability is preserved and a full window of live
 // tokens cannot be silently forgotten (fail-closed when full).
@@ -151,8 +151,8 @@ func NewSeenTokenSet(max int) *SeenTokenSet {
 
 // markOrReject records sessionID as consumed. Returns true if it was novel
 // (admit) and false if already consumed or the set is full of unexpired
-// entries (reject). expiresAt retains the entry until the token can no longer
-// pass the age check.
+// entries (reject). expiresAt retains the entry until the token fails the
+// age check.
 func (s *SeenTokenSet) markOrReject(sessionID [8]byte, expiresAt time.Time) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -233,8 +233,8 @@ type Store interface {
 
 	// List returns the peer IDs with currently-stored resume tokens.
 	// Order is unspecified. Callers typically use this on boot to
-	// kick off 0-RTT reconnection attempts against previously-known
-	// peers before waiting on gossip discovery.
+	// kick off 0-RTT reconnection attempts against known peers
+	// before waiting on gossip discovery.
 	List() ([]string, error)
 }
 

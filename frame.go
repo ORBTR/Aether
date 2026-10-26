@@ -99,11 +99,11 @@ func (t FrameType) String() string {
 
 // IsValid returns true if the frame type is a defined wire type.
 //
-// AE-L-14: this enumerates the defined types rather than range-checking
-// [TypeDATA..TypeCONGESTION]. The range check admitted the reserved hole
+// This enumerates the defined types rather than range-checking
+// [TypeDATA..TypeCONGESTION]. A range check would admit the reserved hole
 // at 0x09 (between TypeACK=0x08 and TypePRIORITY=0x0A): a Type=0x09 frame
-// passed Validate (IsValid true, no minPayloadSizes entry) and was then
-// silently dropped at dispatch instead of being scored via
+// would pass Validate (IsValid true, no minPayloadSizes entry) and then be
+// silently dropped at dispatch instead of scored via
 // reportAbuse(ReasonMalformedFrame). Enumerating defined types makes 0x09
 // — and any future in-range gap — fail Validate and route to the
 // malformed-frame abuse path, exactly like out-of-range types >0x14.
@@ -446,7 +446,7 @@ const (
 	CACKInvertedBitmap  CompositeACKFlags = 0x10 // Reserved for future use: bit=1 means MISSING. Interleaved FEC (FECInterleaved) now handles burst loss recovery via two offset XOR groups in the FEC layer; this flag is kept for forward-compatibility with a potential future ACK-layer loss signaling mode.
 	CACKHasGaps         CompositeACKFlags = 0x20 // Receive window has gaps. ACK-lite (BitmapLen=0) ONLY valid when HasGaps=0
 	CACKHasWindowCredit CompositeACKFlags = 0x40 // Window-credit extension: 8-byte cumulative stream-level WINDOW_UPDATE grant piggybacked on the ACK. Eliminates a separate WINDOW_UPDATE frame when the receiver has granted new credit for this stream. Sender applies via StreamWindow.ApplyUpdate with the same cumulative semantics as a standalone WINDOW_UPDATE.
-	CACKNoCumulative    CompositeACKFlags = 0x80 // No cumulative acknowledgment: the receiver has delivered nothing in-order yet (expected==0), so BaseACK carries the wrapped sentinel expected-1 (0xFFFFFFFF) purely to keep the SACK bitmap aligned (BaseACK+1+i wraps to seq i). The sender MUST skip the cumulative-ack loop and its jump check and process only the SACK bitmap. Without this, expected-1 read as a ~4-billion forward jump made the sender discard the whole ACK and charge the honest receiver with ACK-validation abuse (AER-060).
+	CACKNoCumulative    CompositeACKFlags = 0x80 // No cumulative acknowledgment: the receiver has delivered nothing in-order yet (expected==0), so BaseACK carries the wrapped sentinel expected-1 (0xFFFFFFFF) purely to keep the SACK bitmap aligned (BaseACK+1+i wraps to seq i). The sender MUST skip the cumulative-ack loop and its jump check and process only the SACK bitmap. Without the flag, expected-1 reads as a ~4-billion forward jump, and SendWindow.ProcessCompositeACK discards the whole ACK and charges the honest receiver with ACK-validation abuse.
 )
 
 // FlagCOMPOSITE_ACK is set on TypeACK frames that use the Composite ACK format.
@@ -467,7 +467,7 @@ type CompositeACK struct {
 	// Optional extensions (present only if flagged)
 	ExtRanges     []SACKBlock // extended SACK ranges beyond bitmap window (max 8)
 	DroppedRanges []SACKBlock // ranges receiver has dropped (max 4)
-	LossRate      uint16      // loss% × 100 over a sliding wall-clock window (default 5s, see reliability.DefaultLossWindow) of received-packet samples; 0-10000. Receiver gates emission on ACKEngine.HasWarmedUp() so the warmup-skew of a fixed-length ring (the previous 256-slot bool ring) is no longer present on the wire. Advisory only.
+	LossRate      uint16      // loss% × 100 over a sliding wall-clock window (default 5s, see reliability.DefaultLossWindow) of received-packet samples; 0-10000. Receiver gates emission on ACKEngine.HasWarmedUp() so an undersampled early window never reaches the wire. Advisory only.
 	CEBytes       uint32      // ECN: cumulative bytes of CE-marked packets observed since last ACK
 	WindowCredit  uint64      // Cumulative stream-level WINDOW_UPDATE grant piggybacked on this ACK. Same semantics as the WINDOW_UPDATE frame payload: cumulative, not delta; sender's ApplyUpdate drops stale/duplicate values via the grantsReceived cursor.
 }
@@ -801,7 +801,7 @@ type HandshakeType uint8
 const (
 	HandshakeKeyRotation      HandshakeType = 0 // Rotate session encryption keys
 	HandshakeCapUpdate        HandshakeType = 1 // Update capabilities (e.g., enable FEC)
-	HandshakeSessionResume    HandshakeType = 2 // Resume a previously established session
+	HandshakeSessionResume    HandshakeType = 2 // Resume an established session from its ticket
 	HandshakeAddressMigration HandshakeType = 3 // Connection migration (IP/port change)
 	HandshakeResumeMaterial   HandshakeType = 4 // Responder → initiator delivery of ticket + keys for next-time resume
 )

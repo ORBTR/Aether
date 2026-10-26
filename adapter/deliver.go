@@ -137,13 +137,12 @@ const (
 	// A silent drop here desynchronises caller and credit accounting
 	// and produces a 30s deadline-exceeded sample with no retry. Pay
 	// a per-call latency penalty of waiting up to 1s rather than
-	// burning the 30s deadline. AE-M-02: on the noise adapter this 1s
-	// wait is now paid on the per-stream deliverLoop goroutine, NOT the
+	// burning the 30s deadline. On the noise and TCP adapters this 1s
+	// wait is paid on the per-stream deliverLoop goroutine, NOT the
 	// shared readLoop — a slow stream-1 consumer blocks only its own
-	// delivery goroutine while the readLoop keeps draining the noiseConn
-	// inbox (inbound ACKs for every other stream). Far cheaper than the
-	// silent 30s RPC timeouts ws_same-origin p99 has been pinned to. See
-	// workflow wd4zasivv synthesis.
+	// delivery goroutine while the readLoop keeps draining the inbox
+	// (inbound ACKs for every other stream). Far cheaper than a silent
+	// 30s RPC timeout.
 	stream1MaxBackpressure = 1 * time.Second
 )
 

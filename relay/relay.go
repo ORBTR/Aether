@@ -20,10 +20,11 @@ const (
 	// the build-tag-agnostic packet_types.go so noise's agnostic noiseConn can
 	// reference them under GOOS=js.
 
-	// Relay overhead. AER-098: a canonical NodeID is exactly 30 bytes
-	// ("vl1_" + 26 base32 chars). Sizing the header at 32 left 2 trailing NUL
-	// bytes when reconstructing the NodeID (aether.NodeID(hdr[:32])), so the
-	// forwarding lookup — keyed by canonical 30-byte NodeIDs — never matched.
+	// Relay overhead: a canonical NodeID is exactly 30 bytes ("vl1_" + 26
+	// base32 chars). A 32-byte header would leave 2 trailing NUL bytes when
+	// the NodeID is reconstructed (aether.NodeID(hdr[:RelayHeaderSize])), and
+	// the forwarding lookup — keyed by canonical 30-byte NodeIDs — would never
+	// match.
 	RelayHeaderSize = NodeIDCanonicalSize // 30 — NodeID size
 
 	// NodeIDCanonicalSize is the byte length of a canonical textual NodeID.
@@ -35,7 +36,7 @@ const (
 	TicketPartitionIDSize = 32 // SHA256 hash of scope ID string
 	// v2 format: nonce + expiry + nodeID + targetID + scopeID + sig
 	TicketMinSize = TicketNonceSize + 8 + 32 + 32 + TicketPartitionIDSize + TicketSignatureSize
-	// v1 format (legacy, no scope): nonce + expiry + nodeID + targetID + sig
+	// v1 format (no scope): nonce + expiry + nodeID + targetID + sig
 	ticketMinSizeV1 = TicketNonceSize + 8 + 32 + 32 + TicketSignatureSize
 )
 
@@ -57,13 +58,13 @@ type RelayTicket struct {
 	ExpiresAt time.Time                   // When the ticket expires
 	NodeID    [32]byte                    // Node authorized to use this ticket
 	TargetID  [32]byte                    // Target node the ticket allows relaying to
-	ScopeID   [TicketPartitionIDSize]byte // SHA256 of scope ID (zero = unscoped/legacy)
+	ScopeID   [TicketPartitionIDSize]byte // SHA256 of scope ID (zero = unscoped, the v1 format)
 	Signature [TicketSignatureSize]byte   // Ed25519 signature by relay
 }
 
 // NewRelayTicket creates a new relay ticket signed by the relay node.
 // The scopeID is the SHA256 hash of the scope string — use ScopeHash() to compute it.
-// Pass a zero scopeID for unscoped (legacy/dedicated mode) tickets.
+// Pass a zero scopeID for unscoped (dedicated mode) tickets.
 func NewRelayTicket(relayPrivKey ed25519.PrivateKey, nodeID, targetID [32]byte, ttl time.Duration) (*RelayTicket, error) {
 	return NewPartitionRelayTicket(relayPrivKey, nodeID, targetID, [TicketPartitionIDSize]byte{}, ttl)
 }
@@ -142,7 +143,7 @@ func UnmarshalTicket(data []byte) (*RelayTicket, error) {
 		copy(ticket.ScopeID[:], data[TicketNonceSize+8+32+32:])
 		copy(ticket.Signature[:], data[TicketNonceSize+8+32+32+TicketPartitionIDSize:])
 	} else {
-		// v1 (legacy): no scopeID, signature follows targetID directly
+		// v1: no scopeID, signature follows targetID directly
 		// ScopeID stays zero (unscoped)
 		copy(ticket.Signature[:], data[TicketNonceSize+8+32+32:])
 	}

@@ -38,7 +38,7 @@ const (
 	SignatureHeader = "X-Signature"
 	// NonceHeader carries the client-chosen random nonce bound into the dial
 	// signature; with TimestampHeader it makes each handshake unique so a
-	// captured signature cannot be replayed (AE-M-16).
+	// captured signature cannot be replayed (verifyMeshDial).
 	NonceHeader = "X-Nonce"
 	// TimestampHeader carries the unix-nanosecond dial time bound into the
 	// signature; the server rejects anything outside dialFreshnessWindow.
@@ -55,7 +55,7 @@ const (
 
 	// dialFreshnessWindow bounds clock skew between a dial signature's
 	// timestamp and the server clock; the replay cache retains authenticated
-	// nonces for the same span (AE-M-16). Sized generously (not tightened) so
+	// nonces for the same span. Sized generously (not tightened) so
 	// NTP-synced Fly nodes never falsely reject a legitimate dial.
 	dialFreshnessWindow = 60 * time.Second
 )
@@ -84,7 +84,7 @@ func NewWebsocketTransport(cfg WebsocketTransportConfig) (*WebsocketTransport, e
 }
 
 // dialReplayGuard rejects reuse of an authenticated dial nonce within the
-// freshness window (AE-M-16). Only signature-valid nonces are recorded, so
+// freshness window. Only signature-valid nonces are recorded, so
 // an unauthenticated peer cannot poison it. Retention is bounded by expiry.
 type dialReplayGuard struct {
 	mu   sync.Mutex
@@ -129,7 +129,7 @@ func (t *WebsocketTransport) Dial(ctx context.Context, target aether.Target) (ae
 	headers.Set(NodeIDHeader, string(t.localNode))
 	headers.Set(PubKeyHeader, hex.EncodeToString(t.privateKey.Public().(ed25519.PublicKey)))
 
-	// AE-M-16: bind the dial intent to a fresh timestamp + random nonce so a
+	// Bind the dial intent to a fresh timestamp + random nonce so a
 	// captured (NodeID, PubKey, Signature) header set cannot be replayed to
 	// re-establish a session as us. The server rejects timestamps outside
 	// dialFreshnessWindow and any nonce it has already seen within that window.
@@ -162,7 +162,7 @@ func (t *WebsocketTransport) Dial(ctx context.Context, target aether.Target) (ae
 	// Dial using gobwas/ws — returns the raw net.Conn post-handshake
 	// Measure dial RTT (TCP handshake + TLS + WS upgrade) for cross-region latency
 	dialStart := time.Now()
-	// AE-P-26: capture the server's signed identity headers from the 101
+	// Capture the server's signed identity headers from the 101
 	// response so we can verify the server owns target.NodeID before trusting
 	// it (matching the HTTPUpgrader emit in Listen). Header keys arrive as
 	// canonicalized wire bytes, so match case-insensitively.
@@ -188,7 +188,7 @@ func (t *WebsocketTransport) Dial(ctx context.Context, target aether.Target) (ae
 	}
 	dialRTT := time.Since(dialStart)
 
-	// AE-P-26: verify the server's mesh identity (fail closed) before stamping
+	// Verify the server's mesh identity (fail closed) before stamping
 	// target.NodeID. Mirrors the hijack path: require a signed triple, check the
 	// pubkey derives the claimed NodeID, verify the signature over OUR fresh
 	// nonce+timestamp, and require the proven NodeID == the dialed target. TLS
@@ -243,8 +243,8 @@ func (t *WebsocketTransport) Dial(ctx context.Context, target aether.Target) (ae
 // should surface. VerifyMeshDial returns it (as the error interface) so a
 // caller mounting its own /mesh/ws handler can map the failure to the exact
 // status + message the built-in Listen handler uses: 400 for a malformed
-// request, 401 for a failed authentication (AE-C-04 mandatory signature /
-// AE-M-16 freshness+replay).
+// request, 401 for a failed authentication (mandatory signature, freshness,
+// replay).
 type VerifyMeshDialError struct {
 	Status int
 	Msg    string
@@ -252,7 +252,7 @@ type VerifyMeshDialError struct {
 
 func (e *VerifyMeshDialError) Error() string { return e.Msg }
 
-// VerifyMeshDial runs the AE-C-04 dial verification on an inbound mesh WS
+// VerifyMeshDial runs the dial verification on an inbound mesh WS
 // upgrade request and returns the cryptographically-proven remote NodeID and
 // its ed25519 public key. Callers that mount their own /mesh/ws handler call
 // this before upgrading, replacing a presence-only signature check. The
@@ -265,8 +265,8 @@ func (t *WebsocketTransport) VerifyMeshDial(r *http.Request) (aether.NodeID, ed2
 // verification, shared by VerifyMeshDial/Listen (dialPrefix "ws-dial") and
 // HijackHandler (dialPrefix "hijack-dial"). Both inbound paths sign a byte-
 // identical structure that differs ONLY in this prefix, so threading it keeps
-// one implementation of the mandatory-signature (AE-C-04) and freshness+replay
-// (AE-M-16) checks while each path preserves its exact signed message. On
+// one implementation of the mandatory-signature and freshness+replay
+// checks while each path preserves its exact signed message. On
 // success it has already recorded the dial nonce in the shared replay guard.
 func (t *WebsocketTransport) verifyMeshDial(r *http.Request, dialPrefix string) (aether.NodeID, ed25519.PublicKey, error) {
 	// Extract and validate NodeID from headers
@@ -278,8 +278,8 @@ func (t *WebsocketTransport) verifyMeshDial(r *http.Request, dialPrefix string) 
 
 	// NodeID ownership MUST be cryptographically proven — the signature is
 	// mandatory, never optional-on-presence. A client that omits it would
-	// otherwise be accepted under any claimed NodeID (peer impersonation,
-	// AE-C-04). Ordinary server TLS gives no client-identity guarantee, so
+	// otherwise be accepted under any claimed NodeID (peer impersonation).
+	// Ordinary server TLS gives no client-identity guarantee, so
 	// this signature is the sole NodeID binding. Legitimate clients always
 	// send it (see Dial), so requiring it breaks nothing.
 	signatureStr := r.Header.Get(SignatureHeader)
@@ -291,7 +291,7 @@ func (t *WebsocketTransport) verifyMeshDial(r *http.Request, dialPrefix string) 
 		return "", nil, &VerifyMeshDialError{Status: http.StatusBadRequest, Msg: "invalid signature encoding"}
 	}
 
-	// AE-M-16: reject stale dials before spending a signature verify.
+	// Reject stale dials before spending a signature verify.
 	tsStr := r.Header.Get(TimestampHeader)
 	nonceStr := r.Header.Get(NonceHeader)
 	if tsStr == "" || nonceStr == "" {
@@ -330,7 +330,7 @@ func (t *WebsocketTransport) verifyMeshDial(r *http.Request, dialPrefix string) 
 		return "", nil, &VerifyMeshDialError{Status: http.StatusUnauthorized, Msg: "invalid signature"}
 	}
 
-	// AE-M-16: authentic signature — now reject a replay of it.
+	// Authentic signature — reject a replay of it.
 	if !t.replay.checkAndRecord(nonceStr, now, time.Unix(0, tsNano).Add(dialFreshnessWindow)) {
 		return "", nil, &VerifyMeshDialError{Status: http.StatusUnauthorized, Msg: "replayed dial signature"}
 	}
@@ -350,7 +350,7 @@ func writeVerifyMeshDialError(w http.ResponseWriter, err error) {
 	http.Error(w, err.Error(), http.StatusBadRequest)
 }
 
-// AcceptHeaders builds the AE-P-26 signed identity response headers a
+// AcceptHeaders builds the signed identity response headers a
 // /mesh/ws handler MUST write into the 101 response so the aether WS dialer
 // (which requires the NodeID/PubKey/Signature triple — see Dial) can verify
 // the server owns the dialed NodeID and not close the accepted socket as
@@ -381,7 +381,7 @@ func (t *WebsocketTransport) Listen(ctx context.Context) (aether.Listener, error
 	ch := make(chan aether.IncomingSession, 32)
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// AE-C-04 / AE-M-16 dial verification — single source of truth shared
+		// Dial verification — single source of truth shared
 		// with HijackHandler and exported as VerifyMeshDial for callers that
 		// mount their own /mesh/ws handler.
 		remoteNodeID, _, err := t.VerifyMeshDial(r)
@@ -390,13 +390,13 @@ func (t *WebsocketTransport) Listen(ctx context.Context) (aether.Listener, error
 			return
 		}
 
-		// AE-P-26: emit our signed identity triple in the 101 so the client can
+		// Emit our signed identity triple in the 101 so the client can
 		// verify the server owns target.NodeID and fails closed on mismatch.
 		// AcceptHeaders is the shared source of truth — callers that mount their
 		// own /mesh/ws handler (via VerifyMeshDial) use it too.
 		respHdr := t.AcceptHeaders(r)
 		// Upgrade to WebSocket using gobwas/ws — hijacks the HTTP connection and
-		// writes our signed identity headers into the 101 response (AE-P-26).
+		// writes our signed identity headers into the 101 response.
 		rawConn, _, _, err := ws.HTTPUpgrader{Header: respHdr}.Upgrade(r, w)
 		if err != nil {
 			return
@@ -544,7 +544,7 @@ func (t *WebsocketTransport) DialHijack(ctx context.Context, target aether.Targe
 	req.Header.Set("Upgrade", HijackUpgradeToken)
 	req.Header.Set(NodeIDHeader, string(t.localNode))
 	req.Header.Set(PubKeyHeader, hex.EncodeToString(t.privateKey.Public().(ed25519.PublicKey)))
-	// AE-M-16: bind a fresh timestamp + random nonce into the hijack dial
+	// Bind a fresh timestamp + random nonce into the hijack dial
 	// signature so a captured header set cannot be replayed.
 	nonce := make([]byte, 16)
 	if _, err := rand.Read(nonce); err != nil {
@@ -559,7 +559,7 @@ func (t *WebsocketTransport) DialHijack(ctx context.Context, target aether.Targe
 	signature := ed25519.Sign(t.privateKey, message)
 	req.Header.Set(SignatureHeader, base64.StdEncoding.EncodeToString(signature))
 
-	// AER-018: bound the upgrade exchange with an I/O deadline. req.Write and
+	// Bound the upgrade exchange with an I/O deadline. req.Write and
 	// http.ReadResponse are NOT context-aware, so a server that completes
 	// TCP+TLS but never answers the upgrade (a wedged proxy/backend) would
 	// otherwise hang this goroutine and leak tlsConn forever, past any caller
@@ -591,10 +591,10 @@ func (t *WebsocketTransport) DialHijack(ctx context.Context, target aether.Targe
 			fmt.Errorf("expected 101, got %d", resp.StatusCode))
 	}
 	// Upgrade confirmed — clear the deadline so it never affects the hijacked
-	// data connection returned below (AER-018).
+	// data connection returned below.
 	_ = tlsConn.SetDeadline(time.Time{})
 
-	// AE-P-26: verify the server's mesh identity before trusting target.NodeID.
+	// Verify the server's mesh identity before trusting target.NodeID.
 	// TLS only proves the endpoint holds a cert for the dialed hostname; on
 	// shared infra (Fly anycast, one cert across many machines) that does not
 	// prove WHICH NodeID answered. The client's dial signature already makes an
@@ -676,7 +676,7 @@ func (t *WebsocketTransport) HijackHandler() (http.HandlerFunc, <-chan HijackSes
 			return
 		}
 
-		// AE-C-04 / AE-M-16 dial verification — single source of truth shared
+		// Dial verification — single source of truth shared
 		// with the WS Listen path. The hijack path signs a "hijack-dial:"
 		// prefix rather than "ws-dial:", so it calls the internal verifier with
 		// that prefix; the replay guard is the same t.replay instance the WS
@@ -688,7 +688,7 @@ func (t *WebsocketTransport) HijackHandler() (http.HandlerFunc, <-chan HijackSes
 		}
 
 		// Re-read the freshness headers verifyMeshDial already validated —
-		// they seed the AE-P-26 accept signature written into the 101 below.
+		// they seed the accept signature written into the 101 below.
 		tsStr := r.Header.Get(TimestampHeader)
 		nonceStr := r.Header.Get(NonceHeader)
 
@@ -704,7 +704,7 @@ func (t *WebsocketTransport) HijackHandler() (http.HandlerFunc, <-chan HijackSes
 			return
 		}
 
-		// Write 101 Switching Protocols. AE-P-26: prove our mesh identity to the
+		// Write 101 Switching Protocols. Prove our mesh identity to the
 		// client by signing its fresh dial nonce+timestamp with our own key, so an
 		// endpoint that merely holds a cert for the hostname (and does not own this
 		// NodeID's private key) cannot pass the client's identity check. Guard on
@@ -787,11 +787,12 @@ func (c *HijackConn) Read(p []byte) (int, error) {
 		return n, nil
 	}
 
-	// AER-031: loop over zero-length keepalive frames instead of recursing.
-	// The old `return c.Read(p)` added a stack frame per keepalive; a peer
-	// streaming `00 00 00 00` prefixes forever grew the read goroutine's
-	// stack until Go's 1 GB limit fatally crashed the whole process. A loop
-	// handles the same case in constant stack space (matches WSConn.Read).
+	// Loop over zero-length keepalive frames instead of recursing: a
+	// recursive `return c.Read(p)` adds a stack frame per keepalive, so a
+	// peer streaming `00 00 00 00` prefixes forever would grow the read
+	// goroutine's stack until Go's 1 GB limit fatally crashes the whole
+	// process. A loop handles the same case in constant stack space
+	// (matches WSConn.Read).
 	for {
 		// Read 4-byte length header
 		var hdr [4]byte

@@ -41,8 +41,8 @@ var ErrNilConfig = errors.New("aether adapter: nil config")
 // aether.Config; a nil cfg is rejected with ErrNilConfig before any
 // sub-package is consulted.
 //
-// String dispatch goes through aether.ParseProtocol so the legacy
-// "vl1" alias and the dual "ws"/"websocket" names route to the same
+// String dispatch goes through aether.ParseProtocol so the "vl1"
+// alias and the dual "ws"/"websocket" names route to the same
 // constructor as the typed factory below — callers picking a protocol
 // off the wire don't have to normalise names themselves.
 //

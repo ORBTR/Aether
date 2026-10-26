@@ -17,7 +17,7 @@ import (
 )
 
 // PeerKeyCacheMaxEntries hard-caps the number of cached peer static keys so a
-// flood of distinct peer identities cannot grow the map without bound (AE-L-06).
+// flood of distinct peer identities cannot grow the map without bound (Put).
 // Sized to match noise.SourceLimitMaxEntries (~100-150 B/entry => ~10-15 MB at
 // cap). Eviction is oldest-first, so hot peers are retained; the only cost of
 // an eviction is that peer's next reconnect falls back from XK to a full XX
@@ -35,7 +35,7 @@ type PeerKeyCache struct {
 	mu         sync.RWMutex
 	keys       map[aether.NodeID]*cachedKey
 	maxAge     time.Duration // 0 = no TTL eviction
-	maxEntries int           // AE-L-06: hard cap on map cardinality; 0 = unbounded
+	maxEntries int           // hard cap on map cardinality, enforced by Put; 0 = unbounded
 }
 
 // NewPeerKeyCache creates a cache. maxAge controls TTL-based eviction
@@ -44,7 +44,7 @@ func NewPeerKeyCache(maxAge time.Duration) *PeerKeyCache {
 	return &PeerKeyCache{
 		keys:       make(map[aether.NodeID]*cachedKey),
 		maxAge:     maxAge,
-		maxEntries: PeerKeyCacheMaxEntries, // AE-L-06: hard-bound the map
+		maxEntries: PeerKeyCacheMaxEntries, // bounds the map
 	}
 }
 
@@ -59,9 +59,9 @@ func (c *PeerKeyCache) Get(id aether.NodeID) []byte {
 	}
 	if c.maxAge > 0 && time.Since(ck.cachedAt) > c.maxAge {
 		c.mu.RUnlock()
-		// AE-L-06: lazily drop the expired entry so dead keys are reclaimed on
-		// access instead of lingering (Prune historically had no caller). Take
-		// the write lock only on the rare expiry path; never hold RLock+Lock at
+		// Lazily drop the expired entry so dead keys are reclaimed on access
+		// instead of lingering until a Prune. Take the write lock only on the
+		// rare expiry path; never hold RLock+Lock at
 		// once. The pointer re-check ensures a concurrent Put refresh isn't lost.
 		c.mu.Lock()
 		if cur := c.keys[id]; cur == ck {
@@ -80,10 +80,10 @@ func (c *PeerKeyCache) Put(id aether.NodeID, curvePublic []byte) {
 	key := make([]byte, len(curvePublic))
 	copy(key, curvePublic)
 	c.mu.Lock()
-	// AE-L-06: bound the map. Enforce only for a genuinely NEW id (refreshing an
+	// Bound the map. Enforce only for a genuinely NEW id (refreshing an
 	// existing peer's key doesn't change cardinality). Reclaim expired entries
-	// first (giving Prune's logic the hot-path caller it never had), then evict
-	// the oldest survivor if still at cap, so growth is hard-bounded under any
+	// first (pruneLocked, which Prune also runs), then evict the oldest
+	// survivor if still at cap, so growth is hard-bounded under any
 	// churn or fresh-identity flood.
 	if _, exists := c.keys[id]; !exists && c.maxEntries > 0 && len(c.keys) >= c.maxEntries {
 		if c.pruneLocked(); len(c.keys) >= c.maxEntries {
@@ -113,7 +113,7 @@ func (c *PeerKeyCache) Prune() int {
 }
 
 // pruneLocked removes all expired entries and returns the count. Caller MUST
-// hold c.mu. No-op if maxAge is 0. Shared by Prune and Put's cap path. (AE-L-06)
+// hold c.mu. No-op if maxAge is 0. Shared by Prune and Put's cap path.
 func (c *PeerKeyCache) pruneLocked() int {
 	if c.maxAge <= 0 {
 		return 0
@@ -131,7 +131,7 @@ func (c *PeerKeyCache) pruneLocked() int {
 
 // evictOldestLocked removes the single oldest entry (by cachedAt) to free a slot
 // when the map is at capacity. Caller MUST hold c.mu. Loss-free: the evicted
-// peer's next reconnect simply uses XX instead of XK. (AE-L-06)
+// peer's next reconnect simply uses XX instead of XK.
 func (c *PeerKeyCache) evictOldestLocked() {
 	var oldestID aether.NodeID
 	var oldestAt time.Time

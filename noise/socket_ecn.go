@@ -43,7 +43,7 @@ func isCEMarked(tos int) bool {
 // ecnReader wraps a *net.UDPConn with TOS / traffic-class delivery
 // enabled. Construct once per listener; the underlying socket is
 // mutated (IP_RECVTOS / IPV6_RECVTCLASS). Failure to enable cmsg
-// delivery is non-fatal — the reader silently falls back to legacy
+// delivery is non-fatal — the reader silently falls back to plain
 // ReadFromUDP semantics and reports TOS=0 for every datagram.
 type ecnReader struct {
 	conn    *net.UDPConn

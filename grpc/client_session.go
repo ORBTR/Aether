@@ -42,7 +42,7 @@ type GrpcSession struct {
 	closed     int32
 	remoteAddr net.Addr
 
-	// streamCancel cancels the client stream's context (AER-010). Set on
+	// streamCancel cancels the client stream's context. Set on
 	// dialed sessions; nil for server-side sessions. Invoked from Close so
 	// the long-lived stream tears down deterministically.
 	streamCancel context.CancelFunc
@@ -233,7 +233,7 @@ func (s *GrpcSession) Close() error {
 	}
 
 	close(s.closeCh)
-	// AER-010: tear down the long-lived client stream deterministically.
+	// Tear down the long-lived client stream deterministically.
 	if s.streamCancel != nil {
 		s.streamCancel()
 	}

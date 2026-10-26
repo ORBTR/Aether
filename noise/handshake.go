@@ -375,10 +375,11 @@ recvLoop:
 	// Skipped when no existing session is registered for this NodeID —
 	// first-time dials install unconditionally.
 	if existing := listener.sessions.Get(remoteNode); existing != nil {
-		// AER-004 (initiator mirror): only yield to an existing session that
-		// is actually alive. A dead session left by a restarted peer must not
-		// veto this freshly-completed outbound, or the dial "succeeds" onto a
-		// corpse and churns.
+		// Yield only to an existing session that is alive (connFromSession,
+		// IsClosed): a dead session a restarted peer left in listener.sessions
+		// must not veto this completed outbound, or Dial would return a session
+		// whose peer is gone. handleHandshake applies the same test on the
+		// responder side.
 		existingConn := connFromSession(existing)
 		existingDead := existingConn == nil || existingConn.IsClosed()
 		localLower := string(t.localNode) < string(remoteNode)
@@ -639,8 +640,8 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 	l.mu.Lock()
 	hs := l.handshakes[key]
 
-	// AER-005: a nonce-tagged packet from this address whose dial nonce
-	// differs from the stored handshake's is a NEW dial. The initiator drops
+	// A nonce-tagged packet from this address whose dial nonce differs from
+	// the stored handshake's is a NEW dial. The initiator drops
 	// its nonce and re-dials with a fresh one the moment a dial times out
 	// (one lost msg2 is enough) or when the XK→XX fallback fires. The stale
 	// entry's cached msg2 is bound to the OLD dial's ephemeral, so answering
@@ -737,7 +738,7 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 		}
 		hs = &listenerHandshake{state: state, created: time.Now(), scopeID: scopeID, dialNonce: dialNonce,
 			realm: realmBinding{id: transportCrypto.CRC32Hash(prologue), bound: true}}
-		l.evictOldestHandshakeLocked() // AE-P-21: hard cap on incomplete-handshake map
+		l.evictOldestHandshakeLocked() // holds the map at maxIncompleteHandshakes
 		l.handshakes[key] = hs
 
 		// Process the first message (stripped of preamble + fingerprint)
@@ -886,13 +887,12 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 	// identity-matched parentStop ensures that close does not disturb
 	// the new entry we are about to install.
 	if existing := l.sessions.Get(remoteNode); existing != nil {
-		// AER-004: only honour the deterministic tiebreak when the existing
-		// session is actually ALIVE. A peer that restarted (commonly on a new
-		// IP after a redeploy) leaves a dead session registered under its
-		// NodeID; sacrificing the freshly-completed handshake to that corpse
-		// makes the new session go dark immediately and loop (dial succeeds →
-		// reaped in 30–120s → redial → loses the tiebreak again) until the
-		// corpse idle-times out. If the existing session is closed, the new
+		// The deterministic tiebreak applies only when the existing session is
+		// ALIVE (connFromSession, IsClosed). A peer that restarted (commonly on
+		// a new IP after a redeploy) leaves a dead session registered under its
+		// NodeID; yielding the completed handshake to it would leave the new
+		// session dark and the peer redialling and losing the tiebreak until the
+		// dead session idles out. When the existing session is closed, the new
 		// one wins regardless of NodeID ordering.
 		existingConn := connFromSession(existing)
 		existingDead := existingConn == nil || existingConn.IsClosed()

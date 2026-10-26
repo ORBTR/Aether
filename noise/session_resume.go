@@ -5,8 +5,8 @@
  * Queries: licensing@orbtr.io
  */
 
-// 0-RTT session resumption initiator-side plumbing. Concern S-ticket /
-// remediation item #1.
+// 0.5-RTT session resumption, initiator side, and the responder's resume
+// handler.
 //
 // Overview — how resumption works end-to-end:
 //
@@ -40,7 +40,7 @@
 //     resumeAcceptPrefix with [its ephemeral pub][confirm-tag]; the
 //     initiator does the same DH and derives identical keys. Because every
 //     resume mixes a fresh ephemeral DH, no (key,nonce) pair is ever shared
-//     with the original session or another resume (AE-C-01).
+//     with the original session or another resume (session_resume_keys.go).
 //
 //  5. **Rollback**: if the responder rejects resume (ticket expired, key
 //     rotated out of overlap window, binder mismatch, replay, etc.) it
@@ -306,7 +306,7 @@ func (t *NoiseTransport) tryResumeDial(ctx interface{}, target aether.Target, ud
 
 	// Fresh ephemeral X25519 keypair for this resume — the forward-secret
 	// input that makes the derived traffic keys unique to this resume, so no
-	// (key,nonce) pair is ever shared with the original session (AE-C-01).
+	// (key,nonce) pair is ever shared with the original session.
 	ephPriv, err := newResumeEphemeral()
 	if err != nil {
 		return nil, fmt.Errorf("resume: ephemeral keygen: %w", err)
@@ -516,7 +516,7 @@ func (l *noiseListener) handleResumePacket(ctx context.Context, conn *net.UDPCon
 		}
 	}
 
-	// Fresh ephemeral + DH → forward-secret, per-resume traffic keys (AE-C-01).
+	// Fresh ephemeral + DH → forward-secret, per-resume traffic keys.
 	ephPriv, err := newResumeEphemeral()
 	if err != nil {
 		sendReject()
@@ -561,10 +561,10 @@ func (l *noiseListener) handleResumePacket(ctx context.Context, conn *net.UDPCon
 	// peer via the ticket PSK + confirm-tag, not a signed NodeInfo, so no
 	// verified ed25519 identity key is available to thread through.
 	nc := newNoiseConnListener(l, send, recv, addr, ticket.PeerID, nil)
-	// AE-H-07: restore the original session's scope from the ticket so
-	// the resumed conn keeps its relay isolation. Without this the conn would
-	// register scopeless (""), and resolveRelayTarget's cross-partition guard
-	// (relay.go) treats empty scope as unrestricted — bypassing partition isolation.
+	// Restore the original session's scope from the ticket so the resumed
+	// conn keeps its relay isolation: a conn registered scopeless ("") reads
+	// as dedicated mode to resolveRelayTarget's cross-partition guard
+	// (relay.go), which treats an empty scope as unrestricted.
 	nc.scopeID = ticket.ScopeID
 	nc.wireVersions, nc.peerWireVersions = ticket.Chosen, ticket.PeerOffer
 	nc.realm = ticket.Realm
@@ -588,7 +588,7 @@ func (l *noiseListener) handleResumePacket(ctx context.Context, conn *net.UDPCon
 // Uses `UnsafeNewCipherState`, flynn/noise's documented helper for installing
 // externally-derived keys. Nonce starts at 0 because the keys are FRESH per
 // resume (see deriveResumeKeys) — never the original session's advancing keys —
-// so nonce 0 here can never collide with the original session (AE-C-01).
+// so nonce 0 here can never collide with the original session.
 //
 // The cipher suite must match what the original handshake used: aether
 // hard-wires Curve25519 / ChaCha20-Poly1305 / BLAKE2b.

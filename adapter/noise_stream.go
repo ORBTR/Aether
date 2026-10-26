@@ -52,7 +52,7 @@ type noiseStream struct {
 	recvOnce sync.Once
 
 	// lastRTOBackoffAt is the last time reliabilityTick applied an RTO
-	// backoff for this stream. AER-065: backoff is bounded to once per RTO
+	// backoff for this stream, which bounds the backoff to once per RTO
 	// interval (RFC 6298 §5.5 — one doubling per timeout event) rather than
 	// once per retransmitted frame. Written and read only from the single
 	// reliabilityTick goroutine, so no lock is needed.
@@ -170,14 +170,13 @@ type noiseStream struct {
 // RESET(ResetRefused) when the cap is reached (peer-initiated paths only;
 // locally-initiated OpenStream passes false).
 func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, enforceRemoteCap bool) *noiseStream {
-	// FEC group size selection. AER-062: FEC is DISABLED by default. The FEC
-	// RECEIVE path is not wired — the decoder is only ever fed repair shards
-	// (AddRepair), never DATA (AddData), and DATA frames carry no group/index
-	// metadata — so a group can never be reconstructed. Emitting repair frames
-	// by default therefore only spent 25-50% extra bandwidth with zero recovery
-	// benefit. Callers may still opt in explicitly via cfg.FECLevel (e.g. once
-	// the receive path is wired, AER-062/063), but the default no longer emits
-	// parity that can never be used.
+	// FEC group size selection. FEC is off by default: the FEC RECEIVE path
+	// is not wired — the decoder is only ever fed repair shards (AddRepair),
+	// never DATA (AddData), and DATA frames carry no group/index metadata —
+	// so a group can never be reconstructed, and repair frames emitted by
+	// default would spend 25-50% extra bandwidth with zero recovery benefit.
+	// A caller opts in explicitly through cfg.FECLevel.
+	// TODO: wire the receive path before any default emits parity.
 	fecGroup := 0
 	if cfg.FECLevel != 0 {
 		// Caller explicitly opted in — map the level to a group size.
@@ -221,10 +220,11 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 		rack:        congestion.NewRACK(eng.RTT.SRTT()),
 		tlp:         congestion.NewTLP(eng.RTT.SRTT()),
 	}
-	// AER-066: surface retransmit-queue evictions instead of dropping them
-	// silently. An eviction (byte-cap pressure, deadline, or max-retries
-	// exceeded) means a reliable frame lost its RTO safety net — previously
-	// invisible, so the resulting stall/loss had no diagnosable root cause.
+	// Surface retransmit-queue evictions (the queue's onEvict hook) instead
+	// of dropping them silently. An eviction (byte-cap pressure, deadline, or
+	// max-retries exceeded) means a reliable frame lost its RTO safety net,
+	// and without the count and the log the resulting stall or loss has no
+	// diagnosable cause.
 	st.retransmitQ.SetOnEvict(func(e *reliability.RetransmitEntry) {
 		if e == nil || e.Frame == nil {
 			return
@@ -244,13 +244,13 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 	//   1. PEER-ADVERTISED value carried in the Noise handshake
 	//      NodeInfo payload (s.peerMaxAckDelay, captured at
 	//      NewNoiseSession via the noiseConnAckDelay probe). This is
-	//      the RFC 9002-compliant path — full handshake-capability
-	//      exchange now satisfies both halves of the audit's A8.
+	//      the RFC 9002-compliant path: the handshake carries the value
+	//      in both directions.
 	//   2. RECEIVER-SIDE APPROXIMATION max(ACKPolicy.MaxDelay, SRTT/4)
-	//      when (1) is zero (peer didn't advertise, e.g. an older
-	//      build, or an over-conn substrate using the minimal NodeInfo
-	//      encoding that doesn't carry the field). Preserves correct
-	//      behaviour against legacy peers and over-conn substrates.
+	//      when (1) is zero (peer didn't advertise, e.g. an over-conn
+	//      substrate using the minimal NodeInfo encoding that doesn't
+	//      carry the field). Preserves correct behaviour against a peer
+	//      whose NodeInfo lacks the field and over-conn substrates.
 	initialAckDelay := s.peerMaxAckDelay
 	if initialAckDelay <= 0 {
 		policy := reliability.DefaultACKPolicy()
@@ -377,7 +377,7 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 		class = aether.DefaultLatencyClass(streamID)
 	}
 	s.sched.RegisterWithClass(streamID, cfg.Priority, cfg.Dependency, class)
-	// AE-M-02: start the per-stream delivery goroutine. This is the only
+	// Start the per-stream delivery goroutine. This is the only
 	// return path for a newly-created stream — the duplicate-open path
 	// returns `existing` (already has a worker) and cap-refused paths return
 	// nil, so no stream ever gets a second worker or is left without one.
@@ -549,10 +549,10 @@ func (st *noiseStream) sendSingleFrame(ctx context.Context, data []byte, extra a
 	// handler nil-checks before dereferencing.
 	if bbr, ok := st.session.congestion().(*congestion.BBRController); ok {
 		if entry := st.sendWindow.GetEntry(seqNo); entry != nil {
-			// AER-076: stamp the sample WITHOUT incrementing inflight. The
+			// Stamp the sample WITHOUT incrementing inflight (StampSample): the
 			// writeLoop's congestion().OnSend at actual transmission is the
-			// single authoritative on-wire inflight increment; incrementing
-			// here too double-counted every frame and wedged BBR in Drain.
+			// single authoritative on-wire inflight increment, and an increment
+			// here too would double-count every frame and wedge BBR in Drain.
 			sample := bbr.StampSample()
 			entry.BBRSample = &sample
 		}

@@ -123,8 +123,8 @@ func (s *NoiseSession) writeLoop() {
 			// otherwise incur on every paced send.
 			wait := s.pacer.TimeUntilSend(frameSize)
 			if wait > 0 {
-				// AER-079: preserve probe status across a pacing deferral. A
-				// TLP probe re-enqueued via plain Enqueue re-emerges with
+				// Preserve probe status across a pacing deferral. A TLP probe
+				// re-enqueued via plain Enqueue re-emerges with
 				// isProbe=false and is then trapped behind the CanSend gate —
 				// the exact cwnd-collapse the RFC 8985 §7.5 bypass exists to
 				// escape. In the degraded-BBR regime (per-frame waits > PTO)
@@ -303,19 +303,16 @@ func (s *NoiseSession) totalInFlightBytes() int64 {
 
 // reliabilityTick checks for retransmission timeouts periodically.
 //
-// Lock discipline: previously this function held s.mu across the full
-// stream iteration (potentially 50+ streams). Inbound ACK frames hitting
-// handleACK during that window blocked on s.mu, and the resulting
-// readLoop stall caused the per-session noiseConn.inbox to fill, which
-// caused the noise listener to drop inbound packets — including ACKs.
-// Result: fleet-wide ACK starvation (sendBase=0, progressAge=n/a) while
-// session-level Pings (handled pre-aether at the noise transport layer)
-// continued to work.
-//
-// Fix: snapshot the stream list under a brief lock, then iterate without
-// holding s.mu. Per-stream state is already atomic where the contention-
-// sensitive readers (handleACK CAS loop, etc.) need it. session-level
-// state (s.lastAnyProgressAt) is touched briefly under lock at the end.
+// Lock discipline: the stream list is snapshotted under a brief s.mu and
+// iterated without it. Holding s.mu across the full iteration (50+
+// streams) would block handleACK on every inbound ACK frame for that
+// window; the readLoop stall then fills the per-session noiseConn.inbox
+// and the noise listener drops inbound packets, ACKs included — ACK
+// starvation (sendBase=0, progressAge=n/a) while session-level Pings,
+// handled below aether at the noise transport, still succeed. Per-stream
+// state is atomic where the contention-sensitive readers (handleACK's CAS
+// loop) need it; session-level state (s.lastAnyProgressAt) is touched
+// briefly under the lock at the end.
 func (s *NoiseSession) reliabilityTick() {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
@@ -408,12 +405,12 @@ func (s *NoiseSession) reliabilityTick() {
 					s.sched.MarkRetransmit(streamID)
 					s.sched.Enqueue(streamID, frame)
 					st.sendWindow.BumpXmitTime(frame.SeqNo, tickNow)
-					// AER-065: back off at most once per RTO interval, not
-					// once per retransmitted frame. A burst loss of N frames
-					// drained one-per-tick otherwise doubled RTO N times,
-					// pinning it at the 60s cap and stalling RTO-only recovery
-					// for up to a minute (RFC 6298 §5.5 doubles once per
-					// timeout event).
+					// Back off at most once per RTO interval, not once per
+					// retransmitted frame: a burst loss of N frames drained
+					// one-per-tick would otherwise double RTO N times, pinning
+					// it at the 60s cap and stalling RTO-only recovery for up
+					// to a minute (RFC 6298 §5.5 doubles once per timeout
+					// event).
 					if st.lastRTOBackoffAt.IsZero() || tickNow.Sub(st.lastRTOBackoffAt) >= st.rtt.RTO() {
 						st.rtt.BackoffRTO()
 						st.lastRTOBackoffAt = tickNow
@@ -482,11 +479,11 @@ func (s *NoiseSession) reliabilityTick() {
 					// re-arm), separate from the regular WFQ queue.
 					probeFired := false
 					if st.tlp.ShouldProbe(tickNow) {
-						// AER-086: probe the highest REMAINING in-flight seq,
-						// not strictly Next()-1. If that entry was selectively
-						// ACKed/evicted, GetEntry returns nil and no probe ever
-						// fired — recovery silently fell back to RTO. Scan down
-						// to the highest still-in-flight entry.
+						// Probe the highest REMAINING in-flight seq, not strictly
+						// Next()-1: when that entry was selectively ACKed or
+						// evicted, GetEntry returns nil and no probe fires, so
+						// recovery would fall back to RTO silently. Scan down to
+						// the highest still-in-flight entry.
 						next := st.sendWindow.Next()
 						base := st.sendWindow.Base()
 						var probeFrame *aether.Frame
@@ -516,12 +513,12 @@ func (s *NoiseSession) reliabilityTick() {
 					}
 
 					// Re-arm TLP based on the freshest XmitTime in the
-					// in-flight set. AER-080: if we fired a probe this tick its
-					// XmitTime was bumped to tickNow — newer than anything in
-					// the pre-probe snapshot — so seed `newest` with tickNow.
-					// Re-arming from the stale snapshot left scheduledAt in the
-					// past, firing probe #2 on the very next 10ms tick and
-					// burning maxConsecutiveProbes into one loss burst.
+					// in-flight set. If we fired a probe this tick its XmitTime
+					// was bumped to tickNow — newer than anything in the
+					// pre-probe snapshot — so seed `newest` with tickNow.
+					// Re-arming from the stale snapshot would leave scheduledAt
+					// in the past, firing probe #2 on the very next 10ms tick
+					// and burning maxConsecutiveProbes into one loss burst.
 					newest := time.Time{}
 					if probeFired {
 						newest = tickNow
@@ -591,8 +588,8 @@ func (s *NoiseSession) reliabilityTick() {
 			if s.lastAnyProgressAt.IsZero() {
 				s.lastAnyProgressAt = time.Now()
 			}
-			// AER-002: reseed the progress clock when in-flight transitions
-			// 0→N. lastAnyProgressAt otherwise advances only on ACK progress,
+			// Reseed the progress clock when in-flight transitions 0→N.
+			// lastAnyProgressAt otherwise advances only on ACK progress,
 			// so a session idle past the stall threshold would trip the
 			// detector on its first fresh frame — before any ACK could
 			// arrive — falsely resetting cwnd and demoting a healthy path.
@@ -903,8 +900,8 @@ type writeDeadlineConn interface {
 // again. CloseWithError is closeOnce-guarded and idempotent, so calling
 // it here is safe even if another path is closing concurrently.
 //
-// AE-H-02: the teardown is dispatched on its OWN goroutine, never called
-// inline. connWrite only ever runs while writeFrame holds s.writeMu, and
+// The teardown is dispatched on its OWN goroutine, never called inline.
+// connWrite only ever runs while writeFrame holds s.writeMu, and
 // CloseWithError re-enters writeFrame on the same goroutine — via the
 // connGrantDebouncer flush (-> sendWindowUpdate) and the acceptor backlog
 // Reset (-> RESET frame). A synchronous call would re-acquire the

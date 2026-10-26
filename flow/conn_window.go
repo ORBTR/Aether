@@ -39,11 +39,9 @@ const DefaultMaxConnCredit int64 = 16 * 1024 * 1024
 // All stream sends must also consume from the connection window.
 //
 // Both Consume and StreamWindow.Consume block up to ConsumeTimeout waiting
-// for credit via a semaphore. Previously Consume was synchronous (error on
-// exhaustion); that made sense when TCP backpressure at the stream level
-// absorbed pacing, but on Noise-UDP a brief conn-level exhaustion would
-// surface as an immediate error even though a WINDOW_UPDATE was about to
-// arrive. Blocking gives grants time to land.
+// for credit via a semaphore: on Noise-UDP a brief conn-level exhaustion
+// would otherwise surface as an immediate error even though a WINDOW_UPDATE
+// was about to arrive. Blocking gives grants time to land.
 //
 // WINDOW_UPDATE semantics match StreamWindow: wire value is the peer's
 // CUMULATIVE total granted since stream start. ApplyUpdate computes delta
@@ -63,7 +61,7 @@ type ConnWindow struct {
 	// max(initialCredit, DefaultMaxConnCredit). grantLocked (recv cap) and
 	// Available (send report) use it instead of the DefaultMaxConnCredit
 	// constant so a window built with initialCredit > 16 MB still emits
-	// grants and reports an accurate Available. AE-P-14.
+	// grants and reports an accurate Available.
 	maxSize int64
 
 	// initialSize is the configured starting credit (e.g. 1 MB); used for
@@ -259,7 +257,7 @@ func (w *ConnWindow) ReceiverConsume(n int64) int64 {
 // (e.g. recvCredit already at the cap).
 func (w *ConnWindow) grantLocked(sinceLastGrant int64, trigger string) int64 {
 	grant := sinceLastGrant
-	// AE-P-14: cap against the true capacity (maxSize), not the
+	// Cap against the true capacity (maxSize), not the
 	// DefaultMaxConnCredit constant, so a window constructed with
 	// initialCredit > 16 MB still emits grants instead of pinning at 0.
 	if w.recvCredit+grant > w.maxSize {

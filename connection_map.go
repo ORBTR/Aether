@@ -63,11 +63,12 @@ func (m *ConnectionMap) Remove(id NodeID) {
 	sess := m.byNodeID[id]
 	delete(m.byNodeID, id)
 
-	// Remove from byAddr (find by value). AER-051: sweep ALL addr keys that
-	// point at this session, not just the first. A session re-Put under a
-	// second addr (dual-stack, or an address change) otherwise left a
-	// dangling byAddr entry, so GetByAddr kept returning a closed session and
-	// inbound routing delivered to a dead conn until coincidental overwrite.
+	// Remove from byAddr (find by value), sweeping ALL addr keys that point
+	// at this session, not just the first: a session re-Put under a second
+	// addr (dual-stack, or an address change) would otherwise leave a
+	// dangling byAddr entry, so GetByAddr would keep returning a closed
+	// session and inbound routing deliver to a dead conn until a coincidental
+	// overwrite.
 	for addr, s := range m.byAddr {
 		if s == sess {
 			delete(m.byAddr, addr)
@@ -161,7 +162,7 @@ func (m *ConnectionMap) RemoveByAddr(addr string) NodeID {
 // listener port). Put silently overwrites the first. If the upper-layer
 // dedup then closes the displaced session, a plain RemoveByAddr would
 // clobber the WINNING session's map entries by addr collision —
-// orphaning a live session that no longer has any map presence, so
+// orphaning a live session that has no map presence left, so
 // future inbound packets fall through to handleHandshake and get
 // silently dropped as malformed msg1. The peer eventually sees
 // "session stuck (no forward progress)" and tears the conversation
@@ -217,11 +218,11 @@ func (m *ConnectionMap) PartitionCountAll() int {
 // Prune removes sessions that are idle beyond maxAge.
 // Returns count of pruned sessions.
 //
-// AER-022: gate on a minimal IsAlive interface rather than the full
-// HealthReporter. noiseConnSession implements only IsAlive, so the previous
-// `sess.(HealthReporter)` assertion failed for every noise session and Prune
-// was a silent no-op for them — the documented idle eviction never ran. And
-// sessions are Closed OUTSIDE m.mu: a noise conn's close path re-enters this
+// Prune gates on a minimal IsAlive interface rather than the full
+// HealthReporter: noiseConnSession implements only IsAlive, so a
+// `sess.(HealthReporter)` assertion would fail for every noise session and
+// make Prune a silent no-op for them, with no idle eviction. And sessions
+// are Closed OUTSIDE m.mu: a noise conn's close path re-enters this
 // map via parentStop → RemoveBy → m.mu.Lock(), which self-deadlocks if Close
 // runs under the lock.
 func (m *ConnectionMap) Prune(maxAge time.Duration) int {
@@ -237,7 +238,7 @@ func (m *ConnectionMap) Prune(maxAge time.Duration) int {
 			continue
 		}
 		delete(m.byNodeID, id)
-		// AER-051: sweep ALL addr keys for this session, not just the first.
+		// sweep ALL addr keys for this session, not just the first (as Remove does).
 		for addr, s := range m.byAddr {
 			if s == sess {
 				delete(m.byAddr, addr)
