@@ -797,7 +797,7 @@ func (s *NoiseSession) GoAway(ctx context.Context, reason aether.GoAwayReason, m
 // releaseStream performs the session-side cleanup that every stream
 // termination path needs: unregister from the scheduler and from the
 // idle-stream GC. Callers must already have removed the stream from
-// s.streams under s.mu (and closed recvCh where appropriate) — this
+// s.streams under s.mu (and ended its receive side where appropriate) — this
 // helper intentionally does neither so it can be called from the GC
 // sweep (which cannot re-acquire s.mu) and the RESET/CLOSE handlers
 // (which run under different lock disciplines).

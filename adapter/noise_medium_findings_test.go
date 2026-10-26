@@ -162,13 +162,14 @@ func TestNoiseEnqueueDeliveryNonBlocking(t *testing.T) {
 func TestNoiseDeliverLoopPreservesOrder(t *testing.T) {
 	s := &NoiseSession{}
 	st := &noiseStream{
-		streamID:  1,
-		session:   s,
-		recvCh:    make(chan []byte, 128),
-		deliverCh: make(chan []byte, 128),
+		streamID:    1,
+		session:     s,
+		recvCh:      make(chan []byte, 128),
+		deliverCh:   make(chan []byte, 128),
+		deliverDone: make(chan struct{}),
 	}
 	go st.deliverLoop()
-	defer st.teardown() // closes deliverCh → deliverLoop exits
+	defer st.teardown() // closes deliverDone → deliverLoop exits
 
 	const n = 100
 	for i := 0; i < n; i++ {

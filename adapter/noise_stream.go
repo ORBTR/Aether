@@ -36,7 +36,19 @@ type noiseStream struct {
 	config   aether.StreamConfig
 	session  *NoiseSession
 	state    *aether.StreamStateMachine
+	// recvCh holds the whole messages deliverLoop has handed to the
+	// application (and the remainder handleClose hands over directly);
+	// Receive reads it. It is never closed: its end is recvDone, which
+	// closeRecvOnce closes exactly once (recvOnce) and Receive selects on,
+	// draining what recvCh still holds before it returns io.EOF. A close of
+	// recvCh would race deliverLoop's send into it, since closeRecvOnce runs
+	// on the readLoop (handleClose, handleReset) and on application
+	// goroutines (Reset) while deliverLoop runs on its own. recvDone is made
+	// in createStream with recvCh; a stream built outside createStream has
+	// neither recvDone nor deliverCh, and closeRecvOnce closes its recvCh
+	// instead.
 	recvCh   chan []byte
+	recvDone chan struct{}
 	recvOnce sync.Once
 
 	// lastRTOBackoffAt is the last time reliabilityTick applied an RTO
@@ -46,15 +58,22 @@ type noiseStream struct {
 	// reliabilityTick goroutine, so no lock is needed.
 	lastRTOBackoffAt time.Time
 
-	// deliverCh feeds this stream's deliverLoop goroutine. AE-M-02: the
-	// readLoop enqueues in-order payloads here (non-blocking) instead of
-	// calling the up-to-1s-blocking DeliverToRecvChWithSignals itself, so one
-	// slow consumer cannot stall the shared readLoop (which drains the
-	// noiseConn inbox). Buffered at recvChCapacity(streamID): with recvCh this
-	// gives 2x buffering before any drop. Single producer / single consumer =>
-	// FIFO order into recvCh preserved.
+	// deliverCh carries each in-order payload from the readLoop (handleData,
+	// handleImplicitOpen and deliverToStream, through enqueueDelivery) to this
+	// stream's deliverLoop, which performs the send into recvCh with its
+	// bounded backpressure off the readLoop, so one slow consumer cannot stall
+	// the readLoop that drains the noiseConn inbox for every stream. Buffered
+	// at recvChCapacity(streamID), which with recvCh gives two buffers before
+	// any drop; one producer and one consumer keep the order into recvCh. It
+	// is never closed: its end is deliverDone, which teardown closes exactly
+	// once (deliverOnce); enqueueDelivery and deliverLoop select on it. A
+	// close of deliverCh would race enqueueDelivery's send, since teardown
+	// runs on application goroutines (Close, Reset), the stream GC and
+	// CloseWithError while the readLoop is still dispatching DATA for the
+	// stream. Both are made in createStream, which starts deliverLoop.
 	deliverCh   chan []byte
-	deliverOnce sync.Once // closes deliverCh exactly once from teardown
+	deliverDone chan struct{}
+	deliverOnce sync.Once // closes deliverDone exactly once
 
 	window *flow.StreamWindow
 
@@ -187,7 +206,9 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 		session:     s,
 		state:       aether.NewStreamStateMachine(),
 		recvCh:      make(chan []byte, recvChCapacity(streamID)),
+		recvDone:    make(chan struct{}),
 		deliverCh:   make(chan []byte, recvChCapacity(streamID)),
+		deliverDone: make(chan struct{}),
 		window:      flow.NewStreamWindowWithCap(cfg.InitialCredit, cfg.MaxCredit),
 		engine:      eng,
 		fragBuf:     NewFragmentBuffer(),
@@ -581,21 +602,41 @@ func (st *noiseStream) sendSingleFrame(ctx context.Context, data []byte, extra a
 	return nil
 }
 
+// Receive returns the next whole message deliverLoop (or handleClose's
+// remainder) handed to recvCh. After closeRecvOnce has closed recvDone it
+// still returns what recvCh holds, one message per call, and then io.EOF;
+// the drain comes first because a select with both recvCh and recvDone ready
+// picks either, and a message delivered before the CLOSE or RESET must not
+// be lost behind the end. A stream built without recvDone reports the same
+// end through its closed recvCh.
 func (st *noiseStream) Receive(ctx context.Context) ([]byte, error) {
+	consumed := func(data []byte) ([]byte, error) {
+		// recvCh holds whole messages only: the readLoop reassembles
+		// fragments (reassemble) before delivery. Record credit for the
+		// message now that the application has received it, which is the
+		// length the sender charged for it. This advances both the
+		// stream-level and conn-level flow-control windows from the
+		// application's perspective (true consume-driven grants).
+		st.recordReceive(int64(len(data)))
+		return data, nil
+	}
 	for {
 		select {
 		case data, ok := <-st.recvCh:
 			if !ok {
 				return nil, io.EOF
 			}
-			// recvCh holds whole messages only: the readLoop reassembles
-			// fragments (reassemble) before delivery. Record credit for the
-			// message now that the application has received it, which is the
-			// length the sender charged for it. This advances both the
-			// stream-level and conn-level flow-control windows from the
-			// application's perspective (true consume-driven grants).
-			st.recordReceive(int64(len(data)))
-			return data, nil
+			return consumed(data)
+		case <-st.recvDone:
+			select {
+			case data, ok := <-st.recvCh:
+				if !ok {
+					return nil, io.EOF
+				}
+				return consumed(data)
+			default:
+				return nil, io.EOF
+			}
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-st.session.CloseSignal():
@@ -665,21 +706,19 @@ func (st *noiseStream) Close() error {
 	return st.session.writeFrame(frame)
 }
 
-// deliverLoop is the per-stream delivery goroutine. AE-M-02: it drains
-// deliverCh (fed in-order by the single readLoop) and performs the actual
-// send into recvCh — including the up-to-1s stream-1 backpressure — OFF the
-// readLoop, so a slow application consumer blocks only this goroutine, never
-// the shared readLoop / inbound-ACK path. Exits when teardown closes deliverCh.
+// deliverLoop is the per-stream delivery goroutine: it takes each in-order
+// payload the readLoop put on deliverCh and performs the send into recvCh,
+// with the bounded backpressure DeliverToRecvChWithSignals applies, off the
+// readLoop, so a slow application consumer holds only this goroutine while
+// the readLoop keeps draining the noiseConn inbox and the inbound ACKs of
+// every other stream. It returns when teardown closes deliverDone, after
+// handing over what deliverCh still holds, each payload within the same
+// bound, so a message that arrived before a CLOSE reaches recvCh ahead of
+// the end Receive reports. Nothing closes recvCh while this goroutine runs
+// (closeRecvOnce closes recvDone), so the send never meets a closed channel.
 func (st *noiseStream) deliverLoop() {
 	s := st.session
-	defer func() {
-		// recvCh may be closed by closeRecvOnce (teardown race); recover so a
-		// send-on-closed is a benign drop, matching handleData's prior guard.
-		if r := recover(); r != nil {
-			dbgNoise.Printf("deliverLoop: send-on-closed for stream %d (race with teardown): %v", st.streamID, r)
-		}
-	}()
-	for payload := range st.deliverCh {
+	deliver := func(payload []byte) {
 		ok := DeliverToRecvChWithSignals(st.recvCh, payload, st.window, st.streamID, s.sendWindowUpdateAgnostic, s.SendCongestion, &s.deliveryStats)
 		if !ok {
 			if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
@@ -687,19 +726,44 @@ func (st *noiseStream) deliverLoop() {
 			}
 		}
 	}
+	for {
+		select {
+		case payload := <-st.deliverCh:
+			deliver(payload)
+		case <-st.deliverDone:
+			for {
+				select {
+				case payload := <-st.deliverCh:
+					deliver(payload)
+				default:
+					return
+				}
+			}
+		}
+	}
 }
 
-// enqueueDelivery hands one in-order payload to deliverLoop. AE-M-02:
-// non-blocking — the readLoop must never block here. Returns false only when
-// deliverCh is full (deliverCh AND recvCh saturated == genuine sustained
-// overload); the payload is then dropped with the SAME accounting
-// DeliverToRecvChWithSignals' drop path uses (backpressure+dropped stats,
-// stream-window grant, CONGESTION signal) so the sender is throttled and never
-// stalls on lost credit. Caller grants conn-level credit on false.
+// enqueueDelivery hands one in-order payload to deliverLoop without
+// blocking: the readLoop (handleData, handleImplicitOpen, deliverToStream)
+// calls it and must never wait on a stream's consumer. It returns false when
+// it does not hand the payload over: deliverCh is full (deliverCh and recvCh
+// both saturated, a sustained overload), in which case the payload is
+// dropped with the accounting DeliverToRecvChWithSignals' drop path uses
+// (backpressure and dropped stats, stream-window grant, CONGESTION signal) so
+// the sender is throttled and never stalls on lost credit; or the stream has
+// been torn down (deliverDone closed), in which case the payload is dropped
+// without stream-level accounting, since the stream's window ends with the
+// RESET or CLOSE teardown sent or received. The caller grants conn-level
+// credit on false either way, as the conn window outlives the stream.
+// deliverCh is never closed, so the send cannot meet a closed channel;
+// selecting on deliverDone is what keeps a torn-down stream from filling its
+// buffer and then signalling congestion for bytes no one will read.
 func (st *noiseStream) enqueueDelivery(payload []byte) bool {
 	select {
 	case st.deliverCh <- payload:
 		return true
+	case <-st.deliverDone:
+		return false
 	default:
 	}
 	s := st.session
@@ -719,22 +783,32 @@ func (st *noiseStream) teardown() {
 	if st.grantDebouncer != nil {
 		st.grantDebouncer.Close()
 	}
-	// AE-M-02: stop the delivery goroutine. Closing deliverCh ends deliverLoop's
-	// range; deliverOnce keeps concurrent teardown paths idempotent. The nil
-	// guard covers streams constructed outside createStream (unit tests /
-	// future direct construction) where deliverCh was never made.
-	if st.deliverCh != nil {
-		st.deliverOnce.Do(func() { close(st.deliverCh) })
+	// End delivery: closing deliverDone makes deliverLoop hand over what
+	// deliverCh still holds and return, and makes enqueueDelivery drop what
+	// the readLoop dispatches from now on. deliverCh is not closed because the
+	// readLoop may be sending into it at this moment (enqueueDelivery). The
+	// nil guard covers a stream built outside createStream, which has no
+	// deliverCh and no deliverLoop.
+	if st.deliverDone != nil {
+		st.deliverOnce.Do(func() { close(st.deliverDone) })
 	}
 }
 
-// closeRecvOnce closes st.recvCh exactly once. Multiple teardown
-// paths (handleReset, local Reset, handleClose, streamGC callback)
-// can race; recvOnce makes the close idempotent so none of them
-// panic with `close of closed channel`. Any in-flight Receive()
-// returns io.EOF.
+// closeRecvOnce ends the stream's receive side exactly once: it closes
+// recvDone, on which Receive returns what recvCh still holds and then io.EOF.
+// Every termination path calls it (handleClose, handleReset, Reset, the
+// stream GC through Reset), from the readLoop and from application
+// goroutines, so recvOnce keeps the close idempotent. recvCh itself is never
+// closed here because deliverLoop may be sending into it on another
+// goroutine; a stream built without recvDone (outside createStream, with no
+// deliverLoop) has its recvCh closed instead, which Receive reads as the same
+// end.
 func (st *noiseStream) closeRecvOnce() {
 	st.recvOnce.Do(func() {
+		if st.recvDone != nil {
+			close(st.recvDone)
+			return
+		}
 		close(st.recvCh)
 	})
 }
