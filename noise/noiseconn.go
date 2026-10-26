@@ -48,8 +48,8 @@ type connHost interface {
 	handleRelayRequest(c *noiseConn, payload []byte) error
 	handleRelayData(c *noiseConn, payload []byte) error
 	// recordInitiatorResume decodes + caches initiator-side resume material
-	// (formerly noiseConn.RecordResumeMaterial's body; moved behind the
-	// interface so the decode/cache types stay !js).
+	// for RecordResumeMaterial; behind the interface so the decode and cache
+	// types (resumeMaterial, initiatorTicketCache) stay !js.
 	recordInitiatorResume(remoteNode aether.NodeID, data []byte)
 }
 
@@ -404,7 +404,9 @@ func (c *noiseConn) sendPacket(packetType byte, payload []byte) error {
 		return err
 	}
 
-	// Legacy sequential nonce path
+	// Implicit-nonce path (the peer did not advertise capExplicitNonce): the
+	// CipherState's own counter is the nonce, so sends are serialised under
+	// sendMu to keep that counter in step with the wire order.
 	c.sendMu.Lock()
 	cipher, err := c.send.Encrypt(nil, nil, data)
 	c.sendMu.Unlock()

@@ -8,8 +8,8 @@ package aether
 // `credit` additional bytes on the stream identified by streamID. Use
 // StreamConnectionLevel for the conn-level window.
 //
-// Pulled out of the Noise + TCP adapters because both built the same
-// frame with the same payload encoding — the only adapter-specific
+// The Noise and TCP adapters' sendWindowUpdate build their frame here, so
+// both carry the same payload encoding — the only adapter-specific
 // concern is the writeFrame path, which stays in the adapter (TCP wraps
 // writeMu, Noise wraps writeMu + encryption pipeline). Adapter callers
 // pass the result to their own writeFrame.
@@ -29,7 +29,7 @@ func BuildWindowUpdateFrame(sender, receiver PeerID, streamID uint64, credit uin
 // supplied throttle hint payload. Always emitted on
 // StreamConnectionLevel — the throttle is a session-wide signal.
 //
-// Pulled out of the Noise + TCP adapters which built identical frames.
+// Both adapters' SendCongestion build their frame here.
 func BuildCongestionFrame(sender, receiver PeerID, p CongestionPayload) *Frame {
 	payload := EncodeCongestion(p)
 	return &Frame{
@@ -43,11 +43,10 @@ func BuildCongestionFrame(sender, receiver PeerID, p CongestionPayload) *Frame {
 }
 
 // HandleCongestionFrame applies an inbound CONGESTION-hint frame to the
-// session-wide throttle. Adapter callers used to inline the same
-// Decode + Apply two-liner each; pulled here so the wire-format
-// handling lives in exactly one place. The caller still owns its own
-// per-adapter debug logging — that's adapter-specific tracing rather
-// than wire behaviour.
+// session-wide throttle. Both adapters' handleCongestion call it, so the
+// wire-format handling lives in exactly one place. The caller still owns
+// its own per-adapter debug logging — that's adapter-specific tracing
+// rather than wire behaviour.
 func HandleCongestionFrame(throttle *CongestionThrottle, frame *Frame) CongestionPayload {
 	p := DecodeCongestion(frame.Payload)
 	throttle.Apply(p)

@@ -113,10 +113,12 @@ type noiseListener struct {
 	pendingDials map[string]chan []byte // nonce hex → channel for outgoing handshake responses
 	quicDemux    *DemuxPacketConn       // routes QUIC packets to quic-go
 	// drops tallies every datagram this listener discards or diverts, by
-	// reason. The receive path used to drop packets with a bare `continue`, so
-	// a fleet-wide outage (msg3 misrouted into quic-go ~50% of the time) was
-	// invisible: the packets just stopped existing and nothing counted them.
-	// Read via DropSnapshot(). See drops.go.
+	// reason: each `continue` in runReader that discards or diverts a
+	// datagram counts it first, so a datagram that leaves the Noise path (the
+	// QUIC demux, STUN, a rate limiter, a pending dial) is visible in
+	// DropSnapshot rather than gone without trace. The forwarder branch
+	// keeps its own tally (IntraOriginForwarder.recordDrop), and a datagram
+	// dispatchToSession delivers is not a drop. See drops.go.
 	drops dropCounters
 }
 
@@ -212,8 +214,9 @@ func (l *noiseListener) run(ctx context.Context) {
 		go l.runReader(ctx, l.ipv6Conn)
 	}
 
-	// G13/G14: Periodic cleanup of stale handshakes and pending dials.
-	// Handshakes that don't complete within 30 seconds are leaked state.
+	// Periodic pruning (pruneStaleHandshakes): an entry in l.handshakes whose
+	// msg3 never arrives, and the relay service's idle external sessions,
+	// are dropped once older than 30 s.
 	go func() {
 		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
@@ -286,13 +289,17 @@ func (l *noiseListener) runReader(ctx context.Context, conn *net.UDPConn) {
 		// ⚠ This branch is classified by FIRST BYTE ONLY and DeliverQUICPacket
 		// validates nothing — anything in 0x40-0xBF (128 of 256 values) is
 		// enqueued for quic-go, which discards it if it is not really QUIC.
-		// Raw Noise ciphertext has a uniformly random first byte, so this
-		// branch silently destroyed ~50% of msg3 until msg3 was moved inside
-		// the dial-nonce envelope. Note the STUN branch below IS guarded by
-		// stun.IsMessage (magic-cookie validated); this one has no equivalent.
-		// The counter exists so the next occurrence is a lookup, not a
-		// nine-hour investigation: quic_demux climbing while noise-UDP fails
-		// is the signature.
+		// Raw Noise ciphertext has a uniformly random first byte, which is
+		// why every handshake message this build's initiator sends travels
+		// inside an envelope ClassifyPacket reads before these byte ranges: the
+		// dial-nonce envelope (performInitiatorHandshakeSharedAttempt,
+		// wrapDialResponse) or, for a cross-origin dial's msg3, the routing
+		// preamble (EncodeRoutingPreamble, by its magic). A bare one would take
+		// this branch half the time.
+		// The STUN branch below IS guarded by stun.IsMessage (magic-cookie
+		// validated); this one has no equivalent, so DropQUICDemux counts every
+		// datagram diverted here: quic_demux climbing while noise-UDP fails is
+		// the signature of a bare Noise datagram taking this branch.
 		if pktType == PacketQUIC && l.quicDemux != nil {
 			l.drops.count(DropQUICDemux)
 			l.quicDemux.DeliverQUICPacket(append([]byte(nil), buf[:n]...), addr)
@@ -588,8 +595,11 @@ func (l *noiseListener) evictOldestHandshakeLocked() {
 	}
 }
 
-// pruneStaleHandshakes removes incomplete handshakes and leaked pending dials
-// older than maxAge. Fixes G13 (relay handshake leak) and G14 (pending dial leak).
+// pruneStaleHandshakes removes incomplete handshakes older than maxAge from
+// l.handshakes and prunes the relay service's external sessions idle for as
+// long. run calls it every 15 s with 30 s: an initiator that never sends msg3
+// leaves its entry, and without this sweep the map would be bounded only by
+// evictOldestHandshakeLocked's cap.
 func (l *noiseListener) pruneStaleHandshakes(maxAge time.Duration) {
 	cutoff := time.Now().Add(-maxAge)
 	l.mu.Lock()

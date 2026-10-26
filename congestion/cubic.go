@@ -274,9 +274,11 @@ func (c *CUBICController) OnCE(bytesMarked int64) {
 	c.OnLoss()
 }
 
-// OnLoss handles packet loss detection. Legacy entry point — adapters
-// that have current flight-size info should prefer OnLossWithPipe so
-// PRR can seed recoverFS correctly.
+// OnLoss handles a loss detected without a flight-size reading: it is
+// OnLossWithPipe(0), which seeds recoverFS from cwnd. OnCE calls it, since a
+// CE mark carries no pipe size; the adapter's handleACK and reliabilityTick
+// know the in-flight bytes and call OnLossWithPipe so PRR's denominator is
+// the real pipe.
 func (c *CUBICController) OnLoss() {
 	c.OnLossWithPipe(0)
 }

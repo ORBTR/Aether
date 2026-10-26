@@ -591,13 +591,10 @@ func (t *Tracker) PeerReliability(peerID string) float64 {
 // Stability is 1 − EMA of |Δscore| so a path whose score bounces around
 // scores lower in the next compute.
 //
-// Proper EMA: stability_new = α·current_stability_estimate + (1-α)·prev.
-// The previous formula computed `variance = 0.2*delta + 0.8*(1-stab)`
-// then `stab = 1 - variance`, whose fixed point at delta=0 sits at
-// stab=1.0 ONLY if reached from stab=1.0 — anything below 1.0 oscillated
-// around 0.5 (was H-Quality-EMA-Oscillation). The correct EMA-of-|delta|
-// formula tracks delta directly and derives stab as `1 - smoothed_delta`,
-// with a steady-state of 1.0 at delta=0 reachable from any prior value.
+// The EMA runs over |delta| (stabilitySmoothedDelta) and stab is derived as
+// `1 - smoothed_delta`, so its steady state at delta=0 is 1.0 from any prior
+// value: the stability Stability reports for a path whose score has stopped
+// moving.
 func (t *Tracker) RecordScore(key string, score float64) {
 	e := t.entry(key)
 	e.mu.Lock()
@@ -698,11 +695,10 @@ func (t *Tracker) RecordCooldown(key string, d time.Duration) {
 // return value is the cooldown's remaining duration, useful for
 // observability and for the EnsureK reconnect loop's backoff.
 //
-// Audit M12: this used to mutate dialProbeLastNs as a side effect of
-// the predicate query, violating command-query separation — a caller
-// that read the result twice would have stamped two probes. The
-// probe-allowance side effect now lives in TryDialThrough, called
-// only by the dialer when it's about to actually attempt a dial.
+// Nothing but the lazy clear above is written here: dashboards and the
+// EnsureK loop read this repeatedly, and a probe stamp on a read would spend
+// the probe slot. The probe allowance (dialProbeLastNs) is stamped by
+// TryDialThrough alone, which the dialer calls once per attempt.
 func (t *Tracker) IsDialSuppressed(key string) (bool, time.Duration) {
 	v, ok := t.entries.Load(key)
 	if !ok {
@@ -739,13 +735,13 @@ func (t *Tracker) IsDialSuppressed(key string) (bool, time.Duration) {
 //	}
 //	// actually dial
 //
-// Audit M12 fix — splits the predicate (IsDialSuppressed, pure)
-// from the command (TryDialThrough, allowed to mutate).
+// IsDialSuppressed is the predicate (pure) and this the command (it
+// mutates dialProbeLastNs); the dialer calls this once per attempt and
+// everything else reads the predicate.
 //
-// L1 #6 opportunistic probe semantics: even during cooldown, this
-// returns true once every dialProbeInterval(failureCount) so a
-// transient issue that's actually resolved doesn't burn the full
-// 10-minute cap before any retry.
+// Opportunistic probe: even during cooldown, this returns true once every
+// dialProbeInterval(failureCount) so a transient issue that has resolved
+// doesn't burn the full 10-minute cap before any retry.
 func (t *Tracker) TryDialThrough(key string) bool {
 	v, ok := t.entries.Load(key)
 	if !ok {

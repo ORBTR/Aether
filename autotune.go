@@ -37,10 +37,10 @@ type AutoTuneResult struct {
 // emit a per-stream log line. ResetPeak() is invoked regardless so the
 // next pass starts from a fresh peak measurement.
 //
-// Adapters (Noise + TCP) used to inline an identical 30-line copy of
-// this math, varying only in where the RTT comes from and how they log
-// — those concerns stay in the adapter (the per-stream snapshot under
-// s.mu happens there). AutoTuneWindow is the pure inner step.
+// Both adapters' autoTuneWindows call this for every stream; they differ
+// only in where the RTT comes from and how they log, and those concerns
+// stay in the adapter (the per-stream snapshot under s.mu happens there).
+// AutoTuneWindow is the pure inner step.
 //
 // Returns the zero AutoTuneResult{Action:"noop"} when rtt <= 0 or when
 // suggested == current — i.e. no work needed.

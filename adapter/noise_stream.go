@@ -824,11 +824,14 @@ func (st *noiseStream) Reset(reason aether.ResetReason) error {
 		Length:     uint32(len(payload)),
 		Payload:    payload,
 	}
-	// Send the wire RESET first, then clean up local session state.
-	// Previously only sched.Unregister was called, which left the
-	// s.streams entry and the streamGC tracker alive — both are
-	// now released here so local Reset is fully symmetric with
-	// the peer-initiated handleReset path.
+	// Send the wire RESET first, then release the local state: teardown, the
+	// s.streams entry, the scheduler and stream GC registrations
+	// (releaseStream) and the receive side (closeRecvOnce), the set
+	// handleReset releases for a peer-initiated RESET. The stream GC's sweep
+	// and CloseWithError's acceptor drain call Reset for a stream still in
+	// s.streams, and createStream counts every entry against
+	// MaxConcurrentStreams, so a Reset that left the entry or the GC
+	// registration behind would hold a slot and be reset again by the sweep.
 	err := st.session.writeFrame(frame)
 	st.teardown()
 	st.session.mu.Lock()

@@ -56,22 +56,20 @@ type RetransmitQueue struct {
 	maxAge        time.Duration // 0 = no deadline. Frames older than this are dropped instead of retransmitted.
 	maxBytes      int64         // 0 = unlimited
 	bufferedBytes int64
-	// onEvict (if set) is invoked for every entry the queue silently
-	// drops to make room — byte-cap eviction, deadline drop, etc.
-	// Upper layers register a callback to bump a metric or release
-	// flow-control credit so the eviction doesn't surface as a
-	// permanently-stuck send window (was the H-Reliability-Eviction
-	// finding — evicted entries vanished without notice). Called WITH
+	// onEvict (if set) is invoked for every entry the queue drops to make
+	// room — byte-cap eviction, deadline drop, max-retries drop. The
+	// adapter's createStream registers a callback that counts the eviction
+	// and logs it, so a reliable frame that lost its RTO safety net is
+	// visible rather than a send window that never advances. Called WITH
 	// q.mu held; callbacks must not re-enter the queue.
 	onEvict func(*RetransmitEntry)
 
 	// ackedOnDequeue is an atomic counter of entries dropped at Dequeue
-	// time because their underlying SendEntry was already marked Acked.
-	// Closes the ProcessCompositeACK TOCTOU window between
-	// "Send.Acked=true" and "retransmitQ.Remove(seq)"; without observable
-	// counting, post-ACK retransmits would silently amplify under load
-	// (was the A5 security audit finding — TOCTOU duplicate-retransmit).
-	// Read via AckedOnDequeueCount().
+	// time because their underlying SendEntry was already marked Acked:
+	// ProcessCompositeACK sets Send.Acked and the adapter's handleACK calls
+	// Remove afterwards, so an RTO firing between the two finds an acked
+	// entry at the heap top. The count makes those withheld retransmits
+	// observable. Read via AckedOnDequeueCount().
 	ackedOnDequeue uint64
 }
 
@@ -345,10 +343,10 @@ func (q *RetransmitQueue) Remove(seqNo uint32) {
 
 // AckedOnDequeueCount returns the number of retransmit entries dropped
 // at Dequeue time because their underlying SendEntry was already Acked
-// by ProcessCompositeACK in the TOCTOU window before Remove ran. A
-// non-zero rate is benign (the bug it fixes used to cause silent
-// duplicate retransmits); a sustained high rate suggests pathological
-// ACK/RTO interleaving worth investigating. See A5 security audit.
+// by ProcessCompositeACK in the window before Remove ran. A non-zero
+// rate is benign: each count is a duplicate retransmit withheld; a
+// sustained high rate means ACKs and RTOs are interleaving
+// pathologically and is worth investigating.
 func (q *RetransmitQueue) AckedOnDequeueCount() uint64 {
 	return atomic.LoadUint64(&q.ackedOnDequeue)
 }

@@ -37,11 +37,10 @@ type PingFrameWriter func(seqNo uint32) error
 // identical zombie-session detection requirements: writeFrame can succeed
 // against a torn-down peer because the kernel buffers the datagram, so
 // returning the cached RTT immediately after a successful send is unsafe.
-// The two adapters used to maintain byte-identical copies of this loop;
-// the helper consolidates them so both transports observe one definition
-// of "the peer is alive" — any inbound frame counts, so a peer that sends
-// other traffic within deadline counts as alive even if a PONG never
-// arrives (acceptable for keepalive; the goal is detecting silence).
+// Both adapters' Ping run this loop, so the two transports observe one
+// definition of "the peer is alive" — any inbound frame counts, so a peer
+// that sends other traffic within deadline counts as alive even if a PONG
+// never arrives (acceptable for keepalive; the goal is detecting silence).
 //
 // QUIC's Ping intentionally does NOT use this helper — it returns the
 // cached RTT without writing an aether PING frame because QUIC has its
@@ -83,12 +82,10 @@ func WaitForActivityPing(
 		return 0, err
 	}
 	// Honour the caller's ctx deadline as the authoritative budget. Only
-	// fall back to PingDefaultDeadline when the caller hasn't set one.
-	// Earlier revisions capped the deadline at the smaller of the two,
-	// which meant a caller wanting a 5 s budget on a slow path was
-	// silently clamped to the 2 s PingDefaultDeadline. The keepalive
-	// loop passes an explicit adaptiveKeepaliveTimeout(RTO) ctx; that
-	// budget MUST be the one that fires.
+	// fall back to PingDefaultDeadline when the caller hasn't set one: the
+	// keepalive loop passes an explicit adaptiveKeepaliveTimeout(RTO) ctx,
+	// and capping it at the 2 s PingDefaultDeadline would cut a 5 s budget
+	// on a slow path short; that budget MUST be the one that fires.
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		deadline = time.Now().Add(PingDefaultDeadline)
@@ -104,10 +101,9 @@ func WaitForActivityPing(
 		// A real Pong is the gold standard: it proves the round-trip AND
 		// feeds the SRTT estimator via RecordPongRecv. Prefer it — on a
 		// healthy path the Pong arrives well inside the deadline and we
-		// return the measured RTT, unchanged from prior behaviour.
-		// Requiring the Pong here (rather than any inbound frame) keeps the
-		// SeqNo/SRTT correlation honest for chatty sessions, which is why
-		// the earlier "any inbound counts" fast-path was removed.
+		// return the measured RTT. Requiring the Pong here (rather than any
+		// inbound frame) keeps the SeqNo/SRTT correlation honest for chatty
+		// sessions; any inbound frame counts only at the deadline, below.
 		//
 		// Compare against `start` (this ping's send time), NOT the pre-entry
 		// LastActivity snapshot: HandlePong calls RecordActivity() before

@@ -119,6 +119,21 @@ type NoiseTransportConfig struct {
 	// is off NewNoiseTransport leaves the resume machinery nil, so
 	// tryResumeDial and ticket issuance short-circuit.
 	// TODO: route the resume path through the listener demux.
+	// TODO, identity on the ticket path: DecryptTicket reads PeerID as the
+	// whole 32-byte field of the ticket plaintext while IssueTicket writes a
+	// canonical 30-byte NodeID into it, so the PeerID handleResumePacket
+	// registers in l.sessions and reports through aether.NewConnection carries
+	// two trailing NUL bytes and matches no canonical NodeID lookup; and
+	// handleResumePacket builds the resumed conn with no remoteIdentity, so
+	// RemoteIdentity is nil on it. Trim the field to the NodeID and carry the
+	// identity key in the ticket.
+	// TODO, scope on the ticket path: tryResumeDial reads no dial override,
+	// initiatorTickets is keyed by peer alone, resumeMaterial carries no
+	// scope, and Dial registers the resumed conn in listener.sessions with
+	// scope "" and leaves nc.scopeID empty, so a shared transport's resumed
+	// dial reads as dedicated to resolveRelayTarget and scopeAllowed. Carry
+	// the scope in the material, key the cache by scope and peer, and set the
+	// resumed conn's scope.
 	EnableResume bool
 
 	// WireVersions are the application's entries of the wire version offer
@@ -193,11 +208,12 @@ type NoiseTransport struct {
 	retryGuard        *retryGuard
 	requireRetryToken bool
 
-	// Sessions
-	listener         *noiseListener
-	listenerMu       sync.Mutex
-	outgoingSessions map[string]*noiseConn
-	outgoingMu       sync.Mutex
+	// Sessions: every session, accepted or dialled, is in the listener's
+	// session map (handleHandshake, handleRelayedHandshake,
+	// handleResumePacket, registerDialSession and Dial's resume path all Put
+	// there), which resolveRelayTarget and findNoiseSession read.
+	listener   *noiseListener
+	listenerMu sync.Mutex
 
 	// Platform + tuning
 	bindResolver     aether.BindAddressResolver
@@ -247,9 +263,10 @@ var _ connHost = (*NoiseTransport)(nil)
 // window size. 0 tells noiseConn.nonceWindowSize to use its default.
 func (t *NoiseTransport) hostNonceWindow() int { return t.nonceWindow }
 
-// recordInitiatorResume implements connHost. It was noiseConn.RecordResumeMaterial's
-// body, moved here so the decode + cache types (resumeMaterial,
-// initiatorTicketCache) stay //go:build !js and never enter the browser build.
+// recordInitiatorResume implements connHost: noiseConn.RecordResumeMaterial
+// hands it the inbound material, and it lives here so the decode + cache
+// types (resumeMaterial, initiatorTicketCache) stay //go:build !js and never
+// enter the browser build.
 func (t *NoiseTransport) recordInitiatorResume(remoteNode aether.NodeID, data []byte) {
 	if t.initiatorTickets == nil {
 		return
@@ -378,9 +395,6 @@ func NewNoiseTransport(cfg NoiseTransportConfig) (*NoiseTransport, error) {
 		// initiator that does not read the retry prefix.
 		retryGuard:        newRetryGuard(),
 		requireRetryToken: resolveRetryTokenDefault(cfg.RequireRetryToken),
-
-		// Sessions
-		outgoingSessions: make(map[string]*noiseConn),
 
 		// Platform + tuning
 		bindResolver:   cfg.BindResolver,

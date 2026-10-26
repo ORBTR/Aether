@@ -94,23 +94,16 @@ func (t *NoiseTransport) resolveRelayTarget(source *noiseConn, payload []byte) (
 	}
 	targetNodeID := string(payload[:relay.RelayHeaderSize])
 
+	// The listener's session map holds every session, accepted
+	// (handleHandshake, handleRelayedHandshake, handleResumePacket) and
+	// dialled (registerDialSession, Dial's resume path), so it is the one
+	// lookup.
 	var targetConn *noiseConn
-
-	// Check incoming sessions
 	t.listenerMu.Lock()
 	if t.listener != nil {
 		targetConn = connFromSession(t.listener.sessions.Get(aether.NodeID(targetNodeID)))
 	}
 	t.listenerMu.Unlock()
-
-	// Check outgoing sessions if not found
-	if targetConn == nil {
-		t.outgoingMu.Lock()
-		if conn, ok := t.outgoingSessions[targetNodeID]; ok {
-			targetConn = conn
-		}
-		t.outgoingMu.Unlock()
-	}
 
 	if targetConn == nil {
 		return nil, relay.ErrTargetUnreachable
@@ -412,26 +405,16 @@ func (t *NoiseTransport) HandleExternalRelayFrame(sourceNodeID aether.NodeID, da
 	return relay.ErrTargetUnreachable
 }
 
-// findNoiseSession looks up a Noise session by NodeID in both incoming and
-// outgoing session tables. Returns nil if not found.
+// findNoiseSession looks up a Noise session by NodeID in the listener's
+// session map, which holds accepted sessions (handleHandshake,
+// handleRelayedHandshake, handleResumePacket) and dialled ones
+// (registerDialSession, Dial's resume path) alike. Returns nil if not found
+// or before Listen. LookupByNodeID and HandleExternalRelayFrame call it.
 func (t *NoiseTransport) findNoiseSession(nodeID aether.NodeID) *noiseConn {
-	// Check incoming sessions
 	t.listenerMu.Lock()
-	if t.listener != nil {
-		if nc := connFromSession(t.listener.sessions.Get(nodeID)); nc != nil {
-			t.listenerMu.Unlock()
-			return nc
-		}
+	defer t.listenerMu.Unlock()
+	if t.listener == nil {
+		return nil
 	}
-	t.listenerMu.Unlock()
-
-	// Check outgoing sessions
-	t.outgoingMu.Lock()
-	if conn, ok := t.outgoingSessions[string(nodeID)]; ok {
-		t.outgoingMu.Unlock()
-		return conn
-	}
-	t.outgoingMu.Unlock()
-
-	return nil
+	return connFromSession(t.listener.sessions.Get(nodeID))
 }

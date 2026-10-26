@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"net"
 	"testing"
 	"time"
 
@@ -42,8 +43,7 @@ func newTestNoiseConn(scopeID string, remoteNode aether.NodeID) *noiseConn {
 // newTestTransport creates a NoiseTransport with relay enabled and a listener.
 func newTestTransport() *NoiseTransport {
 	t := &NoiseTransport{
-		relayConfig:      relay.RelayConfig{Enabled: true},
-		outgoingSessions: make(map[string]*noiseConn),
+		relayConfig: relay.RelayConfig{Enabled: true},
 	}
 	t.listener = &noiseListener{
 		transport:  t,
@@ -275,9 +275,9 @@ func TestResolveRelayTarget_OutgoingSession_CrossPartition(t *testing.T) {
 	sourceConn := newTestNoiseConn("scope-1", sourceNode)
 	targetConn := newTestNoiseConn("scope-2", targetNode)
 
-	tr.outgoingMu.Lock()
-	tr.outgoingSessions[string(targetNode)] = targetConn
-	tr.outgoingMu.Unlock()
+	// A dialled session enters the listener's session map through
+	// registerDialSession, as the dial path registers it.
+	tr.listener.registerDialSession(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4242}, targetConn, targetNode)
 
 	payload := buildRelayPayload(targetNode, []byte("hello"))
 	_, err := tr.resolveRelayTarget(sourceConn, payload)
@@ -294,9 +294,9 @@ func TestResolveRelayTarget_OutgoingSession_SamePartition(t *testing.T) {
 	sourceConn := newTestNoiseConn("scope-1", sourceNode)
 	targetConn := newTestNoiseConn("scope-1", targetNode)
 
-	tr.outgoingMu.Lock()
-	tr.outgoingSessions[string(targetNode)] = targetConn
-	tr.outgoingMu.Unlock()
+	// A dialled session enters the listener's session map through
+	// registerDialSession, as the dial path registers it.
+	tr.listener.registerDialSession(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4243}, targetConn, targetNode)
 
 	payload := buildRelayPayload(targetNode, []byte("hello"))
 	target, err := tr.resolveRelayTarget(sourceConn, payload)
