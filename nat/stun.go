@@ -139,7 +139,7 @@ func (c *STUNClient) querySTUNServer(ctx context.Context, localAddr *net.UDPAddr
 		return nil, fmt.Errorf("decode STUN response: %w", err)
 	}
 
-	// AE-L-08: verify the response before trusting the mapped address.
+	// Verify the response before trusting the mapped address.
 	// XORMappedAddress.GetFrom de-XORs using whatever TransactionID the response
 	// carries, so a well-formed forged reply is otherwise self-consistent and
 	// would poison the reflexive-address cache (see DiscoverReflexiveAddr). The
@@ -185,18 +185,17 @@ func (c *STUNClient) detectNATType(localAddr, publicAddr *net.UDPAddr) aether.NA
 		return aether.NATOpen
 	}
 
-	// AE-P-18: a single STUN query reveals only this server's reflexive
-	// mapping — it cannot distinguish full-cone / restricted / port-restricted
-	// / symmetric behaviour. Asserting NATFullCone here fabricated a confident
-	// and frequently-wrong classification (e.g. a symmetric NAT reported as
-	// full-cone), which then leaks to external peers via ReflexiveAddress.NATType
-	// (NoiseTransport.DiscoverReflexiveAddr) and to DetectNATType's single-server
-	// branch. Return NATUnknown so callers fall through to the multi-server
-	// DetectNATType / RFC 5780 DetectNATBehaviour paths instead of trusting a
-	// guess. Routing is unchanged and no capability is lost — relay/fallback.go
-	// chooseStrategy maps both NATUnknown and NATFullCone to StrategyHolePunch
-	// (hole-punch then automatic relay fallback) — the fix only stops emitting a
-	// false full-cone signal for a NAT we could not actually classify.
+	// A single STUN query reveals only this server's reflexive mapping — it
+	// cannot distinguish full-cone / restricted / port-restricted / symmetric
+	// behaviour. Asserting NATFullCone here would fabricate a confident and
+	// frequently-wrong classification (a symmetric NAT reported as full-cone)
+	// that leaks to external peers via ReflexiveAddress.NATType
+	// (NoiseTransport.DiscoverReflexiveAddr) and to DetectNATType's
+	// single-server branch. Return NATUnknown so callers fall through to the
+	// multi-server DetectNATType / RFC 5780 DetectNATBehaviour paths instead of
+	// trusting a guess. Routing is unchanged — relay/fallback.go chooseStrategy
+	// maps both NATUnknown and NATFullCone to StrategyHolePunch (hole-punch
+	// then automatic relay fallback).
 	return aether.NATUnknown
 }
 

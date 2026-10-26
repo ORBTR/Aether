@@ -13,7 +13,7 @@ import (
 // adaptiveGoroutineFloor is the goroutine count below which the (poor)
 // goroutine-based CPU heuristic reports zero load. Sized well above a normal
 // mesh node's per-session goroutine footprint so ordinary operation never
-// false-triggers load-shedding (AER-025).
+// false-triggers load-shedding (check).
 const adaptiveGoroutineFloor = 2000
 
 // AdaptiveController monitors system load and dynamically disables
@@ -28,19 +28,19 @@ const adaptiveGoroutineFloor = 2000
 // See docs/_SECURITY.md §3.10 for the threat model justification.
 type AdaptiveController struct {
 	mu             sync.RWMutex
-	sessions       map[CompressionCapable]struct{} // AE-L-03: live sessions this controller sheds load from
+	sessions       map[CompressionCapable]struct{} // live sessions this controller sheds load from (Register, applyDegradation)
 	enabled        bool
 	checkInterval  time.Duration
 	lastCPUPercent float64
-	fecDegraded    bool // AE-L-03: current FEC rung decision (monitoring / future runtime FECCapable toggle)
-	schedDegraded  bool // AE-L-03: current scheduler rung decision (monitoring / future runtime SchedulerCapable toggle)
+	fecDegraded    bool // current FEC rung decision (monitoring; TODO: a runtime FECCapable toggle)
+	schedDegraded  bool // current scheduler rung decision (monitoring; TODO: a runtime SchedulerCapable toggle)
 	stopCh         chan struct{}
 	stopOnce       sync.Once // Stop is exported; concurrent callers must not double-close stopCh
 }
 
 // NewAdaptiveController creates a controller that monitors CPU and degrades
 // features. Register live sessions via Register so check() can shed their
-// load; call Unregister on session close. AE-L-03.
+// load; call Unregister on session close.
 func NewAdaptiveController() *AdaptiveController {
 	return &AdaptiveController{
 		sessions:      make(map[CompressionCapable]struct{}),
@@ -82,14 +82,14 @@ func (a *AdaptiveController) Stop() {
 // Register enrols a runtime-toggleable session so the controller can shed its
 // load under CPU pressure. Sessions whose transport has no per-frame DEFLATE
 // simply don't implement CompressionCapable and aren't registered. Safe for
-// concurrent use. AE-L-03.
+// concurrent use.
 func (a *AdaptiveController) Register(s CompressionCapable) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.sessions[s] = struct{}{}
 }
 
-// Unregister drops a session from the degrade set on close. AE-L-03.
+// Unregister drops a session from the degrade set on close.
 func (a *AdaptiveController) Unregister(s CompressionCapable) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -121,14 +121,15 @@ func (a *AdaptiveController) check() {
 	}
 	a.mu.Unlock()
 
-	// AER-025: goroutine count is a POOR proxy for CPU. Each Noise/TCP session
-	// spawns several goroutines, so the old goroutines/(maxProcs*10) formula
-	// read as permanently "saturated" on any node with more than ~2×maxProcs
-	// sessions and disabled compression fleet-wide — a bandwidth cost, not a
-	// real load response. Until a real CPU source (cgroup/pprof) is wired,
-	// only a genuine goroutine EXPLOSION (far beyond normal per-session
-	// counts) is treated as pressure, scaling from a high floor so ordinary
-	// operation reads as unloaded and the safe default (compression on) holds.
+	// Goroutine count is a POOR proxy for CPU. Each Noise/TCP session spawns
+	// several goroutines, so a goroutines/(maxProcs*10) formula reads as
+	// permanently "saturated" on any node with more than ~2×maxProcs sessions
+	// and disables compression fleet-wide — a bandwidth cost, not a real load
+	// response. Only a genuine goroutine EXPLOSION (far beyond normal
+	// per-session counts) is treated as pressure, scaling from a high floor
+	// (adaptiveGoroutineFloor) so ordinary operation reads as unloaded and the
+	// safe default (compression on) holds.
+	// TODO: a real CPU source (cgroup/pprof).
 	goroutines := runtime.NumGoroutine()
 	estimated := 0.0
 	if goroutines > adaptiveGoroutineFloor {
@@ -145,8 +146,9 @@ func (a *AdaptiveController) check() {
 // LIVE registered sessions, under a.mu. Split out of check() so the rung
 // thresholds are unit-testable without synthesizing real CPU load.
 // Encryption is intentionally never toggled — security invariant (§3.10).
-// AE-L-03: previously this block mutated a private by-value SessionOptions
-// copy (a.opts) that no session ever read, so the ladder was inert.
+// The ladder acts on the registered sessions (Register), the only thing a
+// toggle reaches: a private options copy no session reads would leave it
+// inert.
 func (a *AdaptiveController) applyDegradation(estimated float64) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -155,8 +157,8 @@ func (a *AdaptiveController) applyDegradation(estimated float64) {
 	// Rung 1 (>70%): disable per-frame DEFLATE on every registered session
 	// via the atomic runtime toggle the encode path samples per frame
 	// (noise_session.go compressionEnabled). This IS the shared,
-	// atomically-read policy sessions actually consult — unlike the old
-	// detached a.opts copy. Restore below 65% (hysteresis avoids flap).
+	// atomically-read policy sessions consult. Restore below 65%
+	// (hysteresis avoids flap).
 	// SetCompressionEnabled is an atomic store and takes no lock of its
 	// own, so calling it under a.mu cannot deadlock.
 	if estimated > 70 {

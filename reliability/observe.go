@@ -82,7 +82,7 @@ func (o *ObserveEngine) RecordReceive(seqNo uint32, size int, arrivalTime time.T
 	// at different values (Aether/noise stream seqs start at 0; the TCP
 	// adapter feeds a monotonic counter starting at 1), so anchoring on the
 	// first observed seq is more robust than a fixed initial expectedSeq —
-	// seeding expectedSeq to 1 previously mislabelled seq 0 as a reorder.
+	// a fixed seed of 1 would mislabel seq 0 as a reorder.
 	if o.packetsReceived == 1 {
 		o.expectedSeq = seqNo + 1
 	} else if seqNo > o.expectedSeq {
@@ -102,9 +102,9 @@ func (o *ObserveEngine) RecordReceive(seqNo uint32, size int, arrivalTime time.T
 	// the data path, so we approximate transit-time variation by the change
 	// in inter-arrival spacing between consecutive packets: for a uniformly
 	// paced sender, variation in arrival spacing ≈ variation in transit time.
-	// EMAing the raw spacing (the previous behaviour) converged to the mean
-	// inter-arrival interval instead — a steady 20 ms stream reported
-	// ~20000 µs of "jitter" rather than ~0, making the metric useless.
+	// EMAing the raw spacing would converge to the mean inter-arrival
+	// interval instead — a steady 20 ms stream would report ~20000 µs of
+	// "jitter" rather than ~0, making the metric useless.
 	if !o.lastArrival.IsZero() {
 		diff := arrivalTime.Sub(o.lastArrival).Microseconds()
 		if diff < 0 {

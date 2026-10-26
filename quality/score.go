@@ -172,9 +172,9 @@ func DispatchRank(s Score, op DispatchOp) float64 {
 	case RouteInterContinental:
 		rank *= 0.90
 	case RouteUnknown:
-		// AER-088: an unclassified path already scores on the most-lenient
-		// RTT band; without a discount here it kept ×1.0 and out-ranked a
-		// healthy classified path, inverting path selection. Discount it below
+		// An unclassified path already scores on the most-lenient RTT
+		// band; at ×1.0 here it would out-rank a healthy classified path,
+		// inverting path selection. Discount it below
 		// InterContinental so an unknown path never wins on affinity alone.
 		rank *= 0.85
 	}
@@ -214,10 +214,10 @@ type Tracker struct {
 	// decayLoopOnce guards lazy startup of the periodic decay
 	// goroutine. Started on the first call to UpdateRTT /
 	// UpdateThroughput / RecordCloseReason / IsDialSuppressed —
-	// whichever fires first. Audit H8: previously decay only ran
-	// from UpdateThroughput, so a dormant standby path (no traffic)
-	// kept its accumulated failure count forever, suppressing
-	// promotion even after the underlying issue cleared.
+	// whichever fires first: a decay driven from UpdateThroughput
+	// alone would leave a dormant standby path (no traffic) with its
+	// accumulated failure count forever, suppressing promotion after
+	// the underlying issue cleared.
 	decayLoopOnce sync.Once
 	decayStop     chan struct{}
 }
@@ -238,8 +238,7 @@ type trackerEntry struct {
 	// consecutiveFailures because a dial failure means the handshake
 	// never completed — there was no session to score. The dispatcher
 	// suppresses dials of paths that have hit a threshold of consecutive
-	// dial failures, mirroring the legacy peer.failedProtos cooldown
-	// behaviour.
+	// dial failures, a cooldown per (peer, transport).
 	dialFailureCount    atomic.Int64
 	dialCooldownUntilNs atomic.Int64 // unix nanos; 0 = no cooldown
 
@@ -247,13 +246,13 @@ type trackerEntry struct {
 	// probe" attempt — IsDialSuppressed allows one dial through every
 	// dialProbeInterval(failureCount) of cooldown so a transient issue
 	// that's actually resolved doesn't burn the full 10-minute cap
-	// before any retry happens. L1 #6 fix from the routing review.
+	// before any retry happens.
 	dialProbeLastNs atomic.Int64 // unix nanos; 0 = never probed
 
 	// lastFailureDecayAt is the most recent time
 	// decayConsecutiveFailuresLocked halved the failure counter.
-	// Cascade E / L4 #10 — prevents a long-stale failure penalty
-	// from suppressing a path that's actually recovered.
+	// Prevents a long-stale failure penalty from suppressing a path
+	// that has recovered.
 	lastFailureDecayAt time.Time
 }
 
@@ -267,8 +266,8 @@ func NewTracker() *Tracker {
 }
 
 // ensureDecayLoop starts the periodic ConsecutiveFailures-decay
-// goroutine on first call. Idempotent via sync.Once. Audit H8 fix —
-// a path that's dormant (no UpdateThroughput firing) needs its
+// goroutine on first call. Idempotent via sync.Once. A path that's
+// dormant (no UpdateThroughput firing) needs its
 // failure count to age out anyway, otherwise it stays penalised long
 // after the underlying network blip cleared.
 func (t *Tracker) ensureDecayLoop() {
@@ -333,7 +332,7 @@ func Key(peerID, transport string) string {
 func (t *Tracker) entry(key string) *trackerEntry {
 	// Lazy-start the periodic decay loop on first entry creation —
 	// any tracker that has at least one entry needs the decay loop
-	// running. Idempotent via sync.Once. Audit H8.
+	// running. Idempotent via sync.Once.
 	t.ensureDecayLoop()
 	if v, ok := t.entries.Load(key); ok {
 		return v.(*trackerEntry)
@@ -385,7 +384,7 @@ func (t *Tracker) BaselineRTT(key string) time.Duration {
 // actually been carrying traffic gets its old failure penalty halved
 // every consecutiveFailuresDecayInterval. Without this, a path that
 // racked up 8 failures during a week of intermittent issues stays
-// penalised hours after recovery — Cascade E / L4 #10 fix.
+// penalised hours after recovery.
 //
 // Caller holds e.mu.
 func decayConsecutiveFailuresLocked(e *trackerEntry, now time.Time) {
@@ -480,11 +479,11 @@ func (t *Tracker) BytesPerSec(key string) float64 {
 // signal about path health) from a clean GoAway (positive signal) from
 // an actual transport error (negative signal).
 //
-// L4 #4 fix: the previous (cleanClose bool) signature lumped dedup-race
-// closes and transport errors together based on lifetime — a transport
-// that died in the first 6s of every attempt LOOKED LIKE a perfect
-// clean-close path to the EMA, so chronically-broken paths stayed at
-// reliability=1.0 forever.
+// A two-state (cleanClose bool) signature lumps dedup-race closes and
+// transport errors together based on lifetime — a transport that dies in
+// the first 6s of every attempt LOOKS LIKE a perfect clean-close path to
+// the EMA, so a chronically-broken path would stay at reliability=1.0
+// forever. RecordClose maps its bool onto these reasons.
 type CloseReason int
 
 const (
@@ -504,9 +503,8 @@ const (
 )
 
 // RecordCloseReason feeds a session-close event classified by reason.
-// Preferred over the legacy RecordClose for new call sites; the
-// legacy bool maps to either CloseClean or CloseTransportError so
-// existing callers keep working.
+// RecordClose's bool maps onto CloseClean or CloseTransportError, so
+// both entry points feed one EMA.
 func (t *Tracker) RecordCloseReason(key string, reason CloseReason) {
 	e := t.entry(key)
 	switch reason {
@@ -517,9 +515,8 @@ func (t *Tracker) RecordCloseReason(key string, reason CloseReason) {
 		e.mu.Unlock()
 	case CloseRaceLoser:
 		// Neither signal — race-loser closes are routing churn,
-		// not path health. Per memory project_dedup_feedback_loop:
-		// feeding these to EMA causes scaler→K→dial→reject→close
-		// self-amplifying churn loops.
+		// not path health: feeding them to the EMA causes
+		// scaler→K→dial→reject→close self-amplifying churn loops.
 	case CloseTransportError:
 		e.consecutiveFailures.Add(1)
 		e.mu.Lock()
@@ -528,11 +525,11 @@ func (t *Tracker) RecordCloseReason(key string, reason CloseReason) {
 	}
 }
 
-// RecordClose is the legacy two-state API. Maintained for existing
-// callers. New code should use RecordCloseReason with an explicit
-// reason — particularly CloseRaceLoser, which this legacy signature
-// cannot express (the cleanClose=true mapping doesn't capture that
-// race-loser closes carry no health signal at all).
+// RecordClose is the two-state entry point: cleanClose maps to
+// CloseClean, false to CloseTransportError. A caller that can tell a
+// dedup-race loss calls RecordCloseReason with CloseRaceLoser, which
+// this signature cannot express (race-loser closes carry no health
+// signal at all).
 func (t *Tracker) RecordClose(key string, cleanClose bool) {
 	if cleanClose {
 		t.RecordCloseReason(key, CloseClean)

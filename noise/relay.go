@@ -19,12 +19,13 @@ import (
 	"github.com/flynn/noise"
 )
 
-// relayForwardTimeout bounds a single relay forward to an external session so
-// a wedged/backpressured target can't pin the relaying goroutine (AER-041).
+// relayForwardTimeout bounds a single relay forward to an external session
+// (handleRelayRequest's extSess.Send) so a wedged or backpressured target
+// cannot pin the relaying goroutine, which is the source conn's reader.
 const relayForwardTimeout = 5 * time.Second
 
-// relayDedicatedScopeKey is the rate-limiter bucket used for dedicated /
-// empty-scope relay traffic so it is still metered (AER-040).
+// relayDedicatedScopeKey is the rate-limiter bucket resolveRelayTarget uses
+// for dedicated / empty-scope relay traffic, so that traffic is metered too.
 const relayDedicatedScopeKey = "__aether_dedicated__"
 
 // handleRelayRequest processes an incoming relay request from a Noise session.
@@ -48,10 +49,10 @@ func (t *NoiseTransport) handleRelayRequest(c *noiseConn, payload []byte) error 
 	}
 
 	// Fallback: try external session (WS/QUIC bridge) via RelayService.
-	// AE-H-08: enforce scope isolation on the bridge path too — a Noise peer
-	// must not relay into an external session belonging to another scope.
-	// Empty scope on either side = dedicated mode (no restriction), matching
-	// resolveRelayTarget's Noise-path check.
+	// Scope isolation holds on the bridge path as on the Noise path: a Noise
+	// peer must not relay into an external session belonging to another
+	// scope (scopeAllowed). Empty scope on either side is dedicated mode (no
+	// restriction), as resolveRelayTarget reads it.
 	if t.relayService != nil {
 		if extSess, targetScope, ok := t.relayService.ExternalScope(targetNodeID); ok {
 			if !scopeAllowed(c.scopeID, targetScope) {
@@ -61,10 +62,10 @@ func (t *NoiseTransport) handleRelayRequest(c *noiseConn, payload []byte) error 
 			frame := make([]byte, relay.RelayHeaderSize+len(data))
 			copy(frame[:relay.RelayHeaderSize], c.remoteNode)
 			copy(frame[relay.RelayHeaderSize:], data)
-			// AER-041: bound the forward with a deadline. context.Background()
-			// let a wedged/backpressured target session pin this relaying
-			// goroutine indefinitely, so a slow or malicious target could
-			// slowloris-pin relay goroutines.
+			// Bound the forward by relayForwardTimeout: this runs on the source
+			// conn's reader, and an unbounded Send to a wedged or backpressured
+			// target session would hold it, so a slow or hostile target could pin
+			// relay goroutines.
 			ctx, cancel := context.WithTimeout(context.Background(), relayForwardTimeout)
 			defer cancel()
 			return extSess.Send(ctx, frame)
@@ -76,7 +77,7 @@ func (t *NoiseTransport) handleRelayRequest(c *noiseConn, payload []byte) error 
 
 // scopeAllowed reports whether a relay between scopes a and b is permitted.
 // Both scopes must match; an empty scope on either side means dedicated mode
-// (no restriction), mirroring resolveRelayTarget's Noise-path check. AE-H-08.
+// (no restriction), mirroring resolveRelayTarget's Noise-path check.
 func scopeAllowed(a, b string) bool {
 	return a == "" || b == "" || a == b
 }
@@ -123,11 +124,11 @@ func (t *NoiseTransport) resolveRelayTarget(source *noiseConn, payload []byte) (
 		return nil, relay.ErrPartitionMismatch
 	}
 
-	// Per-scope relay rate limiting. AER-040: also rate-limit dedicated /
-	// empty-scope traffic. The old `activePartition != ""` guard skipped limiting
-	// entirely when both scopes were empty, so a dedicated relay was an
-	// unmetered forwarder. Bucket empty-scope traffic under a sentinel key so
-	// per-peer limits still apply.
+	// Per-scope relay rate limiting, dedicated / empty-scope traffic included.
+	// With both scopes empty there is no partition to key the limiter by, so
+	// that traffic is bucketed under relayDedicatedScopeKey and AllowRelay,
+	// CheckRelayPair and TrackRelayPair still apply to it; a relay with no
+	// limiter key would be an unmetered forwarder.
 	activePartition := sourcePartition
 	if activePartition == "" {
 		activePartition = targetPartition
@@ -230,7 +231,7 @@ func (l *noiseListener) handleRelayedHandshake(relayConn *noiseConn, sourceNodeI
 			return err
 		}
 		hs = &listenerHandshake{state: state, created: time.Now()}
-		l.evictOldestHandshakeLocked() // AE-P-21: hard cap on incomplete-handshake map
+		l.evictOldestHandshakeLocked() // holds the map at maxIncompleteHandshakes
 		l.handshakes[sourceNodeID] = hs
 
 		// Process the first message (stripped of fingerprint)
@@ -379,8 +380,8 @@ func (t *NoiseTransport) HandleExternalRelayFrame(sourceNodeID aether.NodeID, da
 	targetNodeID := aether.NodeID(data[:relay.RelayHeaderSize])
 	payload := data[relay.RelayHeaderSize:]
 
-	// AE-H-08: resolve the source bridge session's scope so the same isolation
-	// invariant enforced on the Noise path also applies when a frame originates
+	// Resolve the source bridge session's scope so the same isolation rule the
+	// Noise path enforces (scopeAllowed) also applies when a frame originates
 	// from an external (WS/QUIC/gRPC) bridge session.
 	var sourceScope string
 	if t.relayService != nil {

@@ -52,7 +52,7 @@ type PortMapper interface {
 	// RequestMapping opens an external port. ExternalPort=0 means
 	// "any" — gateway returns the assigned port.
 	RequestMapping(ctx context.Context, req MappingRequest) (*MappingResult, error)
-	// ReleaseMapping closes a previously-opened port.
+	// ReleaseMapping closes a port RequestMapping opened.
 	ReleaseMapping(ctx context.Context, mapping *MappingResult) error
 }
 

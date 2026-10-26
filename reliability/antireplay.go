@@ -211,7 +211,7 @@ func (w *ReplayWindow) commitLocked(seqNo uint32) {
 // commits acceptance via Commit only after the frame is durably buffered,
 // so a frame dropped by a full reorder buffer is not marked seen — which
 // would make every retransmit of it classify ResultDuplicate and be
-// discarded forever (AER-061). Thread-safe.
+// discarded forever (the adapter's handleData). Thread-safe.
 func (w *ReplayWindow) Classify(seqNo uint32) CheckResult {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -239,7 +239,7 @@ func (w *ReplayWindow) Commit(seqNo uint32) {
 // seen when it is. Convenience for callers that always accept a new SeqNo
 // and don't need to gate the mark on a downstream buffer insert. Production
 // hot paths that can drop a frame after acceptance should Classify then
-// Commit-on-success instead (AER-061).
+// Commit-on-success instead.
 func (w *ReplayWindow) Check(seqNo uint32) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()

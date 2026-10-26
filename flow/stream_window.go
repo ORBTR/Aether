@@ -147,7 +147,7 @@ type StreamWindow struct {
 	// Receive-side accounting — drives auto-grant decisions.
 	// recvCredit represents credit we have extended to the sender but that has
 	// not yet been consumed by the data arriving at us. It decreases as we
-	// receive data (we're consuming the credit we previously granted) and
+	// receive data (the sender is consuming credit we granted earlier) and
 	// increases when we emit a new WINDOW_UPDATE.
 	initialSize int64
 	recvCredit  int64
@@ -327,7 +327,7 @@ func (w *StreamWindow) SetGrantStarveHist(h *metrics.DurationHist) {
 // surface this as "insufficient stream credit after 10s".
 // TryConsume attempts a non-blocking credit acquire (the fast path only) and
 // returns true if credit was available and consumed, false otherwise — it
-// NEVER blocks. AER-087: transports with native backpressure (TCP/WS) track
+// NEVER blocks. Transports with native backpressure (TCP/WS) track
 // outstanding bytes for metrics but must never stall a send on Aether-level
 // credit; the blocking Consume could park a TCP Send for the full
 // ConsumeTimeout (~10s) on a drained window.

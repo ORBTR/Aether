@@ -14,7 +14,7 @@ import (
 )
 
 // payloadPool reduces GC pressure from per-frame []byte allocations.
-// Payloads are returned to the pool when the frame is no longer needed.
+// Payloads are returned to the pool once the frame is done with.
 var payloadPool = sync.Pool{
 	New: func() interface{} {
 		b := make([]byte, 0, 16*1024) // 16 KB initial capacity
@@ -283,7 +283,7 @@ func DecodeSACKBlocks(data []byte) []SACKBlock {
 // EncodeCompositeACK encodes a Composite ACK into wire format.
 // Wire: [BaseACK:4][AckDelay:2][BitmapLen:1][Bitmap:N][Flags:1][extensions...]
 func EncodeCompositeACK(ack *CompositeACK) []byte {
-	// AER-054: BitmapLen is a single wire byte. A bitmap longer than 255
+	// BitmapLen is a single wire byte. A bitmap longer than 255
 	// bytes would wrap when written (data[off] = byte(bitmapLen)) while all
 	// its bytes were still copied, so the decoder would read Flags/extensions
 	// from inside the bitmap and move the peer's send window on fabricated

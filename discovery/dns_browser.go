@@ -47,9 +47,9 @@ func (d *BrowserDNSDiscoverer) Discover(ctx context.Context) ([]string, error) {
 
 func (d *BrowserDNSDiscoverer) queryDoH(ctx context.Context, gateway string) ([]string, error) {
 	// Use JSON DNS API (simpler than wire format for browser).
-	// AER-043: query the _mesh._tcp.<domain> SRV name, matching the native
-	// resolver path (dns.go). Querying the bare apex domain returned no SRV
-	// records, silently disabling DNS discovery in WASM builds.
+	// Query the _mesh._tcp.<domain> SRV name, matching the native resolver
+	// path (dns.go): the bare apex domain returns no SRV records, which would
+	// silently disable DNS discovery in WASM builds.
 	url := fmt.Sprintf("%s?name=_mesh._tcp.%s&type=SRV", gateway, d.domain)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)

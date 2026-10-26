@@ -329,8 +329,8 @@ func (t *TLP) MarkProbeAcked() {
 // an ACK from TLP's perspective). Resets every per-probe field so the
 // state matches the invariant "no probe is currently in flight":
 //
-//   - consecutiveProbes back to 0 (re-enables ShouldProbe after the
-//     adapter previously hit maxConsecutiveProbes)
+//   - consecutiveProbes back to 0 (re-enables ShouldProbe once the
+//     adapter has hit maxConsecutiveProbes)
 //   - probePending and pendingProbeSeq cleared so the diagnostic
 //     snapshot stops reporting a phantom in-flight probe
 //

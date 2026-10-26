@@ -36,7 +36,7 @@ type Scheduler struct {
 	// REALTIME bandwidth cap tracking
 	realtimeBytes int64 // bytes sent from REALTIME class in current window
 	totalBytes    int64 // total bytes sent in current window
-	nonBulkStreak int   // AER-082: consecutive non-BULK dequeues (BULK anti-starvation)
+	nonBulkStreak int   // consecutive non-BULK dequeues; Dequeue serves BULK at bulkStarvationLimit
 
 	// Wake channel — Enqueue does a non-blocking signal so the writeLoop
 	// can park on a select instead of polling with time.Sleep(1ms).
@@ -58,8 +58,7 @@ type Scheduler struct {
 	// (default for schedulers constructed via NewScheduler). Sampled on
 	// every wake-signal path (Enqueue / EnqueueProbe / external Wake)
 	// and on every ObserveDepth call (writeLoop just before parking on
-	// WakeCh) — the two events the audit identified as the natural
-	// sampling points for queue depth.
+	// WakeCh) — the two natural sampling points for queue depth.
 	depthHist *metrics.Uint32Ring
 }
 
@@ -255,7 +254,7 @@ func (s *Scheduler) Enqueue(streamID uint64, frame *aether.Frame) {
 	s.mu.Lock()
 	queued := false
 	if ss, ok := s.streams[streamID]; ok {
-		// AE-M-08: seed an idle/newly-registered stream's WFQ deficit up to
+		// Seed an idle/newly-registered stream's WFQ deficit up to
 		// the current virtual start time of its class on the empty→backlogged
 		// edge. A stream registers (and re-registers on reopen) with
 		// deficit=0, and dequeueFromClass selects the minimum-finish stream,
@@ -288,7 +287,7 @@ func (s *Scheduler) Enqueue(streamID uint64, frame *aether.Frame) {
 // currently backlogged (queue non-empty). Callers hold s.mu. Returns 0 when
 // no stream of the class is backlogged — Enqueue's `>` guard then leaves the
 // caller's own deficit untouched. Used to seed an idle/newly-registered
-// stream so it cannot monopolise its class from deficit=0 (AE-M-08).
+// stream so it cannot monopolise its class from deficit=0 (Enqueue).
 func (s *Scheduler) classVirtualStartLocked(class aether.LatencyClass) float64 {
 	found := false
 	var minDeficit float64
@@ -394,14 +393,14 @@ func (s *Scheduler) Dequeue() (*aether.Frame, bool) {
 	}
 
 	// 3. Try each latency class in priority order: REALTIME → INTERACTIVE → BULK.
-	// AE-H-05: a capped REALTIME class is DEMOTED into the INTERACTIVE round
+	// A capped REALTIME class is DEMOTED into the INTERACTIVE round
 	// (its streams compete there via WFQ) rather than dropped from every round.
-	// Dropping it stalled a REALTIME-only connection forever: with no other
-	// class queued, Dequeue returned nil, totalBytes froze below the 1MB decay
-	// threshold, and the pinned >10% ratio never recovered. Demotion keeps the
+	// Dropped, a REALTIME-only connection would stall forever: with no other
+	// class queued, Dequeue returns nil, totalBytes freezes below the 1MB decay
+	// threshold, and the pinned >10% ratio never recovers. Demotion keeps the
 	// cap's purpose (REALTIME loses its absolute priority over other classes)
 	// while guaranteeing forward progress when nothing else competes.
-	// AER-082: anti-starvation floor for BULK. Strict class priority (only
+	// Anti-starvation floor for BULK. Strict class priority (only
 	// REALTIME is capped) otherwise lets a saturating INTERACTIVE stream starve
 	// BULK indefinitely. After bulkStarvationLimit consecutive non-BULK
 	// dequeues, serve one BULK frame first if any is queued so BULK always
@@ -420,7 +419,7 @@ func (s *Scheduler) Dequeue() (*aether.Frame, bool) {
 			continue // capped REALTIME is served in the INTERACTIVE round below
 		}
 		// Fold capped REALTIME streams into the INTERACTIVE round so their
-		// frames still make progress at INTERACTIVE priority (AE-H-05).
+		// frames still make progress at INTERACTIVE priority.
 		demoteRealtime := realtimeCapped && targetClass == aether.ClassINTERACTIVE
 		frame, isRealtime := s.dequeueFromClass(targetClass, order, demoteRealtime)
 		if frame != nil {
@@ -432,7 +431,7 @@ func (s *Scheduler) Dequeue() (*aether.Frame, bool) {
 			if isRealtime {
 				s.realtimeBytes += bytesOut
 			}
-			// AER-082: track the non-BULK streak for the anti-starvation floor.
+			// Track the non-BULK streak for the anti-starvation floor.
 			if targetClass == aether.ClassBULK {
 				s.nonBulkStreak = 0
 			} else {
@@ -446,7 +445,7 @@ func (s *Scheduler) Dequeue() (*aether.Frame, bool) {
 }
 
 // bulkStarvationLimit is the number of consecutive non-BULK dequeues after
-// which the scheduler forces one BULK frame to prevent starvation (AER-082).
+// which the scheduler forces one BULK frame to prevent starvation (Dequeue).
 const bulkStarvationLimit = 16
 
 // dequeueFromClass picks the best frame within a specific latency class using WFQ.
@@ -456,7 +455,7 @@ const bulkStarvationLimit = 16
 //
 // includeRealtime folds REALTIME streams into this round in addition to
 // targetClass — used to serve a capped (demoted) REALTIME class in the
-// INTERACTIVE round (AE-H-05). The returned bool reports whether the chosen
+// INTERACTIVE round (Dequeue). The returned bool reports whether the chosen
 // frame belonged to a REALTIME stream so the caller charges the REALTIME
 // bandwidth counter correctly.
 func (s *Scheduler) dequeueFromClass(targetClass aether.LatencyClass, order []uint64, includeRealtime bool) (*aether.Frame, bool) {
@@ -469,7 +468,7 @@ func (s *Scheduler) dequeueFromClass(targetClass aether.LatencyClass, order []ui
 			continue
 		}
 		// Serve the target class, plus REALTIME streams when a capped REALTIME
-		// class is being demoted into this round (AE-H-05).
+		// class is being demoted into this round.
 		if ss.latencyClass != targetClass && !(includeRealtime && ss.latencyClass == aether.ClassREALTIME) {
 			continue
 		}
@@ -504,7 +503,7 @@ func (s *Scheduler) dequeueFromClass(targetClass aether.LatencyClass, order []ui
 	ss.queue = ss.queue[1:]
 	s.queueDepth.Add(-1)
 
-	// Advance virtual time by the SAME cost used for selection (AE-L-07),
+	// Advance virtual time by the SAME cost used for selection,
 	// not the raw frame size. Recompute the retransmit(2x)/FEC(0.5x) cost
 	// for the chosen frame — mirroring the selection metric above — so the
 	// penalty/bonus persists in the accumulated deficit instead of only

@@ -36,14 +36,14 @@ const (
 	// MetadataPubKey is the gRPC metadata key for hex-encoded Ed25519 public key
 	MetadataPubKey = "x-orbtr-pubkey"
 	// MetadataNonce and MetadataTimestamp carry per-dial freshness so a
-	// captured metadata set cannot be replayed (AER-032).
+	// captured metadata set cannot be replayed (extractNodeIDImpl).
 	MetadataNonce     = "x-orbtr-nonce"
 	MetadataTimestamp = "x-orbtr-timestamp"
 )
 
 // grpcDialFreshnessWindow bounds clock skew between a dial signature's
 // timestamp and the server's clock. A dial whose timestamp is outside this
-// window, or whose nonce was already seen within it, is rejected (AER-032).
+// window, or whose nonce was already seen within it, is rejected.
 const grpcDialFreshnessWindow = 60 * time.Second
 
 // GrpcTransportConfig configures the gRPC aether.
@@ -65,12 +65,12 @@ type GrpcTransport struct {
 	tlsConfig  *tls.Config
 	server     *grpc.Server
 	incoming   chan aether.IncomingSession
-	closeOnce  sync.Once            // AER-104: guard against double-close of incoming
-	replay     *grpcDialReplayGuard // AER-032: per-dial nonce replay defense
+	closeOnce  sync.Once            // Close closes incoming once
+	replay     *grpcDialReplayGuard // per-dial nonce replay defense (extractNodeIDImpl)
 }
 
 // grpcDialReplayGuard rejects reuse of an authenticated dial nonce within the
-// freshness window (AER-032). Mirrors the WebSocket transport's dialReplayGuard.
+// freshness window. Mirrors the WebSocket transport's dialReplayGuard.
 type grpcDialReplayGuard struct {
 	mu   sync.Mutex
 	seen map[string]time.Time // nonce → expiry
@@ -141,7 +141,7 @@ func (t *GrpcTransport) Dial(ctx context.Context, target aether.Target) (aether.
 		return nil, errors.New("grpc: missing address")
 	}
 
-	// Create signed metadata to prove our identity. AER-032: bind a fresh
+	// Create signed metadata to prove our identity. Bind a fresh
 	// timestamp + random nonce into the signed message so a captured metadata
 	// set cannot be replayed to impersonate this NodeID.
 	nonce := make([]byte, 16)
@@ -168,7 +168,7 @@ func (t *GrpcTransport) Dial(ctx context.Context, target aether.Target) (aether.
 		return nil, aether.WrapOp("dial", aether.ProtoGRPC, target.NodeID, err)
 	}
 
-	// AER-010: the identity metadata must ride the STREAM RPC — the server's
+	// The identity metadata must ride the STREAM RPC — the server's
 	// auth interceptor reads it off client.Stream(ctx), not off DialContext
 	// (outgoing metadata on the dial ctx is dropped). It also must outlive the
 	// caller's dial ctx: a customary `WithTimeout(...); defer cancel()` around
@@ -264,7 +264,7 @@ func (t *GrpcTransport) extractNodeID(ctx context.Context) (aether.NodeID, error
 // extractNodeIDVerified returns the authenticated NodeID WITHOUT re-consuming
 // the dial nonce. The stream handler calls this after the interceptor has
 // already gated the stream, so re-running the replay check would reject the
-// legitimate second read of the same nonce (AER-032).
+// legitimate second read of the same nonce.
 func (t *GrpcTransport) extractNodeIDVerified(ctx context.Context) (aether.NodeID, error) {
 	return t.extractNodeIDImpl(ctx, false)
 }
@@ -284,8 +284,8 @@ func (t *GrpcTransport) extractNodeIDImpl(ctx context.Context, checkReplay bool)
 
 	// NodeID ownership MUST be cryptographically proven — the signature is
 	// mandatory, never optional-on-presence. A caller that omits it would
-	// otherwise be accepted under any claimed NodeID (peer impersonation,
-	// AE-C-03). There is no client-cert backstop that binds TLS identity to the
+	// otherwise be accepted under any claimed NodeID (peer impersonation).
+	// There is no client-cert backstop that binds TLS identity to the
 	// aether NodeID, so this signature is the sole ownership proof. Legitimate
 	// clients always send it (see Dial), so requiring it breaks nothing.
 	signatures := md.Get(MetadataSignature)
@@ -314,10 +314,10 @@ func (t *GrpcTransport) extractNodeIDImpl(ctx context.Context, checkReplay bool)
 		return "", errors.New("grpc: public key does not match NodeID")
 	}
 
-	// AER-032: require a fresh timestamp + unseen nonce, and verify the
-	// signature over BOTH. Without this the signature was over a static
-	// message, so a captured (nodeid, sig, pubkey) triple replayed
-	// indefinitely to open sessions impersonating the victim NodeID.
+	// Require a fresh timestamp + unseen nonce, and verify the signature
+	// over BOTH: a signature over a static message would let a captured
+	// (nodeid, sig, pubkey) triple be replayed indefinitely to open
+	// sessions impersonating the victim NodeID.
 	nonces := md.Get(MetadataNonce)
 	timestamps := md.Get(MetadataTimestamp)
 	if len(nonces) == 0 || len(timestamps) == 0 {
@@ -373,10 +373,9 @@ func (t *GrpcTransport) CreateServer() *grpc.Server {
 	if t.server != nil {
 		return t.server
 	}
-	// AER-105: install server TLS credentials when a TLS config was supplied,
-	// matching Listen(). Previously CreateServer ignored TLSConfig and built a
-	// plaintext server even for a secure endpoint — an asymmetric contract that
-	// reinforced the false "encrypted" capability signal.
+	// Install server TLS credentials when a TLS config was supplied, matching
+	// Listen(): a plaintext server for a secure endpoint would contradict the
+	// encrypted capability aether.CapabilitiesForConnection reports for it.
 	opts := []grpc.ServerOption{
 		grpc.UnaryInterceptor(t.unaryAuthInterceptor),
 		grpc.StreamInterceptor(t.streamAuthInterceptor),
@@ -392,7 +391,7 @@ func (t *GrpcTransport) CreateServer() *grpc.Server {
 
 // Close shuts down the aether.
 func (t *GrpcTransport) Close() error {
-	// AER-104: GracefulStop drains active handlers before we close the
+	// GracefulStop drains active handlers before we close the
 	// producer-visible incoming channel, and closeOnce makes a second Close
 	// a no-op instead of panicking on a double close(t.incoming).
 	t.closeOnce.Do(func() {

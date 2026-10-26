@@ -97,7 +97,7 @@ type PunchOffer struct {
 var ErrPunchSignature = errors.New("nat: punch signature invalid")
 
 // appendPunchAddrs folds a candidate-address slice into a signing buffer.
-// AE-P-03: the punch signature must cover every ReflexiveAddr/LocalAddr the
+// The punch signature must cover every ReflexiveAddr/LocalAddr the
 // execution layer will send traffic to (execute.go PunchCandidates dials and
 // ProbeCandidates probes), otherwise a MITM on the consumer-owned signalling
 // channel — which, for the documented relay/gossip rendezvous, is an untrusted
@@ -134,7 +134,7 @@ func (r *PunchRequest) SignBytes() []byte {
 	var ts [8]byte
 	binary.BigEndian.PutUint64(ts[:], uint64(r.Timestamp))
 	out = append(out, ts[:]...)
-	// AE-P-03: authenticate the candidate addresses the execution layer acts on.
+	// Authenticate the candidate addresses the execution layer acts on.
 	out = appendPunchAddrs(out, r.ReflexiveAddrs)
 	out = appendPunchAddrs(out, r.LocalAddrs)
 	return out
@@ -164,7 +164,7 @@ func (o *PunchOffer) SignBytes() []byte {
 	var ts [8]byte
 	binary.BigEndian.PutUint64(ts[:], uint64(o.Timestamp))
 	out = append(out, ts[:]...)
-	// AE-P-03: authenticate the candidate addresses the execution layer acts on.
+	// Authenticate the candidate addresses the execution layer acts on.
 	out = appendPunchAddrs(out, o.ReflexiveAddrs)
 	out = appendPunchAddrs(out, o.LocalAddrs)
 	return out

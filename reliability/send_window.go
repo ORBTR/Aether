@@ -204,7 +204,7 @@ func (w *SendWindow) AddEntry(frame *aether.Frame) (uint32, *SendEntry) {
 // detector (RFC 8985 §6.2) sees the freshest transmission timestamp and
 // doesn't repeatedly mark a just-retransmitted frame as lost.
 //
-// No-op if seq is no longer in the window (already ACKed). Safe to call
+// No-op if seq has left the window (already ACKed). Safe to call
 // from the reliability tick — single-mutex acquisition.
 func (w *SendWindow) BumpXmitTime(seq uint32, t time.Time) {
 	w.mu.Lock()
@@ -345,7 +345,7 @@ func (w *SendWindow) ProcessCompositeACK(ack *aether.CompositeACK, reorderThresh
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// AER-060: CACKNoCumulative means the receiver has delivered nothing
+	// CACKNoCumulative means the receiver has delivered nothing
 	// in-order yet, so BaseACK is the wrapped sentinel expected-1
 	// (0xFFFFFFFF) carried only to keep the bitmap aligned. Skip the
 	// cumulative loop and its jump check entirely — reading the sentinel as
@@ -411,7 +411,7 @@ func (w *SendWindow) ProcessCompositeACK(ack *aether.CompositeACK, reorderThresh
 		// First pass: find largestAcked for reorder threshold
 		for i := 0; i < windowBits; i++ {
 			seqNo := ack.BaseACK + 1 + uint32(i)
-			// AE-H-09: bits at/beyond largestSent must not inflate largestAcked;
+			// Bits at/beyond largestSent must not inflate largestAcked;
 			// a peer setting a high bit could otherwise widen the NACK range.
 			if seqNo >= w.next {
 				break
@@ -440,7 +440,7 @@ func (w *SendWindow) ProcessCompositeACK(ack *aether.CompositeACK, reorderThresh
 				}
 			} else {
 				// bit=0: missing — implicit NACK if reorder threshold met.
-				// AE-H-09: require seqNo strictly below largestAcked. Without
+				// Require seqNo strictly below largestAcked. Without
 				// this guard an in-flight seq above the highest SACKed seq makes
 				// largestAcked-seqNo underflow uint32 to ~4e9, which widens to a
 				// large positive int (>= reorderThreshold) and spuriously NACKs
@@ -470,7 +470,7 @@ func (w *SendWindow) ProcessCompositeACK(ack *aether.CompositeACK, reorderThresh
 			// wraps 0xFFFFFFFF→0 and stays <= End forever, spinning at 100%
 			// CPU while holding w.mu — one crafted frame wedges the session.
 			// This is the same upper-bound scope guard the DroppedRanges loop
-			// applies (block.End >= w.next). (§3.2 / S1 — AE-C-02)
+			// applies (block.End >= w.next). (§3.2 / S1)
 			atomic.AddUint64(&w.suspiciousACKs, 1)
 			continue
 		}

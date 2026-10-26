@@ -71,13 +71,12 @@ func (c *Client) Call(ctx context.Context, handler string, payload []byte, metad
 	readCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 
-	// AER-035 note: this protocol correlates responses by ORDER (calls are
-	// serialized under c.mu), not by ID — the responder is not required to
-	// echo the request ID, so we cannot gate on resp.Id == reqID here. A late
-	// response from a timed-out prior call could still be mis-paired; the
-	// robust fix is a protocol change (echo the request ID, then correlate) or
-	// draining stale buffered reads after a timeout, both out of scope for a
-	// client-only patch.
+	// This protocol correlates responses by ORDER (calls are serialized
+	// under c.mu), not by ID — the responder is not required to echo the
+	// request ID, so we cannot gate on resp.Id == reqID here. A late
+	// response from a timed-out prior call can still be mis-paired.
+	// TODO: echo the request ID and correlate on it, or drain stale buffered
+	// reads after a timeout; either needs the responder's side too.
 	resp, err := c.readMessage(readCtx)
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)

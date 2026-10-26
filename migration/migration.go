@@ -154,7 +154,7 @@ func DecodeMigrationPayload(payload []byte, sessionKey []byte) (connID aether.Co
 }
 
 // ValidateMigration checks a migration request: HMAC + ConnectionID match,
-// timestamp within TTL, nonce not previously seen on this session.
+// timestamp within TTL, nonce not yet seen on this session.
 // On success, records the migration and remembers the nonce.
 func (m *Migrator) ValidateMigration(connID aether.ConnectionID, ip net.IP, port uint16, sessionKey []byte, payload []byte) error {
 	validConnID, nonce, ts, validIP, validPort, err := DecodeMigrationPayload(payload, sessionKey)
@@ -188,13 +188,13 @@ func (m *Migrator) ValidateMigration(connID aether.ConnectionID, ip net.IP, port
 
 // recordNonceLocked stores nonce with TTL-then-size eviction. Caller holds m.mu.
 func (m *Migrator) recordNonceLocked(nonce [8]byte) {
-	// AER-090: evict expired nonces by TTL first. A nonce older than
-	// MigrationTokenTTL can no longer be replayed (ValidateMigration rejects
-	// stale timestamps), so it need not occupy the seen-set. This bounds the
-	// set by the ACTUAL in-window nonce count rather than a fixed FIFO depth,
-	// closing the window where >MigrationSeenCacheSize tokens within one TTL
-	// evicted still-valid nonces and let a captured token replay. The stored
-	// per-nonce timestamp (previously dead) now drives the eviction.
+	// Evict expired nonces by TTL first. A nonce older than
+	// MigrationTokenTTL cannot be replayed (ValidateMigration rejects stale
+	// timestamps), so it need not occupy the seen-set. This bounds the set
+	// by the ACTUAL in-window nonce count rather than the fixed FIFO depth
+	// alone: with the FIFO alone, >MigrationSeenCacheSize tokens within one
+	// TTL would evict still-valid nonces and let a captured token replay.
+	// The stored per-nonce timestamp drives the eviction.
 	cutoff := time.Now().Add(-MigrationTokenTTL)
 	for len(m.seenOrder) > 0 {
 		oldest := m.seenOrder[0]
@@ -244,9 +244,9 @@ func (m *Migrator) Prune(maxAge time.Duration) {
 }
 
 // deriveMigrationKey derives a migration-HMAC-specific key from the session
-// key via a labelled HMAC (HKDF-Expand-style). AER-091: the raw session key is
-// also the AEAD frame key; using it directly as the migration MAC key reused
-// one key across two primitives. A per-purpose derived subkey removes that
+// key via a labelled HMAC (HKDF-Expand-style). The raw session key is
+// also the AEAD frame key; used directly as the migration MAC key it would
+// be one key across two primitives. A per-purpose derived subkey removes that
 // cross-primitive coupling.
 func deriveMigrationKey(sessionKey []byte) []byte {
 	mac := hmac.New(sha256.New, sessionKey)
@@ -255,7 +255,7 @@ func deriveMigrationKey(sessionKey []byte) []byte {
 }
 
 // computeHMAC generates HMAC-SHA256 over data with a migration-specific key
-// derived from the session key (AER-091).
+// derived from the session key (deriveMigrationKey).
 func computeHMAC(data, key []byte) []byte {
 	mac := hmac.New(sha256.New, deriveMigrationKey(key))
 	mac.Write(data)

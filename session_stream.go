@@ -129,10 +129,11 @@ type SessionMetrics struct {
 	// Security observability counters. See _SECURITY.md for the attack
 	// classes each addresses.
 	SuspiciousACKs uint64 // §3.2  — Composite ACKs rejected as malformed/oversized
-	// ForensicSuppressed (AER-074 T2): guard-covered abuse events
-	// (ack-validation / malformed-frame) RECORDED for observability but
-	// deliberately NOT scored/closed on an established, grade-A (past-warmup,
-	// actively-delivering) session — the reap-stopping forensic-only tier.
+	// ForensicSuppressed: guard-covered abuse events (ack-validation /
+	// malformed-frame) RECORDED for observability but deliberately NOT
+	// scored/closed on an established, grade-A (past-warmup,
+	// actively-delivering) session — the forensic-only tier of the noise
+	// adapter's reportAbuse.
 	// Local-only (not in the wire STATS EncodeStats/DecodeStats, same as
 	// SuspiciousACKs); surfaced per-node via Library MeshMetrics.
 	ForensicSuppressed uint64

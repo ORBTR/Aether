@@ -24,7 +24,7 @@ const MaxByIDBacklogPerStream = 4
 
 // ByIDBacklogGrace is how long an arrived stream parks on the per-ID
 // backlog waiting for an AcceptStreamByID claim before falling through
-// to the StreamAcceptor's FIFO. Short enough that legacy AcceptStream
+// to the StreamAcceptor's FIFO. Short enough that FIFO AcceptStream
 // consumers (e.g. dynamic RPC streams 10+) do not observe a perceptible
 // delay, long enough to absorb the typical scheduling skew between a
 // stream arriving on the wire and the consuming goroutine calling
@@ -72,8 +72,8 @@ type StreamAcceptorConfig struct {
 
 // StreamAcceptor is the transport-agnostic per-StreamID accept dispatch
 // plus FIFO ownership. Embedded into each transport-adapter session so
-// the "wait for a specific StreamID" semantics AND the legacy
-// AcceptStream FIFO live in one place rather than being re-implemented
+// the "wait for a specific StreamID" semantics AND the AcceptStream
+// FIFO live in one place rather than being re-implemented
 // per transport.
 //
 // The adapter calls Notify(stream) when a stream is ready to be handed
@@ -84,16 +84,16 @@ type StreamAcceptorConfig struct {
 //
 // Lifecycle: construct once per session via NewStreamAcceptor, call
 // Notify on every accepted stream, call AcceptByID for pinned
-// consumers and Accept for legacy FIFO consumers, call Close on
+// consumers and Accept for FIFO consumers, call Close on
 // session teardown. Safe for concurrent use.
 type StreamAcceptor struct {
 	mu      sync.Mutex
 	waiters map[uint64]chan Stream
 	backlog map[uint64][]Stream
-	// fifo is the legacy AcceptStream channel. Owned by the acceptor —
-	// pre-refactor each transport adapter carried its own copy of this
-	// channel plus a pushToAcceptCh shim. mode selects between the two
-	// observed push policies (NonBlockingDrop / BlockUntilClose).
+	// fifo is the AcceptStream channel, owned by the acceptor so the
+	// Noise, TCP and QUIC adapters share one rather than each carrying a
+	// channel plus a push shim. mode selects between the two push policies
+	// (NonBlockingDrop / BlockUntilClose).
 	fifo chan Stream
 	mode PushMode
 	// closed signals session teardown; AcceptByID, Accept, and the
@@ -269,11 +269,11 @@ func (a *StreamAcceptor) AcceptByID(ctx context.Context, streamID uint64) (Strea
 			return nil, ctx.Err()
 		}
 		a.mu.Unlock()
-		// AER-056: Notify already claimed our slot (deleted it from the map)
-		// and is committed to sending on ch (buffered, cap 1) — it just hasn't
-		// executed the send yet. A non-blocking recv here raced that window and
-		// returned ctx.Err() while the committed stream sat unconsumed in ch,
-		// orphaning it (Notify reported delivered; no Reset ever sent). BLOCK
+		// Notify already claimed our slot (deleted it from the map) and is
+		// committed to sending on ch (buffered, cap 1) — it just hasn't
+		// executed the send yet. A non-blocking recv here would race that
+		// window and return ctx.Err() while the committed stream sat unconsumed
+		// in ch, orphaning it (Notify reported delivered; no Reset ever sent). BLOCK
 		// briefly to receive it; the timeout is only a safety backstop.
 		select {
 		case st, ok := <-ch:
@@ -285,7 +285,7 @@ func (a *StreamAcceptor) AcceptByID(ctx context.Context, streamID uint64) (Strea
 			return nil, ctx.Err()
 		}
 	case <-a.closed:
-		// AE-L-16: mirror the ctx.Done() drain above. Session teardown
+		// Mirror the ctx.Done() drain above. Session teardown
 		// closes `closed` (via SignalClose) BEFORE calling the acceptor's
 		// Close() that sets isClosed, so a Notify racing teardown still
 		// takes the waiter fast-path, deletes our slot, and buffers the
@@ -302,7 +302,7 @@ func (a *StreamAcceptor) AcceptByID(ctx context.Context, streamID uint64) (Strea
 			return nil, a.errClosed
 		}
 		a.mu.Unlock()
-		// AER-056: same committed-send window as the ctx.Done() drain above —
+		// Same committed-send window as the ctx.Done() drain above —
 		// block briefly for the stream Notify is committed to sending.
 		select {
 		case st, ok := <-ch:
@@ -317,7 +317,7 @@ func (a *StreamAcceptor) AcceptByID(ctx context.Context, streamID uint64) (Strea
 }
 
 // byIDNotifyDrainTimeout bounds how long AcceptByID blocks to consume a stream
-// that Notify has already committed to delivering (AER-056). The send happens
+// that Notify has already committed to delivering. The send happens
 // microseconds after Notify releases the lock, so this is only a backstop.
 const byIDNotifyDrainTimeout = 1 * time.Second
 
@@ -360,7 +360,7 @@ func (a *StreamAcceptor) Close() []Stream {
 
 // flushBacklogEntry runs when the per-stream grace timer fires. If the
 // stream is still parked on the backlog (no AcceptByID claimed it) it
-// is removed and pushed onto the FIFO so any legacy AcceptStream
+// is removed and pushed onto the FIFO so any FIFO AcceptStream
 // consumer can pick it up. A no-op when the stream was already drained
 // by AcceptByID or by Close.
 func (a *StreamAcceptor) flushBacklogEntry(st Stream) {

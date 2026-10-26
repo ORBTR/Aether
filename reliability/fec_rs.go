@@ -134,7 +134,7 @@ type RSDecoder struct {
 	groups  map[uint32]*rsGroup
 	evicted uint64 // atomic
 
-	maxGroups int // AE-P-24: inline insert-time group budget (0 = disabled)
+	maxGroups int // inline insert-time group budget, enforced by getOrCreateGroup (0 = disabled)
 }
 
 type rsGroup struct {
@@ -196,7 +196,7 @@ func (d *RSDecoder) AddRepair(header aether.FECHeader, payload []byte) [][]byte 
 	if shardLen <= 0 || shardLen > len(payload)-2 {
 		return nil
 	}
-	// AE-P-24: validate Index/Total BEFORE allocating a group so a malformed
+	// Validate Index/Total BEFORE allocating a group so a malformed
 	// repair (Total==0, or Index >= its own Total) can never insert an entry
 	// into d.groups keyed by the peer-controlled GroupID. Honest frames of a
 	// group all carry the same Total and Index < Total (repair index = k+m-1),
@@ -261,7 +261,7 @@ func (d *RSDecoder) EvictedCount() uint64 {
 	return atomic.LoadUint64(&d.evicted)
 }
 
-// SetMaxGroups sets the inline insert-time group budget (0 = disabled). AE-P-24.
+// SetMaxGroups sets the inline insert-time group budget (0 = disabled).
 func (d *RSDecoder) SetMaxGroups(n int) {
 	d.mu.Lock()
 	d.maxGroups = n
@@ -269,7 +269,6 @@ func (d *RSDecoder) SetMaxGroups(n int) {
 }
 
 // evictOldestLocked removes the lowest-ID (oldest) group. Caller holds d.mu.
-// AE-P-24.
 func (d *RSDecoder) evictOldestLocked() {
 	if len(d.groups) == 0 {
 		return
@@ -288,7 +287,7 @@ func (d *RSDecoder) evictOldestLocked() {
 func (d *RSDecoder) getOrCreateGroup(groupID uint32, total, shardLen int) *rsGroup {
 	g, ok := d.groups[groupID]
 	if !ok {
-		// AE-P-24: enforce the group budget inline so a sub-second flood of
+		// Enforce the group budget inline so a sub-second flood of
 		// unique GroupIDs cannot accumulate past the cap between 1 Hz Prune
 		// sweeps.
 		if d.maxGroups > 0 && len(d.groups) >= d.maxGroups {

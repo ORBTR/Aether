@@ -103,10 +103,10 @@ type NoiseSession struct {
 	// Connection migration handler
 	migrator *migration.Migrator
 
-	// AE-P-25: removed packetReplay *reliability.PacketReplayWindow — it was
-	// an allocated-but-never-read field for a redundant+incorrect third
-	// replay layer. Replay is enforced by noise/nonce_window.go (pre-decrypt)
-	// and per-stream reliability.ReplayWindow (engine.go Replay.Check).
+	// Replay protection is two layers: noise/nonce_window.go (pre-decrypt,
+	// per conn) and the per-stream reliability.ReplayWindow
+	// (noiseStream.replay, handleData's Classify and Commit). The session
+	// holds no replay window of its own.
 
 	// streamRefused counts every stream open rejected because the
 	// MaxConcurrentStreams cap is reached — both peer-initiated OPENs
@@ -187,7 +187,8 @@ type NoiseSession struct {
 
 	// retransmitEvicted counts frames dropped from a stream's retransmit
 	// queue (byte-cap eviction, deadline, or max-retries) — each is a
-	// reliable frame that lost its RTO safety net. AER-066.
+	// reliable frame that lost its RTO safety net. Bumped by the onEvict
+	// hook createStream installs.
 	retransmitEvicted uint64
 
 	// Observability histograms (see metrics/duration_hist.go). All four
@@ -297,21 +298,20 @@ type NoiseSession struct {
 	// application DATA stream (handleData / TypeDATA), NOT dispatch-path
 	// bytesRecv (which counts every frame incl. control/gossip/ACK). This
 	// is the un-gameable "this is a real, delivering mesh member" signal
-	// used by reportAbuse's T2 grade-A discriminator (AER-074 extension):
-	// a peer flooding malformed frames / bad ACKs never reaches app
-	// delivery (malformed fails Validate; bad-ACK hits TypeACK not
-	// handleData), so it can never shelter into the forensic-only tier.
-	// See reportAbuse. (R-839/M-99: LastActivity + bytesRecv both refresh
-	// PRE-Validate and are gameable; app-delivery is not.)
+	// reportAbuse reads to place a session in its forensic-only tier: a
+	// peer flooding malformed frames / bad ACKs never reaches app delivery
+	// (malformed fails Validate; bad-ACK hits TypeACK not handleData), so
+	// it can never shelter into that tier. LastActivity and bytesRecv both
+	// refresh PRE-Validate and are gameable; app delivery is not.
 	appBytesDelivered atomic.Uint64
 
 	// forensicSuppressed counts guard-covered abuse events (ack-validation /
 	// malformed-frame) that were RECORDED for observability but deliberately
 	// NOT scored/closed because the session is established + grade-A (past
 	// warmup + actively app-delivering). Surfaced so triage can still see a
-	// genuine post-warmup attack that (A) intentionally stops closing —
-	// keeps R-838 "everything still scored" real without arming the
-	// blacklist (which would relocate the reap to a reconnect-lockout).
+	// genuine post-warmup attack that reportAbuse intentionally stops
+	// closing — every event stays recorded without arming the blacklist
+	// (which would relocate the reap to a reconnect-lockout).
 	forensicSuppressed atomic.Uint64
 
 	// lastPeerStats stores the most-recent STATS frame the peer emitted.
@@ -366,13 +366,12 @@ type NoiseSession struct {
 	connID        aether.ConnectionID
 	classDefaults aether.TransportClassDefaults
 
-	// Short header compression, per-stream state. AER-048: separate encode
-	// (tx) and decode (rx) compressors. A single shared instance let the
-	// peer's inbound sequence numbers and the local outbound sequence numbers
-	// cross-contaminate the same StreamCompState.lastSeqNo and
-	// SessionCompState.lastSender/lastReceiver, corrupting short-header deltas
-	// and identity stamping on bidirectional streams. The TCP adapter fixed
-	// this same class as AE-P-05.
+	// Short header compression, per-stream state: separate encode (tx) and
+	// decode (rx) compressors, as TCPSession's. One shared instance would let
+	// the peer's inbound sequence numbers and the local outbound sequence
+	// numbers cross-contaminate the same StreamCompState.lastSeqNo and
+	// SessionCompState.lastSender/lastReceiver, corrupting short-header
+	// deltas and identity stamping on bidirectional streams.
 	txCompressor *aether.Compressor
 	rxCompressor *aether.Compressor
 
@@ -576,10 +575,6 @@ func NewNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 	)
 
 	s.migrator = migration.NewMigrator()
-	// AE-P-25: removed s.packetReplay allocation — PacketReplayWindow was a
-	// redundant+incorrect third replay layer (see noise_dispatch.go). Replay
-	// is enforced by noise/nonce_window.go (pre-decrypt) and per-stream
-	// reliability.ReplayWindow (engine.go Replay.Check).
 	// connID is owned by *BaseSession (initialised by NewBaseSession).
 	s.classDefaults = aether.DefaultsForClass(aether.ClassRAW)
 	s.streamGC = aether.NewStreamGC(aether.DefaultStreamIdleTimeout, func(streamID uint64) {
@@ -717,8 +712,8 @@ func (s *NoiseSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) 
 	return st, nil
 }
 
-// AcceptStream delegates to the shared aether.StreamAcceptor — the
-// adapter no longer owns the FIFO channel + per-transport select. See
+// AcceptStream delegates to the shared aether.StreamAcceptor, which owns
+// the FIFO channel and the per-StreamID dispatch for every adapter. See
 // stream_acceptor.go for the underlying drain order (waiter → backlog
 // → FIFO).
 func (s *NoiseSession) AcceptStream(ctx context.Context) (aether.Stream, error) {
@@ -806,15 +801,15 @@ func (s *NoiseSession) GoAway(ctx context.Context, reason aether.GoAwayReason, m
 // already unregistered is a no-op on both the scheduler and the GC.
 func (s *NoiseSession) releaseStream(streamID uint64) {
 	dropped, probe := s.sched.Unregister(streamID)
-	// AER-078: release the connection-window credit reserved by frames that
-	// were queued in the scheduler but never reached the wire (the stream was
-	// torn down with frames still queued). Scheduler.Unregister already returns
-	// them; ignoring the return stranded HeaderSize+Length conn credit per
-	// frame, draining the 4MB window under stream churn until Send failed with
-	// "insufficient connection credit". Only metered bytes were reserved (small
-	// frames bypass Consume). The per-stream window is discarded with the
-	// stream, and the conn window has its own lock, so this is safe from the GC
-	// sweep path that must not re-acquire s.mu.
+	// Release the connection-window credit reserved by frames that were
+	// queued in the scheduler but never reached the wire (the stream was
+	// torn down with frames still queued). Scheduler.Unregister returns them;
+	// credit not released here strands HeaderSize+Length conn credit per
+	// frame and drains the 4MB window under stream churn until Send fails
+	// with "insufficient connection credit". Only metered bytes were reserved
+	// (small frames bypass Consume). The per-stream window is discarded with
+	// the stream, and the conn window has its own lock, so this is safe from
+	// the GC sweep path that must not re-acquire s.mu.
 	relConn := func(f *aether.Frame) {
 		if f != nil && int64(f.Length) > flow.MinGuaranteedWindow {
 			s.connWindow.ReleaseUnsent(int64(f.Length))
@@ -1007,8 +1002,8 @@ func (s *NoiseSession) MSS() int { return s.pmtuProber.MSS() }
 // The key should be derived from the Noise handshake shared secret.
 // When set, all outbound frames are encrypted and inbound frames are decrypted.
 func (s *NoiseSession) SetSessionKey(key [32]byte) error {
-	// AE-P-02: reject a second install so a key is never silently re-installed
-	// into a fresh FrameEncryptor whose ordered nonce counter restarts at 0.
+	// Reject a second install so a key is never silently re-installed into
+	// a fresh FrameEncryptor whose ordered nonce counter restarts at 0.
 	// The encryptor's per-instance random nonce prefix already makes reinstall
 	// nonce-safe, but a re-key mid-session is a caller bug (both directions
 	// share the single s.encryptor); fail loud instead of masking it.
@@ -1361,9 +1356,10 @@ func (s *NoiseSession) LastPeerStats() aether.SessionMetrics {
 // Record + threshold-breaker GoAway + close. See aether/abuse_tracker.go
 // for the shape.
 //
-// AER-074: the three ack-validation guards (BaseACK-jump / oversize-range /
-// invalid-bitmap in ProcessCompositeACK, and the A4 CE-overclaim clamp) trip as
-// FALSE POSITIVES during the session warmup window: the send-window base is
+// The three ack-validation guards (BaseACK-jump / oversize-range /
+// invalid-bitmap in ProcessCompositeACK, and the CE-overclaim clamp in
+// handleACK) trip as FALSE POSITIVES during the session warmup window: the
+// send-window base is
 // still settling and CE plausibility (Outstanding()) is small because the
 // window is still filling, so a well-behaved peer's early ACKs read as
 // suspicious. At weight 25 / threshold 100, four such trips inside the 60s
@@ -1377,21 +1373,21 @@ func (s *NoiseSession) LastPeerStats() aether.SessionMetrics {
 // attacker is bounded to the warmup window (its ACKs are still rejected) and
 // scores + closes the instant warmup ends.
 //
-// AER-074 EXTENSION (R-837/R-839/M-98 — the ~110s fleet churn): the guard
-// covers BOTH ack-validation AND malformed-frame, and the false-positive is
-// NOT confined to warmup — a legit established session's recovery ACKs / large
-// frames also trip the guard post-warmup and GOAWAY-close a healthy grade-A
-// session. Since the guard already dropped/clamped the frame (CPU protection
-// is in the guard, not the score), scoring→closing is redundant + kills legit
-// sessions. Three tiers for the two guard-covered reasons:
+// The guard covers BOTH ack-validation AND malformed-frame, and the false
+// positive is NOT confined to warmup — an established session's recovery
+// ACKs and large frames also trip the guard after warmup and would
+// GOAWAY-close a healthy grade-A session. Since the guard already
+// dropped/clamped the frame (CPU protection is in the guard, not the score),
+// scoring→closing there is redundant and kills legitimate sessions. Three
+// tiers for the two guard-covered reasons:
 //
-//	T1 warmup (< SessionWarmupGrace): SUPPRESS (no score) — original AER-074.
+//	T1 warmup (< SessionWarmupGrace): SUPPRESS (no score).
 //	T2 established grade-A (past warmup + actively app-DELIVERING,
 //	   appBytesDelivered>0): FORENSIC-ONLY — record (forensicSuppressed) for
 //	   triage visibility but do NOT score / close / arm the blacklist. A
 //	   flooder never delivers app data (malformed fails Validate; bad-ACK is
 //	   TypeACK, not handleData) so it can never reach T2. NOT blacklist-arming
-//	   is deliberate (R-839): arming would relocate the reap-cycle to a
+//	   is deliberate: arming would relocate the reap-cycle to a
 //	   reconnect-LOCKOUT — strictly worse.
 //	T3 post-warmup zombie (past warmup + never app-delivered): FULL Report —
 //	   a genuine slow-loris that only ever sends garbage still scores + closes
@@ -1423,7 +1419,8 @@ func (s *NoiseSession) reportAbuse(r abuse.Reason) {
 
 // ForensicSuppressedCount returns the number of guard-covered abuse events
 // (ack-validation / malformed-frame) that were RECORDED but deliberately not
-// scored/closed on this established grade-A session (AER-074 T2). Surfaced via
+// scored/closed on this established grade-A session (reportAbuse's
+// forensic-only tier). Surfaced via
 // MeshMetrics so triage retains visibility into a genuine post-warmup attack
 // that the forensic-only tier intentionally stops closing.
 func (s *NoiseSession) ForensicSuppressedCount() uint64 {

@@ -19,8 +19,9 @@ import (
 	aether "github.com/ORBTR/aether"
 )
 
-// relayServiceForwardTimeout bounds a single relay forward so a wedged or
-// backpressured target session can't pin the relaying goroutine (AER-041).
+// relayServiceForwardTimeout bounds a single relay forward (HandleRelayRequest's
+// Send) so a wedged or backpressured target session can't pin the relaying
+// goroutine.
 const relayServiceForwardTimeout = 5 * time.Second
 
 // SessionIndex provides session lookup for relay forwarding.
@@ -34,7 +35,7 @@ type SessionIndex interface {
 }
 
 // externalEntry pairs a bridge session with its scope so relay forwarding can
-// enforce partition isolation on external paths. AE-H-08.
+// enforce partition isolation on external paths (ExternalScope).
 type externalEntry struct {
 	conn    aether.Connection
 	scopeID string
@@ -86,7 +87,7 @@ func (rs *RelayService) HandleRelayRequest(sourceNodeID aether.NodeID, data []by
 	if idx != nil {
 		if sess := idx.LookupByNodeID(targetNodeID); sess != nil {
 			frame := makeRelayFrame(sourceNodeID, payload)
-			// AER-041: bound the forward so a wedged target can't pin us.
+			// Bound the forward so a wedged target can't pin us.
 			ctx, cancel := context.WithTimeout(context.Background(), relayServiceForwardTimeout)
 			defer cancel()
 			return sess.Send(ctx, frame)
@@ -99,7 +100,7 @@ func (rs *RelayService) HandleRelayRequest(sourceNodeID aether.NodeID, data []by
 	rs.mu.RUnlock()
 	if e.conn != nil {
 		frame := makeRelayFrame(sourceNodeID, payload)
-		// AER-041: bound the forward so a wedged target can't pin us.
+		// Bound the forward so a wedged target can't pin us.
 		ctx, cancel := context.WithTimeout(context.Background(), relayServiceForwardTimeout)
 		defer cancel()
 		return e.conn.Send(ctx, frame)
@@ -156,7 +157,7 @@ func (rs *RelayService) LookupExternal(id aether.NodeID) aether.Connection {
 }
 
 // ExternalScope returns the bridge session and its scope for id, with ok=false
-// when none is registered. Used to enforce relay scope isolation. AE-H-08.
+// when none is registered. Used to enforce relay scope isolation.
 func (rs *RelayService) ExternalScope(id aether.NodeID) (conn aether.Connection, scopeID string, ok bool) {
 	rs.mu.RLock()
 	defer rs.mu.RUnlock()

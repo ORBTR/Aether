@@ -247,7 +247,7 @@ func (d *FECDecoder) tryRecover(groupID uint32, g *fecGroup) []byte {
 		return nil // more than one frame missing — can't recover with XOR
 	}
 
-	// AE-M-13: XOR reconstruction requires the exact (dataCount-1) surviving
+	// XOR reconstruction requires the exact (dataCount-1) surviving
 	// data frames to XOR against the repair. A group with zero received data
 	// frames — e.g. a Total==2 repair where dataCount==1, so `0 < dataCount-1`
 	// is `0 < 0` = false and the `>= dataCount` check above is also false —

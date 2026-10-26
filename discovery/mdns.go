@@ -22,7 +22,7 @@ const MDNSServiceType = "_orbtr-mesh._tcp.local."
 
 // Bounds on the discovered-peer map. Without them an on-LAN attacker minting
 // fresh nodeIDs (each hitting the trust-on-first-use store branch in
-// processMDNSResponse) could grow d.discovered without bound. AE-M-09.
+// processMDNSResponse) could grow d.discovered without bound.
 const (
 	mdnsPeerTTL       = 10 * time.Minute // forget peers not re-announced within this window
 	mdnsMaxDiscovered = 4096             // hard cap on retained peers; oldest evicted first
@@ -32,7 +32,7 @@ const (
 type MDNSPeer struct {
 	NodeID       string
 	Addresses    []string
-	Signature    []byte // ed25519 signature over NodeID + signed (addr=) addresses; Addresses may also carry an unsigned transport-observed dial hint (AE-P-15)
+	Signature    []byte // ed25519 signature over NodeID + signed (addr=) addresses; Addresses may also carry an unsigned transport-observed dial hint (processMDNSResponse)
 	DiscoveredAt time.Time
 }
 
@@ -257,10 +257,10 @@ func (d *MDNSDiscoverer) queryPeers(ctx context.Context) {
 		if addrStr != "" {
 			addresses = strings.Split(addrStr, ",")
 		}
-		// AE-P-15: the transport-observed host:port is NOT covered by the
-		// announcer's ed25519 signature (SignMDNSAnnouncement signs only the
-		// addr= set), so it must stay OUT of the address list handed to
-		// verification. Appending it here made every genuinely-signed peer fail
+		// The transport-observed host:port is NOT covered by the announcer's
+		// ed25519 signature (SignMDNSAnnouncement signs only the addr= set), so
+		// it must stay OUT of the address list handed to verification: appended
+		// here it would make every genuinely-signed peer fail
 		// VerifyMDNSAnnouncement (augmented payload != signed payload) and let a
 		// TOFU peer's stored addresses carry an unsigned, attacker-settable
 		// endpoint. Pass it separately as an unsigned dial hint instead.
@@ -302,11 +302,11 @@ func (d *MDNSDiscoverer) processMDNSResponse(nodeID string, addresses []string, 
 		}
 	}
 
-	// AE-P-15: verification above ran over the signed addr= set only. Add the
+	// Verification above ran over the signed addr= set only. Add the
 	// transport-observed address (if any) as an ADDITIONAL, unsigned dial
 	// candidate, de-duplicated against the signed set. It never participated in
 	// the signature check, so it can neither break verification nor be laundered
-	// as a signed address; preserves the original host:port dial-hint capability.
+	// as a signed address; the host:port dial hint is kept.
 	stored := addresses
 	if observed != "" {
 		dup := false
@@ -323,7 +323,7 @@ func (d *MDNSDiscoverer) processMDNSResponse(nodeID string, addresses []string, 
 
 	now := time.Now()
 	d.mu.Lock()
-	// AE-M-09: bound the discovered-peer map. An on-LAN attacker can mint
+	// Bound the discovered-peer map. An on-LAN attacker can mint
 	// unlimited distinct nodeIDs — each reaching the trust-on-first-use
 	// store-unverified branch above — so without pruning and a hard size cap
 	// d.discovered would grow without bound (LAN memory-exhaustion DoS), and

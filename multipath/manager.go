@@ -105,8 +105,7 @@ type Path struct {
 	// OnPrimaryFailure stamps this when marking PathDead; the probe loop
 	// (and PickByQuality / PickPath opportunistically) check that
 	// `time.Now().Sub(LastFailure) >= deadResurrectCooldown` before
-	// re-considering the path as a standby candidate. Cascade A.3 fix
-	// (L4 #2+#7) — previously PathDead was terminal with no recovery.
+	// re-considering the path as a standby candidate.
 	LastFailure time.Time
 
 	// Level 3 weighted scheduling counters. weight is derived from
@@ -132,8 +131,8 @@ type Path struct {
 // deadResurrectCooldown is the minimum time a path stays in PathDead
 // before becoming a probe/promotion candidate again. Without this,
 // either every probe attempt would slam a dead path immediately after
-// failure (wasteful churn) or PathDead would be permanent (the bug
-// Cascade A.3 fixed). 30s matches the probeInterval default so the
+// failure (wasteful churn) or PathDead would be permanent. 30s
+// matches the probeInterval default so the
 // next probe tick is the first chance for resurrection.
 const deadResurrectCooldown = 30 * time.Second
 
@@ -145,7 +144,7 @@ type Manager struct {
 
 	// probeTick increments on every probeNonPrimary invocation. Used to
 	// decide whether to include the primary path in this tick's probe
-	// set (every primaryProbeEvery-th tick). Was H-Multipath-PrimaryProbe.
+	// set (every primaryProbeEvery-th tick).
 	probeTick uint64
 
 	// Configuration
@@ -158,9 +157,8 @@ type Manager struct {
 	weightedLB        bool // Level 3: weighted load balance across paths
 
 	// qstate carries the quality scoring + EnsureK reconnect state.
-	// nil for legacy callers that haven't called AddPathQA or
-	// EnsureK; populated lazily by either, so existing AddPath +
-	// PrimarySession callers continue to work unchanged.
+	// nil for a manager whose callers use AddPath and PrimarySession
+	// only; populated lazily by AddPathQA or EnsureK.
 	qstate *qualityState
 
 	// nowFunc is an injectable clock for tests. nil → time.Now. The
@@ -343,12 +341,11 @@ func (m *Manager) AddPath(session aether.Session, proto aether.Protocol, quality
 
 // addPathLocked is the lock-already-held variant of AddPath. Used by
 // AddPathQA so the quality-aware bookkeeping can happen under the same
-// lock as the legacy path insertion — eliminates the race window
-// where a concurrent AddPath could insert a path between AddPathQA's
-// unlock and relock, leaving its meta attached to the wrong Path.
-// Audit M11.
+// lock as the path insertion: a concurrent AddPath could otherwise
+// insert a path between AddPathQA's unlock and relock, leaving its meta
+// attached to the wrong Path.
 func (m *Manager) addPathLocked(session aether.Session, proto aether.Protocol, quality int) *Path {
-	// L4 #5: seed bytesScheduled at half the current live minimum so a
+	// Seed bytesScheduled at half the current live minimum so a
 	// new path doesn't pin the WDRR scheduler at deficit=0 for the
 	// first many sends. Without this, a freshly-added path WINS every
 	// PickPath comparison (cost = 0/weight = 0) until it accumulates
@@ -398,10 +395,9 @@ func (m *Manager) RemovePath(session aether.Session) {
 		}
 		wasPrimary := i == m.primary
 		m.paths = append(m.paths[:i], m.paths[i+1:]...)
-		// L4 #6 fix: correctly adjust m.primary on removal. Previously
-		// the code only handled "primary index ran off the end"
-		// (m.primary >= len after splice → reset to 0, which silently
-		// picked paths[0] not the best). Three cases now:
+		// Adjust m.primary on removal. Handling only "primary index ran
+		// off the end" (reset to 0 when m.primary >= len after the splice)
+		// would silently pick paths[0], not the best. Three cases:
 		//   - removed path was primary → promote best standby
 		//   - removed path was BEFORE primary → decrement index so it
 		//     still points at the same Path pointer post-shift
@@ -450,9 +446,9 @@ func (m *Manager) AllSessions() []aether.Session {
 // states (but excluding closed sessions). Used by EnsureK to decide
 // which protocols still need a fresh dial.
 //
-// L4 #12 fix: previously EnsureK consulted AllSessions which excludes
-// PathDead. A transiently dead path's protocol was missing from the
-// "already represented" set, so EnsureK kept re-dialing the same
+// EnsureK consults this rather than AllSessions, which excludes
+// PathDead: a transiently dead path's protocol missing from the
+// "already represented" set would make EnsureK re-dial the same
 // broken transport — racing the still-extant Dead-state Path on the
 // other side and producing fresh dedup races. Including Dead lets
 // EnsureK pick a different protocol instead.
@@ -585,10 +581,11 @@ func (m *Manager) resurrectExpiredFlappingPathsLocked() {
 // Exits when ctx is cancelled. Safe to call once per manager; calling
 // multiple times spawns multiple loops (caller's responsibility).
 //
-// Cascade A.3 (L4 #2): before this, the manager had probeInterval +
-// stabilityPeriod + maxFailures fields and OnProbeSuccess hook, but no
-// code ever drove them. Standby paths could not be promoted; dead
-// paths could not be resurrected. RunProbeLoop closes that gap.
+// RunProbeLoop is what drives probeInterval, stabilityPeriod,
+// maxFailures and the OnProbeSuccess hook (probeNonPrimary); without it
+// a dead path returns to standby only through the cooldown checks
+// PickPath and PickByQuality run opportunistically, and no probe
+// measures a standby path's RTT.
 func (m *Manager) RunProbeLoop(ctx context.Context) {
 	interval := m.probeInterval
 	if interval <= 0 {
@@ -753,7 +750,7 @@ func (m *Manager) setPrimary(i int) {
 	}
 	m.primary = i
 	m.paths[i].State = PathActive
-	// L4 #9: reset the new primary's bytesScheduled to the cohort minimum
+	// Reset the new primary's bytesScheduled to the cohort minimum
 	// so it gets fair WDRR scheduling from the moment of promotion
 	// rather than ranking below its true quality due to the long quiet
 	// standby window. Tracker-level throughput EMA recovers naturally
@@ -868,12 +865,12 @@ func (m *Manager) RecordTLPReset(session aether.Session) bool {
 		return false
 	}
 
-	// AER-017: never demote a SOLE usable path to Flapping. PickByQuality and
+	// Never demote a SOLE usable path to Flapping. PickByQuality and
 	// AllSessions exclude flapping paths, so demoting the only one leaves them
 	// returning nothing for the whole demote window — consumers see "no session
 	// to peer" while a perfectly usable session exists and self-inflict a ~60s
-	// outage (and the demote events here can be manufactured by healthy
-	// idle-resume traffic, AER-002). A flapping-but-only path beats none.
+	// outage (and the demote events here can come from healthy idle-resume
+	// traffic tripping the stall detector). A flapping-but-only path beats none.
 	hasAlt := false
 	for _, p := range m.paths {
 		if p != target && p.State != PathDead && p.State != PathFlapping {

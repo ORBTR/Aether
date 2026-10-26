@@ -102,10 +102,10 @@ func wrapPostHandshakeAsSession(aetherConn aether.Connection, localNodeID aether
 // itself — that moved out of adapter into the WASM glue so aether carries
 // no syscall/js browser I/O.
 //
-// The return type is *NoiseSession — callers that previously held
-// *BrowserWSSession should switch to *NoiseSession or aether.Session,
-// both of which expose OpenStream / AcceptStream identically. Prefer
-// DialSessionOverConn directly for new code; this is a thin keyed wrapper.
+// The return type is *NoiseSession; a caller holds it as *NoiseSession or
+// aether.Session, both of which expose OpenStream / AcceptStream
+// identically. This is a thin keyed wrapper over DialSessionOverConn,
+// which new code calls directly.
 func DialSessionOverBrowserWS(ctx context.Context, localNodeID aether.NodeID, staticPriv, staticPub []byte, conn net.Conn, opts aether.SessionOptions) (*NoiseSession, error) {
 	return DialSessionOverConn(ctx, noise.DialConnConfig{
 		LocalNodeID: localNodeID,
@@ -120,14 +120,14 @@ func DialSessionOverBrowserWS(ctx context.Context, localNodeID aether.NodeID, st
 //
 // On the DialOverConn path the static key is DH material only: the handshake
 // exchanges a minimal NodeInfo, `remoteIdentity` is left nil, and there is no
-// AE-P-26 signed-identity binding — the browser is a CLIENT, not a mesh peer
-// (ratified #R-707). So a per-connection ephemeral key is equivalent in
-// security to the old keyless BrowserWS dial: it authenticates nothing on its
-// own, and generating it here keeps the JS `connect` API keyless (no
-// staticPriv/staticPub plumbed through the WASM boundary).
+// signed-identity binding of the kind the mesh transports' dials perform —
+// the browser is a CLIENT, not a mesh peer. So a per-connection ephemeral
+// key authenticates nothing on its own, and generating it here keeps the JS
+// `connect` API keyless (no staticPriv/staticPub plumbed through the WASM
+// boundary).
 //
 // ticket is OPTIONAL — pass nil when the responder does not require an
-// aether-level ticket (e.g. the legacy /bridge/{nodeID} raw-proxy relay route,
+// aether-level ticket (e.g. the /bridge/{nodeID} raw-proxy relay route,
 // where authorization is the relay's job, not aether's). noise.DialConnConfig
 // treats an empty ticket as "no ticket"; the responder enforces one ONLY when
 // its noise.AcceptConnConfig.TrustedTicketSigner is non-nil (otherwise the

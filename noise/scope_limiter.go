@@ -303,8 +303,8 @@ func (l *PartitionRelayLimiter) CheckRelayPair(scopeID, pairKey string) error {
 		if busiest != "" && busiest != scopeID {
 			l.evictOldestLocked(busiest, l.state[busiest], true /* crossScope */)
 		} else if busiest == scopeID {
-			// AE-L-10: The calling scope itself is the busiest. We only reach
-			// here with total still >= MaxTotalPairs, so step 2 did NOT free a
+			// The calling scope itself is the busiest. We only reach here with
+			// total still >= MaxTotalPairs, so step 2 did NOT free a
 			// slot — it evicts only when the scope is already at its own
 			// MaxRelayPairs, which a below-cap dominant partition never hits.
 			// Self-evict this scope's LRU pair unconditionally so the caller's

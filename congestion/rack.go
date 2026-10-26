@@ -17,14 +17,14 @@ import (
 // see (no further ACKs ever arriving), but in steady-state RACK gives
 // the controller far more accurate per-packet loss decisions:
 //
-//   - One isolated packet drop no longer triggers a CWND reduction every
-//     time it RTO-retransmits. A single OnLoss fires when RACK identifies
+//   - One isolated packet drop triggers no CWND reduction at each
+//     RTO-retransmit. A single OnLoss fires when RACK identifies
 //     it as lost; subsequent retransmits do not re-trigger congestion
 //     control.
 //   - Reordering is tolerated up to a dynamic reorder window (rackReoWnd),
 //     so paths that reorder packets without true loss don't waste CWND.
 //   - Loss decisions are tied to delivery time, not retransmit count, so
-//     "stuck base" head-of-line scenarios that previously cumulated
+//     "stuck base" head-of-line scenarios that would otherwise cumulate
 //     OnLoss until CWND collapsed are diagnosed once and only once.
 //
 // Per-stream state. The reliability layer owns one *RACK per noiseStream
@@ -63,7 +63,7 @@ type RACK struct {
 	reoWndPersist int
 
 	// dsack records whether we've observed a DSACK (acknowledgement that
-	// a previously-marked-lost packet actually arrived). DSACKs are the
+	// a packet marked lost actually arrived). DSACKs are the
 	// strongest reordering signal RACK has and are the primary trigger
 	// for reoWnd inflation.
 	dsackSeen bool
@@ -154,8 +154,8 @@ func (r *RACK) UpdateRTT(rtt time.Duration) {
 func (r *RACK) Ack(seq uint32, xmitTime, ackTime time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	// AE-L-05: a seq RACK previously declared lost that is now being
-	// acknowledged is DSACK evidence — the packet was reordered past reoWnd,
+	// A seq RACK declared lost that is now being acknowledged is DSACK
+	// evidence — the packet was reordered past reoWnd,
 	// not truly lost. Inflate the reorder window (RFC 8985 §7.2) BEFORE the
 	// delete below clears the markedLost entry, so genuinely-reordering paths
 	// widen their tolerance instead of re-declaring the same in-order-late
@@ -194,8 +194,8 @@ func (r *RACK) Ack(seq uint32, xmitTime, ackTime time.Time) {
 }
 
 // OnDSACK is called when the adapter sees evidence (via SACK or
-// duplicate-data delivery on a re-sent seq) that a previously-marked-lost
-// packet actually arrived. This is the strongest reorder signal RACK has
+// duplicate-data delivery on a re-sent seq) that a packet marked lost
+// actually arrived. This is the strongest reorder signal RACK has
 // and is the primary trigger for reoWnd inflation.
 func (r *RACK) OnDSACK() {
 	r.mu.Lock()
@@ -204,8 +204,8 @@ func (r *RACK) OnDSACK() {
 }
 
 // inflateReoWndLocked widens reoWnd by one adaptive step in response to a
-// DSACK (a previously-marked-lost packet proven to have arrived). Caller
-// must hold mu. AE-L-05: shared by the exported OnDSACK and the in-Ack DSACK
+// DSACK (a packet marked lost proven to have arrived). Caller must hold
+// mu. Shared by the exported OnDSACK and the in-Ack DSACK
 // detection so both reorder-evidence paths grow the window identically per
 // RFC 8985 §7.2, still capped at rackReoWndCap.
 func (r *RACK) inflateReoWndLocked() {
@@ -276,16 +276,16 @@ func (r *RACK) DetectLost(snap []SendEntrySnapshot, now time.Time) (lost []uint3
 			continue
 		}
 		if e.XmitTime.Before(fack) {
-			// AER-083: an entry behind the latest delivery is presumed lost if
-			// it is beyond the reorder window by EITHER measure:
+			// An entry behind the latest delivery is presumed lost if it is
+			// beyond the reorder window by EITHER measure:
 			//   - ACK-driven cutoff: xmitTime <= fack - reoWnd, OR
 			//   - the RFC 8985 §6.2 reorder TIMER: now - xmitTime >= reoWnd.
 			// The timer lets a tail loss be declared WITHOUT a further ACK.
-			// Previously only the ACK-driven cutoff applied — an entry within
-			// the window could transition to lost only when a new ACK advanced
-			// fack, so a lost tail (with no more ACKs, and TLP unavailable) fell
-			// all the way to RTO. reliabilityTick re-polls this every ~10ms, so
-			// the timer fires promptly.
+			// With the ACK-driven cutoff alone, an entry within the window
+			// could transition to lost only when a new ACK advanced fack, so a
+			// lost tail (with no more ACKs, and TLP unavailable) would fall all
+			// the way to RTO. reliabilityTick re-polls this every ~10ms, so the
+			// timer fires promptly.
 			if !e.XmitTime.After(cutoff) || !now.Before(e.XmitTime.Add(reoWnd)) {
 				lost = append(lost, e.Seq)
 			} else {
@@ -306,7 +306,7 @@ func (r *RACK) DetectLost(snap []SendEntrySnapshot, now time.Time) (lost []uint3
 		for _, seq := range lost {
 			r.markedLost[seq] = true
 		}
-		// AER-084: bound markedLost. Entries for seqs that are never ACKed
+		// Bound markedLost (rackMarkedLostCap). Entries for seqs that are never ACKed
 		// (peer-dropped range, stream reset, ACK race) are cleared only in
 		// Ack, so they would otherwise persist forever — a slow map leak, and
 		// on uint32 seq reuse a stale entry both suppresses re-marking of the
@@ -322,7 +322,7 @@ func (r *RACK) DetectLost(snap []SendEntrySnapshot, now time.Time) (lost []uint3
 	return lost, nextWakeup
 }
 
-// rackMarkedLostCap bounds the markedLost map (AER-084). Far above any
+// rackMarkedLostCap bounds the markedLost map (DetectLost). Far above any
 // plausible in-flight loss set so it only trips on a genuine leak.
 const rackMarkedLostCap = 4096
 

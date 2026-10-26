@@ -56,7 +56,7 @@ type FallbackDialer struct {
 	natCacheTTL   time.Duration
 	// natDetectFailedAt negative-caches a failed STUN detection so a
 	// blocked/down STUN server doesn't make every dial burn the full
-	// detection timeout before falling through to strategy selection (AER-016).
+	// detection timeout before falling through to strategy selection.
 	natDetectFailedAt time.Time
 
 	// Relay discovery function (injected from LAD)
@@ -154,7 +154,7 @@ func (d *FallbackDialer) detectNATType(ctx context.Context) (aether.NATType, err
 		d.mu.RUnlock()
 		return cachedType, nil
 	}
-	// AER-016: if detection failed recently, don't re-probe — proceed
+	// If detection failed recently, don't re-probe — proceed
 	// immediately with NATUnknown (the caller falls through to a direct+relay
 	// strategy) instead of burning another full 10s STUN timeout on every
 	// dial while STUN is unreachable, which is exactly when relay fallback
@@ -376,10 +376,10 @@ func (s *RelayedSession) RemoteAddr() net.Addr {
 
 // RemoteNodeID returns the actual target node ID (not the relay).
 func (s *RelayedSession) RemoteNodeID() aether.NodeID {
-	// AER-015: derive the canonical NodeID (vl1_ + base32(sha256(pub)[:16]))
-	// from the target's public key. A raw cast of the 32 key bytes produced a
-	// value that never equalled any real NodeID, so relayed sessions were
-	// invisible to dedup/lookup and triggered duplicate dials.
+	// Derive the canonical NodeID (vl1_ + base32(sha256(pub)[:16])) from
+	// the target's public key. A raw cast of the 32 key bytes would never
+	// equal any real NodeID, so relayed sessions would be invisible to
+	// dedup/lookup and trigger duplicate dials.
 	id, err := aether.NewNodeID(ed25519.PublicKey(s.targetID[:]))
 	if err != nil {
 		return ""

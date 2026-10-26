@@ -113,7 +113,7 @@ func (t *QuicTransport) Dial(ctx context.Context, target aether.Target) (aether.
 	tlsConf := t.tlsConfig.Clone()
 	tlsConf.ServerName = string(target.NodeID)
 
-	// AER-009: the target-identity check belongs on the CLIENT only. Verify
+	// The target-identity check belongs on the CLIENT only. Verify
 	// the server's presented cert derives the exact NodeID we dialed. The
 	// shared VerifyConnection (used by the server) intentionally omits this.
 	expectedPeer := target.NodeID
@@ -321,7 +321,7 @@ func generateTLSConfig(key ed25519.PrivateKey) (*tls.Config, error) {
 		Certificates:       []tls.Certificate{tlsCert},
 		NextProtos:         []string{"vl1-quic"},
 		InsecureSkipVerify: true, // We verify manually in VerifyConnection
-		// AE-H-12: RequireAnyClientCert makes the QUIC server send a CertificateRequest so it
+		// RequireAnyClientCert makes the QUIC server send a CertificateRequest so it
 		// obtains the client's cert and can bind the inbound peer NodeID (validated in VerifyConnection).
 		// Server-only field; ignored on the dial side that shares this config.
 		ClientAuth: tls.RequireAnyClientCert,
@@ -339,10 +339,10 @@ func generateTLSConfig(key ed25519.PrivateKey) (*tls.Config, error) {
 				return err
 			}
 
-			// AER-009: do NOT compare cs.ServerName here. This VerifyConnection
-			// runs on BOTH roles; on the SERVER cs.ServerName is the SNI the
-			// client sent (the server's OWN NodeID) while PeerCertificates[0]
-			// is the CLIENT's cert, so the comparison rejected every inbound
+			// Do NOT compare cs.ServerName here. This VerifyConnection runs on
+			// BOTH roles; on the SERVER cs.ServerName is the SNI the client
+			// sent (the server's OWN NodeID) while PeerCertificates[0] is the
+			// CLIENT's cert, so the comparison would reject every inbound
 			// handshake between two distinct nodes. The client-side target-
 			// NodeID check is installed on the dial config clone in Dial().
 			// Here we only validate the peer presented a well-formed Ed25519

@@ -261,7 +261,7 @@ func (e *ACKEngine) Flush() {
 
 // OnDuplicateReceived is called when a duplicate frame arrives — a
 // SeqNo already marked as seen in the per-stream replay window. The
-// original was previously delivered + ACKed but the sender retransmitted
+// original was delivered and ACKed earlier, but the sender retransmitted
 // because its ACK was lost / late. We force an immediate ACK back so
 // the sender's retransmit timer clears its pending state and stops
 // retransmitting. Without this, the sender's RTO/TLP keeps firing and
@@ -413,10 +413,10 @@ func (e *ACKEngine) flushLocked() {
 		e.pending, e.recvWindow.BufferedCount(), e.sendACK != nil)
 	ack := e.buildLocked()
 	e.pending = 0
-	// AER-072: capture the PREVIOUS ACK time before overwriting it, so the
-	// "resumed after silence" starvation log below measures the real gap.
-	// Reading e.lastACK after the store made every Sub() ≈ 0, so the log
-	// added specifically to expose ACK starvation could never fire.
+	// Capture the PREVIOUS ACK time before overwriting it, so the
+	// "resumed after silence" starvation log below measures the real gap;
+	// read after the store, every Sub() is ≈ 0 and the log could never
+	// fire.
 	prevACK := e.lastACK
 	e.lastACK = time.Now()
 
@@ -491,13 +491,14 @@ func (e *ACKEngine) buildLocked() *aether.CompositeACK {
 		Bitmap:   bitmap,
 	}
 
-	// AER-060: before the first in-order delivery, expected==0 and
-	// BaseACK becomes 0xFFFFFFFF (expected-1 wrapped). That value keeps the
-	// SACK bitmap aligned on the sender (BaseACK+1+i wraps to seq i) but
-	// reads as a ~4-billion cumulative forward jump, so the sender discarded
-	// the whole ACK — dropping the bitmap that would fast-retransmit seq 0 —
-	// and charged the honest receiver with ACK-validation abuse. Flag it so
-	// the sender skips the cumulative loop and processes only the bitmap.
+	// Before the first in-order delivery, expected==0 and BaseACK
+	// becomes 0xFFFFFFFF (expected-1 wrapped). That value keeps the SACK
+	// bitmap aligned on the sender (BaseACK+1+i wraps to seq i) but reads
+	// as a ~4-billion cumulative forward jump, on which
+	// SendWindow.ProcessCompositeACK would discard the whole ACK — dropping
+	// the bitmap that would fast-retransmit seq 0 — and charge the honest
+	// receiver with ACK-validation abuse. Flag it so the sender skips the
+	// cumulative loop and processes only the bitmap.
 	if expected == 0 {
 		ack.Flags |= aether.CACKNoCumulative
 	}
@@ -517,8 +518,8 @@ func (e *ACKEngine) buildLocked() *aether.CompositeACK {
 	}
 
 	// Loss density (advisory) — gated on warmup so the early-stream
-	// undersample skew (the old fixed-256 bool ring inflated loss for the
-	// first <256 packets) cannot leak onto the wire. Computed inline to
+	// undersample skew (a fixed-length ring inflates loss for its first
+	// few hundred packets) cannot leak onto the wire. Computed inline to
 	// avoid re-entering LossRate() while e.mu is already held.
 	if e.hasWarmedUpLocked() {
 		lossRate := e.lossRateLocked()

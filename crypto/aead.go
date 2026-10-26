@@ -32,8 +32,8 @@ type FrameEncryptor struct {
 	counter uint64 // atomic counter for ordered nonces
 	random  bool   // true for unordered streams (use random nonces)
 
-	// AE-P-02: per-encryptor random 32-bit nonce prefix (nonce[0:4]) for
-	// ordered mode. The counter alone restarts at 0 for every encryptor,
+	// noncePrefix is the per-encryptor random 32-bit nonce prefix (nonce[0:4])
+	// for ordered mode. The counter alone restarts at 0 for every encryptor,
 	// so two encryptors sharing a key — both directions of a session, or a
 	// re-installed/resumed key — would emit identical (key,nonce) pairs.
 	// A fresh random prefix per instance makes those nonce spaces disjoint.
@@ -52,7 +52,7 @@ func NewFrameEncryptor(key [32]byte, ordered bool) (*FrameEncryptor, error) {
 		aead:   aead,
 		random: !ordered,
 	}
-	// AE-P-02: seed the ordered-mode nonce prefix so encryptors sharing a key
+	// Seed the ordered-mode nonce prefix so encryptors sharing a key
 	// (both directions, or a re-installed/resumed key) never collide.
 	if _, err := rand.Read(fe.noncePrefix[:]); err != nil {
 		return nil, fmt.Errorf("aether crypto: seed nonce prefix: %w", err)
@@ -126,7 +126,7 @@ func (e *FrameEncryptor) DecryptWithNonce(frame *aether.Frame, nonce []byte) err
 		return fmt.Errorf("aether crypto: invalid nonce size %d (need %d)", len(nonce), e.aead.NonceSize())
 	}
 
-	// AE-P-11: authenticate the reconstructed frame header with the same
+	// Authenticate the reconstructed frame header with the same
 	// header-AAD contract as Decrypt (aead.go Decrypt) instead of nil AAD, so
 	// the 0x87 short-encrypted path binds SenderID/ReceiverID/StreamID/SeqNo/
 	// Length to the Poly1305 tag exactly like the full-header path — a
@@ -160,7 +160,7 @@ func (e *FrameEncryptor) nextNonce() aether.Nonce {
 	var nonce aether.Nonce
 	if e.random {
 		// Random nonce for unordered streams — prevents nonce reuse under reordering.
-		// AER-045: crypto/rand must not fail silently here. A discarded error
+		// crypto/rand must not fail silently here. A discarded error
 		// leaves nonce at its zero value, and an all-zero nonce reused across
 		// frames is catastrophic (key,nonce) reuse — keystream/Poly1305
 		// one-time-key reuse enabling forgery. A crypto/rand failure means the
@@ -171,7 +171,7 @@ func (e *FrameEncryptor) nextNonce() aether.Nonce {
 		}
 		return nonce
 	}
-	// AE-P-02: nonce = per-encryptor random prefix (nonce[0:4]) || monotonic
+	// nonce = per-encryptor random prefix (nonce[0:4]) || monotonic
 	// counter (nonce[4:12]). The prefix separates nonce spaces across every
 	// encryptor instance that shares a key — the single s.encryptor encrypts
 	// AND decrypts, so interop forces one key across both directions, and a

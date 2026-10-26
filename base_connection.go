@@ -27,7 +27,7 @@ type BaseConnection struct {
 	initialRTT time.Duration // TCP handshake / dial RTT for cross-region latency
 
 	// pendingRead preserves an in-flight fallback Read across a cancelled
-	// Receive (AER-050). When Receive's ctx fires while the read goroutine is
+	// Receive. When Receive's ctx fires while the read goroutine is
 	// still blocked in Conn.Read, the goroutine's eventual result is kept here
 	// so the NEXT Receive consumes it instead of the orphaned read swallowing
 	// and discarding that inbound message. Guarded by readMu.
@@ -43,11 +43,11 @@ type readResult struct {
 // Protocol returns the transport protocol.
 func (s *BaseConnection) Protocol() Protocol { return s.proto }
 
-// NewConnection creates a new BaseConnection. AER-058: pass the transport
-// protocol so Connection.Protocol() reports the real transport instead of
-// ProtoUnknown (which collapsed any protocol-grade fallback / capability
-// lookup keyed on it). The variadic parameter keeps older call sites
-// compiling; transports should always supply their protocol.
+// NewConnection creates a new BaseConnection. proto is the transport
+// protocol Connection.Protocol() reports; without it the connection reports
+// ProtoUnknown, which collapses any protocol-grade fallback or capability
+// lookup keyed on it. The parameter is variadic so a caller with no
+// protocol compiles; transports always supply theirs.
 func NewConnection(localNode, remoteNode NodeID, conn net.Conn, proto ...Protocol) *BaseConnection {
 	p := ProtoUnknown
 	if len(proto) > 0 {
@@ -89,8 +89,8 @@ func (s *BaseConnection) Receive(ctx context.Context) ([]byte, error) {
 		return buf[:n], nil
 	}
 
-	// Fallback: a goroutine performs the blocking Read. AER-050: reuse a
-	// still-running read from a previously cancelled Receive so a cancelled
+	// Fallback: a goroutine performs the blocking Read. Reuse a
+	// still-running read left by an earlier cancelled Receive so a cancelled
 	// call doesn't orphan a Read that then swallows and discards the next
 	// inbound message. The read goroutine owns its own buffer, so nothing
 	// aliases across calls.

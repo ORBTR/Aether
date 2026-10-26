@@ -57,9 +57,10 @@ type Engine struct {
 	// Configuration
 	maxAge time.Duration // 0 = no deadline (reliable forever)
 
-	// closed guards post-Close use. AER-069: Close no longer nils the
-	// component pointers (which panicked on any later call); it flips this
-	// flag under both locks instead. Guarded by sendMu (Close takes both).
+	// closed guards post-Close use: Close flips it under both locks and
+	// leaves the component pointers intact, since a nil pointer there would
+	// panic any later Tick/ProcessACK/Receive. Guarded by sendMu (Close
+	// takes both).
 	closed bool
 }
 
@@ -176,11 +177,11 @@ func (e *Engine) ProcessACK(ackNo uint32, sackBlocks []aether.SACKBlock) (rttSam
 	defer e.sendMu.Unlock()
 
 	// Cumulative ACK: ackNo acknowledges EVERY outstanding seq in
-	// [base, ackNo], not just ackNo itself. AER-069: the old code acked and
-	// removed only `ackNo`, stranding every lower unacked seq in both the
-	// send window and the retransmit queue forever — they never left the
-	// retransmit heap, so they fired spurious duplicate retransmits and the
-	// send window never advanced past them. Walk base..ackNo, acking each.
+	// [base, ackNo], not just ackNo itself. Acking only `ackNo` would
+	// strand every lower unacked seq in both the send window and the
+	// retransmit queue — never leaving the retransmit heap, firing spurious
+	// duplicate retransmits, and holding the send window behind them. Walk
+	// base..ackNo, acking each.
 	//
 	// Bound the walk by maxAckRangeSpan exactly as the SACK path below and
 	// SendWindow.AckRange do: ackNo is peer-controlled, so base..ackNo can be
@@ -195,7 +196,7 @@ func (e *Engine) ProcessACK(ackNo uint32, sackBlocks []aether.SACKBlock) (rttSam
 			if entry := e.SendWin.Ack(seq); entry != nil {
 				ackedBytes += int64(entry.Frame.Length)
 				e.RetransmitQ.Remove(seq)
-				// AER-064: sample RTT from the largest-acked non-retransmitted
+				// Sample RTT from the largest-acked non-retransmitted
 				// entry (RFC 9002 §5.1), consistent with the noise dispatch
 				// path — sampling the oldest instead inflates SRTT/RTO.
 				if entry.Retries == 0 && (sample == nil || entry.SentAt.After(sample.SentAt)) {
@@ -214,7 +215,7 @@ func (e *Engine) ProcessACK(ackNo uint32, sackBlocks []aether.SACKBlock) (rttSam
 	for _, block := range sackBlocks {
 		count := e.SendWin.AckRange(block.Start, block.End)
 		ackedBytes += int64(count) * int64(aether.HeaderSize)
-		// AE-P-23: bound the retransmit-removal scan the same way
+		// Bound the retransmit-removal scan the same way
 		// SendWindow.AckRange does. block.End is peer-controlled; the naive
 		// `for seq := Start; seq <= End; seq++` never terminates when
 		// End=0xFFFFFFFF (seq wraps to 0 and stays <= End) and runs ~4B
@@ -240,13 +241,11 @@ func (e *Engine) ProcessACK(ackNo uint32, sackBlocks []aether.SACKBlock) (rttSam
 // this tick. Should be called periodically (e.g., every 10ms). Send-path →
 // sendMu.
 //
-// AER-069: the old signature returned a single frame and called BackoffRTO
-// once per returned frame. A caller draining all due frames (the only correct
-// use) therefore looped Tick and backed the RTO estimator off once *per due
-// frame* — an N-frame timeout burst multiplied the RTO by 2^N, freezing the
-// send side. Drain the whole due set here and back the estimator off at most
-// once, since a single detection instant is one loss signal regardless of how
-// many frames it covers.
+// Tick returns the whole due set and backs the estimator off at most once:
+// a caller draining due frames one per call would back the RTO estimator
+// off once *per due frame*, and an N-frame timeout burst would multiply the
+// RTO by 2^N, freezing the send side. A single detection instant is one
+// loss signal regardless of how many frames it covers.
 func (e *Engine) Tick() []*aether.Frame {
 	e.sendMu.Lock()
 	defer e.sendMu.Unlock()
@@ -268,16 +267,16 @@ func (e *Engine) Tick() []*aether.Frame {
 // GenerateSACKInfo returns the cumulative ACK point and SACK blocks for
 // sending an ACK frame back to the sender. Recv-path → recvMu.
 //
-// AER-069: the cumulative ACK point is the highest CONTIGUOUSLY received seq,
-// which is `ExpectedSeqNo() - 1` — NOT ExpectedSeqNo() itself. The old code
-// returned the next-expected seq, i.e. one MORE than was actually received in
-// order; a peer decoding it as the cumulative point (the field's meaning, per
-// the ACKEngine's `BaseACK: expected-1`) would believe an extra frame was
-// delivered and stop retransmitting a frame the receiver never got.
+// The cumulative ACK point is the highest CONTIGUOUSLY received seq, which
+// is `ExpectedSeqNo() - 1` — NOT ExpectedSeqNo() itself: the next-expected
+// seq is one MORE than was received in order, and a peer decoding it as the
+// cumulative point (the field's meaning, per the ACKEngine's `BaseACK:
+// expected-1`) would believe an extra frame was delivered and stop
+// retransmitting a frame the receiver never got.
 //
 // When nothing has been received in order yet (expected==0), the point wraps
 // to 0xFFFFFFFF, which is the same "no cumulative coverage" sentinel the
-// ACKEngine flags with CACKNoCumulative (AER-060). This facade has no flag
+// ACKEngine flags with CACKNoCumulative. This facade has no flag
 // field, so callers must treat 0xFFFFFFFF as "no cumulative ACK yet".
 func (e *Engine) GenerateSACKInfo() (cumulativeAck uint32, blocks []aether.SACKBlock) {
 	e.recvMu.Lock()
@@ -299,11 +298,11 @@ func (e *Engine) RTO() time.Duration {
 // Close marks the engine closed. Acquire both locks so no Send/Receive is in
 // flight when it runs. It is idempotent and safe to call concurrently.
 //
-// AER-069: the old Close nil'd SendWin/RecvWin/RetransmitQ. The sub-components
-// have no resources to release (no goroutines, no fds), so nil-ing bought
-// nothing and turned any post-Close call — including a second Close, or a
-// racing Tick/ProcessACK/Receive — into a nil-pointer panic. Flip a closed
-// flag instead and leave the components intact; Closed() lets callers gate.
+// The sub-components have no resources to release (no goroutines, no fds),
+// so nil-ing SendWin/RecvWin/RetransmitQ would buy nothing and turn any
+// post-Close call — a second Close, or a racing Tick/ProcessACK/Receive —
+// into a nil-pointer panic. Flip the closed flag instead and leave the
+// components intact; Closed() lets callers gate.
 func (e *Engine) Close() {
 	e.sendMu.Lock()
 	defer e.sendMu.Unlock()

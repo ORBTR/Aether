@@ -55,7 +55,7 @@ const (
 	// with no freshness window (Verify checks only the signature), so a
 	// malicious authenticated peer could otherwise park the blocking timer
 	// arbitrarily long. It must comfortably exceed PunchLeadTime plus
-	// worst-case one-way signaling latency and clock skew. (AE-P-17)
+	// worst-case one-way signaling latency and clock skew.
 	MaxPunchWait = 30 * time.Second
 )
 
@@ -102,11 +102,11 @@ func PunchCandidates(offer *PunchOffer) []net.UDPAddr {
 	base := make([]net.UDPAddr, 0, len(offer.LocalAddrs)+len(offer.ReflexiveAddrs))
 	base = append(base, offer.LocalAddrs...)
 	base = append(base, offer.ReflexiveAddrs...)
-	// AE-P-16: bound the peer-controlled seed set BEFORE PredictPorts. Port
+	// Bound the peer-controlled seed set BEFORE PredictPorts. Port
 	// prediction expands each seed 257x (a ±128 port window), so an uncapped
 	// base would materialize a 257·len(base) backing array at the PredictPorts
 	// make() before the trim below — a memory-amplification lever on a
-	// peer-controlled address list. AE-P-03 now signs those addresses, but a
+	// peer-controlled address list. SignBytes covers those addresses, but a
 	// validly-signed offer from an authenticated-but-hostile (or compromised)
 	// peer can still carry an arbitrarily large seed count; the signature binds
 	// the addresses, not their number. Capping the seeds to MaxPunchCandidates
@@ -148,7 +148,7 @@ func ExecutePunch(ctx context.Context, offer *PunchOffer, t0 time.Time, dial Dia
 	// Block until the synchronized fire time. A T0 already in the past
 	// (slow signaling round-trip) falls straight through to the dial.
 	if wait := time.Until(t0); wait > 0 {
-		// AE-P-17: t0 is derived (via PunchFireTime) from the peer-supplied,
+		// t0 is derived (via PunchFireTime) from the peer-supplied,
 		// self-signed PunchRequest.Timestamp, which Verify does not
 		// freshness-check — a malicious authenticated peer can set a
 		// far-future Timestamp and park this timer arbitrarily long. Refuse a
@@ -183,7 +183,7 @@ func ExecutePunch(ctx context.Context, offer *PunchOffer, t0 time.Time, dial Dia
 		}(addr)
 	}
 
-	// AE-L-09: a simultaneous open can complete more than one candidate at
+	// A simultaneous open can complete more than one candidate at
 	// once. The buffered outcomes channel (cap == len(candidates)) means every
 	// dial goroutine sends exactly one outcome even after a winner returns, and
 	// a late winner carries a live aether.Connection. drainAndClose consumes the
@@ -206,13 +206,13 @@ func ExecutePunch(ctx context.Context, offer *PunchOffer, t0 time.Time, dial Dia
 	for received := 0; received < len(candidates); received++ {
 		select {
 		case <-ctx.Done():
-			// AE-L-09: abandon the punch but close conns already dialed.
+			// Abandon the punch but close conns already dialed.
 			drainAndClose(len(candidates) - received)
 			return PunchResult{}, ctx.Err()
 		case o := <-outcomes:
 			if o.err == nil && o.conn != nil {
 				cancel() // stop the remaining handshakes
-				// AE-L-09: close any late winners the losing dials still owe.
+				// Close any late winners the losing dials still owe.
 				drainAndClose(len(candidates) - received - 1)
 				return PunchResult{Conn: o.conn}, nil
 			}
@@ -229,7 +229,7 @@ func ExecutePunch(ctx context.Context, offer *PunchOffer, t0 time.Time, dial Dia
 // covered by PunchRequest.SignBytes, so it is deduplicated, stripped of
 // unroutable targets (nil/unspecified IP, out-of-range port), and capped
 // at MaxPunchCandidates to bound ExecuteProbe's goroutine fan-out and UDP
-// burst (AE-H-06). Mirror of PunchCandidates on the initiator half.
+// burst. Mirror of PunchCandidates on the initiator half.
 func ProbeCandidates(req *PunchRequest) []net.UDPAddr {
 	out := make([]net.UDPAddr, 0, MaxPunchCandidates)
 	seen := make(map[string]struct{}, MaxPunchCandidates)
@@ -259,7 +259,7 @@ func ProbeCandidates(req *PunchRequest) []net.UDPAddr {
 // always-running listener accepts the initiator's inbound dial. A nil
 // probe func or an empty candidate set is a safe no-op.
 func ExecuteProbe(ctx context.Context, req *PunchRequest, t0 time.Time, probe ProbeFunc) {
-	// AE-H-06: req.LocalAddrs is peer-controlled and unsigned (SignBytes
+	// req.LocalAddrs is peer-controlled and unsigned (SignBytes
 	// omits the address slices), so probing it directly would spawn one
 	// goroutine + a 5-datagram burst per address at attacker-chosen
 	// victims. ProbeCandidates dedupes, drops unroutable targets, and caps
@@ -270,7 +270,7 @@ func ExecuteProbe(ctx context.Context, req *PunchRequest, t0 time.Time, probe Pr
 		return
 	}
 	if wait := time.Until(t0); wait > 0 {
-		// AE-P-17: refuse a far-future T0 (peer-controlled via the unfreshened
+		// Refuse a far-future T0 (peer-controlled via the unfreshened
 		// PunchRequest.Timestamp) rather than parking this goroutine+timer.
 		if wait > MaxPunchWait {
 			return

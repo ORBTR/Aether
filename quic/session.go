@@ -54,7 +54,7 @@ func (s *QuicSession) Receive(ctx context.Context) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// AE-M-15: cap the read at MaxPayloadSize so a peer cannot stream
+	// Cap the read at MaxPayloadSize so a peer cannot stream
 	// arbitrarily large data on a single uni-stream and OOM the process
 	// (QUIC per-stream flow control only bounds in-flight bytes, not the
 	// total io.ReadAll accumulates). Read one byte past the cap so an

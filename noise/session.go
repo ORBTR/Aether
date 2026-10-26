@@ -260,12 +260,12 @@ func (l *noiseListener) runReader(ctx context.Context, conn *net.UDPConn) {
 		// replies with resumeAcceptPrefix + a tag proving our own key
 		// possession.
 		if n > 0 && buf[0] == resumePrefix {
-			// AE-L-11: Resume is a first-contact / unknown-source event, not
-			// established-session traffic - it MUST NOT skip the S6 throttles.
-			// Apply the same per-source + global handshake-flood limits the
-			// slow path below uses (session.go sourceLimit/rateLimiter), so
-			// 0xFA spray from spoofed sources can't bypass them and burn CPU
-			// on ticket GCM.Open + per-datagram copies with no rate limit.
+			// Resume is a first-contact / unknown-source event, not
+			// established-session traffic, so it goes through the same
+			// per-source and global handshake-flood limits the slow path below
+			// applies (sourceLimit, rateLimiter): otherwise a 0xFA spray from
+			// spoofed sources would bypass them and burn CPU on ticket GCM.Open
+			// and per-datagram copies with no rate limit.
 			if l.transport.sourceLimit != nil && !l.transport.sourceLimit.Allow(addr) {
 				l.drops.count(DropResumeSourceLimit)
 				continue
@@ -406,15 +406,15 @@ func (l *noiseListener) runReader(ctx context.Context, conn *net.UDPConn) {
 		// Treat as handshake-candidate from unknown / first-contact
 		// source and apply the rate limits intended for that path.
 		//
-		// AER-012: exempt packets for an IN-PROGRESS handshake (we already
-		// hold listenerHandshake state for this address) from the per-source
-		// flood bucket. That bucket (10 burst, 1/sec, keyed by IP) can't keep
+		// Packets for an IN-PROGRESS handshake (this listener holds
+		// listenerHandshake state for the address) bypass the per-source
+		// flood bucket. That bucket (10 burst, 1/sec, keyed by IP) cannot keep
 		// up with the ~1.43/sec msg1/msg3 retransmit cadence, so a dial that
-		// began while the bucket was low could never self-recover — a churn
-		// amplifier. This does not widen the first-contact flood surface: the
-		// initial msg1 still had to pass the limiter to create the entry, the
-		// handshake map is hard-capped (AE-P-21), and the global limiter below
-		// still applies to every packet.
+		// began while the bucket was low could never complete. This does not
+		// widen the first-contact flood surface: the initial msg1 still passes
+		// the limiter to create the entry, the handshake map is held at
+		// maxIncompleteHandshakes (evictOldestHandshakeLocked), and the global
+		// limiter below still applies to every packet.
 		l.mu.Lock()
 		_, handshakeInProgress := l.handshakes[key]
 		l.mu.Unlock()
@@ -455,15 +455,15 @@ func (l *noiseListener) dispatchToSession(key string, msg []byte) bool {
 	}()
 	err := nc.decryptAndDeliver(msg)
 	if err != nil && len(msg) > 0 && msg[0] == dialNoncePrefix {
-		// AER-003: AEAD failed AND this is a nonce-tagged handshake packet
-		// (0xFD) — almost certainly a fresh msg1 from a peer that restarted
-		// on the same 5-tuple. Do NOT claim it; return false so the readLoop
-		// routes it to handleHandshake (rate-limited) instead of silently
-		// eating every re-handshake until the dead session is reaped (which
-		// otherwise locked the peer out for minutes and tripped the 30-min
-		// address dead-cooldown). A genuine session data frame whose random
-		// first byte happens to be 0xFD would have DECRYPTED successfully and
-		// never reached here, so established traffic is unaffected.
+		// AEAD failed AND this is a nonce-tagged handshake packet (0xFD):
+		// almost certainly a fresh msg1 from a peer that restarted on the
+		// same 5-tuple. Do NOT claim it; return false so runReader routes it
+		// to handleHandshake (rate-limited) instead of swallowing every
+		// re-handshake until the dead session is reaped, which would lock the
+		// peer out for that long and trip the address dead-cooldown. A genuine
+		// session data frame whose random first byte happens to be 0xFD would
+		// have DECRYPTED successfully and never reached here, so established
+		// traffic is unaffected.
 		return false
 	}
 	// Established-session trust: a non-handshake AEAD failure (corruption,
@@ -551,15 +551,17 @@ func (l *noiseListener) removeSessionForConn(nc *noiseConn) {
 }
 
 // maxIncompleteHandshakes is a hard ceiling on the number of in-flight
-// (incomplete) handshake states the listener holds at once. AE-P-21:
+// (incomplete) handshake states the listener holds at once, enforced by
+// evictOldestHandshakeLocked at every insert into l.handshakes.
 // pruneStaleHandshakes bounds the map only by a 30s TTL, and the per-source +
 // global rate limiters bound only the arrival rate. When an operator sets
-// RequireRetryToken=false (transport.go, legacy-initiator interop) the
-// stateless-retry anti-amplification early-return (handshake.go) is skipped, so
-// spoofed first-contact msg1s each allocate a Noise HandshakeState. This cap
-// sits far above any realistic concurrent legitimate incomplete-handshake
-// working set yet well below the rate×TTL flood ceiling (~30k at the 1000/s
-// default), so it never fires in normal operation and backstops memory.
+// RequireRetryToken=false (transport.go, for an initiator that does not read
+// the retry prefix) the stateless-retry anti-amplification early-return
+// (handleHandshake) is skipped, so spoofed first-contact msg1s each allocate
+// a Noise HandshakeState. This cap sits far above any realistic concurrent
+// legitimate incomplete-handshake working set yet well below the rate×TTL
+// flood ceiling (~30k at the 1000/s default), so it never fires in normal
+// operation and backstops memory.
 const maxIncompleteHandshakes = 16384
 
 // evictOldestHandshakeLocked enforces maxIncompleteHandshakes by discarding the
@@ -567,7 +569,7 @@ const maxIncompleteHandshakes = 16384
 // hold l.mu. Evicting the oldest (rather than rejecting the new arrival)
 // preserves the ability to always accept a fresh handshake while bounding
 // memory — the oldest entry is closest to its TTL and the most likely to be
-// abandoned/stale. AE-P-21.
+// abandoned/stale.
 func (l *noiseListener) evictOldestHandshakeLocked() {
 	if len(l.handshakes) < maxIncompleteHandshakes {
 		return
@@ -581,7 +583,7 @@ func (l *noiseListener) evictOldestHandshakeLocked() {
 		}
 	}
 	if oldestKey != "" {
-		dbgSession.Printf("AE-P-21: evicting oldest incomplete handshake %s (cap %d reached, age %v)", oldestKey, maxIncompleteHandshakes, time.Since(oldestCreated))
+		dbgSession.Printf("evicting oldest incomplete handshake %s (cap %d reached, age %v)", oldestKey, maxIncompleteHandshakes, time.Since(oldestCreated))
 		delete(l.handshakes, oldestKey)
 	}
 }
