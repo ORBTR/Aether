@@ -618,9 +618,9 @@ recvLoop:
 // DTLS use for their handshakes.
 const handshakeRetransmitInterval = 700 * time.Millisecond
 
-// acceptHandoffTimeout bounds how long a completed handshake/resume waits to
-// hand its session to a slow Accept consumer before dropping it. The handoff
-// runs off the readLoop (AER-019) so this never stalls packet dispatch.
+// acceptHandoffTimeout bounds how long handOffSession waits for Accept to take
+// a completed handshake's or resume's session before closing it. The wait runs
+// off the read loop, so this bounds that goroutine's life, not packet dispatch.
 const acceptHandoffTimeout = 1 * time.Second
 
 // msg3RetransmitWindow bounds how long the initiator keeps re-sending msg3
@@ -1175,24 +1175,11 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 	l.mu.Unlock()
 	s := aether.NewConnection(l.transport.localNode, remoteNode, nc, aether.ProtoNoise)
 	s.OnClose(func() { nc.Close() })
-	// AER-019: hand the accepted session to the Accept queue from a GOROUTINE,
-	// not inline on the readLoop. handleHandshake runs on the single readLoop;
-	// blocking here on a full l.incoming (a slow/stalled Accept consumer) would
-	// stall ALL packet dispatch on this socket — data, ACKs, and in-flight dial
-	// responses — presenting as node-wide handshake/session timeouts. The
-	// recover guards l.incoming being closed on shutdown (matches the relay
-	// accept path); a listener not draining within the timeout drops the
-	// session rather than leaking a goroutine.
-	go func() {
-		defer func() { _ = recover() }()
-		select {
-		case l.incoming <- aether.IncomingSession{Session: s, Reader: nc, Writer: nc}:
-		case <-ctx.Done():
-			nc.Close()
-		case <-time.After(acceptHandoffTimeout):
-			nc.Close()
-		}
-	}()
+	// The hand-off to Accept runs off this read loop (handOffSession, which
+	// bounds the wait by acceptHandoffTimeout and closes the session when the
+	// listener ends or ctx ends): inline here, a full Accept queue would hold
+	// every datagram of this socket, data, ACKs and dial responses included.
+	go l.handOffSession(ctx.Done(), s, nc)
 }
 
 // resolveHandshakeKey extracts the prologue key, optional scope ID, pattern flag,
