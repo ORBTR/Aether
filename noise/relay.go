@@ -334,16 +334,10 @@ func (l *noiseListener) handleRelayedHandshake(relayConn *noiseConn, sourceNodeI
 	s := aether.NewConnection(l.transport.localNode, remoteNode, nc, aether.ProtoNoise)
 	s.OnClose(func() { nc.Close() })
 
-	// Notify listener of new session
-	// We need to be careful not to block if channel is full
-	go func() {
-		select {
-		case l.incoming <- aether.IncomingSession{Session: s, Reader: nc, Writer: nc}:
-		case <-time.After(1 * time.Second):
-			// Drop if listener not accepting
-			nc.Close()
-		}
-	}()
+	// The hand-off to Accept runs off the relay conn's reader (handOffSession,
+	// which bounds the wait by acceptHandoffTimeout and closes the session when
+	// the listener ends); this path has no context, so nil stands for it.
+	go l.handOffSession(nil, s, nc)
 
 	return nil
 }

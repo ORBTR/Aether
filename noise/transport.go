@@ -567,6 +567,7 @@ func (t *NoiseTransport) Listen(ctx context.Context) (aether.Listener, error) {
 		handshakes: make(map[string]*listenerHandshake),
 		sessions:   aether.NewConnectionMap(),
 		incoming:   make(chan aether.IncomingSession, 32),
+		closed:     make(chan struct{}),
 	}
 	// Store connection reference in transport for STUN sending
 	t.stunConn = primaryConn

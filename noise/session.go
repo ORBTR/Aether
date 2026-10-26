@@ -96,13 +96,20 @@ func newNoiseConnListener(ptr *noiseListener, send, recv *noise.CipherState, rem
 }
 
 type noiseListener struct {
-	transport    *NoiseTransport
-	conn         *net.UDPConn // primary UDP socket (IPv4 on Fly, dual-stack elsewhere)
-	ipv6Conn     *net.UDPConn // optional IPv6 socket for same-origin private traffic
-	mu           sync.Mutex
-	handshakes   map[string]*listenerHandshake
-	sessions     *aether.ConnectionMap // addr/NodeID/scope → noiseConnSession
-	incoming     chan aether.IncomingSession
+	transport  *NoiseTransport
+	conn       *net.UDPConn // primary UDP socket (IPv4 on Fly, dual-stack elsewhere)
+	ipv6Conn   *net.UDPConn // optional IPv6 socket for same-origin private traffic
+	mu         sync.Mutex
+	handshakes map[string]*listenerHandshake
+	sessions   *aether.ConnectionMap // addr/NodeID/scope → noiseConnSession
+	incoming   chan aether.IncomingSession
+	// closed is closed once, by run when its read loop ends, and l.incoming is
+	// never closed. handOffSession selects on it beside its send, so a
+	// hand-off in flight when the listener ends drops its session instead of
+	// sending on a channel being closed, and Accept selects on it to return
+	// io.EOF once the queue is drained. A listener built without Listen leaves
+	// it nil, which no select ever sees ready.
+	closed       chan struct{}
 	pendingDials map[string]chan []byte // nonce hex → channel for outgoing handshake responses
 	quicDemux    *DemuxPacketConn       // routes QUIC packets to quic-go
 	// drops tallies every datagram this listener discards or diverts, by
@@ -122,16 +129,53 @@ func (l *noiseListener) connFor(addr *net.UDPAddr) *net.UDPConn {
 	return l.conn
 }
 
-// Accept waits for the next incoming session.
+// Accept waits for the next incoming session. It consumes l.incoming, fed by
+// handOffSession, and l.closed, closed by run when the read loop ends: after
+// that it drains what the queue still holds and then returns io.EOF, the end
+// the Listener contract's callers stop on. The queue itself is never closed
+// (see handOffSession), so the end of the listener is read from l.closed.
 func (l *noiseListener) Accept(ctx context.Context) (aether.Connection, error) {
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case inc, ok := <-l.incoming:
-		if !ok {
+	case inc := <-l.incoming:
+		return inc.Session, nil
+	case <-l.closed:
+		select {
+		case inc := <-l.incoming:
+			return inc.Session, nil
+		default:
 			return nil, io.EOF
 		}
-		return inc.Session, nil
+	}
+}
+
+// handOffSession queues s, a session whose handshake or resume has just
+// completed, for Accept. It consumes s and its noiseConn nc, cancel (the Done
+// channel of the context the caller's read loop runs under; nil from
+// handleRelayedHandshake, which has none) and l.closed; Accept consumes the
+// queue. It runs as its own goroutine, started by handleHandshake,
+// handleResumePacket and handleRelayedHandshake: the first two run on the
+// listener's read loop (runReader) and the third on a relay conn's reader,
+// where a wait on a full queue would hold every other datagram of that
+// socket, so the wait lives here, bounded by acceptHandoffTimeout. l.incoming
+// is never closed, because a close while a hand-off is sending on it is a
+// data race whatever the sender selects on; the end of the queue is the
+// second channel l.closed, which run closes when the read loop ends, the
+// shape decryptAndDeliver keeps for noiseConn.inbox (noiseConn.closed read
+// before the send, inbox never closed) and DeliverQUICPacket for
+// DemuxPacketConn.inbox. A session not taken before the listener ends, the
+// caller's context ends or the timeout fires is closed here, so nothing it
+// holds outlives them.
+func (l *noiseListener) handOffSession(cancel <-chan struct{}, s aether.Connection, nc *noiseConn) {
+	select {
+	case l.incoming <- aether.IncomingSession{Session: s, Reader: nc, Writer: nc}:
+	case <-l.closed:
+		nc.Close()
+	case <-cancel:
+		nc.Close()
+	case <-time.After(acceptHandoffTimeout):
+		nc.Close()
 	}
 }
 
@@ -146,7 +190,12 @@ func (l *noiseListener) Addr() net.Addr {
 }
 
 func (l *noiseListener) run(ctx context.Context) {
-	defer close(l.incoming)
+	// The read loop's end is published on l.closed, never by closing
+	// l.incoming: handOffSession goroutines started by the last datagrams may
+	// still be sending on the queue when this returns, and a close of a channel
+	// another goroutine is sending on is a data race, so the queue stays open
+	// and its senders and Accept both read the end from l.closed.
+	defer close(l.closed)
 	go func() {
 		<-ctx.Done()
 		_ = l.conn.Close()
