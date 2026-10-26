@@ -18,12 +18,11 @@ import (
 type FrameWriter func(*Frame) error
 
 // BuildGoAwayFrame constructs a GOAWAY frame for emission on the given
-// control stream. Pulled out of the Noise and TCP adapters because both
-// adapters built byte-identical frames — only the SenderID / ReceiverID /
-// StreamID inputs differed, and those now flow in as arguments. The
-// frame is returned (not sent) so the adapter can choose its own write
-// path (writeFrame vs scheduler enqueue vs direct conn.Write during
-// teardown).
+// control stream. SendGoAway, which both adapters' GoAway call, builds its
+// frame here, so the two differ only in the SenderID / ReceiverID /
+// StreamID they pass. The frame is returned (not sent) so the adapter can
+// choose its own write path (writeFrame vs scheduler enqueue vs direct
+// conn.Write during teardown).
 func BuildGoAwayFrame(sender, receiver PeerID, controlStreamID uint64, reason GoAwayReason, message string) *Frame {
 	payload := EncodeGoAway(reason, message)
 	return &Frame{
@@ -53,8 +52,8 @@ func SendGoAway(writer FrameWriter, sender, receiver PeerID, controlStreamID uin
 // `remoteShort` is the truncated peer NodeID already prepared by the
 // caller (typically nodeID.Short()). closeWithErr is the session's
 // CloseWithError so the inbound GOAWAY tears the session down with the
-// peer-supplied reason as the close cause. Adapters used to inline this
-// 4-line body each; one definition keeps the log format stable across
+// peer-supplied reason as the close cause. Both adapters' handleGoAway
+// call it, so one definition keeps the log format stable across
 // transports.
 func HandleGoAwayFrame(closeWithErr func(error) error, remoteShort, proto string, frame *Frame) {
 	reason, message := DecodeGoAway(frame.Payload)

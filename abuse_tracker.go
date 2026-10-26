@@ -18,12 +18,12 @@ import (
 // one type so the adapter call sites collapse to `tracker.Report(reason)`
 // and the threshold-breaker path lives in exactly one place.
 //
-// Adapters used to inline three near-identical methods each:
+// Each adapter's three methods are one line over it:
 //
-//   - reportAbuse(reason) — record + maybe GoAway + maybe close
-//   - PeerAbuseScore()    — read the current decayed score
-//   - SetAbuseScoreRegistry(any) — swap the per-session registry for a
-//     cross-session one, validating the concrete type
+//   - reportAbuse(reason) — Report: record + maybe GoAway + maybe close
+//   - PeerAbuseScore()    — PeerScore: read the current decayed score
+//   - SetAbuseScoreRegistry(any) — SetRegistry: swap the per-session
+//     registry for a cross-session one, validating the concrete type
 //
 // The tracker owns the Score pointer so SetRegistry on the tracker
 // uniformly updates both adapters. Goaway is a closure rather than a

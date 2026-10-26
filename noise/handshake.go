@@ -780,12 +780,15 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 	state := hs.state
 	scopeID := hs.scopeID
 
-	// Strip the dial-nonce envelope if present. msg3 now carries it (as msg1
-	// always has) so the classifier routes it as PacketDial instead of
-	// coin-flipping it into the QUIC demux — see the wrapDialResponse call on
-	// the initiator side. Tolerates a bare msg3 so a peer on an older build,
-	// which still sends it raw, keeps interoperating (its msg3 simply retains
-	// the ~50% misroute until it upgrades).
+	// Strip the dial-nonce envelope if present. msg3 carries it, as msg1
+	// does, so ClassifyPacket routes it as PacketDial rather than by its
+	// first ciphertext byte, which falls in the QUIC range half the time —
+	// see the wrapDialResponse call on the initiator side. A bare msg3 is
+	// read as it arrives: an initiator that sends msg3 unwrapped reaches
+	// here only when runReader does not divert it first (a first byte in
+	// the QUIC range goes to DeliverQUICPacket, resumePrefix to
+	// handleResumePacket), and ReadMessage decides whether the bytes are a
+	// msg3.
 	msg3 := msg
 	stripped := false
 	if n := currentDialNonce(msg); n != nil {
@@ -812,8 +815,9 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 		// Not a valid msg3. If we have already sent msg2, this is almost
 		// certainly a retransmitted msg1 — the initiator re-sending
 		// because our msg2 was lost. Re-send the cached msg2 and KEEP
-		// the handshake state; the old behaviour (delete) turned a
-		// single dropped msg2 into a failed handshake.
+		// the handshake state: the initiator retransmits msg1 on
+		// handshakeRetransmitInterval until msg2 arrives, so deleting the
+		// entry here would make one dropped msg2 fail the handshake.
 		if hs.responded && hs.response != nil {
 			// Re-wrap with THIS msg1's dial nonce, not the one the cached
 			// msg2 was first sent under. The initiator drops its nonce when

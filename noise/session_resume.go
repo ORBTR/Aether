@@ -11,10 +11,10 @@
 // Overview — how resumption works end-to-end:
 //
 //  1. **Responder issues a ticket** after a successful XK/XX handshake
-//     (`handshake.go:590`). The ticket is encrypted with a transport-
-//     local AES-256-GCM key and contains the full Noise CipherState
-//     (SendKey, RecvKey, Nonce, Caps) keyed for the responder's
-//     perspective.
+//     (handleHandshake, once the session is in l.sessions). The ticket is
+//     encrypted with a transport-local AES-256-GCM key and contains the
+//     full Noise CipherState (SendKey, RecvKey, Nonce, Caps) keyed for the
+//     responder's perspective.
 //
 //  2. **Responder hands ticket + plaintext keys to the initiator** via
 //     a `HANDSHAKE_RESUME_MATERIAL` control frame (sent inside the now-
@@ -429,8 +429,8 @@ func deliverResumeMaterial(nc *noiseConn, m *resumeMaterial) {
 }
 
 // handleResumePacket is the responder-side entry point for 0.5-RTT
-// resume attempts. Called by the listener's read loop when a datagram
-// prefixed with resumePrefix (0xFD) arrives. The packet layout is:
+// resume attempts. runReader calls it for a datagram whose first byte is
+// resumePrefix (which is not dialNoncePrefix). The packet layout is:
 //
 //	[1B prefix=0xFA][2B opaqueLen][opaque ticket][32B ephemeral X25519 pub][32B binder]
 //

@@ -420,9 +420,9 @@ func NewTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 		dbgTCP.Printf,
 	)
 	// Per-StreamID accept dispatch + AcceptStream FIFO — shared
-	// implementation in the root aether package. NonBlockingDrop
-	// matches pre-consolidation semantics: when the FIFO is full the
-	// OPEN-frame handler drops silently rather than stalling readLoop.
+	// implementation in the root aether package. NonBlockingDrop: when the
+	// FIFO is full the OPEN-frame handler drops the stream rather than hold
+	// the readLoop, which runs handleOpen and handleImplicitOpen.
 	s.acceptor = aether.NewStreamAcceptor(aether.StreamAcceptorConfig{
 		Mode:      aether.NonBlockingDrop,
 		Closed:    base.CloseSignal(),
@@ -952,10 +952,13 @@ func (s *TCPSession) handleClose(frame *aether.Frame) {
 		return
 	}
 	// Transition AND remove-from-map BEFORE releasing s.mu, so that any
-	// concurrent deliverToStream which has not yet acquired s.mu will
-	// see the deleted entry and drop the frame; the residual race (a
-	// reader that already cached `st` before this lock acquisition) is
-	// handled by deliverToStream's panic-recover.
+	// concurrent deliverToStream which has not yet acquired s.mu sees the
+	// deleted entry and drops the frame. A deliverToStream that already holds
+	// st from a lookup before this lock hands its payload to enqueueDelivery,
+	// which selects on deliverDone (closed by the teardown below) beside its
+	// send on deliverCh, a channel nothing closes: the payload is queued for
+	// deliverLoop's drain or dropped, and the send never meets a closed
+	// channel.
 	st.state.Transition(aether.EventRecvFIN)
 	fullyClosed := !st.state.IsOpen()
 	if fullyClosed {
@@ -1003,7 +1006,7 @@ func (s *TCPSession) releaseStream(streamID uint64) {
 // scheduler, health monitor, conn-window and frame writer. The
 // stream-window lookup acquires s.mu around the streams-map read.
 // WakeScheduler is false because the TCP writeLoop runs on a 2 ms
-// ticker rather than blocking on Consume — pre-refactor parity.
+// ticker rather than blocking on Consume, so no writer waits for a wake.
 func (s *TCPSession) controlHandler() *aether.ControlFrameHandler {
 	return &aether.ControlFrameHandler{
 		HealthMon:         s.Health(),
@@ -1317,9 +1320,11 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 	// committed flips to true after every post-registration step succeeds.
 	// Until then, the deferred rollback unwinds every side-effect that
 	// registerStream + attachGrantDebouncer + scheduler.Register + writeFrame
-	// installed. Repeated probes against a dying peer used to grow s.streams
-	// unboundedly because a writeFrame failure returned (nil, err) but left
-	// the map entry + GC + scheduler slot + grantDebouncer goroutine pinned.
+	// installed. A (nil, err) return that left the map entry, the GC and
+	// scheduler registrations and the grantDebouncer goroutine in place would
+	// leave a stream no caller holds in s.streams until the stream GC's idle
+	// sweep resets it, counted against MaxConcurrentStreams by registerStream
+	// the whole while.
 	committed := false
 	defer func() {
 		if committed {
@@ -1441,12 +1446,11 @@ func (s *TCPSession) CloseWithError(err error) error {
 	// defer, stall detector, idle watchdog, the ORBTR dedup/multipath
 	// layer, or transport accept-full.
 	callerChain := aether.CaptureCallerChain(2, 4)
-	// Log EVERY close, including clean nil closes. Previously a
-	// nil-error Close() — exactly what the ORBTR dedup/multipath
-	// layer calls on a losing session — was silent, so the real
-	// churn initiator never appeared in [SESSION-CLOSE] and a
-	// downstream readLoop-exit close masked it on the peer. The
-	// callers= chain names whoever actually triggered the close.
+	// Log EVERY close, including a clean nil Close: the dedup/multipath
+	// layer above closes a losing session with a nil error, and a log of
+	// error closes alone would show only the readLoop-exit close that
+	// follows on the peer, not the close that started the churn. The
+	// callers= chain names whoever triggered the close.
 	reason := "clean(nil)"
 	if err != nil {
 		reason = err.Error()

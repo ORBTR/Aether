@@ -129,31 +129,19 @@ func (s *NoiseSession) processIncomingFrame(frame *aether.Frame, indicator byte)
 		}
 	}
 
-	// NOTE: connection-level packetReplay check removed. It was using
-	// frame.SeqNo (per-stream sequence assigned by st.sendWindow.Add) as
-	// if it were a connection-level packet counter. With multiple streams
-	// open (5+ on ORBTR mesh sessions), each stream independently starts
-	// at SeqNo=0; the second stream's first DATA frame collided with the
-	// first stream's bit-0 in the connection-level bitmap and was silently
-	// dropped as a "replay". As stream 0 (gossip) advanced past the
-	// 128-packet window, EVERY frame from streams 1+ (rpc, keepalive,
-	// control, reconcile) fell outside the window and was dropped. The
-	// observable effect was UDP sessions where streams 1-4 had inFlight
-	// frames that never received an ACK (peer never saw them), while
-	// stream 0 gossip kept working.
-	//
-	// Replay protection is preserved by two correct mechanisms:
+	// Replay protection is two layers, and no check here keys on
+	// frame.SeqNo at the connection level:
 	//
 	//   1. noise/nonce_window.go — connection-level: each encrypted UDP
 	//      packet carries an 8-byte explicit nonce; the sliding 64-bit
-	//      bitmap rejects duplicates BEFORE decryption. This is the right
+	//      bitmap rejects duplicates BEFORE decryption. This is the
 	//      layer for transport-level replay protection.
 	//
-	//   2. noiseStream.replay (per-stream) at line 237 — application-level:
-	//      catches reordering within an open stream. The per-stream SeqNo
-	//      space is correctly used here because frame.SeqNo IS per-stream.
-	//
-	// The deleted check was a third, redundant, AND incorrect layer.
+	//   2. noiseStream.replay — per stream, in handleData's Classify and
+	//      Commit: the space frame.SeqNo lives in, since st.sendWindow.Add
+	//      numbers every stream from 0 on its own. A bitmap shared by all
+	//      streams would read the second stream's first frame as the first
+	//      stream's bit 0.
 	s.Health().RecordActivity()
 	// Per-session frame and byte counters consumed by Metrics() — the
 	// receive-side companions to writeFrame's framesSent/bytesSent.
@@ -275,17 +263,12 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 
 	// Anti-replay classification — distinguishes legitimate retransmits
 	// (drop silently, NO abuse) from genuine anomalies (drop AND feed
-	// abuse score). Conflating the two was the fleet-wide churn root
-	// cause: aether's own reliability layer retransmits frames when an
-	// ACK is lost or late, and on any path with non-zero loss those
-	// retransmits arrive after their originals — landing inside the
-	// replay window as ResultDuplicate. The old `Check()` returned
-	// false for all reject reasons, so every retransmit fed
-	// `abuse.ReasonReplayDetected` (weight 8). ~13 retransmits in
-	// ~28 s crossed the abuse threshold (100) and killed the session.
-	// On lossy paths this killed sessions faster than the connection
-	// manager could re-establish them, producing the rising-churn
-	// pattern.
+	// abuse score). The two must be told apart because aether's own
+	// reliability layer (reliabilityTick, the NACK path in handleACK)
+	// retransmits a frame when its ACK is lost or late, and on any path with
+	// loss those retransmits arrive after their originals — landing inside
+	// the replay window as ResultDuplicate — while reportAbuse scores
+	// abuse.ReasonReplayDetected at weight 8 against a threshold of 100.
 	//
 	// Classify separates the cases: only Ancient (SeqNo below window
 	// bottom — a legitimate retransmit cannot land that far behind the
@@ -907,8 +890,7 @@ func (s *NoiseSession) handleReset(frame *aether.Frame) {
 // scheduler, health monitor, conn-window and frame writer. Constructed
 // per-call (cheap struct) so handler call sites stay independent of
 // session lifecycle ordering. The stream-window lookup acquires s.mu
-// around the streams-map read — the same locking the inlined handler
-// used pre-refactor.
+// around the streams-map read, as every reader of s.streams does.
 func (s *NoiseSession) controlHandler() *aether.ControlFrameHandler {
 	return &aether.ControlFrameHandler{
 		HealthMon:         s.Health(),
