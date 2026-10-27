@@ -61,9 +61,8 @@ func UnmarshalResponse(data []byte) (*RPCResponse, error) {
 // permit a peer-supplied 4 GiB length to drive `make([]byte, length)`
 // and OOM the process). The length check runs BEFORE the make, so a
 // hostile peer's oversized prefix surfaces as ErrMessageTooLarge
-// without any allocation (was H-Codec-ReadMessage-4GB; reading the
-// audit confirmed the existing check is in the right order — this
-// patch tightens the maxSize=0 default).
+// without any allocation; the maxSize=0 substitution is what keeps that
+// check bounded for a caller that passes no limit.
 func ReadMessage(reader io.Reader, maxSize uint32) ([]byte, error) {
 	if maxSize == 0 {
 		maxSize = MaxMessageSize

@@ -150,9 +150,10 @@ type noiseStream struct {
 	// rack runs RFC 8985 time-based loss detection on this stream.
 	// Updated by handleACK on every successful ACK (Ack call), consulted
 	// each reliability tick to enumerate freshly-lost seqs to retransmit.
-	// Replaces the previous "every RTO triggers OnLoss" cwnd-collapse
-	// pattern — RACK fires OnLoss once per actual loss, not once per
-	// retransmit attempt.
+	// It is the loss-signal authority: reliabilityTick calls
+	// OnLossWithPipe once per tick for the seqs DetectLost returns, so
+	// cwnd is reduced once per actual loss and not once per retransmit
+	// attempt (the RTO path re-sends without calling OnLoss).
 	rack *congestion.RACK
 
 	// tlp implements RFC 8985 §7 Tail Loss Probe. Armed by the adapter

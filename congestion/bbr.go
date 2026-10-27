@@ -373,9 +373,9 @@ func (b *BBRController) OnAckWithPipe(ackedBytes int64, rtt time.Duration, pipeB
 // (NoiseSession.cong) don't need a swap.
 //
 // rtProp and btlBw are seeded with sensible defaults (rtPropResetDefault,
-// btlBwResetDefault) rather than zeroes — was the H-BBR-ResetCWND-DivZero
-// finding. With both at zero, recomputeOutputs produces bdp=0 (clamped
-// to minCWND) and pacingRate=0 (clamped to bbrMinPacingRate which is
+// btlBwResetDefault) rather than zeroes. With both at zero,
+// recomputeOutputs produces bdp=0 (clamped to minCWND) and pacingRate=0
+// (clamped to bbrMinPacingRate which is
 // 1400 B/s — far below useful), so post-reset the sender spends many
 // rounds at near-floor pacing before BBR's filters re-converge. Seeding
 // at modest defaults gives the controller a non-degenerate starting
@@ -595,11 +595,11 @@ type maxFilter struct {
 func (f *maxFilter) update(sample float64) {
 	if len(f.samples) >= f.windowSize {
 		// Shift left and overwrite the tail so the backing array stays
-		// at windowSize entries — was L-BBR-MaxFilter-Backing: the
-		// previous `samples[1:]` slid the slice header but kept the
-		// original backing array growing unboundedly under repeated
-		// append+reslice. With copy-then-overwrite the backing array
-		// is bounded by windowSize forever.
+		// at windowSize entries: update runs on every ACK for the
+		// controller's life (OnAckSampled, OnAck), and a reslice
+		// `samples[1:]` followed by append would move the slice header
+		// along a backing array that keeps growing, where
+		// copy-then-overwrite keeps it bounded by windowSize.
 		copy(f.samples, f.samples[1:])
 		f.samples[len(f.samples)-1] = sample
 		return

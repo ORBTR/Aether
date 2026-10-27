@@ -271,7 +271,7 @@ func (w *SendWindow) Ack(seqNo uint32) *SendEntry {
 // Wrap-attack defence: end may be ^uint32(0) (0xFFFFFFFF) from a
 // malicious or buggy peer; the naive `for seq := start; seq <= end; seq++`
 // then never terminates because seq wraps to 0 and continues to satisfy
-// `seq <= end` forever (was M-AckRange-Wrap-Loop). Cap the iteration
+// `seq <= end` forever. Cap the iteration
 // at maxAckRangeSpan entries — a real cumulative ACK never covers
 // that many seqs in one frame; anything larger is corruption or attack.
 func (w *SendWindow) AckRange(start, end uint32) int {
@@ -388,17 +388,13 @@ func (w *SendWindow) ProcessCompositeACK(ack *aether.CompositeACK, reorderThresh
 			// on EVERY subsequent duplicate ACK, while our base is pinned at G,
 			// so BaseACK==base-1 < base holds for the whole life of the gap.
 			// The SACK bitmap on those ACKs is FRESH and is the only signal
-			// that clears the received tail from flight and fast-retransmits G.
-			// Discarding it here (the old `return nil,nil`) starved gap
-			// recovery: inFlight never drained, base never advanced, the
-			// receiver re-ACKed forever (millions of ack_emit_duplicate), and
-			// the consumer keepalive reaped the wedged (still grade-A) session
-			// at ~62s — the fleet-wide noise-udp sawtooth. Skip only the
-			// (now-empty) cumulative removal and fall through to the bitmap /
-			// ExtRange scan below, which is indexed off BaseACK and therefore
-			// evaluates exactly base.. correctly. Counted for observability —
-			// a burst of stale-BaseACKs marks an active gap, not an attack, so
-			// it is deliberately NOT flagged as suspicious.
+			// that clears the received tail from flight and fast-retransmits G,
+			// so the ACK is not discarded: only the (empty) cumulative removal
+			// is skipped, and the bitmap / ExtRange scan below, which is
+			// indexed off BaseACK and therefore evaluates exactly base..
+			// correctly, still runs. Counted for observability — a burst of
+			// stale-BaseACKs marks an active gap, not an attack, so it is
+			// deliberately NOT flagged as suspicious.
 			atomic.AddUint64(&w.staleBaseACKs, 1)
 		}
 	}
@@ -531,9 +527,8 @@ func (w *SendWindow) ProcessCompositeACK(ack *aether.CompositeACK, reorderThresh
 // frame that's already been retransmitted doesn't re-trip Expired the
 // next tick before the new attempt has had a chance to ACK. SentAt
 // stays the original timestamp for diagnostics; XmitTime is the value
-// the dedicated BumpXmitTime path was added to maintain (was the
-// H-Reliability-Expired finding — Expired against SentAt produced a
-// retransmit storm under sustained loss).
+// BumpXmitTime maintains for this comparison (the adapter bumps it on
+// every retransmit).
 func (w *SendWindow) Expired(rto time.Duration) []*SendEntry {
 	w.mu.Lock()
 	defer w.mu.Unlock()

@@ -93,9 +93,11 @@ func (r RouteClass) ExpectedRTT() time.Duration {
 }
 
 // AcceptableRTT returns the upper end of the expected band for this class.
-// At AcceptableRTT the RTT component scores ~0.5; at 2×AcceptableRTT it
-// drops to ~0.1. Replaces the old global "× 3 of expected" cliff in
-// mesh/grade/grade.go with a smooth curve calibrated per class.
+// At AcceptableRTT the RTT component (rttHealth) scores ~0.5; at
+// 2×AcceptableRTT it drops to ~0.1 — a logistic calibrated per class rather
+// than a cliff at a multiple of ExpectedRTT, because the aggregate score
+// is what the multipath dispatch layer ranks paths on (DispatchRank) and a
+// step in it would flip that choice back and forth around one RTT value.
 func (r RouteClass) AcceptableRTT() time.Duration {
 	switch r {
 	case RouteSameRegion:

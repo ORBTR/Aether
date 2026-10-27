@@ -92,9 +92,11 @@ const minWatchdogSweeperInterval = 100 * time.Millisecond
 
 // watchdogRegistry holds every live grantDebouncer and drives a single
 // sweeper goroutine that force-flushes stuck pending grants. One
-// goroutine per process (regardless of peer count × stream count)
-// replaces the previous model of one watchdog goroutine per debouncer,
-// which scaled to 800+ goroutines on a 200-peer × 4-stream fleet.
+// goroutine per process regardless of peer count × stream count: every
+// stream window and every session's conn window has a debouncer
+// (newGrantDebouncer registers each), 800+ on a 200-peer × 4-stream
+// fleet, and a watchdog goroutine per debouncer would scale with that
+// count.
 type watchdogRegistry struct {
 	mu         sync.Mutex
 	debouncers map[*grantDebouncer]struct{}

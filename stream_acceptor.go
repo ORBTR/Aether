@@ -199,9 +199,9 @@ func (a *StreamAcceptor) pushFIFO(st Stream) bool {
 
 // Accept returns the next stream from the FIFO. Blocks until either a
 // stream arrives, ctx is cancelled, or the session closes. Drives the
-// adapter's Session.AcceptStream surface — pre-refactor each adapter
-// owned its own select on (acceptCh, ctx.Done, CloseSignal); now the
-// select lives here once.
+// adapter's Session.AcceptStream surface: the Noise, TCP and QUIC
+// adapters' AcceptStream each delegate here, so the select on (fifo,
+// ctx.Done, closed) exists once.
 func (a *StreamAcceptor) Accept(ctx context.Context) (Stream, error) {
 	select {
 	case st := <-a.fifo:
@@ -222,9 +222,8 @@ func (a *StreamAcceptor) Accept(ctx context.Context) (Stream, error) {
 //
 // Only one waiter per streamID is supported — a second concurrent
 // AcceptByID(id) call closes the previous waiter so its caller returns
-// errClosed rather than hanging forever. The "last caller wins"
-// semantics match what the adapter-local implementations did before
-// this dispatch was consolidated.
+// errClosed rather than hanging forever (last caller wins), which is the
+// contract every adapter's AcceptStreamByID delegates to.
 //
 // Race-safe context cancel: when ctx fires we re-check the waiter map
 // under a.mu and consume any in-flight delivery so the stream is not

@@ -82,10 +82,11 @@ func WaitForActivityPing(
 		return 0, err
 	}
 	// Honour the caller's ctx deadline as the authoritative budget. Only
-	// fall back to PingDefaultDeadline when the caller hasn't set one: the
-	// keepalive loop passes an explicit adaptiveKeepaliveTimeout(RTO) ctx,
-	// and capping it at the 2 s PingDefaultDeadline would cut a 5 s budget
-	// on a slow path short; that budget MUST be the one that fires.
+	// fall back to PingDefaultDeadline when the caller hasn't set one: a
+	// keepalive loop passes a ctx whose deadline it derives from the path's
+	// RTO (the stall probe in reliabilityTick passes a 1 s one), and capping
+	// it at the 2 s PingDefaultDeadline would cut a 5 s budget on a slow
+	// path short; that budget MUST be the one that fires.
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		deadline = time.Now().Add(PingDefaultDeadline)

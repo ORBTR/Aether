@@ -87,13 +87,15 @@ func DefaultACKPolicy() ACKPolicy {
 // declaring a gap as a loss (fast retransmit). Matches QUIC RFC 9002 §6.1.1.
 const ReorderThreshold = 3
 
-// Loss-rate sliding-window defaults. Replaces the previous fixed 256-slot
-// bool ring whose zero-init slots inflated apparent loss during warmup.
-// The window covers the last DefaultLossWindow of stream activity; the
-// warmup gate clears once DefaultLossMinSamples real samples are recorded
-// OR DefaultLossMinDuration of wall-clock has elapsed since engine
-// creation — whichever fires first. A bounded cap on the slice prevents
-// pathological growth on extremely high-rate streams between evictions.
+// Loss-rate sliding-window defaults. The window is a time-ordered sample
+// slice (lossSamples) evicted by age, so only recorded samples enter the
+// rate (a fixed-length ring would count its unfilled slots until it
+// filled). The window covers the last DefaultLossWindow of stream
+// activity; the warmup gate clears once DefaultLossMinSamples real
+// samples are recorded OR DefaultLossMinDuration of wall-clock has
+// elapsed since engine creation — whichever fires first. A bounded cap on
+// the slice prevents pathological growth on extremely high-rate streams
+// between evictions.
 const (
 	DefaultLossWindow      = 5 * time.Second
 	DefaultLossMinSamples  = 32
@@ -103,9 +105,9 @@ const (
 
 // lossSample is one entry in the time-windowed loss ring. lost=false means
 // the packet was received (the OnDataReceived path is the only producer);
-// lost=true is reserved for the future gap-detection wiring that will feed
-// declared losses into the same window without inflating the denominator
-// the way the previous bool-ring did.
+// lost=true is reserved for gap-detection wiring that would feed declared
+// losses into the same window, with the samples in the window as the
+// denominator. TODO: wire gap detection to record lost=true samples.
 type lossSample struct {
 	ts   time.Time
 	lost bool
@@ -125,10 +127,9 @@ type ACKEngine struct {
 	//
 	// Time-windowed sample ring: each entry is (timestamp, lost). Samples
 	// older than lossWindow are evicted on read so the rate reflects the
-	// last lossWindow of traffic regardless of packet rate. The previous
-	// fixed 256-slot bool ring under-counted during warmup — first <256
-	// packets after engine creation always reported a loss rate skewed by
-	// the zero-init "lost" slots that had never received traffic.
+	// last lossWindow of traffic regardless of packet rate, and only
+	// recorded samples enter it, so the first samples after engine creation
+	// are not skewed by capacity that no packet has filled.
 	//
 	// HasWarmedUp() gates downstream emission: callers must not surface
 	// LossRate to the wire (via CompositeACK LossDensity flag) until either
@@ -322,9 +323,9 @@ func (e *ACKEngine) LossRate() uint16 {
 // HasWarmedUp reports whether the loss-rate estimator has accumulated
 // enough samples (or enough wall-clock time) to produce a meaningful
 // rate. Callers should suppress LossDensity-flagged emissions until this
-// returns true to avoid the warmup-skew that the previous fixed-size
-// bool-ring exhibited during the first <256 packets after engine
-// creation.
+// returns true: before lossMinSamples samples or lossMinDuration, a rate
+// over the few samples recorded is not representative, and buildLocked
+// gates the CACKHasLossDensity extension on it.
 func (e *ACKEngine) HasWarmedUp() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()

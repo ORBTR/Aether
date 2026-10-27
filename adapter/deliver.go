@@ -115,15 +115,16 @@ const (
 	// Used under sustained overflow to minimize readLoop stalling.
 	minBackpressure = 10 * time.Millisecond
 
-	// maxBackpressure is the longest wait before dropping a frame.
-	// Lowered to 2ms diagnostic value: investigation showed bidirpc_wait
-	// p99 ~= total p99 on WS same-origin, suggesting a per-stream stall
-	// somewhere on the deliver path. If raising the drop bar surfaces
-	// climbing deliver_backpressure with p99 dropping, this constant is
-	// the dominant contributor and we keep it at 2ms. If
-	// deliver_backpressure stays ~0 and p99 unchanged, the dominant
-	// cause is upstream of deliver (writeLoop HoL) and we accept the
-	// slightly-higher drop bar as cheap.
+	// maxBackpressure is the wait DeliverToRecvChWithSignals gives a full
+	// recvCh before dropping a frame while the recent drop rate is below
+	// dropRateThreshold (stream 1 takes stream1MaxBackpressure instead).
+	// 2 ms bounds what a stalled consumer adds to a bidirectional RPC's
+	// latency through this wait: the wait is paid once per frame that meets
+	// a full channel, and DeliveryStats.Backpressure counts those frames,
+	// so a rising count beside a falling tail latency names this constant
+	// as the dominant contributor while a flat count with the same tail
+	// puts the cause upstream of delivery (the writeLoop's head-of-line
+	// hold, adapter/tcp.go writeLoop).
 	maxBackpressure = 2 * time.Millisecond
 
 	// dropRateThreshold: when the recent drop rate exceeds this,
@@ -306,20 +307,21 @@ func releaseCredit(window *flow.StreamWindow, n int64, streamID uint64, sendUpda
 
 // recvChCapacity returns the receive channel buffer size for a given stream ID.
 // Sized per stream type to reduce maximum payload accumulation:
-//   - Gossip (0): 128 slots (was 32 — a 32-slot channel paired with the
-//     2ms maxBackpressure ceiling cascaded into CongestionDownstream
-//     sev=80 reason=5 emissions on UDP, throttling the sender and
-//     surfacing as walker proving timeouts on noise-UDP edges. 128 slots
-//     gives ~4× headroom for a single full-snapshot IBLT burst at the
-//     cost of an extra ~3 MB worst-case buffer per peer. Verify with
-//     DeliveryStats.Stream0Dropped flattening post-deploy while
-//     Stream1Dropped / StreamOtherDropped track their own pressure.)
-//   - RPC (1): 128 slots (was 32 — bumped after wd4zasivv synthesis
-//     showed cross-region ws_same-origin sessions running 8-11 active
-//     parallel streams saturated the 32-slot channel during burst,
-//     forcing stream-1 into the drop path and producing 30s RPC
-//     timeouts. 128 slots gives ~16× headroom for realistic concurrency
-//     at the cost of an extra ~24 KB worst-case buffer per peer.)
+//   - Gossip (0): 128 slots. A 32-slot channel paired with the 2 ms
+//     maxBackpressure wait fills during one full-snapshot burst on UDP
+//     and the drop path then emits CongestionDownstream (sev=80,
+//     reason=5, DeliverToRecvChWithSignals' sustained branch), throttling
+//     the sender; 128 slots gives ~4× headroom for a single full-snapshot
+//     IBLT burst at the cost of an extra ~3 MB worst-case buffer per
+//     peer. DeliveryStats.Stream0Dropped is where this shows, staying
+//     flat while Stream1Dropped / StreamOtherDropped track their own
+//     pressure.
+//   - RPC (1): 128 slots. Eight to eleven parallel RPC streams on a
+//     cross-region session saturate 32 slots in a burst and force stream
+//     1 into the drop path, where a dropped request becomes a 30 s RPC
+//     timeout (stream1MaxBackpressure); 128 slots gives ~16× headroom
+//     for that concurrency at the cost of an extra ~24 KB worst-case
+//     buffer per peer.
 //   - Keepalive (2): 4 slots (1 ping per 10-30s)
 //   - Control (3): 4 slots (infrequent handshake)
 //   - Dynamic (10+): 8 slots (one-shot request/response)

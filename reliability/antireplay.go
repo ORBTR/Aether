@@ -88,13 +88,13 @@ const (
 	// caller MUST drop the frame silently but MUST NOT feed the abuse
 	// score — retransmissions are protocol-correct, not adversarial.
 	//
-	// Conflating this with the genuine-replay cases was the churn root
-	// cause: on every lossy path, the reliability layer's natural
-	// retransmits accumulated `replay-detected` abuse points until the
-	// abuse threshold tripped and the session was closed (typically
-	// ~28 s in observation). Sessions short-lived under retransmission
-	// produced the rising-churn pattern we tracked through v0.0.308 →
-	// v0.0.310.
+	// The caller (the noise adapter's handleData) charges abuse only for
+	// ResultWrapAttack (an Ancient frame is routed through the receive
+	// window or eager-ACKed, uncharged): on a lossy path the reliability
+	// layer's retransmits arrive as duplicates continually, and reportAbuse
+	// scores abuse.ReasonReplayDetected at weight 8 against a threshold of
+	// 100, so a duplicate that scored would close a session under sustained
+	// retransmission after a dozen or so of them.
 	ResultDuplicate
 
 	// ResultAncient — SeqNo is below the bottom of the sliding window

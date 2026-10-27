@@ -72,11 +72,10 @@ func NewQuicSession(conn quic.Connection, localNodeID, remoteNodeID aether.NodeI
 		streams:     make(map[uint64]*quicStream),
 	}
 	// Per-StreamID accept dispatch + AcceptStream FIFO — shared
-	// implementation in the root aether package. BlockUntilClose
-	// preserves the pre-consolidation QUIC behaviour: when the FIFO
-	// fills up the accept loop stalls until a consumer drains or the
-	// session closes, rather than dropping streams. QUIC has no other
-	// backpressure surface to push on, so blocking is the right
+	// implementation in the root aether package. BlockUntilClose: when the
+	// FIFO fills up the accept loop (acceptLoop) blocks until a consumer
+	// drains or the session closes, rather than dropping streams. QUIC has
+	// no other backpressure surface to push on, so blocking is the right
 	// signal.
 	s.acceptor = aether.NewStreamAcceptor(aether.StreamAcceptorConfig{
 		Mode:      aether.BlockUntilClose,
@@ -222,12 +221,12 @@ func (s *QUICSession) AcceptStreamByID(ctx context.Context, streamID uint64) (ae
 
 // Ping reports session liveness for keepalive. QUIC has its own
 // transport-layer keepalive so we don't write an aether-level PING
-// frame, but we DO need to surface session death to callers — pre-v0.0.22
-// returned the cached RTT regardless of whether the underlying QUIC
-// connection had been torn down, leaving zombie sessions registered
-// in the connection manager indefinitely. Now we check IsClosed plus
-// the underlying QUIC connection's context, which fires on transport
-// close, idle timeout, or peer-initiated CONNECTION_CLOSE.
+// frame, but we DO need to surface session death to callers: the cached
+// RTT alone says nothing about a QUIC connection that has been torn down,
+// and a keepalive that read only it would keep the session registered in
+// the connection manager. So IsClosed is checked plus the underlying QUIC
+// connection's context, which fires on transport close, idle timeout, or
+// peer-initiated CONNECTION_CLOSE.
 func (s *QUICSession) Ping(ctx context.Context) (time.Duration, error) {
 	if s.IsClosed() {
 		return 0, aether.ErrSessionClosed

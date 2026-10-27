@@ -15,11 +15,11 @@ import (
 // CaptureCallerChain returns a `file:line<-file:line<-…` string covering
 // `depth` frames starting `skip` frames up from the call site.
 //
-// Pre-refactor the Noise and TCP adapters' CloseWithError each carried a
-// 20-line copy of this runtime.Callers + frames loop because identifying
-// the first closer in a close cascade ("which goroutine started the
-// teardown?") was load-bearing for diagnosing churn. One definition keeps
-// the log format identical across transports — operators grep one shape.
+// The Noise and TCP adapters' CloseWithError both record the first closer
+// in a close cascade ("which goroutine started the teardown?") through
+// this one definition, since that is what diagnosing churn reads from the
+// [SESSION-CLOSE] line; one definition keeps the log format identical
+// across transports — operators grep one shape.
 //
 // skip is the number of frames above this helper to elide before
 // recording — typically 1 (i.e. start at the function that called

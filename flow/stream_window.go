@@ -237,10 +237,10 @@ const CreditAbuseRatio = 0.5
 
 // CreditAbuseDuration is how long the (grantsEmitted vs consumed) gap
 // must persist past CreditAbuseRatio before CheckCreditAbuse reports
-// abuse. 30s matches the credit-audit advisory in the comprehensive
-// audit: short-lived imbalances under bursty traffic are normal; a
+// abuse. 30 s: short-lived imbalances under bursty traffic are normal; a
 // persistent imbalance for a full half-minute on an active stream is
-// the anomalous signal.
+// the anomalous signal, which the noise adapter's reliabilityTick
+// reports as abuse.ReasonFlowControlAbuse.
 const CreditAbuseDuration = 30 * time.Second
 
 // NewStreamWindow creates a flow control window with the given initial credit.

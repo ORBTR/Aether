@@ -115,7 +115,7 @@ func (s *NoiseSession) processIncomingFrame(frame *aether.Frame, indicator byte)
 		frame.Length = uint32(len(decompressed))
 		frame.Flags = frame.Flags.Clear(aether.FlagCOMPRESSED)
 
-		// B1: re-validate now that the payload is INFLATED. Validate() skips the
+		// Re-validate now that the payload is INFLATED. Validate() skips the
 		// per-type minimum while FlagCOMPRESSED is set (the deflated wire length
 		// is legitimately below the uncompressed minimum), so this is where that
 		// deferred check is actually enforced — against the true size, with the
