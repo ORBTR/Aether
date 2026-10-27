@@ -219,13 +219,14 @@ type SessionMetrics struct {
 
 	// HealthSRTTUs is the smoothed RTT (SRTT) reported by the
 	// session's health.Monitor — populated by Pong arrivals via the
-	// WaitForActivityPing → RecordPingSent → RecordPongRecv chain (S2
-	// fix in aether v0.0.83 ping.go). Independent of the per-stream
-	// RTT estimator (RttP50/95/99) which only fires on DATA-frame ACKs.
-	// On low-traffic sessions (no data sent) RttP50 stays 0 while
-	// HealthSRTTUs still surfaces the ping-derived liveness RTT.
-	// Zero when the session's health.Monitor has never received a
-	// matching Pong (also the pre-S2-fix behaviour fleet-wide).
+	// WaitForActivityPing → RecordPingSent → RecordPongRecv chain
+	// (ping.go, control_handler.go HandlePong). Independent of the
+	// per-stream RTT estimator (RttP50/95/99) which only fires on
+	// DATA-frame ACKs. On low-traffic sessions (no data sent) RttP50
+	// stays 0 while HealthSRTTUs still surfaces the ping-derived
+	// liveness RTT. Zero when the session's health.Monitor has never
+	// received a Pong whose seqNo matches the ping it armed
+	// (RecordPongRecv feeds the estimator only on that match).
 	HealthSRTTUs uint64 `json:"healthSrttUs,omitempty"`
 
 	// Observability histograms surfaced as p50/p99 microseconds — the

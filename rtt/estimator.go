@@ -20,17 +20,18 @@
 // control). Sharing the math (this package) without sharing the sample
 // state preserves both signals while avoiding two copies of RFC 6298.
 //
-// Replaces the prior in-place implementations in
-// reliability.RTTEstimator and the inline EMA in health.Monitor.
-// Capabilities preserved from both:
+// reliability.RTTEstimator (a wrapper at its own API surface) and
+// health.Monitor each hold one Estimator from here. What each needs of
+// it:
 //
 //   - Reliability:  MinRTO/MaxRTO bounds, BackoffRTO (RFC 6298 §5.5),
 //     ack-delay-adjusted samples (UpdateWithDelay,
 //     QUIC RFC 9002 §5.3), Karn's-algorithm-friendly
 //     single-sample API (caller decides which samples
 //     to feed it — retransmitted frames omitted).
-//   - Health:       configurable smoothing alpha for SRTT EMA, lastRTT
-//     accessor for diagnostic readout.
+//   - Health:       configurable smoothing alpha for SRTT EMA
+//     (Options.Alpha), the last-sample accessor
+//     (LastSample) for diagnostic readout.
 package rtt
 
 import (
@@ -44,9 +45,11 @@ import (
 // RTT) supply Options to New.
 const (
 	// DefaultAlpha is the SRTT smoothing factor. RFC 6298 §2.3 specifies
-	// α = 1/8 = 0.125 for new-sample weight. Existing code in
-	// health.Monitor used 0.2 historically; we standardise on the RFC
-	// value here since it produces lower variance in steady state.
+	// α = 1/8 = 0.125 for new-sample weight; it produces lower variance in
+	// steady state than a heavier weight. It governs the data-plane
+	// estimators (reliability.NewRTTEstimator uses NewDefault, Options{});
+	// health.Monitor passes its own alpha through Options.Alpha (the
+	// adapters construct it with 0.2).
 	DefaultAlpha = 0.125
 
 	// DefaultBeta is the RTTVar smoothing factor. RFC 6298 §2.3 specifies

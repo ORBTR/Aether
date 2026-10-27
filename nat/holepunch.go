@@ -54,8 +54,8 @@ func (p PunchMethod) String() string {
 // Both EIM → direct simultaneous open (highest success rate).
 // Otherwise → port prediction; the strategy engine will substitute
 // PunchUPnP when a port mapper is available (cheaper than birthday-style
-// fan-out). The previous code returned PunchDirect for asymmetric pairs
-// which has the lowest success probability for that case.
+// fan-out). PunchDirect for an asymmetric pair has the lowest success
+// probability of the methods, so only the both-EIM case takes it.
 func ChooseMethod(local, remote NATBehaviour) PunchMethod {
 	if local.Mapping == MappingEndpointIndependent && remote.Mapping == MappingEndpointIndependent {
 		return PunchDirect

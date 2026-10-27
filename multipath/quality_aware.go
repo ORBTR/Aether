@@ -91,9 +91,9 @@ type qualityState struct {
 	// probeOnce gates RunProbeLoop start so EnsureK can launch it
 	// idempotently on first call. The probe loop pings non-primary
 	// paths every probeInterval so dead/standby paths can resurrect
-	// based on real liveness signal — without this, dead-path recovery
+	// based on real liveness signal — without it, dead-path recovery
 	// only happens opportunistically when something calls PickPath /
-	// PickByQuality (audit critical finding #1).
+	// PickByQuality, and no probe measures a standby path's RTT.
 	probeOnce sync.Once
 }
 
@@ -108,11 +108,11 @@ type qualityState struct {
 // consecutive failures uses an exponential curve floored at 5 s and
 // capped at 60 s.
 //
-// Replaces the old `Scaler.scaleUp(target=N)` mechanism — the scaler
-// used to decide "I want N connections to this peer" outside the
-// multipath manager and dial through the connection manager. This
-// folds the decision INTO the manager that already knows how many
-// paths there are, eliminating the cross-loop coordination.
+// The decision "I want N paths to this peer" lives INSIDE the manager,
+// which already knows how many paths there are (aliveCount), rather than
+// in a caller that counts them separately and dials through the
+// connection manager; cfg.DialFunc is the one seam the caller provides,
+// so there is no second loop to keep in step with this one.
 func (m *Manager) EnsureK(ctx context.Context, cfg QualityConfig, k int) error {
 	m.mu.Lock()
 	if m.qstate == nil {
@@ -125,11 +125,10 @@ func (m *Manager) EnsureK(ctx context.Context, cfg QualityConfig, k int) error {
 		q := m.qstate
 		m.mu.Unlock()
 		go q.runEnsure(ctx, m)
-		// Critical fix: start the probe loop ONCE per manager. Without
-		// this RunProbeLoop is dead code (it was defined but never
-		// invoked, so dead-path resurrection only happened on
-		// opportunistic PickPath / PickByQuality calls). Now every
-		// manager that runs EnsureK gets active liveness probes.
+		// Start the probe loop ONCE per manager: this and the late-arrival
+		// path below are RunProbeLoop's only callers, so every manager that
+		// runs EnsureK gets active liveness probes rather than only the
+		// opportunistic resurrection PickPath / PickByQuality perform.
 		q.probeOnce.Do(func() {
 			go m.RunProbeLoop(ctx)
 		})
@@ -306,9 +305,8 @@ func (m *Manager) PickByQuality(op quality.DispatchOp) (aether.Session, bool) {
 //
 // Sessions that don't ship STATS frames (TCP, QUIC, in-process fakes)
 // simply don't implement this interface; the type assertion below
-// fails silently and the scorer falls back to local-metrics-only — the
-// behaviour multipath had pre-STATS-wiring, so no regression for those
-// transports.
+// fails silently and the scorer falls back to local-metrics-only, which
+// is all those transports can supply.
 type PeerStatsReporter interface {
 	LastPeerStats() aether.SessionMetrics
 }
@@ -362,8 +360,8 @@ func (m *Manager) computeScoreLocked(p *Path) quality.Score {
 	//
 	// PeerStatsReporter is an optional capability: TCP / QUIC / fake
 	// sessions don't ship STATS frames and don't implement it, so the
-	// type assertion fails silently and the scorer behaves exactly as
-	// before for those transports.
+	// type assertion fails silently and the scorer uses local metrics
+	// only for those transports.
 	if rep, ok := p.Session.(PeerStatsReporter); ok {
 		peer := rep.LastPeerStats()
 		if peerLossPpm := uint32(peer.LossPercent * 10000); peerLossPpm > uint32(metrics.LossPercent*10000) {

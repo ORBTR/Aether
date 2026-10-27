@@ -61,8 +61,10 @@ type Components struct {
 	// FailurePenalty is a multiplicative factor in [0, 1]. Severe
 	// recent failures (consecutive close-with-error events on this
 	// peer-transport pair) drive this toward 0, effectively black-
-	// listing the path. Replaces the boolean ProtoIsDead/
-	// sticky-bad-path memory with a continuous decay.
+	// listing the path. A continuous decay (failurePenalty) rather than
+	// the boolean verdict AddressTracker.ProtoIsDead gives: the aggregate
+	// score is multiplied by it, so a path with recent failures ranks low
+	// without flipping between selectable and unselectable.
 	FailurePenalty float64
 
 	// AgeGrace is a [0, 1] factor that ramps from 0 → 1 over the
@@ -277,8 +279,8 @@ func ageGrace(age time.Duration) float64 {
 
 // failurePenalty exponentially decays based on consecutive recent
 // close-with-error events. 0 events → 1.0; 1 event → ~0.6; 3 events →
-// ~0.2; 5 events → ~0.08. Mirrors what sticky-bad-path memory used
-// to do, but as a continuous factor rather than a boolean blacklist.
+// ~0.2; 5 events → ~0.08. A continuous factor rather than a boolean
+// blacklist, for the reason FailurePenalty gives.
 func failurePenalty(consecutiveFailures int) float64 {
 	if consecutiveFailures <= 0 {
 		return 1.0

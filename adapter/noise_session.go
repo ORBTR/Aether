@@ -532,9 +532,9 @@ func NewNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 	)
 
 	// Per-StreamID accept dispatch + AcceptStream FIFO — shared
-	// implementation in the root aether package. NonBlockingDrop
-	// matches pre-consolidation semantics: when the FIFO is full the
-	// OPEN-frame handler drops silently rather than stalling readLoop.
+	// implementation in the root aether package. NonBlockingDrop: when the
+	// FIFO is full the OPEN-frame handler drops the stream rather than hold
+	// the readLoop, which runs handleOpen and handleImplicitOpen.
 	s.acceptor = aether.NewStreamAcceptor(aether.StreamAcceptorConfig{
 		Mode:      aether.NonBlockingDrop,
 		Closed:    base.CloseSignal(),
@@ -746,34 +746,27 @@ func (s *NoiseSession) notifyStreamAccepted(st *noiseStream) {
 // Ping sends a PING frame and waits briefly for any inbound activity
 // (PONG response or any other frame) before reporting the cached RTT.
 //
-// Pre-v0.0.22 returned the cached health.Monitor RTT immediately after
-// writeFrame returned nil, regardless of whether the peer was actually
-// reachable. That made keepalive blind to zombie sessions: the session's
-// `closed` channel could be closed (IsClosed=true) but s.conn.Write
-// queued the frame into a buffered writer that surfaced the network
-// error several seconds later — by which time keepalive's per-tick
-// retry budget was already spent on stale "OK" responses, and avg RTT
-// was the snapshot from the last completed PING/PONG round-trip.
-//
-// v0.0.22:
-//  1. Fast-fail if IsClosed already — avoids syscall for known-dead
-//     sessions and lets keepalive distinguish "stuck send" from
-//     "session torn down".
-//  2. Capture LastActivity before writeFrame, then poll until either
-//     ctx fires, IsClosed flips, the activity timestamp advances, or
-//     a 2 s ceiling is reached (clamped by ctx deadline if shorter).
-//     Any inbound frame counts as "alive" — we deliberately don't
-//     track per-PING seqNo to avoid adding state. False positives
-//     (peer happens to send something else within 2 s) are fine for
-//     the keepalive use case; the goal is detecting silence.
+// The wait is what lets keepalive see a zombie session: writeFrame can
+// return nil against a torn-down peer, because s.conn.Write queues the
+// frame into a buffered writer that surfaces the network error only
+// seconds later, and the cached health.Monitor RTT read straight after a
+// successful send is the snapshot from the last completed PING/PONG
+// round-trip, which says nothing about the peer now. WaitForActivityPing
+// therefore:
+//  1. Fast-fails if IsClosed already — avoids a syscall for a known-dead
+//     session and lets keepalive distinguish "stuck send" from "session
+//     torn down".
+//  2. Captures LastActivity before writeFrame, then polls until either
+//     ctx fires, IsClosed flips, the Pong for this ping's seqNo arrives,
+//     or the deadline (the caller's ctx deadline, else PingDefaultDeadline)
+//     is reached, at which point any inbound frame since the ping counts
+//     as "alive". A false positive (the peer sent something else inside
+//     the deadline) is fine for keepalive; the goal is detecting silence.
 func (s *NoiseSession) Ping(ctx context.Context) (time.Duration, error) {
-	// CloseSignal() is owned by BaseSession and IS allocated; the local
-	// `s.closed` field (declared on NoiseSession but never make()d) was
-	// silently passing nil here, which kept the WaitForActivityPing
-	// closeSignal select-arm always-blocked and defeated the documented
-	// fast-fail-on-dead-session behaviour. Use the BaseSession signal
-	// so a session torn down mid-probe returns ErrSessionClosed
-	// immediately instead of polling LastActivity for the deadline.
+	// The close signal passed is BaseSession.CloseSignal(), the channel
+	// SignalClose closes (NoiseSession holds no close channel of its own),
+	// so a session torn down mid-probe returns ErrSessionClosed immediately
+	// instead of polling LastActivity for the deadline.
 	return aether.WaitForActivityPing(ctx, s.Health(), s.CloseSignal(), func(seqNo uint32) error {
 		return s.writeFrame(&aether.Frame{
 			SenderID:   s.LocalPeerID(),

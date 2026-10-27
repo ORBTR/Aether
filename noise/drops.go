@@ -10,20 +10,24 @@ package noise
 
 import "sync/atomic"
 
-// DropReason identifies why the listener discarded an inbound datagram.
+// DropReason identifies why the listener discarded or diverted an inbound
+// datagram.
 //
-// WHY THIS EXISTS: every drop on the receive path was a bare `continue` — no
-// log, no counter, nothing. A fleet-wide noise-UDP outage took nine hours to
-// root-cause because the decisive fact ("~50% of msg3 is being handed to the
-// QUIC demux and destroyed") was invisible: the packets simply stopped
-// existing, and no instrument anywhere counted them. Three separate real bugs
-// (retry-token mis-read as msg2, cached msg2 answered with a stale nonce,
-// msg3 coin-flipped into quic-go) all presented identically from the outside —
-// as silence.
-//
-// A single reason-tagged counter would have collapsed that investigation to one
-// lookup. The rule this file exists to enforce: NO SILENT DROPS. Every path
-// that discards a packet names why, and the count is readable at runtime.
+// The rule this file exists to enforce: NO SILENT DROPS. A branch of
+// runReader or handleHandshake that discards or diverts a datagram counts
+// it by reason before its `continue` or return (noiseListener.drops,
+// dropCounters.count), and DropSnapshot reads the tally by reason name, so
+// a datagram that leaves the Noise path is visible by the branch that took
+// it rather than gone without trace. The reasons are per branch, not per
+// fault, because from outside the process every diversion presents as
+// silence: a datagram answered with a retry cookie (DropRetryTokenIssued),
+// one handed to quic-go (DropQUICDemux, a branch classified by first byte
+// alone) and one refused by the first-contact limiter (DropSourceLimit)
+// each look like a handshake that never completes, and only a count per
+// reason separates them. DropForwarderConsumed and DropSessionDeliver name
+// the forwarder-consumed and established-session hand-offs, which
+// runReader does not count. TODO: count those two hand-offs and the
+// 0.5-RTT resume hand-off (handleResumePacket) at their `continue`.
 type DropReason uint8
 
 const (
@@ -95,11 +99,13 @@ type dropCounters [listenerDropReasonCount]atomic.Uint64
 
 // count records one dropped/diverted datagram.
 //
-// Not every reason is a fault: quic_demux, stun, forwarder_consumed,
-// session_deliver and pending_dial are normal routing outcomes. They are
-// counted anyway, because the bug that cost nine hours was a NORMAL-looking
-// outcome (quic_demux) firing on traffic that was never QUIC. Only a count that
-// includes the healthy paths lets you see one of them run away.
+// Not every reason is a fault: quic_demux, stun and pending_dial are normal
+// routing outcomes (forwarder_consumed and session_deliver name two more
+// that runReader does not count, see DropReason). The healthy outcomes are
+// counted too: a normal-looking outcome can fire on traffic that is not
+// its own (the QUIC-demux branch takes any first byte in 0x40-0xBF, see
+// runReader), and only a count that includes the healthy paths lets
+// DropSnapshot's reader see one of them run away.
 func (d *dropCounters) count(r DropReason) {
 	if int(r) < len(d) {
 		d[r].Add(1)

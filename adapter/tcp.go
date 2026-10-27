@@ -955,10 +955,10 @@ func (s *TCPSession) handleClose(frame *aether.Frame) {
 	// concurrent deliverToStream which has not yet acquired s.mu sees the
 	// deleted entry and drops the frame. A deliverToStream that already holds
 	// st from a lookup before this lock hands its payload to enqueueDelivery,
-	// which selects on deliverDone (closed by the teardown below) beside its
-	// send on deliverCh, a channel nothing closes: the payload is queued for
-	// deliverLoop's drain or dropped, and the send never meets a closed
-	// channel.
+	// which selects on deliverDone (closed by the teardown below, when the
+	// stream is fully closed) beside its send on deliverCh, a channel nothing
+	// closes: the payload is queued for deliverLoop's drain or dropped, and
+	// the send never meets a closed channel.
 	st.state.Transition(aether.EventRecvFIN)
 	fullyClosed := !st.state.IsOpen()
 	if fullyClosed {
@@ -1123,12 +1123,10 @@ func (s *TCPSession) writeLoop() {
 		// nothing in compression but extends the writeMu hold and HoL-
 		// blocks stream-1 (RPC). Releasing writeMu after every gossip
 		// frame lets stream-1 interleave instead of waiting for a 16-
-		// frame snapshot burst to drain. Observed effect on v0.0.379:
-		// deliver_backpressure==deliver_dropped grew 1:1 at ~1.5/sec
-		// due to this exact HoL pattern; skipping stream-0 batching
-		// converts the shared writeMu into per-frame fairness without
-		// requiring the per-class writeLoop split that F8's larger
-		// refactor would entail.
+		// frame snapshot burst to drain. Skipping stream-0 batching
+		// gives per-frame fairness on the one shared writeMu; a
+		// writeLoop per class would give the same without the per-frame
+		// release.
 		// A batch is itself a short form (0x85), so only a session whose
 		// grammar has the short forms coalesces.
 		if s.opts.HeaderComp && s.txCompressor.ShortForms() && frame.StreamID != 0 && s.sched.Len() > 0 {

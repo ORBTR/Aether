@@ -343,10 +343,12 @@ type Frame struct {
 //
 // Type-specific minimum-size checks: each control type has a known wire
 // size declared above (OpenPayloadSize, ResetPayloadSize, etc.). A frame
-// arriving with a shorter payload would surface as a decode panic when
-// the type-specific decoder reads past the end (was the
-// H-Frame-Validate-PayloadSize finding). Validation here rejects them
-// before the type-handler is invoked.
+// arriving with a shorter payload would otherwise be read by its decoder
+// as a zero value (DecodeOpenPayload, DecodeReset, DecodeWindowUpdate,
+// DecodeCongestion and DecodeStats each return one on short input) and
+// handled as a real control frame. Validation here rejects it before the
+// type-handler is invoked (minPayloadSizes), which is what lets the noise
+// adapter's processIncomingFrame charge abuse.ReasonMalformedFrame for it.
 func (f *Frame) Validate() error {
 	if !f.Type.IsValid() {
 		return fmt.Errorf("aether: invalid frame type 0x%02X", byte(f.Type))
@@ -360,12 +362,11 @@ func (f *Frame) Validate() error {
 	if f.Flags.Has(FlagENCRYPTED) && f.Nonce.IsZero() {
 		return fmt.Errorf("aether: ENCRYPTED flag set but nonce is zero")
 	}
-	// B1: the per-type minimum describes the UNCOMPRESSED wire size, so it must
-	// not be applied to a payload that is still deflated — a 74-byte STATS frame
-	// compresses to ~40 bytes, which is legitimately below its own minimum, and
-	// checking it here rejected healthy traffic as malformed (one report every
-	// 5s per session, latent since StatsPayloadSize grew 34 -> 74 and crossed the
-	// 64-byte compression gate).
+	// The per-type minimum describes the UNCOMPRESSED wire size, so it must
+	// not be applied to a payload that is still deflated: writeFrame compresses
+	// any payload over 64 bytes, and a 74-byte STATS frame (StatsPayloadSize)
+	// compresses to ~40 bytes, which is legitimately below its own minimum, so
+	// a check here would reject every compressed STATS frame as malformed.
 	//
 	// The check is DEFERRED, NOT DROPPED. The receive path re-runs Validate()
 	// immediately after decompression, where FlagCOMPRESSED has been cleared and

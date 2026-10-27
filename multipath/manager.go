@@ -274,10 +274,11 @@ func (m *Manager) PickPath(n int) aether.Session {
 	// the whole point of the demote is to keep traffic OFF it for
 	// flappingDemoteDur.
 	//
-	// The previous formula `weight - bytesScheduled/weight` inverted the
-	// fair-share semantics — a high-weight path earned deficit 10× faster
-	// per byte than a low-weight path, which is the opposite of "high
-	// weight = bigger share."
+	// Dividing bytesScheduled by weight is what makes weight a share: a
+	// path with twice the weight accrues cost half as fast per byte, so
+	// it carries twice the bytes per round, which is what
+	// EnableWeightedLoadBalance promises ("proportional to each path's
+	// quality score").
 	var best *Path
 	var bestCost float64
 	first := true
@@ -488,7 +489,7 @@ func (m *Manager) ShouldSendRedundant(latencyClass aether.LatencyClass) bool {
 // until something external triggers a re-probe. The recovery path here
 // resurrects all dead standbys (skipping cooldown) and re-runs the
 // promotion — at least one path can return to PathStandby and become
-// the new primary. Was the H-Multipath-DeadPrimary finding.
+// the new primary.
 func (m *Manager) OnPrimaryFailure() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -620,10 +621,10 @@ func (m *Manager) RunProbeLoop(ctx context.Context) {
 // primaryProbeEvery is the modulus that determines how often probeNonPrimary
 // ALSO probes the primary path. Tied to the global probe counter — every Nth
 // probe tick includes the primary. 4 gives a primary-liveness check every
-// ~2 minutes at the default 30s tick. Without primary probing, a silently
-// wedged primary (cwnd-stuck, app reads block, no explicit error) was
-// undetectable until external OnPrimaryFailure was called from dispatch
-// (was H-Multipath-PrimaryProbe).
+// ~2 minutes at the default 30s tick. Probing the primary is how a silently
+// wedged primary (cwnd-stuck, app reads block, no explicit error) is
+// detected: the only other signal is the OnPrimaryFailure call dispatch
+// makes on an explicit error, which such a path never raises.
 const primaryProbeEvery uint64 = 4
 
 // probeNonPrimary pings every non-primary path (and the primary on every

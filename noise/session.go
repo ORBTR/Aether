@@ -290,12 +290,14 @@ func (l *noiseListener) runReader(ctx context.Context, conn *net.UDPConn) {
 		// validates nothing — anything in 0x40-0xBF (128 of 256 values) is
 		// enqueued for quic-go, which discards it if it is not really QUIC.
 		// Raw Noise ciphertext has a uniformly random first byte, which is
-		// why every handshake message this build's initiator sends travels
-		// inside an envelope ClassifyPacket reads before these byte ranges: the
-		// dial-nonce envelope (performInitiatorHandshakeSharedAttempt,
-		// wrapDialResponse) or, for a cross-origin dial's msg3, the routing
-		// preamble (EncodeRoutingPreamble, by its magic). A bare one would take
-		// this branch half the time.
+		// why every handshake message the initiator sends
+		// (performInitiatorHandshakeSharedAttempt) travels inside an envelope
+		// ClassifyPacket tells apart from these byte ranges: the dial-nonce
+		// envelope (dialNoncePrefix, written by
+		// performInitiatorHandshakeSharedAttempt and wrapDialResponse) or, for
+		// a cross-origin dial's msg3, the routing preamble
+		// (EncodeRoutingPreamble, by its magic). A bare one would take this
+		// branch half the time.
 		// The STUN branch below IS guarded by stun.IsMessage (magic-cookie
 		// validated); this one has no equivalent, so DropQUICDemux counts every
 		// datagram diverted here: quic_demux climbing while noise-UDP fails is
@@ -611,9 +613,10 @@ func (l *noiseListener) pruneStaleHandshakes(maxAge time.Duration) {
 	}
 	l.mu.Unlock()
 
-	// B5: Prune external sessions (WebSocket/QUIC relay bridges) that are idle.
-	// Prevents unbounded map growth from sessions that disconnected without cleanup.
-	// Delegated to RelayService which now owns the external session map.
+	// The relay service's external sessions (WebSocket/QUIC/gRPC relay
+	// bridges) idle for maxAge are pruned through RelayService.PruneExternal,
+	// which holds that map (externalSessions), so a bridge session that
+	// disconnected without UnregisterExternal does not stay in it.
 	if l.transport.relayService != nil {
 		l.transport.relayService.PruneExternal(maxAge)
 	}

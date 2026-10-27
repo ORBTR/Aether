@@ -43,11 +43,12 @@ const (
 // an explicit "persistent-congestion exit" path used by the adapter when its
 // probe-before-close confirms the path is alive.
 //
-// PRR replaces the previous "cwnd += ackedBytes*MSS/cwnd during fast
-// recovery" growth, which over-shoots and produces bursty send patterns
-// during recovery. PRR proportionally drains in-flight to the new
-// ssthresh, which empirically performs better on bursty-loss paths and
-// is what Linux's TCP stack has done since 3.2.
+// PRR, in fast recovery with a pipe reading (OnAckWithPipe), proportionally
+// drains in-flight to the new ssthresh rather than growing cwnd by
+// ackedBytes·MSS/cwnd per ACK, which over-shoots and sends in bursts
+// during recovery; the per-ACK growth remains the fallback when no pipe
+// size is supplied (OnAck, pipeBytes 0). Draining proportionally performs
+// better on bursty-loss paths and is what Linux's TCP stack does.
 //
 // Persistent-congestion exit: when the adapter's probe-before-close path
 // (3 Pings within 3 s) succeeds, the path is provably alive, so the
@@ -94,8 +95,8 @@ func (c *CUBICController) SetMSS(mss int) {
 
 // OnAck processes an acknowledgment. Adapter passes pipeBytes (current
 // in-flight) so the recovery-phase PRR formula has the data it needs.
-// Pass 0 for pipeBytes if unknown — fast recovery falls back to the
-// pre-PRR per-ACK growth rule, preserving prior behaviour.
+// Pass 0 for pipeBytes if unknown — fast recovery then falls back to the
+// per-ACK growth rule (OnAckWithPipe).
 func (c *CUBICController) OnAck(ackedBytes int64, rtt time.Duration) {
 	c.OnAckWithPipe(ackedBytes, rtt, 0)
 }

@@ -289,10 +289,10 @@ const cwndUtilSamplePeriod = 16
 // — versus an O(streams × map-iteration + per-stream-lock) walk if
 // it had to fold each window's InFlightBytes() directly.
 //
-// Negative results are clamped to zero defensively: a non-zero return
-// is impossible from a correctly-wired SendWindow set, but the clamp
-// keeps CanSend's invariant (inFlight >= 0) intact even under future
-// audit regressions.
+// Negative results are clamped to zero defensively: a negative value is
+// impossible from a correctly-wired SendWindow set, but the clamp keeps
+// CanSend's invariant (inFlight >= 0) intact should a SendWindow ever
+// decrement past what it added.
 func (s *NoiseSession) totalInFlightBytes() int64 {
 	v := s.inFlightBytes.Load()
 	if v < 0 {
@@ -393,14 +393,15 @@ func (s *NoiseSession) reliabilityTick() {
 			}
 			for _, e := range snap {
 				streamID, st := e.id, e.st
-				// RTO-driven retransmit (safety net). Pre-RACK, this path
-				// also called OnLoss — every retransmit collapsed cwnd by
-				// 30%, which produced the cwnd-stuck-at-floor pattern
-				// FLOW-DIAG caught in production. RACK now owns the
-				// loss-signal authority; RTO is just a re-send mechanism
-				// for ACK-starved sessions where RACK has nothing to
-				// work with (no fack established yet). BackoffRTO still
-				// runs so the RTO interval grows on persistent loss.
+				// RTO-driven retransmit (safety net). This path does not
+				// call OnLoss: RACK (DetectLost below) is the loss-signal
+				// authority and calls OnLossWithPipe once per tick, so
+				// cwnd reacts once per actual loss and not once per
+				// retransmit attempt (under CUBIC each OnLoss cuts cwnd
+				// to cubicBeta, 70%). RTO is just a re-send mechanism for
+				// ACK-starved sessions where RACK has nothing to work
+				// with (no fack established yet). BackoffRTO still runs
+				// so the RTO interval grows on persistent loss.
 				if frame := st.retransmitQ.Dequeue(); frame != nil {
 					s.sched.MarkRetransmit(streamID)
 					s.sched.Enqueue(streamID, frame)
@@ -611,19 +612,19 @@ func (s *NoiseSession) reliabilityTick() {
 				// reset the stall clock. Only if ALL three fail do we
 				// declare the session stuck.
 				//
-				// Pre-v0.0.23 used a single Ping with a 2-second
-				// timeout. On UDP paths with bursty loss (notably fly
-				// cross-region anycast where a 200-ms blackout is
-				// common) that single probe could land entirely in
-				// the bad window and condemn an otherwise-healthy
-				// session. The connection manager would then mark
-				// noise-udp failed for 30 s-2 min, fall back to WS,
-				// and the upgrade churn loop would dominate the
-				// fleet's transport mix until the underlying loss
-				// passed. Three 1-second probes cover ~3 s of wall
-				// time which is long enough for typical fly loss
-				// bursts to clear without being long enough to delay
-				// genuine close-of-dead-session noticeably.
+				// Three 1 s probes rather than one 2 s probe: on a UDP
+				// path with bursty loss (a cross-region anycast path
+				// blacks out for ~200 ms at a time) one probe can land
+				// entirely inside a burst and condemn a healthy
+				// session, which then closes with ErrSessionStuck, the
+				// signal the owning connection manager reads as "fall
+				// back to the next protocol grade" (SessionStallThreshold);
+				// the quality tracker's dial cooldown for a failed path
+				// runs 30 s to 2 min (dialCooldownDuration), so the path
+				// stays abandoned at least that long. Three probes a
+				// second apart cover ~3 s of wall time, long enough for
+				// such a burst to clear and short enough not to delay the
+				// close of a dead session noticeably.
 				const probeAttempts = 3
 				const probeTimeout = 1 * time.Second
 				const probeSpacing = 1 * time.Second
@@ -962,15 +963,17 @@ func (s *NoiseSession) writeFrame(frame *aether.Frame) error {
 	// of times; the first call transforms it, subsequent calls are no-ops
 	// that send the cached bytes.
 	// Compress + encrypt INSIDE writeMu so the check-then-act FlagCOMPRESSED/
-	// FlagENCRYPTED guards execute atomically with the mutation. Was
-	// H-Noise-Frame-Race: two concurrent goroutines (e.g. RACK retx
-	// fighting the original send on the same Frame pointer) could each
-	// pass the !FlagXXX check before either mutated Payload, then both
-	// compressed/encrypted the same plaintext — second one corrupted
-	// the buffer the receiver dedup eventually expects to match. The
-	// re-order moves both check + mutation into the writeMu critical
-	// section. CPU cost: compressPayload + Encrypt run under a lock
-	// the writeLoop already holds for its conn.Write, so the wall-clock
+	// FlagENCRYPTED guards execute atomically with the mutation: a retransmit
+	// re-presents the sendWindow entry's Frame pointer to writeFrame (the
+	// RACK, RTO and NACK paths and the TLP probe enqueue entry.Frame again),
+	// the receiver inflates and decrypts each copy once (processIncomingFrame),
+	// so every copy must carry the bytes the first pass produced, and
+	// writeFrame has callers beside the writeLoop (reliabilityTick's STATS
+	// frame, Ping, the control handlers, Close and Reset) while
+	// FrameEncryptor.Encrypt advances the session's nonce counter, so the
+	// flag check, the payload swap and the write stay inside the one lock
+	// every caller takes. CPU cost: compressPayload + Encrypt run under a
+	// lock the writeLoop already holds for its conn.Write, so the wall-clock
 	// per-frame budget is unchanged.
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -985,13 +988,11 @@ func (s *NoiseSession) writeFrame(frame *aether.Frame) error {
 	}
 
 	// Encryption: encrypt payload if key set and enabled.
-	// MUST be idempotent — see comment above. Re-encrypting already-
-	// encrypted bytes was the root cause of fleet-wide "proto: cannot
-	// parse invalid wire-format data" Unmarshal errors on RPC paths
-	// where retransmits (TLP probes especially after aether v0.0.60's
-	// back-to-back probe fix) re-ran this code on a sendWindow frame
-	// whose Payload had already been swapped to ciphertext by the
-	// first send.
+	// MUST be idempotent — see comment above: a retransmit (RACK, RTO, a
+	// TLP probe, which can follow one another back to back) re-runs this
+	// code on a sendWindow frame whose Payload the first send already
+	// swapped to ciphertext, and the FlagENCRYPTED check is what keeps the
+	// second pass from sealing ciphertext again.
 	if s.encryptor != nil && s.opts.Encryption && !frame.Flags.Has(aether.FlagENCRYPTED) {
 		if err := s.encryptor.Encrypt(frame); err != nil {
 			return fmt.Errorf("aether encrypt: %w", err)

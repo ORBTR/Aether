@@ -201,14 +201,15 @@ func (s *Scheduler) RegisterWithClass(streamID uint64, weight uint8, dependency 
 // Unregister removes a stream from the scheduler. Any queued frames are
 // dropped — but they're returned to the caller (and the pending probe,
 // if any) so upper layers can release the flow-control credit they
-// reserved at Enqueue time. Without that return path, every
-// stream-teardown burnt the credit reserved for in-queue frames,
-// eventually draining the conn-level window (was the
-// H-Scheduler-Unregister-Leak finding).
+// reserved at Enqueue time: the stream's own window is discarded with
+// the stream, but the connection window outlives it and keeps the credit
+// charged for every frame that never reached the wire unless the caller
+// gives it back.
 //
-// Returns (droppedFrames, droppedProbe). Callers (adapter teardown
-// paths) iterate the frames and call ReleaseUnsent on stream-window +
-// conn-window for each payload length.
+// Returns (droppedFrames, droppedProbe). NoiseSession.releaseStream
+// calls connWindow.ReleaseUnsent for each metered frame's payload length;
+// TCPSession.releaseStream discards the return, since a TCP Send reserves
+// no connection credit.
 func (s *Scheduler) Unregister(streamID uint64) (droppedFrames []*aether.Frame, droppedProbe *aether.Frame) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

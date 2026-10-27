@@ -72,7 +72,8 @@ type TLP struct {
 	//      (RFC 9002 §6.2's full handshake-capability exchange — see
 	//      crypto/identity.NodeInfo.MaxAckDelayUS). Falls back to the
 	//      receiver-side approximation max(ACKPolicy.MaxDelay, SRTT/4)
-	//      when the peer didn't advertise (older build / minimal NodeInfo).
+	//      when the peer didn't advertise (a NodeInfo without the field,
+	//      the minimal encoding an over-conn substrate sends).
 	//   3. UpdateMaxAckDelay's EWMA tracks the value from inbound
 	//      CompositeACK AckDelay fields once data flow is established.
 	maxAckDelay time.Duration
@@ -119,8 +120,7 @@ func NewTLP(initialSRTT time.Duration) *TLP {
 // measurement returning math.MaxInt64), 2*srtt overflows int64 and
 // becomes negative — then +maxAckDelay may bring it positive again,
 // surfacing as an undefined value relative to the bounds. Detect either
-// negative or beyond-ceiling and clamp at the ceiling (was
-// L-TLP-Overflow-MaxSRTT).
+// negative or beyond-ceiling and clamp at the ceiling.
 func (t *TLP) computePTO() time.Duration {
 	if t.srtt > tlpPTOCeiling {
 		return tlpPTOCeiling
@@ -157,8 +157,9 @@ func (t *TLP) UpdateSRTT(srtt time.Duration) {
 // satisfies this by passing the peer-advertised value carried in the
 // Noise handshake NodeInfo payload (crypto/identity.NodeInfo.
 // MaxAckDelayUS) — the full handshake-capability exchange. When the
-// peer didn't advertise (older build / minimal NodeInfo encoding) the
-// caller passes the receiver-side approximation max(ACKPolicy.MaxDelay,
+// peer didn't advertise (a NodeInfo without the field, the minimal
+// encoding an over-conn substrate sends) the caller passes the
+// receiver-side approximation max(ACKPolicy.MaxDelay,
 // SRTT/4) as a fallback. UpdateMaxAckDelay's EWMA then takes over once
 // CompositeACKs start flowing.
 //
