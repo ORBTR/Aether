@@ -19,14 +19,30 @@ import (
 // *SendEntry owned by the SendWindow so updates to Retries / Frame are
 // visible to both sides without duplicating fields. The Enqueue
 // path leaves Send nil and keeps the per-entry Retries counter local.
+//
+// PayloadBytes is len(Frame.Payload) as it was when the entry was enqueued:
+// the payload bytes the sender handed over, which the byte cap counts
+// (bufferedBytes adds it at Enqueue and subtracts it wherever the entry
+// leaves: removeBySeq, evictForRoomLocked, Dequeue's acked drop and
+// advanceEntryLocked's age and max-retries drops). It is read instead of
+// the frame because Frame is the sender's live frame: the adapter's
+// writeFrame swaps Frame.Payload for its compressed form when that is
+// shorter and, with a session key, for the ciphertext, under the session's
+// writeMu after the sender has enqueued it here, while Dequeue runs on
+// reliabilityTick, Remove on the readLoop's
+// handleACK and the eviction on a later sender's Enqueue, none under
+// writeMu. The entry's own count keeps every path from reading what the
+// write loop is committing and keeps the sum the payload bytes it is named
+// for, whatever length the committed Payload has.
 type RetransmitEntry struct {
-	Frame      *aether.Frame
-	Send       *SendEntry // optional shared send-side entry; nil for Enqueue callers
-	NextRetry  time.Time
-	EnqueuedAt time.Time // original enqueue time (for accurate MaxAge check)
-	Retries    int
-	RTO        time.Duration // RTO at time of enqueue (for exponential backoff)
-	index      int           // heap index
+	Frame        *aether.Frame
+	Send         *SendEntry // optional shared send-side entry; nil for Enqueue callers
+	PayloadBytes int64
+	NextRetry    time.Time
+	EnqueuedAt   time.Time // original enqueue time (for accurate MaxAge check)
+	Retries      int
+	RTO          time.Duration // RTO at time of enqueue (for exponential backoff)
+	index        int           // heap index
 }
 
 // DefaultRetransmitMaxBytes caps the total payload bytes held in the
@@ -43,10 +59,18 @@ const DefaultRetransmitMaxBytes int64 = 512 * 1024
 //
 // Memory bounds: bufferedBytes + maxBytes enforce a payload-byte cap
 // on the queue in addition to any frame-count limit the caller imposes
-// via the send window. When Enqueue would push bufferedBytes past
-// maxBytes, the oldest entry (lowest NextRetry) is dropped from the
-// heap — the higher-level retry path (e.g. RTO at the session layer)
-// is responsible for eventually noticing the shortfall.
+// via the send window. bufferedBytes is the sum of the queued entries'
+// PayloadBytes, each fixed at its Enqueue, so it is exactly the payload
+// bytes the queue holds and returns to 0 when the queue empties. When
+// Enqueue would push bufferedBytes past maxBytes, the oldest entry
+// (lowest NextRetry) is dropped from the heap — the higher-level retry
+// path (e.g. RTO at the session layer) is responsible for eventually
+// noticing the shortfall.
+//
+// After Enqueue the queue reads nothing of a frame but Frame.SeqNo (the
+// heap index), which the send window writes once before any enqueue;
+// Frame.Payload and Frame.Length belong to the adapter's writeFrame from
+// the moment the sender hands the frame to the scheduler.
 type RetransmitQueue struct {
 	mu            sync.Mutex
 	queue         retransmitHeap
@@ -109,10 +133,14 @@ func (q *RetransmitQueue) SetMaxBytes(n int64) {
 	q.maxBytes = n
 }
 
-// frameBytes returns the payload byte count used for cap accounting.
-// Uses len(frame.Payload) as a conservative proxy for on-wire size;
-// accounting errors bounded by Aether header (~50 bytes) per frame
-// are acceptable for a memory cap.
+// frameBytes returns the payload bytes of a frame being enqueued, the
+// count RetransmitEntry.PayloadBytes keeps for its lifetime. It is the
+// one read of Frame.Payload in this file and runs on the sender's
+// goroutine before the sender hands the frame to the scheduler
+// (noiseStream.sendSingleFrame enqueues here first), so it sees the
+// payload the sender handed over and never the compressed or encrypted
+// form writeFrame commits later. The header is not counted: the cap is
+// named for payload bytes.
 func frameBytes(f *aether.Frame) int64 {
 	if f == nil {
 		return 0
@@ -121,7 +149,7 @@ func frameBytes(f *aether.Frame) int64 {
 }
 
 // removeBySeq performs an indexed O(log N) heap remove. Caller must hold q.mu.
-// Updates bufferedBytes to reflect the dropped entry's payload size.
+// Subtracts the entry's own PayloadBytes, the count its Enqueue added.
 func (q *RetransmitQueue) removeBySeq(seqNo uint32) bool {
 	idx, ok := q.seqIndex[seqNo]
 	if !ok {
@@ -129,7 +157,7 @@ func (q *RetransmitQueue) removeBySeq(seqNo uint32) bool {
 	}
 	entry := q.queue.data[idx]
 	heap.Remove(&q.queue, idx)
-	q.bufferedBytes -= frameBytes(entry.Frame)
+	q.bufferedBytes -= entry.PayloadBytes
 	if q.bufferedBytes < 0 {
 		q.bufferedBytes = 0
 	}
@@ -155,26 +183,28 @@ func (q *RetransmitQueue) Enqueue(frame *aether.Frame) {
 	now := time.Now()
 	rto := q.rtt.RTO()
 	entry := &RetransmitEntry{
-		Frame:      frame,
-		NextRetry:  now.Add(rto),
-		EnqueuedAt: now,
-		Retries:    0,
-		RTO:        rto,
+		Frame:        frame,
+		PayloadBytes: incoming,
+		NextRetry:    now.Add(rto),
+		EnqueuedAt:   now,
+		Retries:      0,
+		RTO:          rto,
 	}
 	heap.Push(&q.queue, entry)
 	q.bufferedBytes += incoming
 }
 
 // evictForRoomLocked pops the oldest entries until incoming fits under
-// the byte cap. Notifies onEvict for each evicted entry so upper layers
-// can release flow-control credit / bump metrics. Caller holds q.mu.
+// the byte cap, subtracting each one's own PayloadBytes. Notifies onEvict
+// for each evicted entry so upper layers can release flow-control credit /
+// bump metrics. Caller holds q.mu.
 func (q *RetransmitQueue) evictForRoomLocked(incoming int64) {
 	if q.maxBytes <= 0 || incoming > q.maxBytes {
 		return
 	}
 	for q.queue.Len() > 0 && q.bufferedBytes+incoming > q.maxBytes {
 		oldest := heap.Pop(&q.queue).(*RetransmitEntry)
-		q.bufferedBytes -= frameBytes(oldest.Frame)
+		q.bufferedBytes -= oldest.PayloadBytes
 		if q.onEvict != nil {
 			q.onEvict(oldest)
 		}
@@ -202,12 +232,13 @@ func (q *RetransmitQueue) EnqueueFromSend(se *SendEntry) {
 	now := time.Now()
 	rto := q.rtt.RTO()
 	entry := &RetransmitEntry{
-		Frame:      se.Frame,
-		Send:       se,
-		NextRetry:  now.Add(rto),
-		EnqueuedAt: now,
-		Retries:    0,
-		RTO:        rto,
+		Frame:        se.Frame,
+		Send:         se,
+		PayloadBytes: incoming,
+		NextRetry:    now.Add(rto),
+		EnqueuedAt:   now,
+		Retries:      0,
+		RTO:          rto,
 	}
 	heap.Push(&q.queue, entry)
 	q.bufferedBytes += incoming
@@ -239,9 +270,11 @@ func (q *RetransmitQueue) Dequeue() *aether.Frame {
 			return nil // not due yet
 		}
 
-		// Pop it
+		// Pop it. The entry's own count, not the frame's current length:
+		// this runs on reliabilityTick while the write loop may be
+		// committing the frame (see RetransmitEntry.PayloadBytes).
 		heap.Pop(&q.queue)
-		entryBytes := frameBytes(entry.Frame)
+		entryBytes := entry.PayloadBytes
 
 		// Drop entries whose underlying SendWindow entry was already ACKed.
 		// Send is nil for callers that use Enqueue without a shared
@@ -349,6 +382,14 @@ func (q *RetransmitQueue) Remove(seqNo uint32) {
 // pathologically and is worth investigating.
 func (q *RetransmitQueue) AckedOnDequeueCount() uint64 {
 	return atomic.LoadUint64(&q.ackedOnDequeue)
+}
+
+// BufferedBytes returns the payload bytes of the entries the queue holds,
+// the sum the cap SetMaxBytes sets is compared against.
+func (q *RetransmitQueue) BufferedBytes() int64 {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.bufferedBytes
 }
 
 // Len returns the number of entries in the queue.
