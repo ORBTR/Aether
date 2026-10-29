@@ -559,7 +559,12 @@ func (st *noiseStream) sendSingleFrame(ctx context.Context, data []byte, extra a
 		}
 	}
 
-	// Enqueue for retransmission tracking
+	// Enqueue for retransmission tracking. This comes before the scheduler
+	// hand-off below on purpose: Enqueue fixes the entry's PayloadBytes from
+	// len(frame.Payload) now, while the frame is still this goroutine's; from
+	// the hand-off on, writeFrame may swap frame.Payload and frame.Length
+	// (compression, encryption) under writeMu on the write loop, and the
+	// queue reads only its own count.
 	st.retransmitQ.Enqueue(frame)
 
 	// FEC: add to encoder (may generate repair frames) — skip if disabled for this stream.
