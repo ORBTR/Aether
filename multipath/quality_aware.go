@@ -20,9 +20,9 @@ import (
 // and PrimarySession callers use.
 type QualityConfig struct {
 	// Tracker holds longer-window state shared across paths in this
-	// manager. One Tracker per ConnectionManager (the Library passes
-	// the same instance to every per-peer Manager) so failure history
-	// is visible across reconnects.
+	// manager. The caller that owns the per-peer Managers passes one
+	// instance to every Manager it builds, so failure history is visible
+	// across reconnects.
 	Tracker *quality.Tracker
 
 	// LocalRegion is the region tag of the current node ("syd", "iad",

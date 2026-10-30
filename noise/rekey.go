@@ -19,7 +19,7 @@ import (
 type RekeyTracker struct {
 	bytesSent   atomic.Uint64
 	lastTime    atomic.Int64  // Unix nanos of last rekey (or session start)
-	totalRekeys atomic.Uint64 // OBS-15: lifetime count of completed send-side rekeys
+	totalRekeys atomic.Uint64 // lifetime count of completed send-side rekeys (TotalRekeys)
 	threshBytes uint64        // 0 = disabled
 	threshDur   time.Duration // 0 = disabled
 }
@@ -50,7 +50,7 @@ func (rt *RekeyTracker) ShouldRekey() bool {
 }
 
 // ResetSend resets counters after a send-side rekey. Bumps the lifetime
-// totalRekeys counter (OBS-15) so Library AggregateAetherStats can report
+// totalRekeys counter so the consumer that sums a session's stats can report
 // how often each session has ratcheted its send cipher — the raw signal
 // for sustained-throughput sessions hitting the byte threshold or
 // long-lived idle sessions hitting the time threshold.
@@ -85,10 +85,10 @@ func (rt *RekeyTracker) ThreshDur() time.Duration {
 	return rt.threshDur
 }
 
-// TotalRekeys returns the lifetime count of send-side rekeys completed
-// (OBS-15). Each successful ResetSend bumps this exactly once. Surfaced
-// up the stack as SessionMetrics.RekeyTotal so Library MeshMetrics can
-// aggregate fleet-wide. Atomic load — safe to sample outside any lock.
+// TotalRekeys returns the lifetime count of send-side rekeys completed.
+// Each successful ResetSend bumps this exactly once. Surfaced up the
+// stack as SessionMetrics.RekeyTotal for the consumer that sums a
+// session's stats. Atomic load — safe to sample outside any lock.
 func (rt *RekeyTracker) TotalRekeys() uint64 {
 	return rt.totalRekeys.Load()
 }

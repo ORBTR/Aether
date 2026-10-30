@@ -36,7 +36,7 @@ type RecvWindow struct {
 	lastRecvTime  time.Time            // when the last data frame was received (for ACK delay)
 	dropCount     uint64               // atomic: frames dropped due to reorder buffer full
 
-	// OBS-13: HOL-block histogram. When non-nil, every buffered frame that
+	// holHist is the head-of-line-block histogram. When non-nil, every buffered frame that
 	// is flushed in order records (deliveryTime − bufferArrivalTime) into
 	// this histogram. The distribution describes how long each frame was
 	// head-of-line blocked waiting for its predecessors. Set by the session
@@ -81,7 +81,7 @@ func (w *RecvWindow) SetMaxAge(d time.Duration) {
 	w.maxAge = d
 }
 
-// SetHOLHist wires an OBS-13 head-of-line-block histogram into this window.
+// SetHOLHist wires a head-of-line-block histogram into this window.
 // When set, each buffered frame that is delivered in order records
 // (deliveryTime − bufferArrivalTime) so operators can see the HOL-block
 // latency distribution. Passing nil disables the measurement. Safe to call
@@ -140,7 +140,7 @@ func (w *RecvWindow) InsertMarked(seqNo uint32, payload []byte, mark bool) (deli
 		w.expected++
 
 		// Flush buffered successors, skipping expired frames.
-		// OBS-13: for each flushed buffered frame, record the time it spent
+		// For each flushed buffered frame, record the time it spent
 		// head-of-line blocked (bufferArrivalTime → now) into holHist.
 		// Frames that arrive in order and are delivered immediately have
 		// zero HOL-block time and are not recorded — the histogram represents

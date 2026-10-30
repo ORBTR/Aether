@@ -32,7 +32,7 @@ const HandshakeAddressMigration = aether.HandshakeAddressMigration
 // MigrationPayloadSize is the fixed size of a migration handshake payload.
 // [ConnectionID:8][Nonce:8][Timestamp:8][NewAddr_IP:16][NewAddr_Port:2][HMAC-SHA256:32] = 74 bytes
 //
-// See _SECURITY.md §3.11. Without a nonce + timestamp the HMAC would be
+// Nonce and timestamp are HMAC inputs: without them the HMAC would be
 // deterministic over (ConnID, IP, Port), so a captured migration payload
 // could be replayed forever from any observer. The nonce makes each
 // migration unique; the timestamp gives a time-bound TTL; the
@@ -90,7 +90,7 @@ func NewMigrator() *Migrator {
 // EncodeMigrationPayload creates a HANDSHAKE(AddressMigration) payload.
 // The HMAC is computed over ConnectionID || Nonce || Timestamp || IP || Port
 // using the session key. A fresh random Nonce + monotonic Timestamp prevent
-// replay (S4): the same (connID, ip, port) tuple yields a different HMAC
+// replay: the same (connID, ip, port) tuple yields a different HMAC
 // every call, and the receiver enforces both a TTL and a seen-set.
 func EncodeMigrationPayload(connID aether.ConnectionID, ip net.IP, port uint16, sessionKey []byte) []byte {
 	payload := make([]byte, MigrationPayloadSize)

@@ -27,7 +27,8 @@ import (
 // completes in under 50µs almost certainly hit the flow.StreamWindow
 // fast path (Consume's non-blocking TryAcquire) and the writeLoop wake
 // path, neither of which the caller-block percentile should be dominated
-// by. The same fast-path skip pattern OBS-5 applies to its grantStarveHist.
+// by. The same fast-path skip flow.StreamWindow.Consume applies to its
+// grantStarveHist.
 const streamSendBlockFloor = 50 * time.Microsecond
 
 // noiseStream is a single Aether stream over Noise-UDP with full reliability.
@@ -270,14 +271,14 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 	// MUST run before any Send on this stream — earlier sends would
 	// under-report by the size of their in-flight frames.
 	eng.SendWin.SetSessionInFlightCounter(&s.inFlightBytes)
-	// OBS-5: share the session-level grant-starvation histogram with this
+	// Share the session-level grant-starvation histogram with this
 	// stream's flow window. All streams on a session record into the same
 	// histogram so the percentile readout describes session-wide
 	// credit-starvation tail behaviour rather than fragmenting per
 	// stream (most streams produce too few samples to compute stable
 	// percentiles on their own).
 	st.window.SetGrantStarveHist(&s.grantStarveHist)
-	// OBS-13: share the session-level HOL-block histogram with this stream's
+	// Share the session-level HOL-block histogram with this stream's
 	// RecvWindow. Same rationale as grantStarveHist — per-stream sample
 	// volume is too low for stable percentiles; the session-aggregate view
 	// is what operators need to spot reordering. All streams on a session
@@ -404,11 +405,11 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 		return fmt.Errorf("stream %d: cannot send", st.streamID)
 	}
 
-	// OBS-14: caller-block instrumentation. Measures wall-clock time the
+	// Caller-block instrumentation. Measures wall-clock time the
 	// application spent inside Send (window.Consume + connWindow.Consume +
 	// sendSingleFrame for each fragment) from entry to return. Samples
 	// below streamSendBlockFloor bypass the histogram Record and increment
-	// streamSendFastTotal instead — same fast-path skip pattern OBS-5
+	// streamSendFastTotal instead — the fast-path skip flow.StreamWindow.Consume
 	// applies to grant-starvation, for the same reason: recording every
 	// microsecond-fast send would dominate the distribution with
 	// uncontended noise. CanSend gate is excluded — it's a single atomic
@@ -437,7 +438,7 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 	// reproduce the production-observed drain of a 1 MB stream window
 	// to ~40 KB after 13 failed exchanges.
 	//
-	// OBS-14b: record per-phase timing so streamSendBlockHist's total can
+	// Record per-phase timing so streamSendBlockHist's total can
 	// be attributed to per-stream credit vs conn credit vs the post-credit
 	// path. Same below-floor skip as the aggregate to keep the fast-path
 	// (uncontended) noise out of the percentile distribution.

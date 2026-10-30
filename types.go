@@ -164,15 +164,17 @@ type SessionOptions struct {
 
 	// MaxConcurrentStreams caps the number of streams the remote peer can
 	// open against this session. Once reached, the adapter replies to
-	// further OPEN frames with RESET(ResetRefused). Protects against
-	// memory exhaustion from stream-flood attacks (_SECURITY.md §3.12 / S5).
+	// further OPEN frames with RESET(ResetRefused) and counts the refusal
+	// (streamRefused). Protects against memory exhaustion from
+	// stream-flood attacks.
 	// 0 = use DefaultMaxConcurrentStreams.
 	MaxConcurrentStreams int
 
 	// MaxFECGroups caps the FEC decoder's in-flight group count. Older
-	// groups are pruned from the decoder once this many are buffered.
+	// groups are pruned from the decoder once this many are buffered
+	// (the noise adapter's reliabilityTick prunes once a second).
 	// Protects against unbounded memory growth from FEC_REPAIR flooding
-	// with unique GroupIDs (_SECURITY.md §3.5 / S2).
+	// with unique GroupIDs.
 	// 0 = use DefaultMaxFECGroups.
 	MaxFECGroups int
 

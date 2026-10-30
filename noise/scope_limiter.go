@@ -31,7 +31,7 @@ var (
 //  2. **Global hard cap with cross-scope WFQ preemption** (`MaxTotalPairs`):
 //     when the whole limiter is at capacity and a new pair arrives, we
 //     find the most-over-committed scope (usage / weight highest) and
-//     evict its LRU pair. This is the WFQ arbiter from S9 — a busy
+//     evict its LRU pair. This is the WFQ arbiter — a busy
 //     scope that's consuming more than its weighted share yields to a
 //     quiet scope's incoming request, not the other way around.
 //
@@ -78,7 +78,7 @@ type partitionState struct {
 	relayTokens    float64
 	relayLastCheck time.Time
 	// Active relay pairs: pairKey → most-recent-use time (used for LRU
-	// eviction under pair-cap pressure — Concern S9).
+	// eviction under pair-cap pressure).
 	relayPairs map[string]time.Time
 }
 
@@ -93,7 +93,7 @@ type PartitionRelayLimiter struct {
 	state  map[string]*partitionState // scopeID → state
 
 	// pairsEvicted counts pairs displaced by LRU when MaxRelayPairs would
-	// otherwise reject a new pair (per-scope LRU eviction). S9.
+	// otherwise reject a new pair (per-scope LRU eviction).
 	pairsEvicted uint64
 
 	// relayEvictions counts cross-scope WFQ evictions — when the global
@@ -105,14 +105,14 @@ type PartitionRelayLimiter struct {
 }
 
 // PairsEvictedCount returns the number of relay pairs evicted under
-// per-scope LRU pressure. Observability hook for S9.
+// per-scope LRU pressure. Observability hook.
 func (l *PartitionRelayLimiter) PairsEvictedCount() uint64 {
 	return atomic.LoadUint64(&l.pairsEvicted)
 }
 
 // RelayEvictions returns the count of cross-scope WFQ evictions — pairs
 // displaced from over-committed scopes to admit requests on under-
-// committed scopes. Zero unless MaxTotalPairs is set. S9 metric.
+// committed scopes. Zero unless MaxTotalPairs is set.
 func (l *PartitionRelayLimiter) RelayEvictions() uint64 {
 	return atomic.LoadUint64(&l.relayEvictions)
 }
@@ -268,7 +268,7 @@ func (l *PartitionRelayLimiter) AllowRelay(scopeID string) error {
 //     (per-scope self-churn), admit new one.
 //  3. If global MaxTotalPairs set and total at cap → find the busiest
 //     scope (highest count/weight ratio) and evict *its* LRU pair
-//     (cross-scope WFQ preemption, S9).
+//     (cross-scope WFQ preemption).
 //
 // Step 3 runs in addition to step 2, so a scope that's both over its own
 // cap AND the global cap will see its own eviction (step 2) rather than

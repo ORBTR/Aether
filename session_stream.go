@@ -126,23 +126,24 @@ type SessionMetrics struct {
 	FECRecoveries uint64        // frames recovered via FEC (without retransmit)
 	ReplayRejects uint64        // frames rejected by anti-replay window (deprecated: now equals ReplayDuplicates + ReplayAncient — kept for back-compat)
 
-	// Security observability counters. See _SECURITY.md for the attack
-	// classes each addresses.
-	SuspiciousACKs uint64 // §3.2  — Composite ACKs rejected as malformed/oversized
+	// Security observability counters: each counts one bound the
+	// reliability layer or an adapter enforced on a peer.
+	SuspiciousACKs uint64 // Composite ACKs rejected by SendWindow's bounds (malformed/oversized)
 	// ForensicSuppressed: guard-covered abuse events (ack-validation /
 	// malformed-frame) RECORDED for observability but deliberately NOT
 	// scored/closed on an established, grade-A (past-warmup,
 	// actively-delivering) session — the forensic-only tier of the noise
 	// adapter's reportAbuse.
 	// Local-only (not in the wire STATS EncodeStats/DecodeStats, same as
-	// SuspiciousACKs); surfaced per-node via Library MeshMetrics.
+	// SuspiciousACKs); surfaced per-node by the consumer that sums a
+	// session's stats.
 	ForensicSuppressed uint64
-	FECGroupsEvicted   uint64 // §3.5  — FEC groups evicted by count/age pruning
-	StreamRefused      uint64 // §3.12 — incoming stream opens rejected at cap
-	SeqNoWraps         uint64 // §3.3  — SeqNo jumps rejected as wrap-attack
-	RecvWindowDrops    uint64 //       — reorder-buffer overflow drops (total across streams)
-	DecryptErrors      uint64 //       — decryption failures on incoming packets
-	InboxDrops         uint64 //       — packets dropped because the session inbox was full
+	FECGroupsEvicted   uint64 // FEC groups evicted by count/age pruning (reliabilityTick)
+	StreamRefused      uint64 // incoming stream opens rejected at MaxConcurrentStreams
+	SeqNoWraps         uint64 // SeqNo jumps past SeqNoWrapThreshold rejected by ReplayWindow
+	RecvWindowDrops    uint64 // reorder-buffer overflow drops (total across streams)
+	DecryptErrors      uint64 // decryption failures on incoming packets
+	InboxDrops         uint64 // packets dropped because the session inbox was full
 
 	// Anti-replay classification counters (Classify/Commit split). Total
 	// ReplayRejects is the sum of these — surfaced separately because
@@ -232,27 +233,27 @@ type SessionMetrics struct {
 	// Observability histograms surfaced as p50/p99 microseconds — the
 	// minimum cardinality that lets operators localize the bimodal RPC
 	// latency tail the fleet has been seeing. Source histograms live on
-	// NoiseSession; consumers (Library MeshMetrics, dashboards) read
-	// them via STATS frames + monitoring endpoints.
+	// NoiseSession; the consumer that sums a session's stats and
+	// dashboards read them via STATS frames + monitoring endpoints.
 	//
-	// OBS-1: time inside the underlying transport's write call. High
+	// WriteSyscallP*Us: time inside the underlying transport's write call. High
 	// p99 here points at kernel send-buffer pressure / TLS encode /
 	// WebSocket framing — i.e. cost *outside* aether's control.
 	WriteSyscallP50Us uint64 `json:"writeSyscallP50Us,omitempty"`
 	WriteSyscallP99Us uint64 `json:"writeSyscallP99Us,omitempty"`
-	// OBS-2: time the writeLoop spent parked on its wake channel.
+	// WriteloopParkP*Us: time the writeLoop spent parked on its wake channel.
 	// High p99 with a low p50 is the classic "idle stream with bursts"
 	// shape; sustained-high p50 indicates app-side send pacing is the
 	// throughput bottleneck (not aether's congestion control).
 	WriteloopParkP50Us uint64 `json:"writeloopParkP50Us,omitempty"`
 	WriteloopParkP99Us uint64 `json:"writeloopParkP99Us,omitempty"`
-	// OBS-4: duration that CUBIC.CanSend stayed false in a run of
+	// CubicCwndBlockP*Us: duration that CUBIC.CanSend stayed false in a run of
 	// consecutive writeLoop re-enqueue iterations. Paired with the
 	// CanSendFalseReenqueues counter (above) — counter gives the
 	// frequency, percentiles give the per-event severity.
 	CubicCwndBlockP50Us uint64 `json:"cubicCwndBlockP50Us,omitempty"`
 	CubicCwndBlockP99Us uint64 `json:"cubicCwndBlockP99Us,omitempty"`
-	// OBS-5: time flow.StreamWindow.Consume spent blocked on the
+	// GrantStarveP*Us: time flow.StreamWindow.Consume spent blocked on the
 	// credit semaphore. Skips samples below ~100µs (uncontended fast
 	// path) so the distribution reflects real grant starvation, not
 	// semaphore-acquire overhead. Elevated p99 here means the peer's
@@ -260,21 +261,21 @@ type SessionMetrics struct {
 	// direction path or a malfunctioning auto-tuner.
 	GrantStarveP50Us uint64 `json:"grantStarveP50Us,omitempty"`
 	GrantStarveP99Us uint64 `json:"grantStarveP99Us,omitempty"`
-	// OBS-10: cwnd utilisation per-mille (inFlight/cwnd * 1000)
+	// CwndUtilP*Permille: cwnd utilisation per-mille (inFlight/cwnd * 1000)
 	// sampled every 16th write. p50 ≈ 1000 = cwnd-bound for most
 	// sends; p50 << 1000 = app-bound (the cwnd is bigger than the
 	// session needs). p99 close to 1000 with low p50 = bursty cwnd-
 	// bound spikes inside an otherwise app-bound regime.
 	CwndUtilP50Permille uint32 `json:"cwndUtilP50Permille,omitempty"`
 	CwndUtilP99Permille uint32 `json:"cwndUtilP99Permille,omitempty"`
-	// OBS-11: loss-recovery counters. TLPFiresTotal counts every
+	// Loss-recovery counters. TLPFiresTotal counts every
 	// successfully-enqueued Tail Loss Probe; RACKMarksTotal counts
 	// every seq RACK declared lost. High TLP/RACK ratio = tail-
 	// recovery dominated (app pacing); low ratio = fast-recovery
 	// dominated (genuine packet loss).
 	TLPFiresTotal  uint64 `json:"tlpFiresTotal,omitempty"`
 	RACKMarksTotal uint64 `json:"rackMarksTotal,omitempty"`
-	// OBS-15: noise send-cipher rekey telemetry. RekeyTotal is the
+	// Noise send-cipher rekey telemetry. RekeyTotal is the
 	// lifetime count of send-side rekeys on this session (bumped inside
 	// RekeyTracker.ResetSend); RekeyBytesSinceLast is the rolling byte
 	// count since the last rekey reset. Together they let the operator
@@ -284,7 +285,7 @@ type SessionMetrics struct {
 	// TCP / QUIC sessions don't ratchet through the noise rekey path.
 	RekeyTotal          uint64 `json:"rekeyTotal,omitempty"`
 	RekeyBytesSinceLast uint64 `json:"rekeyBytesSinceLast,omitempty"`
-	// OBS-13: recv-window head-of-line-block latency distribution. Each
+	// RecvWindowHOLP*Us: recv-window head-of-line-block latency distribution. Each
 	// buffered frame records (deliveryTime − bufferArrivalTime) when it is
 	// flushed after its predecessor(s) arrive. Zero when no reordering has
 	// occurred. Paired with RecvWindowDrops: drops are the extreme end of
@@ -294,11 +295,11 @@ type SessionMetrics struct {
 	// (lossy or heavily misordered path).
 	RecvWindowHOLP50Us uint64 `json:"recvWindowHolP50Us,omitempty"`
 	RecvWindowHOLP99Us uint64 `json:"recvWindowHolP99Us,omitempty"`
-	// OBS-14: caller-block latency distribution for Stream.Send. Each
+	// StreamSendBlockP*Us: caller-block latency distribution for Stream.Send. Each
 	// call records wall-clock from entry to return — the time the
 	// application thread spent BLOCKED inside Send (window.Consume +
 	// connWindow.Consume + sendSingleFrame). Distinct from
-	// WriteloopParkP*Us (OBS-2), which measures the writeLoop's internal
+	// WriteloopParkP*Us, which measures the writeLoop's internal
 	// park on its wake channel: that's the sender-side scheduler view;
 	// this is the application-facing view of "how long did my Send
 	// block". Samples below ~50µs are skipped (uncontended fast path)
@@ -310,12 +311,12 @@ type SessionMetrics struct {
 	StreamSendBlockP50Us uint64 `json:"streamSendBlockP50Us,omitempty"`
 	StreamSendBlockP99Us uint64 `json:"streamSendBlockP99Us,omitempty"`
 	// StreamSendFastTotal counts every Stream.Send call that completed
-	// faster than the OBS-14 floor (i.e. the fast path, no credit-
+	// faster than the StreamSendBlock floor (i.e. the fast path, no credit-
 	// starvation block). Paired with StreamSendBlockP*Us, this gives the
 	// operator the "how many sends were uncontended" denominator that
 	// would otherwise be hidden by the percentile-only readout.
 	StreamSendFastTotal uint64 `json:"streamSendFastTotal,omitempty"`
-	// OBS-14b: per-phase decomposition of the StreamSendBlock total. Each
+	// Per-phase decomposition of the StreamSendBlock total. Each
 	// percentile pair attributes the application-facing send latency to a
 	// specific phase of the Send hot path:
 	//   - PerStreamWindowWait — block in st.window.Consume (per-stream
@@ -337,7 +338,7 @@ type SessionMetrics struct {
 	ConnWindowWaitP99Us      uint64 `json:"connWindowWaitP99Us,omitempty"`
 	PostCreditSendP50Us      uint64 `json:"postCreditSendP50Us,omitempty"`
 	PostCreditSendP99Us      uint64 `json:"postCreditSendP99Us,omitempty"`
-	// OBS-18: per-decrypt AEAD latency distribution (microseconds). Each
+	// DecryptLatencyP*Us: per-decrypt AEAD latency distribution (microseconds). Each
 	// recv-side noise Decrypt call records its wall-clock cost; the
 	// percentile readout exposes the bimodal split that single-mean
 	// averages hide. On a healthy CPU-uncontended host p50 and p99 both
@@ -350,7 +351,7 @@ type SessionMetrics struct {
 	// path runs AEAD per packet on the recv hot path.
 	DecryptLatencyP50Us uint64 `json:"decryptLatencyP50Us,omitempty"`
 	DecryptLatencyP99Us uint64 `json:"decryptLatencyP99Us,omitempty"`
-	// OBS-9: scheduler queue-depth distribution. Sampled on every wake
+	// SchedulerDepthP*: scheduler queue-depth distribution. Sampled on every wake
 	// signal (Enqueue / EnqueueProbe / external Wake) and on every
 	// writeLoop pre-park observation. Depth = total frames queued
 	// across all streams + any pending TLP probes. Sustained-high p50

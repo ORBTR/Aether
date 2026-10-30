@@ -54,7 +54,7 @@ func (tb *tokenBucket) Allow(cost float64) bool {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Per-source rate limiter (Concern S6 — _SECURITY.md §3.1)
+// Per-source rate limiter (checked before any handshake crypto)
 // ────────────────────────────────────────────────────────────────────────────
 //
 // The global token bucket above prevents the listener as a whole from being

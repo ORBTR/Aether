@@ -24,8 +24,9 @@ const adaptiveGoroutineFloor = 2000
 //  2. CPU > 80%: disable FEC
 //  3. CPU > 90%: reduce scheduler to simple round-robin
 //
-// Encryption is NEVER disabled — it is a security invariant.
-// See docs/_SECURITY.md §3.10 for the threat model justification.
+// Encryption is NEVER disabled — it is a security invariant:
+// applyDegradation touches only SetCompressionEnabled and the FEC /
+// scheduler rung flags.
 type AdaptiveController struct {
 	mu             sync.RWMutex
 	sessions       map[CompressionCapable]struct{} // live sessions this controller sheds load from (Register, applyDegradation)
@@ -111,8 +112,8 @@ func (a *AdaptiveController) cpuPercent() float64 {
 }
 
 // check measures CPU and applies degradation rules.
-// Encryption is intentionally excluded — disabling it under load
-// would create an exploitable attack vector (see §3.10).
+// Encryption is intentionally excluded — applyDegradation has no rung
+// that touches it.
 func (a *AdaptiveController) check() {
 	a.mu.Lock()
 	if !a.enabled {
@@ -145,7 +146,7 @@ func (a *AdaptiveController) check() {
 // applyDegradation drives the progressive load-shedding ladder against the
 // LIVE registered sessions, under a.mu. Split out of check() so the rung
 // thresholds are unit-testable without synthesizing real CPU load.
-// Encryption is intentionally never toggled — security invariant (§3.10).
+// Encryption is intentionally never toggled — security invariant.
 // The ladder acts on the registered sessions (Register), the only thing a
 // toggle reaches: a private options copy no session reads would leave it
 // inert.

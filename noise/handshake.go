@@ -671,7 +671,9 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 			dbgNoise.Printf("Received nonce-tagged handshake from %s (nonce: %x)", addr, dialNonce)
 		}
 
-		// Source-validation retry token (S3 — _SECURITY.md §3.1).
+		// Source-validation retry token: a stateless HMAC cookie (retryGuard)
+		// bound to the source address, so the responder sends its signed
+		// msg2 only to an address that has echoed one back.
 		// If the inner packet starts with retryPrefix, validate the cookie
 		// and strip it; invalid cookies are silently dropped (no response
 		// = no amplification). If retry is required AND no cookie is

@@ -35,7 +35,7 @@ import (
 func (s *NoiseSession) writeLoop() {
 	wake := s.sched.WakeCh()
 	var pacingTimer *time.Timer
-	// OBS-4 cubicCwndBlock_us: when CUBIC.CanSend returns false the
+	// cwndBlockHist: when CUBIC.CanSend returns false the
 	// writeLoop re-enqueues + parks. We mark the wall-clock at first
 	// rejection (cwndBlockStart non-zero), and on the next successful
 	// CanSend we record the elapsed block duration. Single time.Time on
@@ -47,7 +47,7 @@ func (s *NoiseSession) writeLoop() {
 			pacingTimer.Stop()
 		}
 		// Flush any in-progress cwnd-blocked duration into the
-		// histogram on terminal exit. Without this the OBS-4 dashboard
+		// histogram on terminal exit. Without this the cwnd-block readout
 		// is blind to exactly the case it exists to surface: a session
 		// that black-holed long enough for the connection manager to
 		// tear it down (CloseSignal fires while CanSend stays false).
@@ -98,7 +98,7 @@ func (s *NoiseSession) writeLoop() {
 					// (capped at 1); duplicates collapse and the call is cheap.
 					s.sched.Enqueue(frame.StreamID, frame)
 					atomic.AddUint64(&s.cansendFalseReenqueues, 1)
-					// OBS-4: mark block-entry on the first reject in a
+					// Mark block-entry on the first reject in a
 					// run. Subsequent rejects keep the earlier start so
 					// the histogram captures the full cwnd-blocked
 					// duration, not just the per-iteration retry cost.
@@ -150,7 +150,7 @@ func (s *NoiseSession) writeLoop() {
 
 			s.pacer.OnSend(frameSize)
 
-			// OBS-10 cwnd-util permille: sample inFlight/cwnd once per
+			// cwndUtilRing permille: sample inFlight/cwnd once per
 			// cwndUtilSamplePeriod writes. The full-rate version would
 			// add ~1.5% overhead per send (an extra atomic load + ring
 			// push); a 1-in-16 sample keeps cost negligible while still
@@ -209,7 +209,7 @@ func (s *NoiseSession) writeLoop() {
 			}
 		}
 
-		// OBS-9 aether_scheduler_depth: sample queue depth at the
+		// Scheduler depth: sample queue depth at the
 		// "queue drained, about to park" moment so the histogram
 		// captures the idle tail of the depth distribution in
 		// addition to the work-arrives samples that signalWake
@@ -219,7 +219,7 @@ func (s *NoiseSession) writeLoop() {
 		s.sched.ObserveDepth()
 
 		// Park until either new work arrives or the session closes.
-		// OBS-2 aether_writeloop_park_us: time the writeLoop spent
+		// writeloopParkHist: time the writeLoop spent
 		// blocked on the wake channel. High p99 here is the canonical
 		// "no work, idle" signal — bimodal latency in this histogram
 		// (low p50 with very long p99 spikes) usually means individual
@@ -274,7 +274,7 @@ func (s *NoiseSession) writeLoop() {
 // values delay legitimate cwnd-recovery beyond a typical SRTT.
 const cwndBlockedProbeInterval = 1 * time.Millisecond
 
-// cwndUtilSamplePeriod governs the per-N-writes sampling rate of OBS-10.
+// cwndUtilSamplePeriod governs the per-N-writes sampling rate of cwndUtilRing.
 // 16 keeps cost negligible (single atomic add per write, ring push on
 // every 16th) while still filling the 256-entry ring within ~10s of
 // sustained sending. Power-of-two so the modulo compiles to a mask.
@@ -443,7 +443,7 @@ func (s *NoiseSession) reliabilityTick() {
 					}
 					lost, _ := st.rack.DetectLost(rackSnap, tickNow)
 					if len(lost) > 0 {
-						// OBS-11 aether_rack_marks_total: count only seqs
+						// rackMarksTotal: count only seqs
 						// that were both RACK-flagged AND actually
 						// retransmitted on the wire. RACK works off a
 						// snapshot copy of the send window, so a
@@ -504,7 +504,7 @@ func (s *NoiseSession) reliabilityTick() {
 							s.sched.EnqueueProbe(streamID, probeFrame)
 							st.sendWindow.BumpXmitTime(probeSeq, tickNow)
 							st.tlp.MarkProbeSent(probeSeq)
-							// OBS-11 aether_tlp_fires_total: increment only when
+							// tlpFiresTotal: increment only when
 							// a probe actually reaches the wire.
 							atomic.AddUint64(&s.tlpFiresTotal, 1)
 							probeFired = true
@@ -830,7 +830,7 @@ func (s *NoiseSession) reliabilityTick() {
 				s.refreshWindowGrants()
 			}
 
-			// FEC decoder pruning (S2). Without this, FEC_REPAIR flooding
+			// FEC decoder pruning. Without this, FEC_REPAIR flooding
 			// with unique GroupIDs causes unbounded memory growth.
 			// Rate-limited to once per second so the 10ms tick stays cheap.
 			// Both count-based (budget) and age-based (2×SRTT) pruning
@@ -915,7 +915,7 @@ type writeDeadlineConn interface {
 // graceful-close paths (idle/stall/application Close) are untouched — the
 // final grant + RESET frames still reach a live peer from those callers.
 func (s *NoiseSession) connWrite(b []byte) error {
-	// OBS-1 aether_write_syscall_us: time the actual syscall (or the
+	// writeSyscallHist: time the actual syscall (or the
 	// transport adapter's effective send path) so operators can see
 	// when kernel send-buffer pressure / TLS encode / WS framing is the
 	// latency source vs in-process scheduling. Single time.Now() pair on
@@ -941,7 +941,7 @@ func (s *NoiseSession) writeFrame(frame *aether.Frame) error {
 	s.framesSent.Add(1)
 	if frame != nil {
 		s.bytesSent.Add(uint64(frame.Length))
-		// A4: feed the per-CE-interval cap. handleACK drains this counter
+		// Feed the per-CE-interval cap. handleACK drains this counter
 		// when the peer's CompositeACK carries CACKHasECN, using the
 		// drained value as the upper bound on a plausible CEBytes claim.
 		s.bytesSentSinceLastCE.Add(uint64(frame.Length))

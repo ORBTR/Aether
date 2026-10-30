@@ -373,7 +373,7 @@ func (f *IntraOriginForwarder) recordCrossOriginMsg1Received() {
 }
 
 // CrossOriginMsg1Received returns the current value of the M_r ingress
-// counter. Surfaced via /api/monitoring/mesh-debug.mesh_metrics.
+// counter, for the observability consumer that polls this forwarder.
 func (f *IntraOriginForwarder) CrossOriginMsg1Received() uint64 {
 	if f == nil {
 		return 0

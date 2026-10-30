@@ -179,7 +179,7 @@ type noiseConn struct {
 	// without extra locking.
 	ceBytes uint64
 
-	// OBS-18: per-decrypt AEAD latency distribution. Records the wall-
+	// Per-decrypt AEAD latency distribution. Records the wall-
 	// clock cost of every recv-side Decrypt call (both explicit-nonce
 	// window.Decrypt and CipherState recv.Decrypt paths) so a bimodal
 	// distribution — uncontended µs-tier vs goroutine-queued ms-tier on
@@ -270,7 +270,7 @@ func (c *noiseConn) decryptAndDeliver(msg []byte) error {
 	var plaintext []byte
 	var err error
 
-	// OBS-18: time the AEAD call itself so the latency histogram
+	// Time the AEAD call itself so the latency histogram
 	// captures the cost goroutines pay when the host is CPU-saturated.
 	// time.Now() / time.Since are nanosecond-resolution wall-clock —
 	// they include any goroutine-scheduling queue time between the
@@ -741,7 +741,7 @@ func (c *noiseConn) InboxDrops() uint64 {
 }
 
 // RekeyTotal returns the lifetime count of send-side rekeys completed on
-// this connection (OBS-15). Pass-through to the embedded RekeyTracker.
+// this connection. Pass-through to the embedded RekeyTracker.
 // Probed via the adapter's noiseConnStats interface so the aether
 // adapter pkg doesn't need a direct import of noise/.
 func (c *noiseConn) RekeyTotal() uint64 {
@@ -765,7 +765,7 @@ func (c *noiseConn) RekeyBytesSinceLast() uint64 {
 }
 
 // DecryptLatencySnapshot returns the p50 and p99 of the recv-side AEAD
-// decrypt-call wall-clock cost in microseconds (OBS-18). Probed via the
+// decrypt-call wall-clock cost in microseconds. Probed via the
 // adapter's noiseConnStats interface so the adapter package never
 // imports noise/ directly — mirrors the RekeyTotal / DecryptErrors
 // pass-through pattern.

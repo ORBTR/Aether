@@ -125,7 +125,7 @@ type fecGroup struct {
 	total     int              // total frames in group (data + repair)
 	received  map[uint8][]byte // index → payload
 	repair    []byte           // XOR repair payload (nil until received)
-	firstSeen time.Time        // when the first frame of this group arrived (for age-based eviction — S2)
+	firstSeen time.Time        // when the first frame of this group arrived (PruneOlderThan evicts on it)
 }
 
 // NewFECDecoder creates a decoder.
@@ -191,9 +191,11 @@ func (d *FECDecoder) Prune(maxGroups int) {
 }
 
 // PruneOlderThan removes groups first seen more than maxAge ago. Complements
-// count-based Prune for S2: a slow trickle of FEC_REPAIR frames with unique
+// count-based Prune: a slow trickle of FEC_REPAIR frames with unique
 // GroupIDs can stay under the count cap but still accumulate memory over
-// time. Plan S2 specifies 2×SRTT as the right age bound.
+// time. The noise adapter's reliabilityTick passes twice the session's
+// largest stream SRTT (floor 2 s): after two RTTs the sender's retransmit
+// has covered any frame a group could still repair.
 func (d *FECDecoder) PruneOlderThan(maxAge time.Duration) {
 	if maxAge <= 0 {
 		return
@@ -210,7 +212,8 @@ func (d *FECDecoder) PruneOlderThan(maxAge time.Duration) {
 }
 
 // EvictedCount returns the total number of groups pruned (count-based or
-// age-based) over the decoder's lifetime. Observability hook for S2.
+// age-based) over the decoder's lifetime. The noise adapter's Metrics()
+// sums it into SessionMetrics.FECGroupsEvicted.
 func (d *FECDecoder) EvictedCount() uint64 {
 	return atomic.LoadUint64(&d.evicted)
 }

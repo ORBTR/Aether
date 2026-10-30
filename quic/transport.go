@@ -31,7 +31,7 @@ type QuicTransportConfig struct {
 	ListenAddr   string
 	BindResolver aether.BindAddressResolver // Optional platform bind resolver (for standalone listen)
 
-	// G07: 0-RTT resumption. When enabled, QUIC connections to known peers
+	// 0-RTT resumption. When enabled, QUIC connections to known peers
 	// skip the TLS handshake round-trip using cached session tickets.
 	// The TLS ClientSessionCache stores tickets in memory (or SQLite via adapter).
 	Allow0RTT          bool                   // Enable 0-RTT early data
@@ -68,7 +68,7 @@ func NewQuicTransport(cfg QuicTransportConfig) (*QuicTransport, error) {
 		return nil, err
 	}
 
-	// G07: Configure TLS session cache for 0-RTT resumption
+	// Configure TLS session cache for 0-RTT resumption
 	if cfg.Allow0RTT {
 		sessionCache := cfg.ClientSessionCache
 		if sessionCache == nil {
@@ -164,7 +164,7 @@ func (t *QuicTransport) Dial(ctx context.Context, target aether.Target) (aether.
 			return nil, resolveErr
 		}
 		if t.allow0RTT {
-			// G07: Use DialEarly for 0-RTT — sends data before handshake completes
+			// Use DialEarly for 0-RTT — sends data before handshake completes
 			earlyConn, dialErr := tr.DialEarly(ctx, addr, tlsConf, quicCfg)
 			conn, err = earlyConn, dialErr
 		} else {

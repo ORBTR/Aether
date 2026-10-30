@@ -87,7 +87,7 @@ func (s *NoiseSession) processIncomingFrame(frame *aether.Frame, indicator byte)
 				log.Printf("[AETHER-NOISE] Decrypt (short) error: %v", err)
 				// Decrypt failure is a strong abuse signal — either the peer is
 				// replaying stale ciphertexts, using a wrong key, or probing.
-				// Feed S7 circuit breaker so repeated bad decrypts trip GoAway.
+				// Feed the abuse breaker (reportAbuse) so repeated bad decrypts trip GoAway.
 				s.reportAbuse(abuse.ReasonDecryptFail)
 				return
 			}
@@ -234,8 +234,9 @@ func (s *NoiseSession) Throttle() *aether.CongestionThrottle {
 	return &s.throttle
 }
 
-// DeliveryStats exposes the session's receive-path delivery counters
-// (OBS-8). The returned pointer is stable for the session's lifetime —
+// DeliveryStats exposes the session's receive-path delivery counters to
+// the consumer that sums a session's stats. The returned pointer is
+// stable for the session's lifetime —
 // callers can sample Delivered / Dropped / Backpressure / BytesDropped
 // via Load() at monitoring cadence without holding any session lock.
 // Updated by DeliverToRecvChWithSignals on every receive-side delivery
@@ -481,9 +482,9 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 
 	// Snapshot suspicious-ACK counter before ProcessCompositeACK so we can
 	// detect rejections this call caused — the window increments the atomic
-	// counter at every S1 guard (BaseACK jump, oversize range, out-of-window
-	// bitmap, etc.). If the delta is > 0, the peer just sent an ACK that
-	// tripped one of those guards → feed abuse score (S7).
+	// counter at every validation guard (BaseACK jump, oversize range,
+	// out-of-window bitmap, etc.). If the delta is > 0, the peer just sent
+	// an ACK that tripped one of those guards → feed the abuse score.
 	suspiciousBefore := st.sendWindow.SuspiciousACKsCount()
 
 	// Process the Composite ACK with reorder threshold
@@ -645,7 +646,7 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	//
 	// CEBytes is peer-supplied data — an inflated claim ("you sent 1GB
 	// and 1GB got CE-marked" when we sent 1KB) would drive cwnd
-	// collapses on a bad-faith peer. A4: cap against the strongest
+	// collapses on a bad-faith peer. Cap against the strongest
 	// upper bound available — the total bytes WE sent in this CE
 	// interval (bytesSentSinceLastCE, drained per CE-bearing ACK). The
 	// per-ACK ackedBytes and per-stream Outstanding() are used as a

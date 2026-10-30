@@ -15,8 +15,8 @@ const ReplayWindowSize = 64
 // SeqNoWrapThreshold is the maximum legitimate forward jump in one step.
 // Per-stream rekey happens long before this (RekeyAfterBytes = 1 GiB ≈ 1M
 // frames), so any jump past ~2B SeqNos is a wraparound attack — the uint32
-// space is 4B, half of that is definitely forged.
-// See _SECURITY.md §3.3.
+// space is 4B, half of that is definitely forged. classifyLocked returns
+// ResultWrapAttack for such a jump and commitLocked never advances past it.
 const SeqNoWrapThreshold uint32 = 1 << 31
 
 // ReplayWindow implements a sliding window for anti-replay protection.
@@ -108,7 +108,7 @@ const (
 	// ResultWrapAttack — SeqNo jumped past half the uint32 SeqNo space,
 	// which a legitimate sender never does inside one rekey window
 	// (RekeyAfterBytes ≈ 1 M frames < 2 B SeqNos). Drop AND report
-	// abuse. See _SECURITY.md §3.3.
+	// abuse (the noise adapter's handleData charges ReasonReplayDetected).
 	ResultWrapAttack
 )
 
@@ -157,8 +157,8 @@ func (w *ReplayWindow) classifyLocked(seqNo uint32) CheckResult {
 	if seqNo > w.topSeq {
 		diff := seqNo - w.topSeq
 		// Reject jumps past half the SeqNo space — likely a uint32
-		// wraparound attack rather than a legitimate forward step.
-		// (S8 — see _SECURITY.md §3.3.)
+		// wraparound attack rather than a legitimate forward step
+		// (SeqNoWrapThreshold; Classify and Check count it in wrapsDetected).
 		if diff > SeqNoWrapThreshold {
 			return ResultWrapAttack
 		}

@@ -4,8 +4,9 @@
  */
 
 // Package abuse implements per-peer behavioural scoring with a circuit
-// breaker for cross-subsystem misbehaviour. See _SECURITY.md §3.6 and
-// §3.9. The goal is a single dial operators can read ("this peer is
+// breaker for cross-subsystem misbehaviour: every subsystem's abuse report
+// lands in one registry (Record) and the session accept gate consults it
+// (IsBlacklisted). The goal is a single dial operators can read ("this peer is
 // misbehaving, drop it") instead of relying on each subsystem to enforce
 // its own per-feature cap.
 //
@@ -27,8 +28,8 @@ type Reason int
 const (
 	ReasonDecryptFail       Reason = iota // noise/session.go decrypt error
 	ReasonMalformedFrame                  // frame decode / validate failure
-	ReasonACKValidation                   // S1 — Composite ACK rejected
-	ReasonStreamRefused                   // S5 — peer hit MaxConcurrentStreams
+	ReasonACKValidation                   // Composite ACK rejected by SendWindow's bounds
+	ReasonStreamRefused                   // peer hit MaxConcurrentStreams
 	ReasonWHOISFlood                      // application: WHOIS spam
 	ReasonReplayDetected                  // anti-replay window rejection
 	ReasonProtocolViolation               // any unexpected sequence/state
