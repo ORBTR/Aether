@@ -98,8 +98,8 @@ type NoiseTransportConfig struct {
 	// Only effective when relay is enabled and transport is shared (multi-scope).
 	ScopeLimiterConfig ScopeLimiterConfig
 
-	// RequireRetryToken enables the QUIC-style stateless retry path (S3 —
-	// _SECURITY.md §3.1). When true, the listener responds to first-contact
+	// RequireRetryToken enables the QUIC-style stateless retry path
+	// (retryGuard). When true, the listener responds to first-contact
 	// handshake initiations with a small RETRY cookie instead of computing
 	// Noise state, eliminating reflection amplification. The initiator must
 	// echo the cookie in its next attempt.
@@ -201,10 +201,10 @@ type NoiseTransport struct {
 
 	// Rate limiting
 	rateLimiter *tokenBucket   // Global handshake budget
-	sourceLimit *sourceLimiter // Per-source-IP budget (S6 — _SECURITY.md §3.1)
+	sourceLimit *sourceLimiter // Per-source-IP budget, checked before any handshake crypto
 
 	// Source validation — issues stateless retry tokens to first-contact
-	// addresses when requireRetryToken is true. Concern S3.
+	// addresses when requireRetryToken is true.
 	retryGuard        *retryGuard
 	requireRetryToken bool
 
@@ -385,11 +385,11 @@ func NewNoiseTransport(cfg NoiseTransportConfig) (*NoiseTransport, error) {
 		relayConfig:  cfg.RelayConfig,
 		scopeLimiter: NewPartitionRelayLimiter(cfg.ScopeLimiterConfig),
 
-		// Rate limiting — global + per-source (S6)
+		// Rate limiting — global + per-source
 		rateLimiter: newTokenBucket(float64(rateLimitBurst), float64(rateLimitRate), time.Second),
 		sourceLimit: newSourceLimiter(SourceLimitDefaultBurst, SourceLimitDefaultRate, SourceLimitMaxEntries),
 
-		// Source-validation cookies (S3) — guard always exists so peers
+		// Source-validation cookies — guard always exists so peers
 		// can opt in by sending cookies; enforcement gated on the flag.
 		// Tri-state nil → default (on); explicit *false disables it for an
 		// initiator that does not read the retry prefix.

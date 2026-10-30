@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-// Handshake amplification mitigation — "Retry token" pattern (S3).
+// Handshake amplification mitigation — "Retry token" pattern.
 //
 // The Noise XX handshake replies to a small msg1 (~5 bytes header + Curve25519
 // ephemeral) with a much larger msg2 (~280 bytes including the responder's

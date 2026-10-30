@@ -133,17 +133,19 @@ const (
 
 	// stream1MaxBackpressure is the wait window before dropping a
 	// stream-1 frame. Stream-1 carries reliable bidi RPC: the caller
-	// blocks on its reply channel up to the full callerRequestTTL
-	// (Library/dispatch/hwp_dispatch.go: 30s) waiting for a response.
-	// A silent drop here desynchronises caller and credit accounting
-	// and produces a 30s deadline-exceeded sample with no retry. Pay
-	// a per-call latency penalty of waiting up to 1s rather than
-	// burning the 30s deadline. On the noise and TCP adapters this 1s
-	// wait is paid on the per-stream deliverLoop goroutine, NOT the
+	// blocks on its reply channel up to its full request deadline
+	// (30 s on the RPC caller that opens stream 1) waiting for a
+	// response. A silent drop here desynchronises caller and credit
+	// accounting and produces a 30s deadline-exceeded sample with no
+	// retry. Pay a per-call latency penalty of waiting up to 1s rather
+	// than burning the 30s deadline. On the noise and TCP adapters this
+	// 1s wait is paid on the per-stream deliverLoop goroutine, NOT the
 	// shared readLoop — a slow stream-1 consumer blocks only its own
 	// delivery goroutine while the readLoop keeps draining the inbox
 	// (inbound ACKs for every other stream). Far cheaper than a silent
 	// 30s RPC timeout.
+	// TODO: the 30 s deadline belongs to the RPC caller outside this
+	// repository; a change to it must be agreed with this window.
 	stream1MaxBackpressure = 1 * time.Second
 )
 

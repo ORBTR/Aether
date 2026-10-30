@@ -240,7 +240,8 @@ func (d *RSDecoder) Prune(maxGroups int) {
 
 // PruneOlderThan drops groups first seen more than maxAge ago. Complements
 // count-based Prune (slow trickle of unique GroupIDs can stay under the
-// count cap but accumulate memory over time). Plan S2 specifies 2×SRTT.
+// count cap but accumulate memory over time). The noise adapter's
+// reliabilityTick passes twice the session's largest stream SRTT (floor 2 s).
 func (d *RSDecoder) PruneOlderThan(maxAge time.Duration) {
 	if maxAge <= 0 {
 		return

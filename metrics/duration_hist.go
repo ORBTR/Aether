@@ -112,7 +112,7 @@ func (h *DurationHist) copy() []int64 {
 }
 
 // PermilleRing is a fixed-capacity ring buffer of uint32 per-mille
-// (0..1000) ratio samples used for OBS-10 cwnd-utilisation. Cheaper than
+// (0..1000) ratio samples used for cwnd-utilisation sampling. Cheaper than
 // DurationHist (uint32 vs int64), no negative-sample guard.
 //
 // Used by writeLoop to record inFlight/cwnd ratios on a sampled subset
@@ -178,7 +178,7 @@ func (r *PermilleRing) copy() []uint32 {
 }
 
 // Uint32Ring is a fixed-capacity ring buffer of raw uint32 samples used
-// for OBS-9 scheduler queue-depth sampling. Unlike PermilleRing it does
+// for scheduler queue-depth sampling. Unlike PermilleRing it does
 // not clamp to 1000 — depth values are unbounded in principle (any
 // number of frames may queue across all streams) so the caller-supplied
 // value is recorded verbatim.

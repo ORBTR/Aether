@@ -46,14 +46,14 @@ type Scheduler struct {
 
 	// queueDepth tracks the total number of frames currently queued
 	// across all streams (including pending TLP probes). Maintained as
-	// an atomic counter so OBS-9 scheduler-depth sampling does not need
+	// an atomic counter so depth sampling (recordDepth) does not need
 	// to acquire s.mu and walk the stream map (which Len() does).
 	// Mutated inside the same s.mu critical sections that own the
 	// queues — eventual consistency is bounded to the moment between
 	// queue-mutation and counter-add.
 	queueDepth atomic.Int64
 
-	// depthHist is the optional OBS-9 scheduler-depth histogram. Wired
+	// depthHist is the optional scheduler-depth histogram. Wired
 	// by the owning session via SetDepthHist; nil disables sampling
 	// (default for schedulers constructed via NewScheduler). Sampled on
 	// every wake-signal path (Enqueue / EnqueueProbe / external Wake)
@@ -96,7 +96,7 @@ func (s *Scheduler) WakeCh() <-chan struct{} {
 	return s.wakeCh
 }
 
-// SetDepthHist wires an OBS-9 scheduler-depth histogram into the
+// SetDepthHist wires a scheduler-depth histogram into the
 // scheduler. Sampled on every wake signal (Enqueue / EnqueueProbe /
 // external Wake) and on every ObserveDepth call (writeLoop just before
 // it parks on WakeCh) so the histogram captures both the "work arrives"
@@ -111,7 +111,7 @@ func (s *Scheduler) SetDepthHist(h *metrics.Uint32Ring) {
 	s.depthHist = h
 }
 
-// recordDepth pushes the current queue depth into the wired OBS-9
+// recordDepth pushes the current queue depth into the wired depth
 // histogram (no-op if SetDepthHist hasn't been called). Internal
 // helper shared by signalWake (work-arrives face) and ObserveDepth
 // (drained-idle face). Cost: one atomic.Load plus one mutex'd uint32
@@ -130,7 +130,7 @@ func (s *Scheduler) recordDepth() {
 	s.depthHist.Record(uint32(d))
 }
 
-// ObserveDepth records the current queue depth into the wired OBS-9
+// ObserveDepth records the current queue depth into the wired depth
 // histogram. Called by the writeLoop just before it parks on WakeCh so
 // the histogram sees the "queue drained, idle" tail of the
 // distribution as well as the "work arrives" tail captured at
@@ -143,7 +143,7 @@ func (s *Scheduler) ObserveDepth() {
 // Caller must NOT hold s.mu (a blocked send would deadlock with
 // any consumer that tries to take s.mu after waking).
 //
-// Side-effect: samples the current queue depth into the OBS-9
+// Side-effect: samples the current queue depth into the depth
 // histogram if wired. signalWake fires on every Enqueue /
 // EnqueueProbe / external Wake() so this samples the "work-arrives"
 // face of the depth distribution; the writeLoop's pre-park

@@ -28,7 +28,7 @@ import (
 // DefaultTCPMaxConcurrentStreams is the stream cap for TCP/WS/gRPC
 // sessions (lower than Noise-UDP because one TCP conn is a narrower
 // pipe and the head-of-line blocking risk from too many streams is higher).
-// See _SECURITY.md §3.12.
+// registerStream refuses opens past it with RESET(ResetRefused).
 const DefaultTCPMaxConcurrentStreams = 256
 
 // Per-StreamID backlog tuning constants moved to the root aether
@@ -82,7 +82,7 @@ type TCPSession struct {
 	rxCompressor *aether.Compressor
 
 	// streamRefused counts peer-initiated OPEN requests rejected because
-	// MaxConcurrentStreams was reached. See _SECURITY.md §3.12.
+	// MaxConcurrentStreams was reached (registerStream).
 	streamRefused uint64
 
 	// Protocol-agnostic capabilities (cross-adapter parity with Noise —
@@ -97,14 +97,13 @@ type TCPSession struct {
 	// for RateFactor/ShouldStall before committing to large sends.
 	throttle aether.CongestionThrottle
 
-	// OBS-8: per-session delivery-side flow-control telemetry. Cross-
+	// Per-session delivery-side flow-control telemetry. Cross-
 	// adapter parity with NoiseSession.deliveryStats — every
 	// DeliverToRecvChWithSignals call on this session points at this
 	// shared DeliveryStats so receive-path delivery / drop /
 	// backpressure / bytes-dropped counters are session-aggregate.
-	// Surfaced through DeliveryStats(); Library MeshMetrics consumes
-	// it via AggregateAetherStats to publish aether_deliver_* under
-	// /api/monitoring/mesh-debug.
+	// Surfaced through DeliveryStats() for the consumer that sums a
+	// session's stats.
 	deliveryStats DeliveryStats
 
 	// wireOffer is the wire version offer this session's preface sends:
@@ -776,8 +775,8 @@ func (s *TCPSession) sendWindowUpdate(streamID uint64, credit uint64) {
 // tcpStream. When enforceRemoteCap is true and MaxConcurrentStreams would be
 // exceeded, sends RESET(ResetRefused) and returns nil — the caller drops the
 // frame. The check and the map write happen under a single s.mu.Lock so
-// concurrent peer OPENs cannot race past the cap.
-// See _SECURITY.md §3.12 / S5.
+// concurrent peer OPENs cannot race past the cap. Each refusal counts in
+// streamRefused and charges abuse.ReasonStreamRefused.
 func (s *TCPSession) registerStream(st *tcpStream, enforceRemoteCap bool) *tcpStream {
 	s.mu.Lock()
 	if existing, ok := s.streams[st.streamID]; ok {
@@ -1072,8 +1071,9 @@ func (s *TCPSession) Throttle() *aether.CongestionThrottle {
 	return &s.throttle
 }
 
-// DeliveryStats exposes the session's receive-path delivery counters
-// (OBS-8). Cross-adapter parity with NoiseSession.DeliveryStats. The
+// DeliveryStats exposes the session's receive-path delivery counters to
+// the consumer that sums a session's stats; cross-adapter parity with
+// NoiseSession.DeliveryStats. The
 // returned pointer is stable for the session's lifetime — callers can
 // sample Delivered / Dropped / Backpressure / BytesDropped via Load()
 // at monitoring cadence without holding any session lock.

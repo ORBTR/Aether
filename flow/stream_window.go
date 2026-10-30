@@ -22,8 +22,8 @@ import (
 // DefaultStreamCredit is the initial flow control credit per stream (1 MB).
 //
 // Sized to absorb a full startup gossip burst without stalling: on a
-// post-restart reconnect each peer needs a G1 full-state sync (observed
-// ~80 KB per peer), and a fleet of 10 peers produces ~800 KB of outbound
+// post-restart reconnect each peer needs a full-state gossip sync (about
+// 80 KB per peer), and a fleet of 10 peers produces ~800 KB of outbound
 // gossip in the first second. A smaller initial window (e.g. 256 KB) means
 // the 4th full-sync stalls on ConsumeTimeout, every subsequent gossip
 // retries piles up, and HTTP goroutines sharing the accept path starve —
@@ -231,7 +231,7 @@ const grantStarveFloor = 100 * time.Microsecond
 // threshold above which a stream is considered to be hoarding credit
 // — the receiver extended bandwidth via WINDOW_UPDATE but the peer is
 // not delivering data to consume it. Mirrors the sustained-imbalance
-// definition used by the S7 abuse scorer for other flow-control
+// definition the abuse scorer uses for other flow-control
 // anomalies.
 const CreditAbuseRatio = 0.5
 
@@ -304,11 +304,13 @@ func NewStreamWindowWithCap(initialCredit, maxCredit int64) *StreamWindow {
 	}
 }
 
-// SetGrantStarveHist wires a session-shared OBS-5 histogram into this
-// stream window. Consume records the wall-clock it spent blocked on the
-// credit semaphore into the histogram, skipping samples below
-// grantStarveFloor (the uncontended fast path). Pass nil to disable
-// recording (default for windows constructed via NewStreamWindow).
+// SetGrantStarveHist wires the session-shared grant-starvation histogram
+// into this stream window. Consume records the wall-clock it spent blocked
+// on the credit semaphore into the histogram, skipping samples below
+// grantStarveFloor (the uncontended fast path); the owning noise session
+// reads its percentiles into SessionMetrics.GrantStarveP50Us/P99Us. Pass
+// nil to disable recording (default for windows constructed via
+// NewStreamWindow).
 //
 // Must be called BEFORE Consume sees concurrent traffic. The field is
 // wired once at session-create time and never swapped — concurrent
@@ -360,10 +362,10 @@ func (w *StreamWindow) Consume(ctx context.Context, n int64) error {
 
 	// Fast path: try a non-blocking acquire first. When credit is
 	// immediately available (the common case on a healthy stream) we
-	// skip both the timeout-context construction and the entire OBS-5
-	// timing instrumentation. The wired-histogram cost is therefore
-	// zero on uncontended Consume calls — matching what the OBS-5
-	// design promises.
+	// skip both the timeout-context construction and the entire
+	// grant-starvation timing instrumentation. The wired-histogram cost
+	// is therefore zero on uncontended Consume calls — the fast-path
+	// skip SetGrantStarveHist documents.
 	if w.sem.TryAcquire(n) {
 		w.mu.Lock()
 		w.dataOutstanding += n
@@ -383,7 +385,7 @@ func (w *StreamWindow) Consume(ctx context.Context, n int64) error {
 	// Consume is going to block on real credit-starvation. Time it
 	// unconditionally and record on BOTH success and timeout paths —
 	// every sample here represents real semaphore contention worth
-	// surfacing in OBS-5. No floor gate: the worst-case ~10s timeout
+	// surfacing in grantStarveHist. No floor gate: the worst-case ~10s timeout
 	// path is the single most important starvation signal an operator
 	// needs in a credit-deadlock dashboard, and the fast-path skip
 	// above already filters out uncontended noise.

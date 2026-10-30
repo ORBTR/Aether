@@ -16,7 +16,8 @@ import (
 // Caps preventing CPU exhaustion from malicious Composite ACK frames.
 // An attacker post-authentication could otherwise craft an ACK that pins
 // the send CPU for seconds by claiming a huge cumulative jump or range.
-// See _SECURITY.md §3.2.
+// ProcessCompositeACK rejects an ACK past either cap and counts it in
+// suspiciousACKs.
 const (
 	// MaxACKCumulativeJump caps the distance between the current send-window
 	// base and ack.BaseACK. A normal peer's BaseACK advances by small numbers
@@ -75,7 +76,8 @@ type SendWindow struct {
 
 	// Atomic counter of Composite ACKs rejected due to validation failures
 	// (out-of-range BaseACK jump, oversized range, invalid bitmap length).
-	// See _SECURITY.md §3.2.
+	// Read through SuspiciousACKsCount(); the noise adapter's handleACK
+	// charges abuse (ReasonACKValidation) when it rises across one ACK.
 	suspiciousACKs uint64
 
 	// Atomic counter of ACKs silently no-op'd because BaseACK < base
@@ -336,7 +338,7 @@ func (w *SendWindow) GetEntry(seqNo uint32) *SendEntry {
 func (w *SendWindow) ProcessCompositeACK(ack *aether.CompositeACK, reorderThreshold int) (acked []*SendEntry, nacks []uint32) {
 	// Validate bitmap length per spec: must be one of {0, 4, 8, 16, 32}
 	// bytes (i.e. {0, 32, 64, 128, 256} bits). Reject otherwise to prevent
-	// attacker-controlled scan loops. See _SECURITY.md §3.2.
+	// attacker-controlled scan loops (each bit is one map lookup below).
 	if !validBitmapLens[len(ack.Bitmap)] {
 		atomic.AddUint64(&w.suspiciousACKs, 1)
 		return nil, nil
@@ -453,7 +455,7 @@ func (w *SendWindow) ProcessCompositeACK(ack *aether.CompositeACK, reorderThresh
 
 	// 3. Extended ranges — must NOT overlap bitmap window. Each range is
 	// also capped at MaxACKRangeSize to prevent CPU exhaustion from a
-	// crafted block with Start=0, End=0xFFFFFFFF. (§3.2 / S1)
+	// crafted block with Start=0, End=0xFFFFFFFF.
 	bitmapEnd := ack.BaseACK + uint32(len(ack.Bitmap)*8)
 	for _, block := range ack.ExtRanges {
 		if block.Start <= bitmapEnd {
@@ -466,7 +468,7 @@ func (w *SendWindow) ProcessCompositeACK(ack *aether.CompositeACK, reorderThresh
 			// wraps 0xFFFFFFFF→0 and stays <= End forever, spinning at 100%
 			// CPU while holding w.mu — one crafted frame wedges the session.
 			// This is the same upper-bound scope guard the DroppedRanges loop
-			// applies (block.End >= w.next). (§3.2 / S1)
+			// applies (block.End >= w.next).
 			atomic.AddUint64(&w.suspiciousACKs, 1)
 			continue
 		}
@@ -490,7 +492,7 @@ func (w *SendWindow) ProcessCompositeACK(ack *aether.CompositeACK, reorderThresh
 
 	// 4. Dropped ranges — permanently remove (never retransmit)
 	// Scope validation: must fall within (BaseACK, largestSent] AND be
-	// bounded in size to prevent mass-drop amplification. (§3.2 / S1)
+	// bounded in size to prevent mass-drop amplification.
 	for _, block := range ack.DroppedRanges {
 		if block.Start <= ack.BaseACK || block.End >= w.next {
 			continue // out of scope — ignore (prevents malicious mass-drop)

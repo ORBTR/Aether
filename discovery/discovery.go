@@ -35,7 +35,7 @@ type Discoverer interface {
 
 // DiscoveredPeer is the unified type returned by the discovery chain.
 // It aggregates information from one or more PeerAddress results into
-// a richer peer record suitable for the PeerConnectionManager.
+// a richer peer record for the caller that dials and keeps peer connections.
 type DiscoveredPeer struct {
 	NodeID    string
 	Addresses []string

@@ -32,10 +32,10 @@ type BytePipe interface {
 // versa, preserving full Aether framing. The relay never decrypts,
 // inspects, or modifies frames.
 //
-// On relay.orbtr.io's `/mesh/aether-ws` accept path, the browser-side
-// argument is an aether.Connection produced by noise.AcceptOverConn;
-// the agent-side argument is an aether.Stream opened on the relay's
-// existing mesh session to the target agent. Both satisfy BytePipe.
+// The caller of noise.AcceptOverConn passes the browser-side
+// aether.Connection it produced as one argument and, as the other, an
+// aether.Stream opened on its existing mesh session to the target agent.
+// Both satisfy BytePipe.
 //
 // Lifecycle:
 //   - Blocks until EITHER direction errors or ctx is cancelled.

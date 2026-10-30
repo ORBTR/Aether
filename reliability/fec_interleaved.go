@@ -161,7 +161,7 @@ func (d *InterleavedFECDecoder) Prune(maxGroups int) {
 }
 
 // PruneOlderThan drops groups first seen more than maxAge ago from both
-// sub-decoders. See FECDecoder.PruneOlderThan for the S2 rationale.
+// sub-decoders. See FECDecoder.PruneOlderThan for why age bounds the groups.
 func (d *InterleavedFECDecoder) PruneOlderThan(maxAge time.Duration) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
