@@ -98,11 +98,14 @@ const (
 	ResultDuplicate
 
 	// ResultAncient — SeqNo is below the bottom of the sliding window
-	// (`top - ReplayWindowSize` or older). A legitimate retransmit
-	// cannot land this far behind — the reliability layer doesn't keep
-	// frames around long enough. Either a buggy/malicious peer is
-	// replaying an old frame or the window has been deliberately
-	// skipped past. Drop AND report abuse.
+	// (`top - ReplayWindowSize` or older): a replayed old frame, a deep
+	// reorder, or a legitimate retransmit that lands more than
+	// ReplayWindowSize behind a topSeq that a burst carried far past the
+	// lost SeqNo (in-flight is bounded by cwnd and credit, not by this
+	// window). The noise adapter's handleData tells those apart by the
+	// receive window's delivery floor, not here: below the floor it is
+	// eager-ACKed and dropped, at or above it is delivered through the
+	// receive window; neither is charged as abuse.
 	ResultAncient
 
 	// ResultWrapAttack — SeqNo jumped past half the uint32 SeqNo space,
@@ -134,9 +137,11 @@ func (r CheckResult) IsAccept() bool {
 	return r == ResultNew
 }
 
-// IsAbuse reports whether the caller should feed the abuse tracker.
-// True for ResultAncient and ResultWrapAttack; false for ResultDuplicate
-// (legitimate retransmit, not adversarial).
+// IsAbuse reports the classes a receiver may treat as abuse: true for
+// ResultAncient and ResultWrapAttack, false for ResultDuplicate (a
+// legitimate retransmit). The noise adapter's handleData does not consult
+// it: it charges ResultWrapAttack alone and routes an Ancient frame by the
+// receive window's delivery floor (see ResultAncient).
 func (r CheckResult) IsAbuse() bool {
 	return r == ResultAncient || r == ResultWrapAttack
 }

@@ -351,8 +351,8 @@ recvLoop:
 	// responder with no session for this addr and is discarded, nothing ever
 	// comes back, and STALL-DETECT reaps us at the 120s threshold with
 	// "session stuck (no forward progress)" / "ping timeout (no inbound
-	// activity)". Fleet-wide that is the noise-UDP sawtooth: links establish,
-	// win the path, die ~2m later, reform, forever.
+	// activity)"; without the retransmit below, every such dial would
+	// establish, win the path, be reaped at that threshold and be re-dialled.
 	//
 	// Retransmit until the peer proves it completed by sending us anything.
 	// Safe and idempotent: the responder ignores a duplicate msg3 once its

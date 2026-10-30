@@ -192,10 +192,10 @@ func DeliverToRecvCh(recvCh chan<- []byte, payload []byte, window *flow.StreamWi
 //   - Drop rate < 10% : severity = 50, reason = QueueFull, backoff = 200 ms
 //   - Drop rate ≥ 10% : severity = 80, reason = Downstream, backoff = 500 ms
 //
-// These were picked to keep the signal actionable without flapping:
-// moderate severity on the first drop so the sender tapers, higher
-// severity under sustained pressure. Sender's CongestionThrottle.Apply
-// already merges multiple signals so repeated fires don't compound.
+// Moderate severity on the first drop so the sender tapers, higher
+// severity under sustained pressure, keeps the signal actionable without
+// flapping; the sender's CongestionThrottle.Apply merges repeated signals
+// so repeated fires do not compound.
 func DeliverToRecvChWithSignals(
 	recvCh chan<- []byte,
 	payload []byte,

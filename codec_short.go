@@ -599,8 +599,8 @@ func (c *Compressor) DecodeEncryptedDataShort(r io.Reader) (*Frame, error) {
 // Layout: [indicator:1][type:1][streamID:2][seqNo:4]. The seqNo round-
 // trips PING <-> PONG so the receiver's pendingPingSeq gate in
 // RecordPongRecv can correlate the matching pong and feed an RTT sample
-// to the RFC 6298 estimator. Earlier 4-byte revisions dropped seqNo on
-// the wire, leaving the estimator permanently at its InitialRTO seed.
+// to the RFC 6298 estimator; without it on the wire no pong would match
+// and the estimator would stay at its InitialRTO seed.
 func (c *Compressor) EncodeControlShort(w io.Writer, f *Frame) (int, error) {
 	if !c.ShortForms() {
 		return 0, ErrShortFormsNotNegotiated

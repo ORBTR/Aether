@@ -85,9 +85,11 @@ type NATBehaviour struct {
 	Filtering FilteringBehaviour
 }
 
-// LegacyType maps the RFC 5780 classification back to the simpler
-// (Open/FullCone/Restricted/PortRestricted/Symmetric) enum used by
-// older callers. Uses the matrix:
+// LegacyType maps the RFC 5780 classification to the single-valued
+// aether.NATType enum (Open/FullCone/Restricted/PortRestricted/Symmetric)
+// that ReflexiveAddress.NATType carries and the STUN detector reports, for
+// consumers that key on that one value rather than the mapping/filtering
+// pair. Uses the matrix:
 //
 //	               | EIF              | ADF              | APDF
 //	---------------|------------------|------------------|--------------------

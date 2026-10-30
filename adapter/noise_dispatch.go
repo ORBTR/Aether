@@ -271,12 +271,14 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 	// the replay window as ResultDuplicate — while reportAbuse scores
 	// abuse.ReasonReplayDetected at weight 8 against a threshold of 100.
 	//
-	// Classify separates the cases: only Ancient (SeqNo below window
-	// bottom — a legitimate retransmit cannot land that far behind the
-	// reliability layer's send window) and WrapAttack (SeqNo jumped past
-	// half the uint32 space, impossible in a single rekey window) are
-	// reported as abuse. Duplicate is the protocol-correct behaviour of
-	// a working reliability layer under loss.
+	// Classify separates the cases, and only WrapAttack (SeqNo jumped past
+	// half the uint32 space, impossible in a single rekey window) is charged
+	// (reportAbuse below). Duplicate is the protocol-correct behaviour of a
+	// working reliability layer under loss and is eager-ACKed, uncharged.
+	// Ancient (SeqNo below the replay window's bottom) is routed by the
+	// recvWindow's delivery floor in its arm below: below the floor it is
+	// eager-ACKed, uncharged; at or above it, it is still needed and goes
+	// through the recvWindow like a new frame.
 	// Classify is read-only — it does NOT mark the SeqNo seen.
 	// We commit the replay window (st.replay.Commit) only AFTER the frame is
 	// durably buffered by recvWindow below. If we marked it seen here and the
@@ -298,10 +300,10 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 		// SHOULD be eager about replying to break the retransmit
 		// storm. Matches RFC 5681 §4.2 (TCP) / RFC 9002 §B.7 (QUIC).
 		// Without this, recovery from one lost ACK takes
-		// O(maxRetries × RTO) instead of one extra round-trip, and
-		// duplicate count climbs until the abuse-tracker fix
-		// (CheckResult split) is the only thing keeping the session
-		// alive — fix the symptom AND stop the storm.
+		// O(maxRetries × RTO) instead of one extra round-trip, and the
+		// sender's retransmits keep arriving as duplicates for that whole
+		// time: this arm's uncharged drop keeps the session alive through
+		// the storm, and the eager ACK is what ends it.
 		//
 		// Skip recvWindow.Insert (already delivered) and
 		// congestion.OnAck (would double-count bytes).
@@ -326,8 +328,9 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 		// early loss lets topSeq advance far past the lost SeqNo; the
 		// sender's legitimate retransmit -- or a deep network reorder --
 		// then lands >64 behind and is misclassified Ancient. Dropping it
-		// here AND charging abuse re-opens the retransmit churn class the
-		// ResultDuplicate/ResultAncient split was built to eliminate.
+		// here AND charging abuse would score a legitimate retransmit at
+		// weight 8 against the threshold of 100, the same churn the
+		// uncharged ResultDuplicate arm above exists to absorb.
 		//
 		// The reorder authority is the recvWindow's cumulative delivery
 		// floor (expected), not topSeq: any SeqNo at or above `expected`

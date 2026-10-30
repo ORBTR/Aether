@@ -1215,9 +1215,9 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 		DecryptErrors:      decryptErr,
 		InboxDrops:         inboxDrops,
 		// Anti-replay classification (Classify/Commit split). ReplayRejects
-		// preserved as the sum so old consumers reading the aggregate
-		// see the same total — the split surfaces the operational
-		// meaning. See SessionMetrics docs for the distinction.
+		// is the sum so a consumer that reads only the aggregate sees the
+		// whole; the split surfaces the operational meaning. See
+		// SessionMetrics docs for the distinction.
 		ReplayDuplicates: replayDup,
 		ReplayAncient:    replayAncient,
 		ReplayRejects:    replayDup + replayAncient + seqWraps,

@@ -92,8 +92,9 @@ type Controller interface {
 	// ResetCWND restores the controller to a known-clean state — cwnd =
 	// initialCWND, ssthresh cleared, recovery state cleared, slow-start
 	// re-engaged. Called by the adapter when the probe-before-close path
-	// confirms the network is alive: prior OnLoss reductions were
-	// over-zealous, the cwnd-collapsed deadlock should be broken.
+	// confirms the network is alive: the OnLoss reductions that collapsed
+	// cwnd answered transient loss, so the inFlight >= cwnd deadlock they
+	// left is to be broken.
 	ResetCWND()
 
 	// CWND returns the current congestion window in bytes.

@@ -68,8 +68,9 @@ func CaptureCallerChain(skip, depth int) string {
 //	DEBUG=aether.flow,aether.gossip   — enable both explicitly
 //
 // An entry matches a namespace when the namespace equals the entry or
-// starts with "entry.". Prior versions used plain substring matching in
-// the wrong direction, so DEBUG=aether did not enable aether.flow.
+// starts with "entry." (matchesAnyDebugEntry): the prefix test runs from
+// the entry into the namespace, so DEBUG=aether enables aether.flow while
+// DEBUG=flow does not.
 type DebugLogger struct {
 	namespace string
 	enabled   bool

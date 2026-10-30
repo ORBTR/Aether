@@ -626,9 +626,9 @@ func (c *noiseConn) Close() error {
 	c.closeOnce.Do(func() {
 		c.health.MarkClosed()
 		close(c.closed)
-		// Do NOT close(c.inbox) — the double-select pattern in decryptAndDeliver
-		// checks c.closed before sending, so inbox does not need to be closed.
-		// Closing it caused panics when runReader was still sending.
+		// Do NOT close(c.inbox): decryptAndDeliver's double select checks
+		// c.closed before sending, which is the only guard between runReader's
+		// sends and this close, and a send on a closed inbox would panic.
 		if c.parentStop != nil {
 			c.parentStop()
 		}

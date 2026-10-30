@@ -31,10 +31,10 @@ import (
 // registerStream refuses opens past it with RESET(ResetRefused).
 const DefaultTCPMaxConcurrentStreams = 256
 
-// Per-StreamID backlog tuning constants moved to the root aether
-// package (stream_acceptor.go) — they are shared with the Noise and
-// QUIC adapters via the StreamAcceptor type rather than duplicated
-// here. See aether.MaxByIDBacklogPerStream / aether.ByIDBacklogGrace.
+// The per-StreamID backlog tuning constants (aether.MaxByIDBacklogPerStream,
+// aether.ByIDBacklogGrace) live in the root package beside StreamAcceptor
+// (stream_acceptor.go), which the Noise, TCP and QUIC adapters share, so one
+// limit governs every adapter's accept backlog and none redeclares it here.
 
 // TCPSession implements Session over a TCP/TLS connection.
 // Provides Aether multiplexing (all streams share one conn), flow control,
@@ -453,8 +453,8 @@ func NewTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 	// A TCPSession is long-lived and owns its liveness via the keepalive
 	// stream + housekeepingTick idle eviction — readLoop blocks
 	// indefinitely by design. A leftover deadline fires mid-session and
-	// kills it at exactly the dial-timeout mark (observed: grade-C WS
-	// sessions dying fleet-wide at lived≈5.00s). Cleared once here, at the
+	// kills it at exactly the dial-timeout mark, 5 s in for a WebSocket
+	// dial. Cleared once here, at the
 	// single chokepoint every stream transport (WebSocket, TLS) funnels
 	// through, so no transport can leak a deadline into a live session.
 	_ = conn.SetDeadline(time.Time{})
