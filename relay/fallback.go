@@ -280,10 +280,11 @@ func (d *FallbackDialer) tryRelayDial(ctx context.Context, targetAddr string, ta
 
 // dialViaRelay establishes a relayed connection to the target.
 func (d *FallbackDialer) dialViaRelay(ctx context.Context, relay RelayInfo, targetNodeID [32]byte) (aether.Connection, error) {
-	// Request a relay ticket from the relay node
-	// This would normally involve an RPC call to the relay
-	// For now, we use the local private key to create a self-signed ticket
-	// In production, the relay would issue the ticket after authorization
+	// The ticket is self-signed with d.privateKey (NewRelayTicket, one hour).
+	// TODO: have the relay issue the ticket after authorising this dialler
+	// over an RPC to the relay node; RelayTicket.Verify checks the signature
+	// against the relay's public key, so this self-signed ticket passes only
+	// at a relay that holds d.privateKey.
 
 	ticket, err := NewRelayTicket(
 		d.privateKey,

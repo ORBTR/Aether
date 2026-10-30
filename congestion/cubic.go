@@ -51,9 +51,9 @@ const (
 // better on bursty-loss paths and is what Linux's TCP stack does.
 //
 // Persistent-congestion exit: when the adapter's probe-before-close path
-// (3 Pings within 3 s) succeeds, the path is provably alive, so the
-// previous cumulative OnLoss reductions that drove cwnd to the floor
-// were diagnosing transient loss as persistent congestion. ResetCWND()
+// (3 Pings within 3 s) succeeds, the path is provably alive, so the loss
+// behind the cumulative OnLoss reductions that drove cwnd to the floor
+// is transient, not persistent congestion. ResetCWND()
 // restores cwnd to initialCWND and exits fast recovery, breaking the
 // deadlock where inFlight >= cwnd prevents any new sends and thus any
 // new ACKs.
@@ -242,8 +242,8 @@ func (c *CUBICController) OnSend(sentBytes int64) DeliveryRateSample {
 // ResetCWND restores cwnd to initialCWND, clears ssthresh back to a
 // no-threshold state (effectively re-enters slow start), and clears
 // PRR state. Called by the adapter when the probe-before-close path
-// confirms the network is alive — the previous OnLoss reductions
-// were over-zealous and drove cwnd to the floor. Without this, the
+// confirms the network is alive, so the OnLoss reductions that drove
+// cwnd to the floor answered transient loss. Without this, the
 // session enters a deadlock where inFlight >= cwnd prevents any
 // further sends and therefore any further ACKs.
 //

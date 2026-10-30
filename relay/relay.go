@@ -16,9 +16,9 @@ import (
 )
 
 const (
-	// Packet-type constants (PacketTypeData … PacketTypeRelayData) moved to
-	// the build-tag-agnostic packet_types.go so noise's agnostic noiseConn can
-	// reference them under GOOS=js.
+	// The packet-type constants (PacketTypeData … PacketTypeRelayData) live
+	// in packet_types.go, which carries no build tag, so noise's noiseConn can
+	// reference them under GOOS=js while this file is built only for !js.
 
 	// Relay overhead: a canonical NodeID is exactly 30 bytes ("vl1_" + 26
 	// base32 chars). A 32-byte header would leave 2 trailing NUL bytes when

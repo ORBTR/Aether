@@ -24,13 +24,13 @@ import (
 // dialer of another origin reaches them only through the public anycast
 // address.
 //
-// Problem: Fly's public anycast IPv4 is per-app. An initiator's Noise
-// msg1 lands on whichever of the app's N machines wins the 5-tuple
-// hash. If that machine doesn't hold the target NodeID's keys (the
-// 1-in-N case is rare; the (N-1)-in-N case is the common one), the
-// handshake fails. Caller drops to WebSocket fallback.
+// Fly's public anycast IPv4 is per-app: an initiator's Noise msg1 lands
+// on whichever of the app's N machines wins the 5-tuple hash, and when
+// that machine doesn't hold the target NodeID's keys (the (N-1)-in-N case,
+// the common one) the handshake fails and the caller drops to the
+// WebSocket fallback.
 //
-// Fix: the anycast-receiving machine M_r inspects the cleartext
+// So the anycast-receiving machine M_r inspects the cleartext
 // routing preamble on msg1, looks up which machine M_t of the same
 // origin holds the target NodeID, and forwards the datagram via 6PN.
 // M_t processes the handshake as if msg1 had arrived natively from

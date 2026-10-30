@@ -254,13 +254,13 @@ func (t *TLP) Disarm() {
 // NOTE: This deliberately does NOT gate on probePending. RFC 8985 §7.5
 // and RFC 9002 §6.2.4 allow back-to-back probes (up to N) without an
 // intervening ACK so that a single dropped probe doesn't permanently
-// wedge the connection. The earlier "probePending blocks ShouldProbe"
-// behaviour fired exactly one probe per stream and then, if that probe
-// was lost on the wire (the very case we built TLP to handle), the
-// stream stayed wedged forever because no subsequent probe could fire.
-// consecutiveProbes — incremented on every MarkProbeSent and capped at
-// maxConsecutiveProbes — provides the correct giving-up signal: after
-// N consecutive un-ACKed probes the session stall path takes over.
+// wedge the connection. A ShouldProbe gated on probePending would fire
+// exactly one probe per stream and then, were that probe lost on the wire
+// (the case a loss probe exists for), no later probe could fire and the
+// stream would stay wedged. consecutiveProbes — incremented on every
+// MarkProbeSent and capped at maxConsecutiveProbes — is the giving-up
+// signal instead: after N consecutive un-ACKed probes the session stall
+// path takes over.
 //
 // On true, the adapter selects which seq to probe (typically the
 // largest in-flight seq, per RFC 8985 §7.4) and calls MarkProbeSent.

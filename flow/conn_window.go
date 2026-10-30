@@ -16,15 +16,15 @@ import (
 
 // DefaultConnCredit is the initial connection-level credit (4 MB).
 //
-// Sized to absorb the observed gossip burst pattern: full-state exchanges
-// run ~70-100 KB per round-trip and the receiver only emits a
-// WINDOW_UPDATE after the 25% auto-grant threshold (1 MB for the old
-// default) was consumed — so roughly 4 round-trips of silence before
-// grants started flowing back. Under high-rate gossip (post-restart
-// convergence storm) that produced "insufficient connection credit after
-// 10s" timeouts where observed avail was 40-70 KB vs 72 KB needed —
-// credit WAS flowing back, just not fast enough to keep up with the
-// leading edge of a burst.
+// Sized for a gossip burst: full-state exchanges run ~70-100 KB per
+// round-trip and the receiver emits a WINDOW_UPDATE only once the
+// AutoGrantThreshold fraction (25%) of the initial credit has been
+// consumed, so a 1 MB window runs about four round-trips before any grant
+// flows back. Under high-rate gossip (every peer converging at once) that
+// leaves Consume waiting out ConsumeTimeout (10 s) and failing with
+// "insufficient connection credit" while the available credit (tens of KB)
+// trails the next 72 KB exchange: credit flows back, just not fast enough
+// to keep up with the leading edge of a burst.
 //
 // 4 MB covers ~16 back-to-back 72 KB exchanges before any stall,
 // comfortably more than the grant-emission cycle. Auto-tuning + the

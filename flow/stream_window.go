@@ -21,13 +21,14 @@ import (
 
 // DefaultStreamCredit is the initial flow control credit per stream (1 MB).
 //
-// Sized to absorb a full startup gossip burst without stalling: on a
-// post-restart reconnect each peer needs a full-state gossip sync (about
-// 80 KB per peer), and a fleet of 10 peers produces ~800 KB of outbound
-// gossip in the first second. A smaller initial window (e.g. 256 KB) means
-// the 4th full-sync stalls on ConsumeTimeout, every subsequent gossip
-// retries piles up, and HTTP goroutines sharing the accept path starve —
-// the observed "credit cascade → health-check timeout → Fly restart" loop.
+// Sized to absorb a full startup gossip burst without stalling: when a
+// node's peers all reconnect to it at once, each needs a full-state gossip
+// sync (about 80 KB per peer), and a fleet of 10 peers produces ~800 KB of
+// outbound gossip in the first second. A smaller initial window (e.g.
+// 256 KB) stalls the 4th full sync on ConsumeTimeout, every later gossip
+// send queues behind it, and the goroutines that share the accept path with
+// those sends starve, so the node's own health check times out and its host
+// restarts it, which starts the burst again.
 //
 // 1 MB covers ~12 back-to-back full syncs which is comfortably over the
 // worst startup burst, and the working-set cost is bounded by

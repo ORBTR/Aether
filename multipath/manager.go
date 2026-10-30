@@ -485,8 +485,8 @@ func (m *Manager) ShouldSendRedundant(latencyClass aether.LatencyClass) bool {
 // Dead-on-arrival recovery: if every other path is also PathDead (a
 // network blip can kill all transports simultaneously) promotebestStandby
 // returns no winner and the primary index would remain pointing at the
-// just-killed path. Dispatch then returns it forever from PrimarySession
-// until something external triggers a re-probe. The recovery path here
+// just-killed path, which PrimarySession would then hand to every caller
+// until something external triggered a re-probe. The recovery path here
 // resurrects all dead standbys (skipping cooldown) and re-runs the
 // promotion — at least one path can return to PathStandby and become
 // the new primary.
@@ -623,14 +623,16 @@ func (m *Manager) RunProbeLoop(ctx context.Context) {
 // probe tick includes the primary. 4 gives a primary-liveness check every
 // ~2 minutes at the default 30s tick. Probing the primary is how a silently
 // wedged primary (cwnd-stuck, app reads block, no explicit error) is
-// detected: the only other signal is the OnPrimaryFailure call dispatch
-// makes on an explicit error, which such a path never raises.
+// detected: the only other signal is OnPrimaryFailure, which the connection
+// manager that owns this Manager's sessions calls when it removes one on an
+// explicit error, and such a path never raises one.
 const primaryProbeEvery uint64 = 4
 
 // probeNonPrimary pings every non-primary path (and the primary on every
 // primaryProbeEvery-th invocation). Holds m.mu only to snapshot the path
 // list — actual Ping calls happen outside the lock so a slow ping doesn't
-// block dispatch.
+// block the path pickers that take m.mu (PrimarySession, PickPath,
+// PickByQuality).
 func (m *Manager) probeNonPrimary(ctx context.Context) {
 	m.mu.Lock()
 	m.resurrectExpiredDeadPathsLocked()
@@ -777,8 +779,8 @@ func (m *Manager) setPrimary(i int) {
 // different reason: a flapping path's session is still alive (its
 // Ping succeeded during the false-positive recovery) so it would
 // otherwise look like a perfectly good promotion candidate. The
-// whole point of the PathFlapping tier is to keep dispatch away from
-// it for flappingDemoteDur so a steadier transport (WS, TCP) carries
+// whole point of the PathFlapping tier is to keep traffic off it for
+// flappingDemoteDur so a steadier transport (WS, TCP) carries
 // traffic while the noise-UDP path settles.
 func (m *Manager) promotebestStandby() bool {
 	bestIdx := -1

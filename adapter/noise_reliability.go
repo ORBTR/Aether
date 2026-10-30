@@ -75,9 +75,9 @@ func (s *NoiseSession) writeLoop() {
 			// the congestion window so they can recover from cwnd-collapse
 			// deadlocks. Without this bypass, a stream that has driven its
 			// cwnd to zero through losses cannot send the very probe that
-			// would elicit an ACK and reopen the window — leading to the
-			// fleet-wide `tlp{scheduledIn=-29s probePending=true probes=1}`
-			// wedge we saw in production. Regular frames still respect
+			// would elicit an ACK and reopen the window: the TLP stays armed
+			// past its scheduled time with probePending set, and this loop
+			// re-enqueues and parks forever. Regular frames still respect
 			// CanSend (and re-enqueue + park until cwnd advances).
 			//
 			// CanSend's contract is `inFlight < cwnd` — pass cumulative
@@ -231,15 +231,15 @@ func (s *NoiseSession) writeLoop() {
 		// path called signalWake AND we ourselves called Wake() — so
 		// the wake channel holds a self-induced signal. Parking on it
 		// fires immediately, we re-dequeue the same frame, CanSend
-		// still returns false, repeat. Live capture showed 19,116,308
-		// cansend_false_reenqueues vs 17 frames_sent (>1M:1 reject:send
-		// ratio) — the writeLoop was burning CPU spinning against its
-		// own wake. Fix: drain the self-wake, then park with a 1ms
-		// timer arm so an ACK that arrives (via noise_dispatch.go:546
-		// Wake()) still wakes us instantly, but absent any external
-		// signal we re-check CanSend at 1kHz instead of MHz. The timer
-		// also gives congestion-controller timer-driven advances a
-		// chance to fire before our retry.
+		// still returns false, repeat: a cwnd that stays blocked would
+		// spin this goroutine at the CPU's rate, counted in
+		// cansendFalseReenqueues against a framesSent that does not move.
+		// So: drain the self-wake, then park with a 1 ms timer
+		// (cwndBlockedProbeInterval) so an ACK that arrives (handleACK's
+		// Wake() in noise_dispatch.go) still wakes us instantly, but absent
+		// any external signal we re-check CanSend at 1 kHz instead of at the
+		// CPU's rate. The timer also gives congestion-controller timer-driven
+		// advances a chance to fire before our retry.
 		parkStart := time.Now()
 		if !cwndBlockStart.IsZero() {
 			select {
@@ -267,10 +267,10 @@ func (s *NoiseSession) writeLoop() {
 }
 
 // cwndBlockedProbeInterval bounds the writeLoop's CanSend retry rate
-// when cwnd is blocking. 1ms gives ACKs (which wake via signalWake)
-// instant priority while preventing the self-wake busy-spin observed
-// in fleet capture (19M reject events / 17 frames sent — >1M:1 ratio).
-// Tuned conservative: lower values risk spin-amplification; higher
+// when cwnd is blocking. 1 ms gives ACKs (which wake via signalWake)
+// instant priority while bounding the self-wake retry loop in writeLoop's
+// park, which would otherwise re-dequeue the same frame at the CPU's rate
+// while cwnd stays blocked. Lower values risk spin-amplification; higher
 // values delay legitimate cwnd-recovery beyond a typical SRTT.
 const cwndBlockedProbeInterval = 1 * time.Millisecond
 
@@ -620,8 +620,9 @@ func (s *NoiseSession) reliabilityTick() {
 				// signal the owning connection manager reads as "fall
 				// back to the next protocol grade" (SessionStallThreshold);
 				// the quality tracker's dial cooldown for a failed path
-				// runs 30 s to 2 min (dialCooldownDuration), so the path
-				// stays abandoned at least that long. Three probes a
+				// starts at 30 s and doubles per failure to a 10 min cap
+				// (dialCooldownDuration), so the path stays abandoned at
+				// least 30 s. Three probes a
 				// second apart cover ~3 s of wall time, long enough for
 				// such a burst to clear and short enough not to delay the
 				// close of a dead session noticeably.
@@ -658,9 +659,9 @@ func (s *NoiseSession) reliabilityTick() {
 					s.mu.Unlock()
 					// Persistent-congestion exit (RFC 9002 §7.6 analog):
 					// the path is provably alive because Ping returned, so
-					// the cumulative OnLoss reductions that drove cwnd to
-					// the floor were diagnosing transient loss as
-					// persistent congestion. Restore cwnd so the
+					// the loss behind the cumulative OnLoss reductions that
+					// drove cwnd to the floor is transient, not persistent
+					// congestion. Restore cwnd so the
 					// reliability layer can drain its in-flight backlog
 					// instead of deadlocking on cwnd <= inFlight.
 					//

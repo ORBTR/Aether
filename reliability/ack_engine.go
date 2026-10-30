@@ -60,9 +60,9 @@ func AckEmitStats() (immediate, delayTimer, duplicate uint64) {
 
 // dbgACK is the debug logger for the ACK engine. Enable with
 // DEBUG=aether.reliability.ack (or any ancestor: aether.reliability,
-// aether). Used to confirm whether real mesh traffic actually reaches
-// OnDataReceived and whether the flush path fires — diagnosing the
-// observed fleet-wide "zero ACKs emitted" condition.
+// aether). Used to confirm whether inbound traffic reaches OnDataReceived
+// and whether the delayed flush (startTimerLocked) fires: the two points
+// that increment AckEmitStats' immediate and delay-timer counters.
 var dbgACK = aether.NewDebugLogger("aether.reliability.ack")
 
 // ACKPolicy controls when ACKs are sent.

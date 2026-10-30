@@ -22,7 +22,7 @@ import (
 // signed NodeInfo). Without source-address validation, an attacker can spoof
 // arbitrary source IPs and use the listener as a ~7× UDP amplifier.
 //
-// The fix mirrors QUIC's stateless retry: on first contact from an
+// Source validation follows QUIC's stateless retry: on first contact from an
 // unvalidated source, the responder does NOT compute Noise state. Instead
 // it returns a small `RETRY` packet containing an HMAC-bound cookie that
 // only the legitimate (non-spoofed) source can echo back. The second

@@ -124,7 +124,7 @@ type SessionMetrics struct {
 	ActiveStreams int           // number of open streams
 	DroppedFrames uint64        // frames dropped (buffer full, expired, replay)
 	FECRecoveries uint64        // frames recovered via FEC (without retransmit)
-	ReplayRejects uint64        // frames rejected by anti-replay window (deprecated: now equals ReplayDuplicates + ReplayAncient — kept for back-compat)
+	ReplayRejects uint64        // frames rejected by the anti-replay window: ReplayDuplicates + ReplayAncient + SeqNoWraps, for consumers that read only this aggregate
 
 	// Security observability counters: each counts one bound the
 	// reliability layer or an adapter enforced on a peer.
@@ -146,8 +146,8 @@ type SessionMetrics struct {
 	InboxDrops         uint64 // packets dropped because the session inbox was full
 
 	// Anti-replay classification counters (Classify/Commit split). Total
-	// ReplayRejects is the sum of these — surfaced separately because
-	// the operational meaning is different:
+	// ReplayRejects is the sum of these and SeqNoWraps — surfaced separately
+	// because the operational meaning is different:
 	//
 	// ReplayDuplicates = legitimate retransmits the sender re-sent
 	//   because its ACK was lost / late. NOT abuse. A high value

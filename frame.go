@@ -387,8 +387,13 @@ func (f *Frame) Validate() error {
 // minPayloadSizes is the per-type minimum wire size for control frames.
 // Sourced from the per-type Size constants declared in this file. DATA
 // frames have no minimum (zero-length DATA is a valid keepalive on some
-// streams). Type-specific decoders never need to bounds-check their
-// initial read because Validate has already rejected undersized frames.
+// streams). Validate refuses a shorter uncompressed payload before any type
+// handler runs, which is what lets the noise adapter's processIncomingFrame
+// charge abuse.ReasonMalformedFrame for it instead of a handler acting on a
+// zero value. The decoders (DecodeOpenPayload, DecodeReset,
+// DecodeWindowUpdate, DecodeCongestion, DecodeStats) still check short input
+// and return a zero value themselves: a second guard that holds for any
+// caller, whether or not it ran Validate on the frame first.
 var minPayloadSizes = map[FrameType]uint32{
 	TypeOPEN:       OpenPayloadSize,
 	TypeRESET:      ResetPayloadSize,
