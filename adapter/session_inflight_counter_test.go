@@ -124,15 +124,8 @@ func TestNoiseSession_InFlightBytesReturnsToZeroAfterOneCompressedFrameIsAcked(t
 // the counter returns to 0 after every one of many compressible messages is
 // acked, whether the ACKs come one at a time or cumulatively. The messages go
 // in bursts of several frames so more than one entry is in flight at once,
-// and each burst is received before the next is sent: the receiving stream
-// holds at most recvChCapacity(streamID) payloads on deliverCh and as many
-// again on recvCh, and enqueueDelivery drops an in-order payload the readLoop
-// dispatches while deliverCh is full (the reliability layer has acked it, so
-// no retransmit brings it back; a payload under flow.MinGuaranteedWindow
-// consumed no credit, so nothing throttles the sender first). A burst that
-// stays under the smaller buffer is received whole however late the
-// stream's deliverLoop runs, so this test asserts the counter, not the
-// delivery layer's overload behaviour.
+// and each burst is received before the next is sent, so what this test asserts
+// is the counter, and delivery has its own tests in delivery_burst_test.go.
 func TestNoiseSession_InFlightBytesReturnsToZeroAfterManyCompressedFramesAreAcked(t *testing.T) {
 	client, server := noisePairWithRealms(t, nil, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -144,9 +137,6 @@ func TestNoiseSession_InFlightBytesReturnsToZeroAfterManyCompressedFramesAreAcke
 	waitInFlightBytesZero(t, client, "before the sends")
 
 	const burst = 4
-	if burst > recvChCapacity(streamID) {
-		t.Fatalf("premise: a burst of %d exceeds the stream's delivery buffer of %d", burst, recvChCapacity(streamID))
-	}
 	const rounds = 5
 	msg := compressibleMessage()
 	for r := 0; r < rounds; r++ {

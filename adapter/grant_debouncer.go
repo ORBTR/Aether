@@ -228,6 +228,11 @@ type grantDebouncer struct {
 	// tick and force-flushes if pending > 0 and the gap exceeds
 	// GrantWatchdogInterval. Protected by mu.
 	lastFlushUnix int64
+
+	// ungranted is set when a flush's bytes met no trigger in the window, so
+	// they wait inside it for a grant only checkAndFlushStuck will ask for.
+	// Protected by mu.
+	ungranted bool
 }
 
 // newGrantDebouncer creates a debouncer bound to a grantable window and
@@ -265,7 +270,7 @@ func newGrantDebouncer(
 // same flush. Safe to call from multiple goroutines.
 //
 // The application's Receive() calls this after successfully reading a
-// payload from the stream's recvCh (post-reassembly for fragmented
+// payload from the stream's receive queue (post-reassembly for fragmented
 // payloads).
 func (d *grantDebouncer) Record(n int64) {
 	if n <= 0 {
@@ -347,6 +352,7 @@ func (d *grantDebouncer) flushLocked(reason string) {
 		return
 	}
 	grant := d.window.ReceiverConsume(n)
+	d.ungranted = grant <= 0
 	if dbgGrant.Enabled() {
 		dbgGrant.Printf("stream=%d flush(%s) n=%d grant=%d", d.streamID, reason, n, grant)
 	}
@@ -390,14 +396,31 @@ func (d *grantDebouncer) Close() {
 // debouncer has accumulated pending without flushing for at least
 // `gapThreshold`, force a flush so the sender doesn't stall waiting for
 // a grant that was already earned but never delivered.
+//
+// With nothing pending it still asks the window when the last flush's bytes met
+// no trigger (ungranted), and credit returns only through grants. A sender whose
+// own initial credit is under a quarter of this window (StreamConfig.InitialCredit
+// is local to each side) can exhaust it without reaching this window's threshold,
+// and then sends nothing that would make another Record happen, so the
+// window's TIMED trigger is reached only from here.
 func (d *grantDebouncer) checkAndFlushStuck(gapThreshold time.Duration) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.closed || d.pending <= 0 {
+	if d.closed {
 		return
 	}
 	gap := time.Since(time.Unix(0, d.lastFlushUnix))
 	if gap < gapThreshold {
+		return
+	}
+	if d.pending <= 0 {
+		if d.ungranted && d.window != nil {
+			grant := d.window.ReceiverConsume(0)
+			d.ungranted = grant <= 0
+			if grant > 0 && d.sendUpdate != nil {
+				d.sendUpdate(d.streamID, uint64(grant))
+			}
+		}
 		return
 	}
 	if dbgGrant.Enabled() {

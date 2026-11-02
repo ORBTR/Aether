@@ -129,10 +129,10 @@ type NoiseSession struct {
 	cansendFalseReenqueues uint64
 	wakeOnAckCalls         uint64
 
-	// Per-session delivery-side flow-control telemetry. Every
-	// DeliverToRecvChWithSignals call on this session points at this
-	// shared DeliveryStats so receive-path delivery / drop /
-	// backpressure / bytes-dropped counters are session-aggregate.
+	// Per-session delivery-side flow-control telemetry. enqueueDelivery and
+	// enqueueControl record every stream's messages in this shared
+	// DeliveryStats, so receive-path delivery / drop / bytes-dropped counters
+	// are session-aggregate.
 	// Lock-free atomics inside DeliveryStats let the readLoop (single
 	// writer per counter per call) and monitoring goroutines (the
 	// DeliveryStats() accessor) coexist without synchronisation; the
@@ -269,6 +269,14 @@ type NoiseSession struct {
 	// correct if a second writer is ever added. Wrap is harmless — we only
 	// inspect counter % period.
 	cwndUtilCounter uint64
+
+	// recvQueued is the cost of every stream's recvQ on this session, the
+	// total receiveCeilings' session limit bounds and signalReceiveOverload
+	// reads. Written under each stream's queue lock, read without one.
+	recvQueued atomic.Int64
+	// lastOverloadSignal is the UnixNano of signalReceiveOverload's last
+	// CONGESTION, so a sustained overload emits one per receiveOverloadInterval.
+	lastOverloadSignal atomic.Int64
 
 	// inFlightBytes is the session's count of framed plaintext bytes in
 	// flight: for every unacked frame in every stream's SendWindow,
@@ -803,28 +811,42 @@ func (s *NoiseSession) GoAway(ctx context.Context, reason aether.GoAwayReason, m
 // All operations are idempotent: calling for a streamID that was
 // already unregistered is a no-op on both the scheduler and the GC.
 func (s *NoiseSession) releaseStream(streamID uint64) {
-	dropped, probe := s.sched.Unregister(streamID)
-	// Release the connection-window credit reserved by frames that were
-	// queued in the scheduler but never reached the wire (the stream was
-	// torn down with frames still queued). Scheduler.Unregister returns them;
-	// credit not released here strands HeaderSize+Length conn credit per
-	// frame and drains the 4MB window under stream churn until Send fails
-	// with "insufficient connection credit". Only metered bytes were reserved
-	// (small frames bypass Consume). The per-stream window is discarded with
-	// the stream, and the conn window has its own lock, so this is safe from
-	// the GC sweep path that must not re-acquire s.mu.
-	relConn := func(f *aether.Frame) {
-		if f != nil && int64(f.Length) > flow.MinGuaranteedWindow {
-			s.connWindow.ReleaseUnsent(int64(f.Length))
-		}
-	}
-	for _, f := range dropped {
-		relConn(f)
-	}
-	relConn(probe)
+	// The frames Unregister hands back need no credit returned here: every
+	// caller has run noiseStream.releaseInFlight, which gives the connection
+	// window all this stream had charged, these included.
+	s.sched.Unregister(streamID)
 	if s.streamGC != nil {
 		s.streamGC.Unregister(streamID)
 	}
+}
+
+// receiveOverloadInterval spaces signalReceiveOverload's CONGESTION frames; it
+// matches the advisory's BackoffMs, so a held overload keeps the hint alive
+// and a passing one lets it lapse.
+const receiveOverloadInterval = 200 * time.Millisecond
+
+// signalReceiveOverload tells the peer this session's consumers are behind: the
+// queues together hold most of the connection credit, the evidence the signal
+// names, so the peer's next sends will start meeting ErrCreditExhausted. It is
+// advisory for the peer's send-path consumers reading Throttle() outside this
+// package; delivery does not depend on it, and credit alone keeps the queues
+// bounded. One stream at its own credit stays below the threshold, since the
+// peer's backpressure there is that stream's alone.
+func (s *NoiseSession) signalReceiveOverload() {
+	initial, _ := s.connWindow.ReceiveCeilings()
+	if s.recvQueued.Load() < initial/4*3 {
+		return
+	}
+	now := time.Now().UnixNano()
+	last := s.lastOverloadSignal.Load()
+	if now-last < int64(receiveOverloadInterval) || !s.lastOverloadSignal.CompareAndSwap(last, now) {
+		return
+	}
+	_ = s.SendCongestion(aether.CongestionPayload{
+		Reason:    aether.CongestionDownstream,
+		Severity:  50,
+		BackoffMs: uint16(receiveOverloadInterval / time.Millisecond),
+	})
 }
 
 func (s *NoiseSession) Close() error {
@@ -877,7 +899,7 @@ func (s *NoiseSession) CloseWithError(err error) error {
 	}
 	// Release any AcceptStreamByID waiters and drain the per-ID
 	// backlog so blocked callers return ErrSessionClosed instead of
-	// hanging. Backlog streams are reset because their recvCh /
+	// hanging. Backlog streams are reset because their recvQ /
 	// reliability engine is otherwise orphaned — the acceptor
 	// surfaces them and the adapter calls Reset because the
 	// transport-specific teardown lives here.

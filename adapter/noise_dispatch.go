@@ -197,7 +197,7 @@ func (s *NoiseSession) dispatchFrame(frame *aether.Frame) {
 		s.handleStats(frame)
 	case aether.TypeWHOIS, aether.TypeRENDEZVOUS, aether.TypeNETWORK_CONFIG:
 		// Control plane — deliver to control stream
-		s.deliverToStream(s.layout.Control, frame.Payload)
+		s.deliverToControl(frame.Payload)
 	}
 }
 
@@ -239,8 +239,10 @@ func (s *NoiseSession) Throttle() *aether.CongestionThrottle {
 // stable for the session's lifetime —
 // callers can sample Delivered / Dropped / Backpressure / BytesDropped
 // via Load() at monitoring cadence without holding any session lock.
-// Updated by DeliverToRecvChWithSignals on every receive-side delivery
-// attempt against any stream on this session.
+// Updated by enqueueDelivery and enqueueControl on every message the readLoop
+// hands to a stream on this session: Delivered when it is queued for the
+// consumer, Dropped when a credit violation or the control-frame limit refuses
+// it. Backpressure stays 0 on this session, since nothing here waits.
 func (s *NoiseSession) DeliveryStats() *DeliveryStats {
 	return &s.deliveryStats
 }
@@ -248,8 +250,8 @@ func (s *NoiseSession) DeliveryStats() *DeliveryStats {
 func (s *NoiseSession) handleData(frame *aether.Frame) {
 	// The stream looked up here may be torn down by another goroutine
 	// (Reset, the stream GC) before the delivery below runs; enqueueDelivery
-	// handles that by selecting on the stream's end, and no recover is
-	// needed here, which keeps an unrelated panic visible.
+	// finds the queue ended and returns false, and no recover is needed here,
+	// which keeps an unrelated panic visible.
 	s.mu.Lock()
 	st, ok := s.streams[frame.StreamID]
 	s.mu.Unlock()
@@ -321,8 +323,7 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 		// A SeqNo more than ReplayWindowSize(64) below topSeq is NOT
 		// necessarily an adversarial replay. In-flight frame count is
 		// bounded by CUBIC cwnd + byte-based flow-control credit (default
-		// 1 MiB, growable to 8 MiB, and frames <= MinGuaranteedWindow=1KiB
-		// bypass credit entirely -- flow/stream_window.go), NOT by the
+		// 1 MiB, growable to 8 MiB -- flow/stream_window.go), NOT by the
 		// 64-frame replay window. On any stream that bursts >64 frames (a
 		// gossip convergence full-sync, an RPC/bulk pipeline) a single
 		// early loss lets topSeq advance far past the lost SeqNo; the
@@ -376,43 +377,31 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 		st.replay.Commit(frame.SeqNo)
 	}
 
-	// Notify ACK engine BEFORE the delivery loop. DeliverToRecvCh-
-	// WithSignals can block up to maxBackpressure (25ms) on a slow
-	// consumer; if the ACK-engine notify were deferred behind that
-	// stall the readLoop pipeline would hold off ACK generation for
-	// EVERY frame on EVERY stream while one stream's recvCh was full,
-	// and the noise inbox (128 slots) would overflow — silently
-	// dropping inbound ACKs for OTHER streams (rack.fackAge would
-	// climb across all streams concurrently).
-	//
-	// The ACK engine only does in-memory state updates + may emit a
-	// CompositeACK; it never blocks on a stream's recvCh. Safe to
-	// promote ahead of delivery.
+	// Notify the ACK engine before delivery. An ACK says the frame reached
+	// this side and takes it out of the sender's flight; it returns no credit,
+	// which only the consumer's Receive replenishes, so it does not depend on
+	// the consumer. It is safe ahead of delivery because enqueueDelivery always
+	// admits what a sender's credit covered: the acknowledged frame sits in a
+	// queue bounded by that credit and only a stream's end or a peer past its
+	// credit (reset by enqueueDelivery) can lose it. The ACK engine does
+	// in-memory state updates and may emit a CompositeACK, which never waits
+	// on a stream's consumer.
 	if st.ackEngine != nil {
 		st.ackEngine.OnDataReceived(frame.SeqNo, s.isAckImmediateStream(frame.StreamID))
 	}
 
-	// Delivery: each whole in-order message goes to the stream's deliverLoop
-	// through enqueueDelivery. A Reset or stream GC sweep on another goroutine
-	// may tear the stream down after the lookup above; enqueueDelivery then
-	// drops the payload, since the queue's end is a channel it selects on and
-	// nothing it sends on is ever closed.
+	// Delivery: each whole in-order message goes to the stream's recvQ through
+	// enqueueDelivery. A Reset or stream GC sweep on another goroutine may tear
+	// the stream down after the lookup above; enqueueDelivery then returns false.
 	for _, d := range delivered {
 		payload, whole := st.reassemble(d)
 		if !whole {
 			continue // a fragment of a message not yet complete, or refused
 		}
-		// Hand the payload to the stream's own deliverLoop goroutine without
-		// blocking instead of holding the shared readLoop up to
-		// stream1MaxBackpressure on a full recvCh. A slow stream-1 consumer
-		// must not stall the readLoop, which would stop draining the noiseConn
-		// inbox and silently drop inbound ACKs for every other stream.
+		// Never waits: a slow consumer must not stall the readLoop, which
+		// would stop draining the noiseConn inbox and drop inbound ACKs for
+		// every other stream.
 		ok := st.enqueueDelivery(payload)
-		// Conn-level flow control: successful delivery grants credit at
-		// application-read time via the session debouncer (Receive →
-		// connGrantDebouncer.Record). On drop, the debouncer will never
-		// see these bytes so we must grant directly here to prevent a
-		// permanent conn-level stall.
 		if ok {
 			// Count only bytes admitted in order (delivered) and handed to the
 			// app stream: reportAbuse reads appBytesDelivered to tell an
@@ -422,10 +411,6 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 			// enqueue, so it never accrues here, where s.bytesRecv (counted at
 			// dispatch, before any check) would.
 			s.appBytesDelivered.Add(uint64(len(payload)))
-		} else {
-			if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
-				s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
-			}
 		}
 	}
 
@@ -589,23 +574,15 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	// Falls back to OnAck (degraded path) for CUBIC or when the sample is
 	// missing (e.g. retransmitted entries).
 	srtt := st.rtt.SRTT()
-	// Always sum acked bytes once — used both for the CUBIC OnAck call
-	// below and for the ACK-driven flow-control credit release that
-	// happens regardless of congestion controller choice.
-	//
-	// Track metered acked bytes separately. Frames <= MinGuaranteedWindow
-	// bypass StreamWindow.Consume (never acquire credit),
-	// so releasing credit for their ACKs drains dataOutstanding that a
-	// different (large) frame consumed — over-admitting in-flight and, on the
-	// connection window, releasing one stream's credit for another's ACK.
-	// Congestion control still uses the full ackedBytes (all delivered bytes).
-	var ackedBytes, meteredAckedBytes int64
+	// Sum acked bytes once for the CUBIC OnAck call below. An ACK returns no
+	// flow-control credit: it proves the frame reached the peer, not that the
+	// peer's consumer took it, and the peer's receive queue is bounded only
+	// while credit stays charged until then. Credit comes back through the
+	// cumulative grant (WINDOW_UPDATE, the CompositeACK piggyback applied
+	// below, and refreshWindowGrants' re-emission for a grant lost on the path).
+	var ackedBytes int64
 	for _, entry := range acked {
-		n := int64(entry.Frame.Length)
-		ackedBytes += n
-		if n > flow.MinGuaranteedWindow {
-			meteredAckedBytes += n
-		}
+		ackedBytes += int64(entry.Frame.Length)
 	}
 	if bbr, ok := s.congestion().(*congestion.BBRController); ok {
 		for _, entry := range acked {
@@ -628,21 +605,6 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 		cubic.OnAckWithPipe(ackedBytes, srtt, s.totalInFlightBytes())
 	} else {
 		s.congestion().OnAck(ackedBytes, srtt)
-	}
-	// ACK-driven flow-control credit release. Every byte the peer has
-	// acknowledged has left flight on this stream, so credit can
-	// be returned to the sender NOW regardless of whether a matching
-	// WINDOW_UPDATE frame has arrived. This closes the stuck-credit gap
-	// on lossy Noise-UDP paths where WINDOW_UPDATE packets can be
-	// dropped — ACKs have their own cumulative-retransmit path and are
-	// fundamentally more robust.
-	//
-	// Per-stream and per-conn windows both get the same delta. Each caps
-	// at its own dataOutstanding, so ACK-path + WINDOW_UPDATE-path
-	// together never over-release (see StreamWindow.ReleaseOnACK).
-	if meteredAckedBytes > 0 {
-		st.window.ReleaseOnACK(meteredAckedBytes)
-		s.connWindow.ReleaseOnACK(meteredAckedBytes)
 	}
 	// ECN feedback: peer reported CE-marked bytes since last ACK. Notify
 	// the controller so it can react one RTT before queue overflow.
@@ -808,21 +770,14 @@ func (s *NoiseSession) handleImplicitOpen(frame *aether.Frame) {
 		st.ackEngine.OnDataReceived(frame.SeqNo, s.isAckImmediateStream(frame.StreamID))
 	}
 
-	// Delivery through the stream's deliverLoop, as handleData: a teardown on
-	// another goroutine makes enqueueDelivery drop the payload, and nothing it
-	// sends on is ever closed.
+	// Delivery through the stream's recvQ, as handleData: a teardown on another
+	// goroutine makes enqueueDelivery return false.
 	for _, d := range delivered {
 		payload, whole := st.reassemble(d)
 		if !whole {
 			continue
 		}
-		ok := st.enqueueDelivery(payload)
-		// Drop-only conn-level credit: see handleData.
-		if !ok {
-			if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
-				s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
-			}
-		}
+		st.enqueueDelivery(payload)
 	}
 }
 
@@ -849,24 +804,19 @@ func (s *NoiseSession) handleClose(frame *aether.Frame) {
 		st.ackEngine.Stop()
 	}
 	remaining := st.recvWindow.DrainMarked()
-	// The messages the receive window still held in order go straight to
-	// recvCh without waiting: the stream ends on this frame, so there is no
-	// consumer to backpressure for and what does not fit is dropped with the
-	// stream. recvCh is never closed (closeRecvOnce closes recvDone), so a
-	// Reset or stream GC sweep on another goroutine cannot make this send meet
-	// a closed channel.
+	// The messages the receive window still held in order are the last the
+	// reader sees before the end; the sender's credit covered them, so they join
+	// the queue whatever the local Close has already ended.
 	for _, d := range remaining {
 		payload, whole := st.reassemble(d)
 		if !whole {
 			continue
 		}
-		select {
-		case st.recvCh <- payload:
-		default:
-		}
+		st.recvQ.pushFinal(payload)
 	}
 	st.closeRecvOnce()
 	st.teardown()
+	st.recvQ.detach(false)
 	s.mu.Lock()
 	delete(s.streams, frame.StreamID)
 	s.mu.Unlock()
@@ -889,6 +839,7 @@ func (s *NoiseSession) handleReset(frame *aether.Frame) {
 	if ok {
 		st.state.Transition(aether.EventRecvReset)
 		st.teardown()
+		st.recvQ.peerEnded()
 		st.closeRecvOnce()
 		// Out of s.streams, as in handleClose: the frames the peer's RESET
 		// leaves unacked go back to the session's in-flight counter.
@@ -981,7 +932,7 @@ func (s *NoiseSession) handleHandshake(frame *aether.Frame) {
 	default:
 		// Other handshake types (key rotation, cap update, session resume
 		// request) deliver to control stream for application handling.
-		s.deliverToStream(s.layout.Control, frame.Payload)
+		s.deliverToControl(frame.Payload)
 	}
 }
 
@@ -1067,7 +1018,19 @@ func (s *NoiseSession) sendWindowUpdateAgnostic(streamID uint64, credit uint64) 
 	s.sendWindowUpdate(streamID, credit)
 }
 
-// deliverToStream delivers raw payload to a stream's receive channel.
+// deliverToControl queues a control-plane frame (handled in dispatch and
+// handleHandshake) for the control stream's consumer. No stream on a session
+// whose control stream is not open receives it.
+func (s *NoiseSession) deliverToControl(payload []byte) {
+	s.mu.Lock()
+	st, ok := s.streams[s.layout.Control]
+	s.mu.Unlock()
+	if ok {
+		st.enqueueControl(payload)
+	}
+}
+
+// deliverToStream delivers a payload FEC recovered for a stream's receive queue.
 func (s *NoiseSession) deliverToStream(streamID uint64, payload []byte) {
 	s.mu.Lock()
 	st, ok := s.streams[streamID]
@@ -1075,15 +1038,7 @@ func (s *NoiseSession) deliverToStream(streamID uint64, payload []byte) {
 	if !ok {
 		return
 	}
-	// Enqueue onto the per-stream deliverLoop without blocking rather than
-	// hold the readLoop on a full recvCh, as handleData. A Reset or stream GC
-	// sweep on another goroutine after the lookup above makes enqueueDelivery
-	// drop the payload; nothing it sends on is ever closed.
-	delivered := st.enqueueDelivery(payload)
-	// Drop-only conn-level credit: see handleData.
-	if !delivered {
-		if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
-			s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
-		}
-	}
+	// Queued without waiting, as handleData. A Reset or stream GC sweep on
+	// another goroutine after the lookup above makes enqueueDelivery return false.
+	st.enqueueDelivery(payload)
 }
