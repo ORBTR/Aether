@@ -32,16 +32,33 @@ import (
 // + channel allocation (~96 B + GC pressure under high-throughput
 // bandwidth-limited streams). Go 1.23+ Timer semantics let us Reset
 // without manual channel draining.
+//
+// A frame the CanSend gate refuses or the pacer defers stays in held, private to
+// this goroutine, and is tried again before anything else the scheduler has, TLP
+// probes aside. Handing it back to Scheduler.Enqueue would put it behind the rest
+// of its stream, so the frames reach the wire out of sequence and the peer reports
+// gaps nothing lost, and Dequeue would charge the stream's WFQ deficit and the
+// REALTIME and BULK counters once per attempt for one frame sent.
 func (s *NoiseSession) writeLoop() {
 	wake := s.sched.WakeCh()
 	var pacingTimer *time.Timer
-	// cwndBlockHist: when CUBIC.CanSend returns false the
-	// writeLoop re-enqueues + parks. We mark the wall-clock at first
-	// rejection (cwndBlockStart non-zero), and on the next successful
-	// CanSend we record the elapsed block duration. Single time.Time on
-	// the goroutine stack — no atomic / mutex needed because writeLoop
-	// is single-goroutine.
+	// held, heldSize and heldPlain: the frame waiting on the gate or the pacer,
+	// its prospective wire size and its length before deflate, so a retry does
+	// not deflate it again.
+	var held *aether.Frame
+	var heldSize, heldPlain int64
+	// cwndBlockHist: when CanSend returns false the writeLoop holds the
+	// frame + parks. We mark the wall-clock at first rejection
+	// (cwndBlockStart non-zero), and on the next successful CanSend we
+	// record the elapsed block duration. Single time.Time on the goroutine
+	// stack — no atomic / mutex needed because writeLoop is single-goroutine.
 	var cwndBlockStart time.Time
+	endCwndBlock := func() {
+		if !cwndBlockStart.IsZero() {
+			s.cwndBlockHist.Record(time.Since(cwndBlockStart))
+			cwndBlockStart = time.Time{}
+		}
+	}
 	defer func() {
 		if pacingTimer != nil {
 			pacingTimer.Stop()
@@ -64,12 +81,39 @@ func (s *NoiseSession) writeLoop() {
 			default:
 			}
 
-			frame, isProbe := s.sched.Dequeue()
+			var frame *aether.Frame
+			var isProbe bool
+			if held != nil {
+				frame = s.sched.DequeueProbe()
+				isProbe = frame != nil
+				if frame == nil {
+					frame = held
+				}
+			} else {
+				frame, isProbe = s.sched.Dequeue()
+			}
 			if frame == nil {
 				break // empty — fall through to park on wake/closed
 			}
 
-			frameSize := int(aether.HeaderSize) + int(frame.Length)
+			st := s.dataFrameStream(frame)
+			if frame == held && st == nil && frame.Type == aether.TypeDATA {
+				// The stream left while its frame waited here. Scheduler.Unregister
+				// dropped every frame still in the stream's queue for the same reason.
+				held = nil
+				endCwndBlock()
+				continue
+			}
+
+			// recorded is the frame's count from its first write, 0 before that.
+			var recorded int64
+			if st != nil {
+				recorded = st.sendWindow.RecordedWireBytes(frame)
+			}
+			frameSize, plain := heldSize, heldPlain
+			if frame != held {
+				frameSize, plain = s.prepareFrame(frame, recorded)
+			}
 
 			// RFC 8985 §7.5: TLP loss probes MUST be transmitted outside
 			// the congestion window so they can recover from cwnd-collapse
@@ -77,26 +121,24 @@ func (s *NoiseSession) writeLoop() {
 			// cwnd to zero through losses cannot send the very probe that
 			// would elicit an ACK and reopen the window: the TLP stays armed
 			// past its scheduled time with probePending set, and this loop
-			// re-enqueues and parks forever. Regular frames still respect
-			// CanSend (and re-enqueue + park until cwnd advances).
+			// parks forever. Regular frames still respect CanSend (and wait
+			// in held until cwnd advances).
 			//
-			// CanSend's contract is `inFlight < cwnd` — pass cumulative
-			// in-flight bytes across the session's streams plus the
-			// prospective frameSize. Passing frameSize alone would make
-			// CanSend ≡ true (frameSize ≪ cwnd) and disable CUBIC entirely.
+			// CanSend's contract is `inFlight < cwnd` — pass the wire bytes
+			// already written across the session's streams plus this frame's
+			// wire size. Passing frameSize alone would make CanSend ≡ true
+			// (frameSize ≪ cwnd) and disable CUBIC entirely.
+			//
+			// A retransmit's bytes are already in the counter at the count
+			// frameSize presents, so they are taken out of other and counted once.
+			//
+			// With nothing else on the wire the frame goes whatever its size: no
+			// ACK can come to open the window, and a frame can exceed it (PMTU's
+			// MSS reaches 8000 against the controllers' 2800 floor).
 			if !isProbe {
-				inFlightBytes := s.totalInFlightBytes()
-				if !s.congestion().CanSend(inFlightBytes + int64(frameSize)) {
-					// Re-enqueue puts the frame back. Enqueue already calls
-					// signalWake() internally so the writeLoop is re-armed
-					// for its next park. The explicit Wake() below is
-					// belt-and-suspenders against a park/wake race in the
-					// scheduler: if another goroutine drained the wake
-					// channel between Enqueue and the parking select below,
-					// the writeLoop would otherwise wait for the next
-					// external wake. Wake() is a non-blocking buffered send
-					// (capped at 1); duplicates collapse and the call is cheap.
-					s.sched.Enqueue(frame.StreamID, frame)
+				other := s.totalInFlightBytes() - recorded
+				if other > 0 && !s.congestion().CanSend(other+frameSize) {
+					held, heldSize, heldPlain = frame, frameSize, plain
 					atomic.AddUint64(&s.cansendFalseReenqueues, 1)
 					// Mark block-entry on the first reject in a
 					// run. Subsequent rejects keep the earlier start so
@@ -105,35 +147,29 @@ func (s *NoiseSession) writeLoop() {
 					if cwndBlockStart.IsZero() {
 						cwndBlockStart = time.Now()
 					}
-					s.sched.Wake()
 					break
 				}
 				// CanSend returned true; if we were in a block run, close
-				// it and record the duration. Reset cwndBlockStart so the
-				// next run starts a fresh measurement.
-				if !cwndBlockStart.IsZero() {
-					s.cwndBlockHist.Record(time.Since(cwndBlockStart))
-					cwndBlockStart = time.Time{}
-				}
+				// it and record the duration.
+				endCwndBlock()
 			}
 
 			// Pacing: park exactly as long as the pacer says. Use the
 			// session-scoped pacingTimer (allocated on first use) to
 			// avoid a per-frame timer allocation that time.After would
 			// otherwise incur on every paced send.
-			wait := s.pacer.TimeUntilSend(frameSize)
+			wait := s.pacer.TimeUntilSend(int(frameSize))
 			if wait > 0 {
 				// Preserve probe status across a pacing deferral. A TLP probe
-				// re-enqueued via plain Enqueue re-emerges with
-				// isProbe=false and is then trapped behind the CanSend gate —
-				// the exact cwnd-collapse the RFC 8985 §7.5 bypass exists to
-				// escape. In the degraded-BBR regime (per-frame waits > PTO)
-				// the probe would never reach the wire, converting a
-				// recoverable tail loss into a session stall.
+				// that came back as a regular frame would be trapped behind
+				// the CanSend gate — the exact cwnd-collapse the RFC 8985 §7.5
+				// bypass exists to escape. In the degraded-BBR regime (per-frame
+				// waits > PTO) the probe would never reach the wire, converting
+				// a recoverable tail loss into a session stall.
 				if isProbe {
 					s.sched.EnqueueProbe(frame.StreamID, frame)
 				} else {
-					s.sched.Enqueue(frame.StreamID, frame)
+					held, heldSize, heldPlain = frame, frameSize, plain
 				}
 				if pacingTimer == nil {
 					pacingTimer = time.NewTimer(wait)
@@ -148,7 +184,10 @@ func (s *NoiseSession) writeLoop() {
 				continue
 			}
 
-			s.pacer.OnSend(frameSize)
+			s.pacer.OnSend(int(frameSize))
+			if frame == held {
+				held = nil
+			}
 
 			// cwndUtilRing permille: sample inFlight/cwnd once per
 			// cwndUtilSamplePeriod writes. The full-rate version would
@@ -175,15 +214,23 @@ func (s *NoiseSession) writeLoop() {
 				dbgNoise.Printf("TX stream=%d type=%d seq=%d len=%d",
 					frame.StreamID, frame.Type, frame.SeqNo, frame.Length)
 			}
-			s.writeFrame(frame)
+			s.countFrameSent(plain)
+			presented, newOnWire, err := s.writeQueuedFrame(frame, st)
+			if err != nil {
+				continue
+			}
 
-			// Notify congestion controller of the send. CUBIC accumulates
-			// prr_out for PRR; BBR's OnSend stamps a delivery-rate sample
-			// internally. The returned sample is used by ACK paths that
-			// already stamp BBRSample on SendEntry — handled in the
-			// upstream send-path that owns the SendEntry pointer (here we
-			// only see the frame, not the entry, so we just notify).
-			_ = s.congestion().OnSend(int64(frameSize))
+			// Notify congestion controller of the send, in the wire bytes its
+			// acked count and pipe use. CUBIC accumulates prr_out for PRR, which
+			// counts every write. BBR's OnSend adds to its inflight estimate, which
+			// only an ACK takes back and one ACK ends a frame however many times it
+			// was written, so BBR hears of a frame at its first write only, and not
+			// of a frame its window has already removed. recordWrite stamps BBRSample
+			// on the entry; the sample OnSend returns is not used.
+			cc := s.congestion()
+			if _, isBBR := cc.(*congestion.BBRController); !isBBR || newOnWire {
+				_ = cc.OnSend(presented)
+			}
 
 			// Update pacer rate from congestion controller after each send.
 			// Clamp controller pacing rate into the safe envelope
@@ -226,26 +273,15 @@ func (s *NoiseSession) writeLoop() {
 		// frames arrive in clumps separated by long idle gaps, which
 		// rules in app-side send pacing as the source of bimodality.
 		//
-		// cwnd-blocked busy-spin guard: when we just rejected a frame
-		// in the inner loop (cwndBlockStart != zero), the re-Enqueue
-		// path called signalWake AND we ourselves called Wake() — so
-		// the wake channel holds a self-induced signal. Parking on it
-		// fires immediately, we re-dequeue the same frame, CanSend
-		// still returns false, repeat: a cwnd that stays blocked would
-		// spin this goroutine at the CPU's rate, counted in
-		// cansendFalseReenqueues against a framesSent that does not move.
-		// So: drain the self-wake, then park with a 1 ms timer
+		// cwnd-blocked park: when we just rejected a frame in the inner loop
+		// (cwndBlockStart != zero), park with a 1 ms timer
 		// (cwndBlockedProbeInterval) so an ACK that arrives (handleACK's
 		// Wake() in noise_dispatch.go) still wakes us instantly, but absent
-		// any external signal we re-check CanSend at 1 kHz instead of at the
-		// CPU's rate. The timer also gives congestion-controller timer-driven
-		// advances a chance to fire before our retry.
+		// any external signal we re-check CanSend at 1 kHz. The timer also
+		// gives congestion-controller timer-driven advances a chance to fire
+		// before our retry, and covers a wake that fired before this park.
 		parkStart := time.Now()
 		if !cwndBlockStart.IsZero() {
-			select {
-			case <-wake: // drain self-induced wake
-			default:
-			}
 			timer := time.NewTimer(cwndBlockedProbeInterval)
 			select {
 			case <-s.CloseSignal():
@@ -268,10 +304,9 @@ func (s *NoiseSession) writeLoop() {
 
 // cwndBlockedProbeInterval bounds the writeLoop's CanSend retry rate
 // when cwnd is blocking. 1 ms gives ACKs (which wake via signalWake)
-// instant priority while bounding the self-wake retry loop in writeLoop's
-// park, which would otherwise re-dequeue the same frame at the CPU's rate
-// while cwnd stays blocked. Lower values risk spin-amplification; higher
-// values delay legitimate cwnd-recovery beyond a typical SRTT.
+// instant priority while bounding the retry of the held frame in writeLoop's
+// park. Lower values risk spin-amplification; higher values delay legitimate
+// cwnd-recovery beyond a typical SRTT.
 const cwndBlockedProbeInterval = 1 * time.Millisecond
 
 // cwndUtilSamplePeriod governs the per-N-writes sampling rate of cwndUtilRing.
@@ -280,17 +315,15 @@ const cwndBlockedProbeInterval = 1 * time.Millisecond
 // sustained sending. Power-of-two so the modulo compiles to a mask.
 const cwndUtilSamplePeriod = 16
 
-// totalInFlightBytes returns the session's framed plaintext bytes in
-// flight across every stream's SendWindow: HeaderSize plus the frame's
-// Length as it was at SendWindow.AddEntry, summed over the unacked
-// entries, the kind inFlightBytes is kept in. The writeLoop adds the
-// dequeued frame's HeaderSize+Length to it for CanSend (the framed
-// plaintext size on a first send; the committed size when a retransmit
-// re-presents a frame writeFrame already committed), and handleACK
-// passes it to OnAckWithPipe as the pipe after an ACK's removals.
+// totalInFlightBytes returns the session's wire bytes in flight across
+// every stream's SendWindow: SendEntry.InFlightBytes summed over the
+// entries written and not yet acked, the kind the controller's acked
+// bytes and CanSend's prospective size are also in. The writeLoop adds
+// the dequeued frame's wire size for CanSend; handleACK and the RACK
+// tick pass it to the controller as the pipe.
 //
 // Fast path: a single atomic.Load on the session-level counter that
-// each SendWindow charges at AddEntry and releases at every removal
+// each SendWindow charges at MarkWritten and releases at every removal
 // (wired by SetSessionInFlightCounter in createStream). Per-send cost is
 // O(1) — versus an O(streams × map-iteration + per-stream-lock) walk if
 // it had to fold each window's InFlightBytes() directly.
@@ -394,10 +427,6 @@ func (s *NoiseSession) reliabilityTick() {
 			}
 
 			tickNow := time.Now()
-			mssBytes := int64(s.MSS())
-			if mssBytes <= 0 {
-				mssBytes = 1400
-			}
 			for _, e := range snap {
 				streamID, st := e.id, e.st
 				// RTO-driven retransmit (safety net). This path does not
@@ -439,11 +468,14 @@ func (s *NoiseSession) reliabilityTick() {
 				// dupack count. Each lost seq is bumped + re-enqueued and
 				// we call OnLossWithPipe ONCE per tick (not once per
 				// declared seq) — CUBIC's PRR seeds itself from the pipe
-				// snapshot taken at this moment.
-				inFlight := st.sendWindow.InFlight()
+				// snapshot taken at this moment. Only written frames count: one
+				// still queued has no transmission to time and no loss to declare,
+				// and the session stall detector below must not read a backlog as
+				// an unanswered send.
+				rawSnap := st.sendWindow.SnapshotEntries()
+				inFlight := len(rawSnap)
 				if inFlight > 0 {
 					anyInFlight = true
-					rawSnap := st.sendWindow.SnapshotEntries()
 					rackSnap := make([]congestion.SendEntrySnapshot, 0, len(rawSnap))
 					for _, re := range rawSnap {
 						rackSnap = append(rackSnap, congestion.SendEntrySnapshot{Seq: re.Seq, XmitTime: re.XmitTime})
@@ -459,12 +491,12 @@ func (s *NoiseSession) reliabilityTick() {
 						// should NOT pollute the counter, otherwise the
 						// TLP-vs-RACK ratio dashboard skews toward RACK
 						// recovery under high ACK concurrency.
-						pipe := int64(inFlight) * mssBytes
+						pipe := s.totalInFlightBytes()
 						var actuallyRetx uint64
 						for _, seq := range lost {
-							if entry := st.sendWindow.GetEntry(seq); entry != nil {
+							if written := st.sendWindow.WrittenFrame(seq); written != nil {
 								s.sched.MarkRetransmit(streamID)
-								s.sched.Enqueue(streamID, entry.Frame)
+								s.sched.Enqueue(streamID, written)
 								st.sendWindow.BumpXmitTime(seq, tickNow)
 								actuallyRetx++
 							}
@@ -487,26 +519,11 @@ func (s *NoiseSession) reliabilityTick() {
 					// re-arm), separate from the regular WFQ queue.
 					probeFired := false
 					if st.tlp.ShouldProbe(tickNow) {
-						// Probe the highest REMAINING in-flight seq, not strictly
-						// Next()-1: when that entry was selectively ACKed or
-						// evicted, GetEntry returns nil and no probe fires, so
-						// recovery would fall back to RTO silently. Scan down to
-						// the highest still-in-flight entry.
-						next := st.sendWindow.Next()
-						base := st.sendWindow.Base()
-						var probeFrame *aether.Frame
-						var probeSeq uint32
-						if next > base {
-							for seq := next - 1; ; seq-- {
-								if e := st.sendWindow.GetEntry(seq); e != nil {
-									probeFrame, probeSeq = e.Frame, seq
-									break
-								}
-								if seq == base {
-									break
-								}
-							}
-						}
+						// Probe the highest REMAINING written seq, not strictly
+						// Next()-1: that entry may be selectively ACKed, evicted,
+						// or still queued behind the CanSend gate, and with no
+						// probe recovery would fall back to RTO silently.
+						probeFrame, probeSeq := st.sendWindow.HighestWritten()
 						if probeFrame != nil {
 							s.sched.EnqueueProbe(streamID, probeFrame)
 							st.sendWindow.BumpXmitTime(probeSeq, tickNow)
@@ -937,22 +954,92 @@ func (s *NoiseSession) connWrite(b []byte) error {
 	return nil
 }
 
-// writeFrame serializes and writes a single frame to the Noise connection.
-// Applies compression (if enabled and payload > 64 bytes) and encryption (if key set).
-func (s *NoiseSession) writeFrame(frame *aether.Frame) error {
-	// Per-session frame and byte counters consumed by Metrics(). Count
-	// at attempt-time rather than at conn.Write success so the
-	// "bytes the session tried to send" is what gets surfaced — the
-	// difference vs at-success is negligible since writeFrame only
-	// errors during teardown / panicked conn.
-	s.framesSent.Add(1)
-	if frame != nil {
-		s.bytesSent.Add(uint64(frame.Length))
-		// Feed the per-CE-interval cap. handleACK drains this counter
-		// when the peer's CompositeACK carries CACKHasECN, using the
-		// drained value as the upper bound on a plausible CEBytes claim.
-		s.bytesSentSinceLastCE.Add(uint64(frame.Length))
+// dataFrameStream returns the stream whose send window may hold frame, or nil for
+// any other frame or a stream that has left s.streams. The write loop calls it per
+// frame before the CanSend gate, which needs the frame's recorded count from that
+// window, and passes the stream on to the write boundary.
+func (s *NoiseSession) dataFrameStream(frame *aether.Frame) *noiseStream {
+	if frame.Type != aether.TypeDATA {
+		return nil
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.streams[frame.StreamID]
+}
+
+// countFrameSent feeds Metrics()'s per-session frame and byte counters. Count
+// at attempt-time rather than at conn.Write success so the "bytes the session
+// tried to send" is what gets surfaced — the difference vs at-success is
+// negligible since a write only errors during teardown / panicked conn. plain is the
+// frame's length before deflate, for the payload-byte semantics these counters
+// document; the write loop counts once per write, so a frame the gate or pacer kept
+// back is counted when it goes.
+func (s *NoiseSession) countFrameSent(plain int64) {
+	s.framesSent.Add(1)
+	s.bytesSent.Add(uint64(plain))
+}
+
+// prepareFrame readies a frame the write loop took from the scheduler and returns
+// the wire size CanSend and the pacer are given, and the frame's length before
+// deflate for countFrameSent. A retransmit (recorded > 0) keeps
+// the frame's committed form and presents the recorded count. A first write
+// compresses here, before the gate, because deflate is the one step that changes
+// the size by an amount only running it can tell; it advances no state, so a frame
+// the gate refuses has committed nothing. Encryption and the header stay at the
+// write: Encrypt takes a nonce and the short-form encoders advance the directional
+// compressor, and neither may happen for a frame that is not written.
+func (s *NoiseSession) prepareFrame(frame *aether.Frame, recorded int64) (wire, plain int64) {
+	if recorded > 0 {
+		return recorded, recorded
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	plain = int64(frame.Length)
+	s.compressFrameLocked(frame)
+	return s.wireSizeLocked(frame), plain
+}
+
+// wireSizeLocked predicts the bytes emitFrameLocked would write for a frame the
+// scheduler holds (DATA or FEC_REPAIR, whose short forms are the data ones) with
+// the compressor as it stands, reading no state it would advance. Caller holds
+// writeMu. Another writer's frame can change the header form before the write, so
+// the count the frame is charged is the one emitFrameLocked measures.
+func (s *NoiseSession) wireSizeLocked(frame *aether.Frame) int64 {
+	length := int64(frame.Length)
+	if s.encryptsLocked(frame) {
+		// An encrypted frame always takes the full header
+		// (Compressor.ShouldCompressData refuses FlagENCRYPTED).
+		return int64(aether.FullFrameHeaderWireSize) + length + int64(s.encryptor.Overhead())
+	}
+	if s.opts.HeaderComp && s.txCompressor.ShouldCompressData(frame) {
+		return int64(aether.ShortDataWireSize(frame.Length)) + length
+	}
+	return int64(aether.FullFrameHeaderWireSize) + length
+}
+
+// encryptsLocked reports whether emitFrameLocked will seal this frame, the
+// conditions there and in FrameEncryptor.Encrypt (which seals no empty frame).
+func (s *NoiseSession) encryptsLocked(frame *aether.Frame) bool {
+	return s.encryptor != nil && s.opts.Encryption && !frame.Flags.Has(aether.FlagENCRYPTED) &&
+		frame.Payload != nil && frame.Length != 0
+}
+
+// writeQueuedFrame writes a frame the write loop has prepared and returns the
+// count the controller is shown for this write (noiseStream.recordWrite) and
+// whether the write puts new bytes in flight: a frame's first write, or a frame no
+// send window tracks. st is the frame's stream, nil for a frame no send window tracks.
+func (s *NoiseSession) writeQueuedFrame(frame *aether.Frame, st *noiseStream) (int64, bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.emitFrameLocked(frame, st)
+}
+
+// writeFrame serializes and writes a single frame to the Noise connection, for a
+// caller beside the write loop: the frame is the caller's own and no send window
+// tracks it. Applies compression (if enabled and payload > 64 bytes) and encryption
+// (if key set).
+func (s *NoiseSession) writeFrame(frame *aether.Frame) error {
+	s.countFrameSent(int64(frame.Length))
 	// Compression + encryption are IDEMPOTENT on the frame object. The
 	// crypto/aead.go Encrypt path mutates frame.Payload in place
 	// (plaintext → ciphertext + 16B auth tag), and compressPayload does
@@ -984,7 +1071,14 @@ func (s *NoiseSession) writeFrame(frame *aether.Frame) error {
 	// per-frame budget is unchanged.
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	s.compressFrameLocked(frame)
+	_, _, err := s.emitFrameLocked(frame, nil)
+	return err
+}
 
+// compressFrameLocked swaps the payload for its DEFLATE form when that is shorter.
+// Caller holds writeMu.
+func (s *NoiseSession) compressFrameLocked(frame *aether.Frame) {
 	if s.compressionEnabled.Load() && len(frame.Payload) > 64 && !frame.Flags.Has(aether.FlagCOMPRESSED) {
 		compressed := compressPayload(frame.Payload)
 		if len(compressed) < len(frame.Payload) { // only use if smaller
@@ -993,7 +1087,15 @@ func (s *NoiseSession) writeFrame(frame *aether.Frame) error {
 			frame.Flags = frame.Flags.Set(aether.FlagCOMPRESSED)
 		}
 	}
+}
 
+// emitFrameLocked encrypts and encodes a frame and writes it: the write boundary,
+// where the committed length exists. Caller holds writeMu. With st non-nil the
+// frame's write is recorded on the stream's send window before conn.Write, so an
+// ACK that follows finds the charge made; a failed conn.Write closes the session,
+// which ends the charge with it. It returns the count the controller is shown and
+// whether the write puts new bytes in flight (writeQueuedFrame).
+func (s *NoiseSession) emitFrameLocked(frame *aether.Frame, st *noiseStream) (int64, bool, error) {
 	// Encryption: encrypt payload if key set and enabled.
 	// MUST be idempotent — see comment above: a retransmit (RACK, RTO, a
 	// TLP probe, which can follow one another back to back) re-runs this
@@ -1002,7 +1104,7 @@ func (s *NoiseSession) writeFrame(frame *aether.Frame) error {
 	// second pass from sealing ciphertext again.
 	if s.encryptor != nil && s.opts.Encryption && !frame.Flags.Has(aether.FlagENCRYPTED) {
 		if err := s.encryptor.Encrypt(frame); err != nil {
-			return fmt.Errorf("aether encrypt: %w", err)
+			return 0, false, fmt.Errorf("aether encrypt: %w", err)
 		}
 	}
 
@@ -1015,39 +1117,57 @@ func (s *NoiseSession) writeFrame(frame *aether.Frame) error {
 	}
 
 	var buf bytes.Buffer
+	if err := s.encodeFrameLocked(&buf, frame); err != nil {
+		return 0, false, err
+	}
+	wire := int64(buf.Len())
+	// Feed the per-CE-interval cap. handleACK drains this counter when the
+	// peer's CompositeACK carries CACKHasECN, using the drained value as the
+	// upper bound on a plausible CEBytes claim, in the unit congestion reads.
+	s.bytesSentSinceLastCE.Add(uint64(wire))
+	presented, newOnWire := wire, true
+	if st != nil {
+		presented, newOnWire = st.recordWrite(frame, wire)
+	}
+	return presented, newOnWire, s.connWrite(buf.Bytes())
+}
+
+// encodeFrameLocked writes frame's wire form to buf. Caller holds writeMu; the
+// short forms and RecordFullHeader advance the directional compressor.
+func (s *NoiseSession) encodeFrameLocked(buf *bytes.Buffer, frame *aether.Frame) error {
 	if s.opts.HeaderComp {
 		// Control frames (not encrypted, no payload) → 4 bytes
 		if s.txCompressor.ShouldCompressControl(frame) {
-			s.txCompressor.EncodeControlShort(&buf, frame)
-			return s.connWrite(buf.Bytes())
+			s.txCompressor.EncodeControlShort(buf, frame)
+			return nil
 		}
 		// ACK frames → 11 bytes (lite) or 3+N (full)
 		if s.txCompressor.ShouldCompressACK(frame) {
-			s.txCompressor.EncodeACKShort(&buf, frame)
-			return s.connWrite(buf.Bytes())
+			s.txCompressor.EncodeACKShort(buf, frame)
+			return nil
 		}
 		// Encrypted DATA → 9 bytes + Nonce-in-payload
 		if frame.Flags.Has(aether.FlagENCRYPTED) && s.txCompressor.ShouldCompressData(frame) {
-			s.txCompressor.EncodeEncryptedDataShort(&buf, frame)
-			return s.connWrite(buf.Bytes())
+			s.txCompressor.EncodeEncryptedDataShort(buf, frame)
+			return nil
 		}
 		// Unencrypted DATA → 6-9 bytes
 		if s.txCompressor.ShouldCompressData(frame) {
-			if frame.Length <= 127 {
-				s.txCompressor.EncodeDataShortVar(&buf, frame)
+			if frame.Length <= aether.ShortDataVarMaxLength {
+				s.txCompressor.EncodeDataShortVar(buf, frame)
 			} else {
-				s.txCompressor.EncodeDataShort(&buf, frame)
+				s.txCompressor.EncodeDataShort(buf, frame)
 			}
-			return s.connWrite(buf.Bytes())
+			return nil
 		}
 	}
 
 	// Full 50-byte header (fallback)
-	if _, err := aether.EncodeFrame(&buf, frame); err != nil {
+	if _, err := aether.EncodeFrame(buf, frame); err != nil {
 		return err
 	}
 	s.txCompressor.RecordFullHeader(frame)
-	return s.connWrite(buf.Bytes())
+	return nil
 }
 
 // flateWriterPool reuses flate.Writer (~32KB each) to avoid per-frame allocation.

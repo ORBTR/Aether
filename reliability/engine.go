@@ -140,6 +140,9 @@ func (e *Engine) Send(frame *aether.Frame) uint32 {
 
 	seqNo, entry := e.SendWin.AddEntry(frame)
 	frame.SeqNo = seqNo
+	// Engine.Send has no later write boundary to report one, so the frame counts
+	// as written here, at its framed size, for the RTT sample ProcessACK takes.
+	e.SendWin.MarkWritten(frame, int64(aether.HeaderSize)+int64(frame.Length), time.Now(), nil)
 
 	// Enqueue for retransmission (unless unreliable/best-effort). Share
 	// the send-side entry so both queues reference one backing struct

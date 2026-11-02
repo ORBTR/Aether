@@ -498,12 +498,16 @@ func (w *StreamWindow) ApplyUpdate(credit int64) {
 	}
 	w.dataOutstanding -= granted
 	outstanding := w.dataOutstanding
+	// Read under w.mu: GrowWindow and ShrinkWindow (the session's autotune tick)
+	// write initialDeficit under it, and the log's arguments are evaluated
+	// whether or not the debug channel is on.
+	avail := w.maxSize - w.initialDeficit - outstanding
 	w.mu.Unlock()
 	if granted > 0 {
 		w.sem.Release(granted)
 	}
 	dbgFlow.Printf("ApplyUpdate cumulative=%d delta=%d granted=%d outstanding=%d avail=%d",
-		credit, delta, granted, outstanding, w.maxSize-w.initialDeficit-outstanding)
+		credit, delta, granted, outstanding, avail)
 }
 
 // ReceiverConsume records that the receiver consumed n bytes of received data.

@@ -498,7 +498,8 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	}
 	var sampleEntry *reliability.SendEntry
 	for _, entry := range acked {
-		if entry.Retries == 0 && (sampleEntry == nil || entry.SentAt.After(sampleEntry.SentAt)) {
+		// An unwritten entry has no send time for an ACK to close an interval on.
+		if entry.Written && entry.Retries == 0 && (sampleEntry == nil || entry.SentAt.After(sampleEntry.SentAt)) {
 			sampleEntry = entry
 		}
 	}
@@ -520,14 +521,18 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	}
 
 	// Remove acked from retransmit queue, and feed RACK its delivery
-	// timestamps. RACK uses XmitTime (set in sendWindow.Add /
+	// timestamps. RACK uses XmitTime (set in SendWindow.MarkWritten /
 	// BumpXmitTime), not SentAt, so we get the freshest transmission
 	// of each acked seq — critical for retransmits where the original
-	// xmit time would mis-classify a recently-delivered ACK.
+	// xmit time would mis-classify a recently-delivered ACK. An unwritten
+	// entry has no transmission to report. Frame.SeqNo is the one Frame field
+	// read here: the write loop may still be rewriting the rest.
 	ackTime := time.Now()
 	for _, entry := range acked {
 		st.retransmitQ.Remove(entry.Frame.SeqNo)
-		st.rack.Ack(entry.Frame.SeqNo, entry.XmitTime, ackTime)
+		if entry.Written {
+			st.rack.Ack(entry.Frame.SeqNo, entry.XmitTime, ackTime)
+		}
 	}
 	if len(acked) > 0 {
 		// Any ACK reset TLP — network is responsive, we don't need
@@ -553,15 +558,11 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	// window (see CUBICController.OnLossWithPipe) so RACK's later
 	// declaration on the same seq won't compound the cwnd reduction.
 	if len(nacks) > 0 {
-		mss := int64(s.MSS())
-		if mss <= 0 {
-			mss = 1400
-		}
-		pipe := int64(st.sendWindow.InFlight()) * mss
+		pipe := s.totalInFlightBytes()
 		for _, nackSeqNo := range nacks {
-			if entry := st.sendWindow.GetEntry(nackSeqNo); entry != nil {
+			if written := st.sendWindow.WrittenFrame(nackSeqNo); written != nil {
 				s.sched.MarkRetransmit(frame.StreamID)
-				s.sched.Enqueue(frame.StreamID, entry.Frame)
+				s.sched.Enqueue(frame.StreamID, written)
 				st.sendWindow.BumpXmitTime(nackSeqNo, ackTime)
 			}
 		}
@@ -580,20 +581,27 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	// while credit stays charged until then. Credit comes back through the
 	// cumulative grant (WINDOW_UPDATE, the CompositeACK piggyback applied
 	// below, and refreshWindowGrants' re-emission for a grant lost on the path).
+	//
+	// The controller's bytes are each entry's recorded wire count, the unit CanSend
+	// and the pipe read. No live Frame field: writeFrame rewrites Length under
+	// writeMu, which this readLoop path does not take, and a frame a peer acks
+	// while it is queued can be under rewrite right now. An unwritten entry counts 0.
 	var ackedBytes int64
 	for _, entry := range acked {
-		ackedBytes += int64(entry.Frame.Length)
+		ackedBytes += entry.InFlightBytes
 	}
 	if bbr, ok := s.congestion().(*congestion.BBRController); ok {
 		for _, entry := range acked {
+			if !entry.Written {
+				continue
+			}
 			// SendEntry.BBRSample is *DeliveryRateSample — nil when the
-			// send happened under CUBIC and the BBR stamping path was
-			// skipped, OR when this entry was created before BBR became
-			// active on this session. Nil-check before deref.
+			// write happened under CUBIC and the BBR stamping path was
+			// skipped. Nil-check before deref.
 			if entry.BBRSample != nil {
-				bbr.OnAckSampled(int64(entry.Frame.Length), srtt, *entry.BBRSample)
+				bbr.OnAckSampled(entry.InFlightBytes, srtt, *entry.BBRSample)
 			} else {
-				bbr.OnAck(int64(entry.Frame.Length), srtt)
+				bbr.OnAck(entry.InFlightBytes, srtt)
 			}
 		}
 	} else if cubic, ok := s.congestion().(*congestion.CUBICController); ok {
@@ -644,15 +652,14 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	// Piggybacked stream-level WINDOW_UPDATE. Same cumulative semantics
 	// as a standalone WINDOW_UPDATE frame — ApplyUpdate drops stale/
 	// duplicate values via its grantsReceived cursor and caps the release
-	// at dataOutstanding so it composes safely with the ACK-driven
-	// release above.
+	// at dataOutstanding.
 	if ack.Flags&aether.CACKHasWindowCredit != 0 && ack.WindowCredit > 0 {
 		st.window.ApplyUpdate(int64(ack.WindowCredit))
 	}
 	// Congestion window may have advanced — wake the writeLoop so it
-	// re-evaluates `CanSend`. Without this, frames re-enqueued after a
-	// CanSend=false break would wait until the next Enqueue (or
-	// indefinitely if traffic stops).
+	// re-evaluates `CanSend`. Without this, a frame held after a
+	// CanSend=false break would wait for the writeLoop's retry timer
+	// (cwndBlockedProbeInterval).
 	//
 	// Every ACK can advance cwnd via SACK info / PRR / BBR delivery
 	// samples even when no new entries are in acked[] (duplicate /

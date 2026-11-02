@@ -7,17 +7,17 @@ package reliability
 import (
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/ORBTR/aether"
 )
 
-// The session counter a SendWindow is wired to is charged HeaderSize plus the
-// frame's Length as the frame is at Add. The adapter's writeFrame then
-// shortens Frame.Payload and Frame.Length on the same *Frame at the write
-// boundary (compression, and the ciphertext's tag), so every path that
-// removes an entry must subtract what the entry was charged, never the
-// frame's length at removal time. commitShorter stands in for that write
-// boundary.
+// The session counter a SendWindow is wired to is charged the count MarkWritten
+// is given at the frame's first write. The adapter's writeFrame rewrites
+// Frame.Payload and Frame.Length on the same *Frame at the write boundary
+// (compression, and the ciphertext's tag), so every path that removes an entry
+// must subtract what the entry was charged, never the frame's length at removal
+// time. commitShorter stands in for that rewrite.
 
 func commitShorter(f *aether.Frame, n int) {
 	f.Payload = f.Payload[:n]
@@ -38,14 +38,88 @@ func addFrames(t *testing.T, w *SendWindow, n int, length int) []*aether.Frame {
 	for i := 0; i < n; i++ {
 		f := &aether.Frame{Type: aether.TypeDATA, StreamID: 7, Length: uint32(length), Payload: make([]byte, length)}
 		w.Add(f)
+		w.MarkWritten(f, int64(aether.HeaderSize)+int64(length), time.Now(), nil)
 		frames = append(frames, f)
 	}
 	return frames
 }
 
+// TestSendWindow_AFrameIsChargedAtItsWriteAndOnlyThere: Add charges nothing and
+// starts no clock; the first MarkWritten charges its count; a retransmit changes
+// neither the charge nor the recorded count; an entry acked unwritten gives back
+// nothing and a later write of its frame charges nothing.
+func TestSendWindow_AFrameIsChargedAtItsWriteAndOnlyThere(t *testing.T) {
+	w, counter := newWiredWindow(t)
+	f := &aether.Frame{Type: aether.TypeDATA, StreamID: 7, Length: 512, Payload: make([]byte, 512)}
+	seq := w.Add(f)
+	if got := counter.Load(); got != 0 {
+		t.Fatalf("after Add: counter %d, want 0", got)
+	}
+	if got := len(w.SnapshotEntries()); got != 0 {
+		t.Fatalf("after Add: %d entries visible to RACK, want 0", got)
+	}
+	if w.WrittenFrame(seq) != nil {
+		t.Fatal("after Add: WrittenFrame found the frame")
+	}
+	if fr, _ := w.HighestWritten(); fr != nil {
+		t.Fatal("after Add: HighestWritten found the frame")
+	}
+
+	recorded, payload, first := w.MarkWritten(f, 300, time.Now(), nil)
+	if recorded != 300 || payload != 512 || !first {
+		t.Fatalf("first write: recorded %d, payload %d, first %v", recorded, payload, first)
+	}
+	if got := counter.Load(); got != 300 {
+		t.Fatalf("after the first write: counter %d, want 300", got)
+	}
+	e := w.GetEntry(seq)
+	if e == nil || e.SentAt.IsZero() {
+		t.Fatal("after the first write: no send time")
+	}
+	sentAt := e.SentAt
+
+	later := sentAt.Add(time.Second)
+	recorded, _, first = w.MarkWritten(f, 280, later, nil)
+	if recorded != 300 || first {
+		t.Fatalf("retransmit: recorded %d, first %v; want the first count", recorded, first)
+	}
+	if got := counter.Load(); got != 300 {
+		t.Fatalf("after a retransmit: counter %d, want 300", got)
+	}
+	if !e.SentAt.Equal(sentAt) || !e.XmitTime.Equal(later) {
+		t.Fatalf("retransmit moved SentAt to %v or XmitTime to %v", e.SentAt, e.XmitTime)
+	}
+	if w.Ack(seq) == nil {
+		t.Fatal("Ack found no entry")
+	}
+	if got := counter.Load(); got != 0 {
+		t.Fatalf("after Ack: counter %d, want 0", got)
+	}
+
+	unwritten := &aether.Frame{Type: aether.TypeDATA, StreamID: 7, Length: 512, Payload: make([]byte, 512)}
+	useq := w.Add(unwritten)
+	if got := w.Ack(useq); got == nil || got.InFlightBytes != 0 || got.Written {
+		t.Fatalf("acked unwritten entry: %+v", got)
+	}
+	if recorded, _, first := w.MarkWritten(unwritten, 300, time.Now(), nil); recorded != 0 || first {
+		t.Fatalf("write after its ACK: recorded %d, first %v", recorded, first)
+	}
+	if got := counter.Load(); got != 0 {
+		t.Fatalf("a frame written after its ACK charged the counter: %d", got)
+	}
+
+	// A frame beside the window that happens to carry a tracked SeqNo charges nothing.
+	tracked := &aether.Frame{Type: aether.TypeDATA, StreamID: 7, Length: 1, Payload: []byte{1}}
+	tseq := w.Add(tracked)
+	beside := &aether.Frame{Type: aether.TypeFEC_REPAIR, SeqNo: tseq}
+	if recorded, _, first := w.MarkWritten(beside, 99, time.Now(), nil); recorded != 0 || first {
+		t.Fatalf("a frame beside the window: recorded %d, first %v", recorded, first)
+	}
+}
+
 // TestSendWindow_InFlightCounterReturnsToZeroWhenCommittedFramesAreAcked:
 // each removal path subtracts the count the entry was charged, so the counter
-// returns to 0 although every frame's Length was shortened after Add.
+// returns to 0 although every frame's Length was shortened after its write.
 func TestSendWindow_InFlightCounterReturnsToZeroWhenCommittedFramesAreAcked(t *testing.T) {
 	const plain = 512
 	charged := int64(aether.HeaderSize) + int64(plain)

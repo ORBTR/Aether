@@ -80,7 +80,11 @@ func TestSendWindow_IsFull(t *testing.T) {
 
 func TestSendWindow_Expired(t *testing.T) {
 	w := NewSendWindow(10)
-	w.Add(&aether.Frame{Type: aether.TypeDATA})
+	f := &aether.Frame{Type: aether.TypeDATA}
+	w.Add(f)
+	unwritten := &aether.Frame{Type: aether.TypeDATA}
+	w.Add(unwritten) // never written: it stays out of Expired at every check
+	w.MarkWritten(f, 50, time.Now(), nil)
 
 	// Immediately check — should not be expired
 	expired := w.Expired(100 * time.Millisecond)

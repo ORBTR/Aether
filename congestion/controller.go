@@ -83,10 +83,12 @@ type Controller interface {
 	OnCE(bytesMarked int64)
 
 	// OnSend is called by the adapter after each transmission so PRR can
-	// track prr_out (RFC 6937 §3.1). BBR also uses OnSend as its delivery
-	// rate sample point and stamps the returned DeliveryRateSample on the
-	// SendEntry so the matching ACK can drive OnAckSampled. CUBIC has no
-	// notion of delivery-rate samples and returns a zero-value sample.
+	// track prr_out (RFC 6937 §3.1), and BBR adds to its inflight estimate,
+	// so the adapter's write loop shows BBR a frame once however many times it
+	// is written. The returned DeliveryRateSample is what OnSend's model holds;
+	// the adapter stamps SendEntry.BBRSample through BBRController.StampSample
+	// so the matching ACK can drive OnAckSampled. CUBIC has no notion of
+	// delivery-rate samples and returns a zero-value sample.
 	OnSend(sentBytes int64) DeliveryRateSample
 
 	// ResetCWND restores the controller to a known-clean state — cwnd =

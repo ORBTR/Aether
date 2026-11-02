@@ -14,8 +14,8 @@
 //   - Startup exit on 3 rounds without BtlBw growth (RFC-aligned)
 //
 // Per-packet sample stamping happens via SendWindow.SendEntry.BBRSample:
-// the adapter calls BBRController.OnSend at send time, stores the
-// returned sample on the entry, and hands it back to OnAckSampled when
+// the adapter calls BBRController.StampSample at the frame's first write,
+// stores the sample on the entry, and hands it back to OnAckSampled when
 // the matching ACK arrives.
 package congestion
 
@@ -179,11 +179,13 @@ func NewBBRController() *BBRController {
 	}
 }
 
-// OnSend stamps a delivery-rate sample for one in-flight packet of size n.
-// The caller (SendWindow) stores the returned sample alongside the packet
-// and passes it back into OnAckSampled when the packet is acked.
+// OnSend adds one packet of size n to inflight and returns a delivery-rate
+// sample. The adapter's write loop calls it once per frame and stamps the
+// entry's sample with StampSample, which leaves inflight alone. A caller with
+// no separate stamp can store the returned sample alongside the packet and
+// pass it back into OnAckSampled when the packet is acked.
 //
-// This is the *recommended* hook for fully-modelled BBR. The simpler
+// The per-packet sample is the *recommended* path for fully-modelled BBR. The simpler
 // OnAck(ackedBytes, rtt) path remains for callers that don't yet
 // integrate per-packet samples — those drive the controller in a
 // degraded mode with rough delivery-rate estimation.
@@ -203,10 +205,10 @@ func (b *BBRController) OnSend(n int64) DeliveryRateSample {
 }
 
 // StampSample captures a DeliveryRateSample from the current model state
-// WITHOUT mutating inflight. The adapter stamps a sample at frame-build
-// time (noiseStream.sendSingleFrame) and increments inflight at actual
-// transmission through the writeLoop's OnSend; a build-time OnSend would
-// count every frame twice, so inflight grows without bound, the Drain-exit
+// WITHOUT mutating inflight. The adapter stamps a sample at the frame's first
+// write (noiseStream.recordWrite) and increments inflight through the writeLoop's
+// OnSend once per frame; a second OnSend for one frame would count it twice with
+// one ACK to take it back, so inflight grows without bound, the Drain-exit
 // test (inflight <= max(bdp, 4·mss)) never passes, and BBR pins pacing at
 // 0.35× and decays to the floor. The writeLoop's OnSend is the single
 // authoritative on-wire increment.
@@ -433,6 +435,14 @@ func (b *BBRController) CWND() int64 {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.cwnd
+}
+
+// InFlightBytes returns the controller's inflight estimate: what OnSend added less
+// what the ACK paths took back.
+func (b *BBRController) InFlightBytes() int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.inflight
 }
 
 // CanSend reports whether more data can be sent given the current cwnd.
