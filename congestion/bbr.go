@@ -396,7 +396,7 @@ func (b *BBRController) ResetCWND() {
 	b.recomputeOutputs()
 }
 
-// OnCE handles ECN CE marks (#15). One RTT-bounded reduction.
+// OnCE handles ECN CE marks. One RTT-bounded reduction.
 func (b *BBRController) OnCE(bytesMarked int64) {
 	if bytesMarked <= 0 {
 		return

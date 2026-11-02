@@ -236,7 +236,7 @@ func (l *noiseListener) run(ctx context.Context) {
 // runReader reads packets from a UDP socket and dispatches them.
 // Used for both the primary socket and the optional IPv6 socket.
 //
-// ECN integration (#15): the read path uses ecnReader which enables
+// ECN integration: the read path uses ecnReader which enables
 // IP_RECVTOS / IPV6_RECVTCLASS at socket open and extracts the IP TOS
 // byte on every datagram. CE-marked packets (TOS bits 0-1 == 0b11) feed
 // NoiseSession.RecordCEBytes so the next outbound CompositeACK carries

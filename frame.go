@@ -375,8 +375,9 @@ func (f *Frame) Validate() error {
 	// minPayloadSizes comment below) is preserved, not weakened.
 	//
 	// ⚠ ANY caller that decompresses a payload MUST re-validate afterwards, or
-	// the minimum goes unenforced for compressed frames. Today the only such
-	// caller is adapter/noise_dispatch.go processIncomingFrame.
+	// the minimum goes unenforced for compressed frames. processIncomingFrame
+	// (adapter/noise_dispatch.go) is the one caller that decompresses, and it
+	// re-runs Validate after decompressPayload.
 	if minSize, ok := minPayloadSizes[f.Type]; ok && f.Length < minSize &&
 		!f.Flags.Has(FlagCOMPRESSED) {
 		return fmt.Errorf("aether: %s payload too small (%d bytes, min %d)", f.Type, f.Length, minSize)

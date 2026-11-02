@@ -173,8 +173,8 @@ type SessionMetrics struct {
 	StreamObserve map[uint64]StreamObserveData `json:"streamObserve,omitempty"`
 
 	// Send-path / ACK-engine observability counters. All are per-session
-	// totals since session create; Library surfaces them via MeshMetrics
-	// under the `aether_*` namespace.
+	// totals since session create; the consumer that sums a session's stats
+	// surfaces them as metrics.
 	//
 	// CanSendFalseReenqueues: writeLoop re-enqueued a frame because
 	// CUBIC CanSend(inFlight+frameSize) returned false. Elevated counts
@@ -232,7 +232,7 @@ type SessionMetrics struct {
 
 	// Observability histograms surfaced as p50/p99 microseconds — the
 	// minimum cardinality that lets operators localize the bimodal RPC
-	// latency tail the fleet has been seeing. Source histograms live on
+	// latency tail. Source histograms live on
 	// NoiseSession; the consumer that sums a session's stats and
 	// dashboards read them via STATS frames + monitoring endpoints.
 	//
@@ -359,9 +359,9 @@ type SessionMetrics struct {
 	// (cwnd-bound or syscall-bound); p99 >> p50 indicates bursty
 	// arrivals that the writeLoop catches up on between bursts;
 	// near-zero on both means the queue is consistently drained as
-	// fast as it fills (healthy regime). Zero on transports that
-	// haven't wired the histogram into their scheduler (any adapter
-	// other than the noise session today).
+	// fast as it fills (healthy regime). Zero on a transport that has
+	// not wired the histogram into its scheduler (every adapter other
+	// than NoiseSession, the one writer of these two fields).
 	SchedulerDepthP50 uint32 `json:"schedulerDepthP50,omitempty"`
 	SchedulerDepthP99 uint32 `json:"schedulerDepthP99,omitempty"`
 
@@ -373,11 +373,11 @@ type SessionMetrics struct {
 	//
 	// Paired with TLPFiresTotal: a high TLPResetTotal:TLPFiresTotal
 	// ratio means most TLPs are firing because of stall-detect
-	// rescue (path is flaky, not genuinely lossy). Multipath
-	// surfaces it through aether_tlp_reset_total; the connection
-	// manager that owns the multipath.Manager forwards the same
-	// signal into Manager.RecordTLPReset for the PathFlapping
-	// demote tier (see multipath/manager.go).
+	// rescue (path is flaky, not genuinely lossy). The consumer that
+	// sums a session's stats surfaces it as a metric; the consumer
+	// that owns the multipath.Manager forwards the same signal into
+	// Manager.RecordTLPReset for the PathFlapping demote tier (see
+	// multipath/manager.go).
 	//
 	// Zero on non-noise transports (TCP / QUIC / in-process fakes
 	// have no STALL-DETECT path).
@@ -385,8 +385,8 @@ type SessionMetrics struct {
 
 	// PathFlappingCount surfaces multipath.Manager.PathFlappingCount
 	// at the moment Metrics() is read. Cumulative summation across
-	// a peer's paths happens at the Library layer (it owns the
-	// per-peer Manager). The field is on SessionMetrics rather than
+	// a peer's paths happens in the consumer that owns the per-peer
+	// Manager. The field is on SessionMetrics rather than
 	// a separate getter so existing observability that snapshots
 	// Metrics() once per scrape picks up the value for free.
 	//

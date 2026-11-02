@@ -42,8 +42,8 @@ import (
 // This file ships the inner relay wire codec, the M_r and M_t flow
 // tables, and the IntraOriginForwarder type. NoiseTransport integration
 // (listener branching + reply-write interception) is in transport.go
-// and session.go. Library wiring (LAD-backed lookup + per-dial
-// preamble emission) is in the consuming mesh runtime.
+// and session.go. The consuming mesh runtime's lookup (which machine holds
+// the target NodeID) and per-dial preamble emission are outside this repository.
 
 // ── wire format ──────────────────────────────────────────────────────
 //

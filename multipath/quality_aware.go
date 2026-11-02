@@ -501,10 +501,10 @@ func (q *qualityState) runEnsure(ctx context.Context, m *Manager) {
 			// Cap the shift before applying. baseBackoff (5s) << 5 already
 			// equals 160s — well past maxBackoff (60s). Without this cap,
 			// consecutiveFails ~33+ overflows the int64 left-shift and
-			// flips backoff negative (observed in fleet logs as
-			// `backoff=-1759548h`). The `> maxBackoff` clamp below
-			// doesn't catch negative values, so timer.Reset(<0) fires
-			// immediately and a permanently-unreachable peer drives a
+			// flips backoff negative; the clamp below also catches
+			// `backoff <= 0`, so a negative or zero backoff becomes
+			// maxBackoff rather than a timer.Reset(<0) that fires
+			// immediately and lets a permanently-unreachable peer drive a
 			// dial-storm at full speed.
 			shift := consecutiveFails - 1
 			if shift > 5 {

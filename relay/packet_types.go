@@ -11,7 +11,9 @@
 package relay
 
 const (
-	// Packet types (matching PROTOCOLS.md)
+	// Packet types: the first byte of every noiseConn packet's plaintext
+	// (noise/noiseconn.go sendPacket prepends it, the receive switch reads
+	// plaintext[0]) and of a relayed datagram (relay/fallback.go).
 	PacketTypeData         = 0x01
 	PacketTypePing         = 0x02 // Health check ping
 	PacketTypePong         = 0x03 // Health check pong response

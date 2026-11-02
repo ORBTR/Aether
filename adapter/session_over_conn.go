@@ -96,16 +96,16 @@ func wrapPostHandshakeAsSession(aetherConn aether.Connection, localNodeID aether
 
 // DialSessionOverBrowserWS wraps an already-open browser WebSocket
 // (supplied as conn — the browser-specific net.Conn using syscall/js,
-// opened by the endpoint's own WASM package, e.g. browser_ws.go's
-// DialWebSocket) with a full Aether session: it runs Noise XX over conn
-// and adds the session layer. This function does NOT open the WebSocket
-// itself — that moved out of adapter into the WASM glue so aether carries
-// no syscall/js browser I/O.
+// opened by the endpoint's own WASM package) with a full Aether session:
+// it runs Noise XX over conn and adds the session layer. This function
+// does NOT open the WebSocket itself: the endpoint's own WASM package
+// opens it, so aether opens no browser socket through syscall/js (its one
+// syscall/js use is resume/browser_store.go's localStorage).
 //
 // The return type is *NoiseSession; a caller holds it as *NoiseSession or
 // aether.Session, both of which expose OpenStream / AcceptStream
 // identically. This is a thin keyed wrapper over DialSessionOverConn,
-// which new code calls directly.
+// which a caller can call directly.
 func DialSessionOverBrowserWS(ctx context.Context, localNodeID aether.NodeID, staticPriv, staticPub []byte, conn net.Conn, opts aether.SessionOptions) (*NoiseSession, error) {
 	return DialSessionOverConn(ctx, noise.DialConnConfig{
 		LocalNodeID: localNodeID,

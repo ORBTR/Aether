@@ -177,11 +177,11 @@ func (a *AdaptiveController) applyDegradation(estimated float64) {
 
 	// Rung 2 (>80%, FEC) and Rung 3 (>90%, WFQ scheduler) are sampled at
 	// session-construction time (opts.FEC / scheduler build), so they cannot
-	// be flipped on a live session yet. Record the rung decision here —
-	// consumed by monitoring and by the future runtime FECCapable /
-	// SchedulerCapable toggles — so the documented three-rung ladder is
-	// preserved and testable. Enforcement wiring is a tracked follow-up.
-	// No capability is removed: these rungs are inert today regardless.
+	// be flipped on a live session. Record the rung decision here so the
+	// three-rung ladder is testable.
+	// TODO: wire fecDegraded and schedDegraded into the sessions' FEC and
+	// scheduler toggles; until then the two rungs set their flags and change
+	// nothing a session reads (the flags are unexported; only a test reads them).
 	if estimated > 80 {
 		a.fecDegraded = true
 	} else if estimated <= 75 {

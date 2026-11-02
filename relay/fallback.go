@@ -59,7 +59,8 @@ type FallbackDialer struct {
 	// detection timeout before falling through to strategy selection.
 	natDetectFailedAt time.Time
 
-	// Relay discovery function (injected from LAD)
+	// Relay discovery function (the consumer injects it through
+	// FallbackConfig.DiscoverRelays)
 	discoverRelays func(ctx context.Context, preferRegion string) ([]RelayInfo, error)
 
 	// Direct dial function (injected from VL1 transport)

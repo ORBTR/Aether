@@ -371,7 +371,7 @@ func EncodeCompositeACK(ack *CompositeACK) []byte {
 		off += 2
 	}
 
-	// Optional: ECN — 4-byte cumulative CE-byte count (#15).
+	// Optional: ECN — 4-byte cumulative CE-byte count.
 	if ack.Flags&CACKHasECN != 0 {
 		binary.BigEndian.PutUint32(data[off:off+4], ack.CEBytes)
 		off += 4
@@ -481,7 +481,7 @@ func DecodeCompositeACK(data []byte) *CompositeACK {
 		}
 	}
 
-	// Optional: ECN extension (#15) — 4-byte CE byte count.
+	// Optional: ECN extension — 4-byte CE byte count.
 	if ack.Flags&CACKHasECN != 0 {
 		if off+4 <= len(data) {
 			ack.CEBytes = binary.BigEndian.Uint32(data[off : off+4])

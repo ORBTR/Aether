@@ -167,16 +167,16 @@ type noiseConn struct {
 	// RealmID reports it.
 	realm realmBinding
 
-	// Observability counters (Concerns #5, #6)
+	// Observability counters
 	decryptErrors uint64 // atomic: failed decrypt attempts
 	inboxDrops    uint64 // atomic: inbox-full drops
 
-	// ECN CE-byte counter (#15). Socket reader (ecnReader) updates this
+	// ECN CE-byte counter. Socket reader (ecnReader) updates this
 	// when a CE-marked datagram arrives; the aether adapter drains it
-	// via the `noiseConnStats` interface and folds the total into the
-	// next outbound CompositeACK. Atomic read/reset pattern mirrors the
-	// adapter's own `ceObservedBytes` counter so the two layers compose
-	// without extra locking.
+	// through DrainCEBytes (its noiseConnCE interface) and folds the
+	// total into the next outbound CompositeACK. Atomic read/reset
+	// pattern mirrors the adapter's own `ceObservedBytes` counter so the
+	// two layers compose without extra locking.
 	ceBytes uint64
 
 	// Per-decrypt AEAD latency distribution. Records the wall-

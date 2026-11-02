@@ -77,9 +77,9 @@ func NewTransport(proto string, cfg *aether.Config) (aether.Transport, error) {
 // NoiseTransportConfig.NetworkKeys, and aether.Config.Noise does NOT
 // surface that field. Calling NewTransportForProtocol(ProtoNoise, cfg)
 // therefore fails at NewNoiseTransport with "crypto: at least one
-// network key is required" unless aether.Config.Noise is extended to
-// carry NetworkKeys. Callers that need a Noise transport today must
-// use noise.NewNoiseTransport directly. The factory still serves QUIC /
+// network key is required", because aether.Config.Noise carries no
+// NetworkKeys field. A caller that needs a Noise transport constructs it
+// with noise.NewNoiseTransport directly. The factory still serves QUIC /
 // WebSocket / gRPC fully and returns ErrProtocolDisabled or the
 // underlying construction error for ProtoNoise — so it remains safe
 // to use from a runtime dispatch that filters by enabled protocols.
