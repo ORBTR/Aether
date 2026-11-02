@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// blacklistPeer trips the S7 breaker for peer by feeding enough
+// blacklistPeer trips the cool-off breaker for peer by feeding enough
 // ACK-validation hits (DefaultWeight 25 each) to cross DefaultThreshold
 // (100). Five hits = 125, comfortably over threshold even after the
 // negligible in-loop exponential decay, so the assertion is not boundary
@@ -24,14 +24,15 @@ func blacklistPeer(t *testing.T, s *Score[string], peer string) {
 	}
 }
 
-// TestAbuseCoolOff_PersistsAcrossSessions_AndGates locks in the abuse-package
-// mechanism AE-M-04 depends on. The S7 cool-off only escalates against a
-// reconnecting peer when callers share ONE node-scoped registry across
-// sessions: the blacklist and score must survive a new session (a second
-// consumer of the same registry) rather than resetting to 0, and
-// IsBlacklisted must serve as the accept-gate predicate. A fresh
-// per-session registry — the pre-fix wiring — carries no prior blacklist,
-// which is exactly the gap the shared registry + accept gate close.
+// TestAbuseCoolOff_PersistsAcrossSessions_AndGates pins the registry
+// behaviour the consumer that accepts sessions (outside this repository)
+// relies on. The cool-off only escalates against a reconnecting peer when
+// callers share ONE node-scoped registry across sessions: the blacklist and
+// score must survive a new session (a second consumer of the same registry)
+// rather than resetting to 0, and IsBlacklisted must answer as the predicate
+// that consumer's accept path refuses on. A fresh per-session registry
+// carries no prior blacklist, so only the shared registry lets the accept
+// path refuse a reconnecting peer.
 func TestAbuseCoolOff_PersistsAcrossSessions_AndGates(t *testing.T) {
 	const remote = "vl1_abuse_m04_peer"
 	shared := New[string](DefaultConfig())
@@ -44,8 +45,8 @@ func TestAbuseCoolOff_PersistsAcrossSessions_AndGates(t *testing.T) {
 
 	// Session B is a NEW session for the SAME remote but the SAME shared
 	// registry. The score must NOT reset to 0 and the peer must still read
-	// as blacklisted. Pre-fix (fresh per-session registry) this read
-	// 0 / not-blacklisted, letting the peer escape the cool-off by
+	// as blacklisted. A fresh per-session registry reads 0 /
+	// not-blacklisted here, which lets the peer escape the cool-off by
 	// reconnecting.
 	if !shared.IsBlacklisted(remote) {
 		t.Fatal("shared registry: remote should still be blacklisted on a new session")
@@ -55,9 +56,9 @@ func TestAbuseCoolOff_PersistsAcrossSessions_AndGates(t *testing.T) {
 			got, float64(DefaultThreshold))
 	}
 
-	// Accept-gate predicate: the gate refuses a blacklisted remote and
-	// admits an unknown one (no capability regression for well-behaved
-	// peers).
+	// The predicate the consumer's accept path refuses on: true for a
+	// blacklisted remote and false for an unknown one, so well-behaved
+	// peers are admitted.
 	if !shared.IsBlacklisted(remote) {
 		t.Fatal("accept gate: blacklisted remote must be refused")
 	}
@@ -65,9 +66,9 @@ func TestAbuseCoolOff_PersistsAcrossSessions_AndGates(t *testing.T) {
 		t.Fatal("accept gate: unknown remote must NOT be refused")
 	}
 
-	// Contrast: a FRESH per-session registry (the pre-fix wiring) does not
-	// inherit the blacklist from another registry — documents precisely why
-	// the registry must be node-scoped/shared.
+	// Contrast: a FRESH per-session registry does not inherit the
+	// blacklist from another registry, which is why the registry must be
+	// node-scoped/shared.
 	fresh := New[string](DefaultConfig())
 	if fresh.IsBlacklisted(remote) {
 		t.Fatal("fresh registry must not inherit blacklist from another registry")
@@ -79,7 +80,8 @@ func TestAbuseCoolOff_PersistsAcrossSessions_AndGates(t *testing.T) {
 
 // TestAbuseCoolOff_AutoClearsAndReArms verifies the cool-off auto-clears
 // once BlacklistTTL lapses, so IsBlacklisted stops refusing the peer and it
-// earns a fresh chance — the re-arm behaviour the accept gate relies on.
+// earns a fresh chance — the re-arm behaviour the consumer's accept path
+// relies on.
 func TestAbuseCoolOff_AutoClearsAndReArms(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.BlacklistTTL = 10 * time.Millisecond
@@ -91,22 +93,24 @@ func TestAbuseCoolOff_AutoClearsAndReArms(t *testing.T) {
 		t.Fatal("peer should be blacklisted immediately after tripping the breaker")
 	}
 
-	// After the TTL lapses, IsBlacklisted must auto-clear so the accept gate
-	// stops refusing the peer.
+	// After the TTL lapses, IsBlacklisted must auto-clear so the consumer's
+	// accept path stops refusing the peer.
 	time.Sleep(25 * time.Millisecond)
 	if s.IsBlacklisted(remote) {
 		t.Fatal("blacklist should auto-clear after BlacklistTTL")
 	}
 }
 
-// TestAEP09_ReArmsAfterCoolOffWhenStillOverThreshold covers the AE-P-09
-// circuit-breaker bypass: a peer whose (decayed) score stays >= threshold
-// across a cool-off window must re-arm the breaker on its next event once
-// the blacklist TTL has lapsed, instead of being permanently re-admitted.
+// TestAEP09_ReArmsAfterCoolOffWhenStillOverThreshold covers the
+// circuit-breaker bypass Record's re-arm closes: a peer whose (decayed)
+// score stays >= threshold across a cool-off window must re-arm the breaker
+// on its next event once the blacklist TTL has lapsed, and never be
+// permanently re-admitted.
 //
 // HalfLife is deliberately long (10s) so the score does NOT decay below
-// threshold during the short (10ms) cool-off — this is exactly the
-// "stays above threshold" case the old rising-edge guard failed to catch.
+// threshold during the short (10ms) cool-off — the "stays above threshold"
+// case a guard that blacklists only on a below->over transition never
+// re-fires for.
 func TestAEP09_ReArmsAfterCoolOffWhenStillOverThreshold(t *testing.T) {
 	s := New[string](Config{
 		Threshold:    DefaultThreshold,
@@ -140,9 +144,10 @@ func TestAEP09_ReArmsAfterCoolOffWhenStillOverThreshold(t *testing.T) {
 		t.Fatalf("precondition: score should still be >= threshold, got %v", got)
 	}
 
-	// The still-abusive peer records another event. Pre-fix the stale
-	// pre-decay wasOver snapshot stayed true, so !wasOver&&nowOver was
-	// false and the breaker never re-fired. Post-fix it re-arms on state.
+	// The still-abusive peer records another event. Record re-arms on the
+	// post-decay state (nowOver && !p.blacklisted); a below->over transition
+	// test against a pre-decay snapshot would read over both times and never
+	// re-fire here.
 	if _, exceeded := s.Record(aep09Peer, ReasonACKValidation); !exceeded {
 		t.Fatal("AE-P-09: breaker must re-arm for a peer still over threshold after cool-off")
 	}

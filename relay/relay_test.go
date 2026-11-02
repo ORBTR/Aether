@@ -275,7 +275,9 @@ func TestDefaultHealthConfig(t *testing.T) {
 }
 
 func TestPacketTypeConstants(t *testing.T) {
-	// Verify packet type constants are unique and match PROTOCOLS.md
+	// Verify packet type constants are unique: each is the first plaintext
+	// byte noiseConn's receive switch and relay/fallback.go read
+	// (packet_types.go).
 	types := map[byte]string{
 		PacketTypeData:         "Data",
 		PacketTypePing:         "Ping",

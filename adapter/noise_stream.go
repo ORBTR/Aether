@@ -346,7 +346,7 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 	s.streamGC.Register(streamID)
 
 	// Propagate cfg.LatencyClass to the scheduler. The caller's setting
-	// MUST be honoured: the RPC caller that opens stream 1 (BidiRPC) sets
+	// MUST be honoured: the RPC caller that opens stream 1 sets
 	// ClassINTERACTIVE and dropping it leaves RPC dispatch competing
 	// with gossip at the lowest priority.
 	//
@@ -783,9 +783,10 @@ func (st *noiseStream) receiveCeilings() (streamLimit, sessionLimit int64) {
 }
 
 // teardown releases per-stream resources that must not outlive the
-// stream itself — currently the grant debouncer's timer goroutine +
-// pending-flush. Idempotent; safe to call from every termination path
-// (Close, Reset, handleClose, handleReset, streamGC sweep).
+// stream itself: the grant debouncer's timer goroutine and pending flush,
+// and the receive queue's admission (recvQ.end). Idempotent; safe to call
+// from every termination path (Close, Reset, handleClose, handleReset,
+// streamGC sweep).
 func (st *noiseStream) teardown() {
 	if st.grantDebouncer != nil {
 		st.grantDebouncer.Close()

@@ -801,11 +801,12 @@ func (m *Manager) promotebestStandby() bool {
 	return false
 }
 
-// RecordTLPReset is invoked by the noise adapter (via the higher-level
-// connection manager that owns this multipath Manager) every time
-// STALL-DETECT fires its false-positive recovery path on a session
-// owned by this Manager. The path identified by `session` accumulates
-// the event in a sliding flappingWindowDur (5-minute) window; once
+// RecordTLPReset is for the consumer that owns this Manager (outside this
+// repository): it polls SessionMetrics.TLPResetTotal (the noise adapter's
+// STALL-DETECT false-positive counter) and calls this once per event on a
+// session owned by this Manager; no caller in this repository outside its
+// tests. The path identified by `session` accumulates the event in a
+// sliding flappingWindowDur (5-minute) window; once
 // flappingResetThreshold (3) events have landed in the window, the
 // path is demoted to PathFlapping for flappingDemoteDur (60 s) —
 // promotebestStandby skips it during the demote so a steadier
@@ -816,7 +817,8 @@ func (m *Manager) promotebestStandby() bool {
 //
 // Callers that don't track a multipath.Manager (single-path peers,
 // tests that don't exercise the demote tier) can safely never call
-// this — Manager behaves exactly as before.
+// this — a Manager that never receives the call holds no PathFlapping
+// path and setPrimary/WDRR run on quality alone.
 //
 // Returns true when the call moved the path INTO PathFlapping (so the
 // caller can log / surface the demote event); false on every other

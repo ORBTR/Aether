@@ -122,7 +122,8 @@ func (s *NoiseSession) processIncomingFrame(frame *aether.Frame, indicator byte)
 		// flag cleared above. Without this call the minimum would go unenforced
 		// for every compressed frame, silently disarming a deliberate anti-abuse
 		// gate; with it, a genuinely undersized frame is still rejected and still
-		// scored, exactly as before. See frame.go Validate() and minPayloadSizes.
+		// scored, as an uncompressed undersized frame is at the first Validate
+		// above. See frame.go Validate() and minPayloadSizes.
 		if err := frame.Validate(); err != nil {
 			s.reportAbuse(abuse.ReasonMalformedFrame)
 			return
@@ -968,14 +969,17 @@ func (s *NoiseSession) handlePathProbe(frame *aether.Frame) {
 // sendCompositeACK sends a Composite ACK frame for a stream.
 func (s *NoiseSession) sendCompositeACK(st *noiseStream, cack *aether.CompositeACK) {
 	// ECN piggyback. Two inputs feed the per-ACK CE-byte total:
-	//   1. The adapter-level ceObservedBytes — populated by test code or
-	//      by future path layers that sit above the Noise conn.
+	//   1. The adapter-level ceObservedBytes, written by
+	//      NoiseSession.RecordCEBytes for a layer above the Noise conn
+	//      that observes CE itself; no caller in this repository writes
+	//      it, so this input is 0 unless a consumer calls RecordCEBytes.
 	//   2. The transport-level counter on the underlying *noiseConn,
-	//      drained via the noiseConnCE interface. The listener's
-	//      ecnReader writes to this counter whenever the kernel
-	//      delivers an IP_TOS/IPV6_TCLASS cmsg with the CE codepoint.
-	// Combining both keeps the ACK piggyback accurate even when ECN
-	// detection is split across layers on exotic platforms.
+	//      drained via the noiseConnCE interface. The listener's read
+	//      loop (noise/session.go runReader) adds a datagram's size to
+	//      it through noiseConn.RecordCEBytes when the TOS byte the
+	//      ecnReader returns carries the CE codepoint.
+	// Summing both lets either source reach the sender's OnCE through
+	// the same CompositeACK, whichever layer observed the mark.
 	ce := atomic.SwapUint64(&s.ceObservedBytes, 0)
 	if drainer, ok := s.conn.(noiseConnCE); ok {
 		ce += drainer.DrainCEBytes()
@@ -1004,10 +1008,13 @@ func (s *NoiseSession) sendCompositeACK(st *noiseStream, cack *aether.CompositeA
 	s.writeFrame(frame)
 }
 
-// RecordCEBytes is called by the receive socket layer when an inbound
-// packet's IP/IPv6 TOS field carries the CE codepoint (0x03). The bytes
-// are folded into the next outbound CompositeACK via CEBytes/CACKHasECN
-// so the sender's congestion controller sees the ECN signal.
+// RecordCEBytes takes n bytes of inbound packets whose IP/IPv6 TOS field
+// carried the CE codepoint (0x03), for a consumer that observes CE above the
+// Noise conn; no caller in this repository calls it (the listener's socket
+// path feeds the noiseConn's own counter, which sendCompositeACK drains
+// through noiseConnCE). The bytes are folded into the next outbound
+// CompositeACK via CEBytes/CACKHasECN so the sender's congestion controller
+// sees the ECN signal.
 func (s *NoiseSession) RecordCEBytes(n int) {
 	if n <= 0 {
 		return

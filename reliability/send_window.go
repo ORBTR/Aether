@@ -129,11 +129,14 @@ type SendWindow struct {
 	// to the controller as the pipe; none walks the streams' windows under their
 	// locks per send.
 	//
-	// Consistency model: every mutation of w.entries happens under w.mu,
-	// and the counter update happens under the same lock — a reader's
-	// atomic.Load may see a value a concurrent removal is about to lower,
-	// but the total never falls under the sum of the entries the wired
-	// windows hold (the CanSend gate is conservative anyway).
+	// Consistency model: every mutation of w.entries and of an entry's
+	// Written and InFlightBytes happens under w.mu, and the counter update
+	// happens under the same lock, so with no MarkWritten or removal
+	// running the counter equals the sum of InFlightBytes over the entries
+	// of the wired windows. Each window has its own lock, so several such
+	// calls can run at once, and a reader's lock-free atomic.Load can read a
+	// value that differs from that sum by the charges those calls are
+	// completing.
 	sessionInFlight *atomic.Int64
 
 	// released is set by ReleaseInFlight and read by AddEntry, both under
@@ -186,9 +189,8 @@ func (w *SendWindow) subInFlightLocked(entry *SendEntry) {
 
 // removeEntryLocked deletes seq from w.entries, decrementing the
 // optional session inflight counter by the entry's InFlightBytes before
-// the delete. No-op if seq isn't present. Centralises the
-// counter+delete invariant so future removal call sites stay
-// consistent.
+// the delete. No-op if seq isn't present. A removal that calls it keeps
+// the counter and the map in step without repeating the pair.
 func (w *SendWindow) removeEntryLocked(seq uint32) (*SendEntry, bool) {
 	entry, ok := w.entries[seq]
 	if !ok {

@@ -118,8 +118,9 @@ func (r RouteClass) AcceptableRTT() time.Duration {
 // The continent map is intentionally narrow — only the regions
 // regionContinent lists. Adding a region requires adding a row; a region
 // absent from the map classifies as RouteUnknown (the !lok || !rok return
-// below), which scores like RouteInterContinental — the lenient thresholds
-// — so a missing entry under-promotes a path, never over-promotes it.
+// below), which takes RouteInterContinental's lenient RTT thresholds
+// (components.go) and a lower affinity rank (score.go), so a missing entry
+// under-promotes a path, never over-promotes it.
 func ClassifyRegions(local, remote string) RouteClass {
 	local = strings.ToLower(strings.TrimSpace(local))
 	remote = strings.ToLower(strings.TrimSpace(remote))
@@ -143,7 +144,9 @@ func ClassifyRegions(local, remote string) RouteClass {
 
 // regionContinent is the continent assignment for each Fly region the
 // table knows. Adding a region requires adding a row; a region absent from
-// the map classifies as RouteUnknown, which scores like RouteInterContinental.
+// the map classifies as RouteUnknown, which takes RouteInterContinental's RTT
+// thresholds and a lower affinity rank (score.go), so a missing row
+// under-promotes a path.
 var regionContinent = map[string]string{
 	// North America
 	"iad": "na", // Ashburn, Virginia
