@@ -870,6 +870,10 @@ func (s *NoiseSession) handleClose(frame *aether.Frame) {
 	s.mu.Lock()
 	delete(s.streams, frame.StreamID)
 	s.mu.Unlock()
+	// The stream is out of s.streams: no later ACK reaches its SendWindow
+	// (handleACK returns on an absent stream), so what it still holds in
+	// flight is given back to the session counter here.
+	st.releaseInFlight()
 	s.releaseStream(frame.StreamID)
 }
 
@@ -886,6 +890,9 @@ func (s *NoiseSession) handleReset(frame *aether.Frame) {
 		st.state.Transition(aether.EventRecvReset)
 		st.teardown()
 		st.closeRecvOnce()
+		// Out of s.streams, as in handleClose: the frames the peer's RESET
+		// leaves unacked go back to the session's in-flight counter.
+		st.releaseInFlight()
 		s.releaseStream(frame.StreamID)
 	}
 }

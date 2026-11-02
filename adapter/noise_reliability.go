@@ -280,17 +280,24 @@ const cwndBlockedProbeInterval = 1 * time.Millisecond
 // sustained sending. Power-of-two so the modulo compiles to a mask.
 const cwndUtilSamplePeriod = 16
 
-// totalInFlightBytes returns the session-wide in-flight byte count
-// across every stream's SendWindow.
+// totalInFlightBytes returns the session's framed plaintext bytes in
+// flight across every stream's SendWindow: HeaderSize plus the frame's
+// Length as it was at SendWindow.AddEntry, summed over the unacked
+// entries, the kind inFlightBytes is kept in. The writeLoop adds the
+// dequeued frame's HeaderSize+Length to it for CanSend (the framed
+// plaintext size on a first send; the committed size when a retransmit
+// re-presents a frame writeFrame already committed), and handleACK
+// passes it to OnAckWithPipe as the pipe after an ACK's removals.
 //
 // Fast path: a single atomic.Load on the session-level counter that
-// each SendWindow maintains as a side effect of Add/Ack (wired by
-// SetSessionInFlightCounter in createStream). Per-send cost is O(1)
-// — versus an O(streams × map-iteration + per-stream-lock) walk if
+// each SendWindow charges at AddEntry and releases at every removal
+// (wired by SetSessionInFlightCounter in createStream). Per-send cost is
+// O(1) — versus an O(streams × map-iteration + per-stream-lock) walk if
 // it had to fold each window's InFlightBytes() directly.
 //
-// Negative results are clamped to zero defensively: a negative value is
-// impossible from a correctly-wired SendWindow set, but the clamp keeps
+// Negative results are clamped to zero defensively: every SendWindow
+// releases exactly the count it charged (SendEntry.InFlightBytes), so a
+// negative value does not arise from the wired set, and the clamp keeps
 // CanSend's invariant (inFlight >= 0) intact should a SendWindow ever
 // decrement past what it added.
 func (s *NoiseSession) totalInFlightBytes() int64 {
