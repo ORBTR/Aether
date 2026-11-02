@@ -182,9 +182,16 @@ func (t *WebsocketTransport) Dial(ctx context.Context, target aether.Target) (ae
 			return nil
 		},
 	}
-	rawConn, _, _, err := dialer.Dial(ctx, target.Address)
+	rawConn, br, _, err := dialer.Dial(ctx, target.Address)
 	if err != nil {
 		return nil, aether.WrapOp("dial", aether.ProtoWebSocket, target.NodeID, err)
+	}
+	// br is non-nil when bytes the server wrote after its 101 arrived in the
+	// same read as the response, as when the accepting session writes its
+	// preface at once. WSConn reads frames from the conn it is given, so the
+	// conn reads br before the socket.
+	if br != nil {
+		rawConn = &bufferedReadConn{Conn: rawConn, r: br}
 	}
 	dialRTT := time.Since(dialStart)
 
@@ -238,6 +245,16 @@ func (t *WebsocketTransport) Dial(ctx context.Context, target aether.Target) (ae
 	session.OnClose(func() { wsConn.Close() })
 	return session, nil
 }
+
+// bufferedReadConn is a dialled conn whose reads drain the handshake reader
+// first. Dial builds it when gobwas returns buffered frame bytes; WSConn.Read
+// consumes it and every other method is the socket's.
+type bufferedReadConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c *bufferedReadConn) Read(p []byte) (int, error) { return c.r.Read(p) }
 
 // VerifyMeshDialError carries the HTTP status a mesh-dial verification failure
 // should surface. VerifyMeshDial returns it (as the error interface) so a
