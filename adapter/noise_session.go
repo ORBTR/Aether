@@ -179,10 +179,10 @@ type NoiseSession struct {
 	// succeeded and we reset per-stream TLP exhaustion counters.
 	// Bumped once per STALL-DETECT false-positive event in
 	// reliabilityTick. Surfaced through SessionMetrics.TLPResetTotal;
-	// the connection manager owning the multipath.Manager polls the
-	// delta and forwards each event into Manager.RecordTLPReset to
-	// drive the PathFlapping demote tier. See multipath/manager.go
-	// for the demote semantics.
+	// the consumer that owns the multipath.Manager (outside this
+	// repository) polls the delta and forwards each event into
+	// Manager.RecordTLPReset to drive the PathFlapping demote tier. See
+	// multipath/manager.go for the demote semantics.
 	tlpResetTotal uint64
 
 	// retransmitEvicted counts frames dropped from a stream's retransmit
@@ -336,12 +336,14 @@ type NoiseSession struct {
 	// STATS frame arrives.
 	lastPeerStats atomic.Pointer[aether.SessionMetrics]
 
-	// ECN observation. The receive path increments ceObservedBytes
-	// when an inbound packet's IP/IPv6 TOS field carries the CE codepoint
-	// (0x03). The next outbound CompositeACK reads-and-resets this counter
-	// into its CEBytes extension so the sender can call cong.OnCE.
-	// Socket-level cmsg plumbing (IP_RECVTOS / IPV6_RECVTCLASS) lives in
-	// the noise/ package; this counter is the protocol-level handoff.
+	// ECN observation from above the Noise conn. RecordCEBytes adds the
+	// bytes of inbound packets whose IP/IPv6 TOS field carried the CE
+	// codepoint (0x03); no caller in this repository calls it, so this
+	// counter stays 0 unless a consumer does. The next outbound
+	// CompositeACK reads-and-resets it, adds the noiseConn's own counter
+	// (noiseConnCE, filled by the noise/ listener's socket-level cmsg
+	// plumbing, IP_RECVTOS / IPV6_RECVTCLASS), and carries the total in
+	// its CEBytes extension so the sender can call cong.OnCE.
 	ceObservedBytes uint64
 
 	// Runtime-mutable compression toggle. Initialised from
@@ -1085,8 +1087,9 @@ type noiseConnStats interface {
 // counter on every outbound CompositeACK so the sender's OnCE handler
 // reacts one RTT before queue overflow. Kept separate from
 // noiseConnStats because ECN support is best-effort (not all kernels /
-// build tags enable it) and the adapter has its own ceObservedBytes
-// fallback for test scenarios that write directly via RecordCEBytes.
+// build tags enable it); a conn without it leaves only the adapter's own
+// ceObservedBytes, which RecordCEBytes fills for a consumer that observes
+// CE above the conn.
 type noiseConnCE interface {
 	DrainCEBytes() uint64
 }
@@ -1447,9 +1450,9 @@ func (s *NoiseSession) reportAbuse(r abuse.Reason) {
 // scored/closed on this established grade-A session (reportAbuse's
 // forensic-only tier). Metrics() carries the same value
 // (SessionMetrics.ForensicSuppressed); this accessor is for the consumer that
-// sums a session's stats, with no caller in this repository, so triage
-// retains visibility into a genuine post-warmup attack that the
-// forensic-only tier intentionally stops closing.
+// sums a session's stats, with no caller in this repository outside its
+// tests, so triage retains visibility into a genuine post-warmup attack that
+// the forensic-only tier intentionally stops closing.
 func (s *NoiseSession) ForensicSuppressedCount() uint64 {
 	return s.forensicSuppressed.Load()
 }

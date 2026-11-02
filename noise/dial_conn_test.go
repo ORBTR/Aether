@@ -39,8 +39,9 @@ func newTestKeypair(t *testing.T) ([]byte, []byte) {
 }
 
 // realmFromGrant is the GrantRealmFn the tests give both ends: it reads the
-// partition and the target the test grants carry, as a consumer's reader of
-// the signaling DialTicketBody does.
+// partition and the target the test grants carry, as a consumer's
+// GrantRealmFn reads them from its own signed grant body (outside this
+// repository; grant_realm.go).
 func realmFromGrant(body []byte) (GrantRealm, error) {
 	var g struct {
 		Scope  string `json:"scope"`

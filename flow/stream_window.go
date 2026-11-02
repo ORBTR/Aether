@@ -126,10 +126,9 @@ const ConsumeTimeout = 10 * time.Second
 // semaphore. SetRTT + Stats expose observation inputs for a BDP-based
 // auto-tuner (not wired by default — consumers own the sizing policy).
 //
-// Alternative design: a future direction is to drop the credit counter
-// entirely and gate Send on write-queue depth (QUIC/HTTP/2 style offsets).
-// Only worth considering if the current credit-based design proves
-// inadequate.
+// Alternative shape, not built: drop the credit counter entirely and gate
+// Send on write-queue depth (QUIC/HTTP/2 style offsets). Worth considering
+// only if credit-based flow control proves inadequate.
 type StreamWindow struct {
 	mu sync.Mutex
 
@@ -350,8 +349,9 @@ func (w *StreamWindow) TryConsume(n int64) bool {
 
 // Consume reserves n bytes of sender credit before a Send, blocking until
 // credit is available and honouring ctx cancellation. After ConsumeTimeout
-// with no credit the call fails with ErrCreditExhausted; higher layers (gossip)
-// surface this as "insufficient stream credit after 10s".
+// with no credit the call fails with ErrCreditExhausted, which the adapter's
+// noiseStream.Send wraps (errors.Is matches) and returns to its caller as typed
+// backpressure.
 func (w *StreamWindow) Consume(ctx context.Context, n int64) error {
 	if n <= 0 {
 		return nil

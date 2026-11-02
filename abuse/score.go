@@ -6,8 +6,9 @@
 // Package abuse implements per-peer behavioural scoring with a circuit
 // breaker for cross-subsystem misbehaviour: every subsystem's abuse report
 // lands in one registry (Record), and IsBlacklisted is for the consumer that
-// accepts sessions — no caller in this repository consults it. The goal is a
-// single dial operators can read ("this peer is misbehaving, drop it")
+// accepts sessions — no caller in this repository outside its tests
+// consults it. The goal is a single dial operators can read ("this peer is
+// misbehaving, drop it")
 // instead of relying on each subsystem to enforce its own per-feature cap.
 //
 // Scores accrue on observed bad behaviour and decay exponentially while
@@ -175,10 +176,9 @@ func (s *Score[K]) Record(peer K, r Reason) (current float64, justExceeded bool)
 	// pre-decay snapshot never re-fires for a peer whose score stays >=
 	// threshold across a cool-off: once IsBlacklisted auto-clears the flag
 	// at TTL expiry (without resetting the score) the consumer's accept path
-	// re-admits
-	// a still-abusive peer for good. Clear an expired cool-off here first
-	// (so re-arming does not depend on
-	// IsBlacklisted having been polled), then re-blacklist whenever the
+	// re-admits a still-abusive peer for good. Clear an expired cool-off
+	// here first (so re-arming does not depend on IsBlacklisted having been
+	// polled), then re-blacklist whenever the
 	// post-decay score is over threshold and the peer is not already
 	// serving a cool-off. This fires at most one GoAway per BlacklistTTL
 	// for a sustained abuser and never resets the accumulated score, so no
@@ -211,8 +211,9 @@ func (s *Score[K]) Current(peer K) float64 {
 // window. Auto-clears once the TTL expires.
 //
 // IsBlacklisted is for the consumer that accepts sessions: no caller in
-// this repository consults it. A consumer that shares one registry across
-// sessions refuses a peer while this reports true, so a reconnect cannot
+// this repository outside its tests consults it. A consumer that shares one
+// registry across sessions refuses a peer while this reports true, so a
+// reconnect cannot
 // reset the score; that protection only holds when callers share ONE
 // node-scoped registry across sessions, because a fresh per-session
 // registry carries no prior blacklist. Auto-clear here only ungates the

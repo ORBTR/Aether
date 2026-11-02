@@ -238,9 +238,11 @@ func (l *noiseListener) run(ctx context.Context) {
 //
 // ECN integration: the read path uses ecnReader which enables
 // IP_RECVTOS / IPV6_RECVTCLASS at socket open and extracts the IP TOS
-// byte on every datagram. CE-marked packets (TOS bits 0-1 == 0b11) feed
-// NoiseSession.RecordCEBytes so the next outbound CompositeACK carries
-// the CEBytes extension and the remote sender reacts via cong.OnCE.
+// byte on every datagram. A CE-marked packet (TOS bits 0-1 == 0b11) that
+// dispatchToSession claims feeds its noiseConn's RecordCEBytes; the aether
+// adapter drains that counter (DrainCEBytes) into the next outbound
+// CompositeACK's CEBytes extension and the remote sender reacts via
+// cong.OnCE.
 func (l *noiseListener) runReader(ctx context.Context, conn *net.UDPConn) {
 	buf := make([]byte, l.transport.maxPacket)
 	reader := newECNReader(conn)
@@ -396,7 +398,7 @@ func (l *noiseListener) runReader(ctx context.Context, conn *net.UDPConn) {
 		// dialNoncePrefix AND an 8-byte nonce matching a dial registered by
 		// this node — unforgeable without guessing 64 random bits. Every
 		// non-matching packet still falls through to the session path and
-		// both limiters exactly as before.
+		// both limiters.
 		if l.dispatchToPendingDial(msg) {
 			l.drops.count(DropPendingDial)
 			continue
@@ -476,8 +478,9 @@ func (l *noiseListener) dispatchToSession(key string, msg []byte) bool {
 		return false
 	}
 	// Established-session trust: a non-handshake AEAD failure (corruption,
-	// replay, or a late frame) is swallowed as before — the cryptographic
-	// check is the gate and we don't want garbage flooding the handshake path.
+	// replay, or a late frame) is swallowed (dispatchToSession returns true
+	// and runReader takes the packet no further) — the cryptographic check
+	// is the gate and we don't want garbage flooding the handshake path.
 	return true
 }
 

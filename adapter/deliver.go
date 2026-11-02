@@ -31,10 +31,10 @@ type CongestionSignaler func(payload aether.CongestionPayload) error
 // Per-stream-class breakout (Stream0*, Stream1*, StreamOther*) lets the
 // caller attribute drops/backpressure to gossip (stream-0), reliable
 // RPC (stream-1), or dynamic streams without growing the map by streamID.
-// This is the verification surface used to confirm whether a TCPSession recvCh
-// capacity bump on a specific stream actually moves the needle: a fix
-// for stream-0 should show Stream0Dropped flattening while Stream1Dropped
-// and StreamOtherDropped continue to track their own pressure.
+// One class's counters move with that class's own pressure: a TCPSession
+// whose stream-0 recvCh (recvChCapacity) is the one filling shows
+// Stream0Dropped rising while Stream1Dropped and StreamOtherDropped track
+// their own.
 type DeliveryStats struct {
 	Delivered    atomic.Int64 // frames queued for the stream's consumer
 	Dropped      atomic.Int64 // frames the session refused: a full recvCh after backpressure on a TCPSession; a credit violation or a full control-frame limit on a NoiseSession

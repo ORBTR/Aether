@@ -713,9 +713,10 @@ func (c *noiseConn) RecordResumeMaterial(data []byte) {
 }
 
 // RecordCEBytes folds a CE-marked datagram's size into the session's
-// ECN counter. Called by the listener's ecnReader when the IP TOS byte
-// carries the ECN "Congestion Experienced" codepoint (RFC 3168). The
-// adapter drains this via DrainCEBytes on every outbound ACK.
+// ECN counter. Called by the listener's read loop (runReader) when the IP
+// TOS byte its ecnReader returns carries the ECN "Congestion Experienced"
+// codepoint (RFC 3168). The adapter drains this via DrainCEBytes on every
+// outbound ACK.
 func (c *noiseConn) RecordCEBytes(n int) {
 	if n <= 0 {
 		return
@@ -724,7 +725,7 @@ func (c *noiseConn) RecordCEBytes(n int) {
 }
 
 // DrainCEBytes atomically reads and zeroes the ECN CE-byte counter.
-// Exposed via the noiseConnStats interface for the aether adapter's
+// Exposed via the adapter's noiseConnCE interface for its
 // sendCompositeACK path — one drain per ACK means the CEBytes field
 // reports exactly what's accumulated since the previous ACK.
 func (c *noiseConn) DrainCEBytes() uint64 {

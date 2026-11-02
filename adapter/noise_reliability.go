@@ -707,10 +707,9 @@ func (s *NoiseSession) reliabilityTick() {
 					//
 					// The session-level Pings that produced this
 					// false-positive verdict ARE proof the path is alive,
-					// which is exactly the signal `AnyAckReceived()` is
-					// designed to consume (per `tlp.go` doc: "if real
-					// data is being ACKed normally we don't want a stale
-					// probe count to suppress future TLPs").
+					// which congestion/tlp.go's AnyAckReceived takes as
+					// equivalent to an ACK: it clears the probe count so
+					// a stale count stops suppressing ShouldProbe.
 					var tlpResetCount int
 					for _, e := range snap {
 						state := e.st.tlp.Snapshot()
@@ -745,10 +744,10 @@ func (s *NoiseSession) reliabilityTick() {
 
 			// Per-stream stuck detector. STALL-DETECT above is session-
 			// level: lastAnyProgressAt resets when ANY stream makes
-			// progress, so a wedged stream-1 (BidiRPC) while stream-0
-			// (gossip) ticks happily would never trip session-level
-			// STALL-DETECT and the BidiRPC wedge could persist for
-			// minutes.
+			// progress, so a wedged stream-1 (the RPC stream) while
+			// stream-0 (gossip) ticks happily would never trip
+			// session-level STALL-DETECT and the RPC-stream wedge could
+			// persist for minutes.
 			//
 			// Per-stream rule: any stream with in-flight > 0 AND no
 			// progress for stuckStreamThreshold while the SESSION is

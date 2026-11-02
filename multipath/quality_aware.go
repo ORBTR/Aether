@@ -345,18 +345,20 @@ func (m *Manager) computeScoreLocked(p *Path) quality.Score {
 	}
 
 	// Asymmetric-aware folding: probe the session for the peer's last
-	// STATS frame, then take the worse of {local, peer} for the loss /
-	// reorder / drop signals. Rationale: a path that's healthy in the
-	// direction we observe (downstream) but lossy in the direction we
-	// send (upstream) is invisible to local metrics alone — the peer's
-	// drop / reorder counts ARE the upstream loss signal. Taking the
-	// max-of-pair gives the scorer the worst-case view; a path that
-	// looks fine from both ends scores as well as before.
+	// STATS frame, then take the worse of {local, peer} for the loss and
+	// drop signals and add the peer's reorders to ours. Rationale: a path
+	// that's healthy in the direction we observe (downstream) but lossy in
+	// the direction we send (upstream) is invisible to local metrics alone
+	// — the peer's drop / reorder counts ARE the upstream loss signal.
+	// Taking the max-of-pair gives the scorer the worst-case view; a path
+	// that looks fine from both ends keeps its local loss and drop values.
 	//
-	// FramesRecv: sum-of-pair (our frames-recv + peer's frames-recv =
-	// total frames the pair has exchanged) is the right denominator
-	// for normalising reorder rate — using only local FramesRecv
-	// under-weights peer-reported reorders against our own count.
+	// FramesRecv stays local: it is the denominator reorderHealth
+	// normalises the reorder count by. TODO: the reorder count sums the
+	// pair's reorders while FramesRecv counts only our frames, so a peer's
+	// reorders raise the rate against our frame count alone; the
+	// denominator that matches the summed count is the pair's frames
+	// (our FramesRecv plus the peer's).
 	//
 	// PeerStatsReporter is an optional capability: TCP / QUIC / fake
 	// sessions don't ship STATS frames and don't implement it, so the
