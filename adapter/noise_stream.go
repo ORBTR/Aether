@@ -264,10 +264,11 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 		}
 	}
 	st.tlp.SetMaxAckDelay(initialAckDelay)
-	// Wire the session-level in-flight-bytes counter into this stream's
-	// SendWindow so Add/Ack mutations update the session-wide atomic
-	// as a side effect, and the writeLoop's CUBIC CanSend gate becomes
-	// a single atomic.Load instead of an O(streams) lock walk per send.
+	// Wire the session's in-flight counter (framed plaintext bytes in
+	// flight) into this stream's SendWindow so AddEntry charges it and every
+	// removal, including releaseInFlight when the stream leaves s.streams,
+	// gives the same count back, and the writeLoop's CUBIC CanSend gate
+	// is a single atomic.Load, not an O(streams) lock walk per send.
 	// MUST run before any Send on this stream — earlier sends would
 	// under-report by the size of their in-flight frames.
 	eng.SendWin.SetSessionInFlightCounter(&s.inFlightBytes)
@@ -846,9 +847,26 @@ func (st *noiseStream) Reset(reason aether.ResetReason) error {
 		delete(st.session.streams, st.streamID)
 	}
 	st.session.mu.Unlock()
+	st.releaseInFlight()
 	st.session.releaseStream(st.streamID)
 	st.closeRecvOnce()
 	return err
+}
+
+// releaseInFlight gives the session's in-flight byte counter back every
+// frame this stream's SendWindow still holds. Called once the stream is out
+// of session.streams (Reset here; handleClose and handleReset on the
+// readLoop): handleACK looks the stream up there and returns when it is
+// absent, so after the removal no ACK can take these entries out of the
+// window, and a charge left in the counter would hold that much of the
+// congestion window against every later send on the session (the write
+// loop's CanSend gate and handleACK's OnAckWithPipe read the counter). The
+// nil guard covers a stream built outside createStream, which has no
+// SendWindow. Idempotent: the window is empty after the first call.
+func (st *noiseStream) releaseInFlight() {
+	if st.sendWindow != nil {
+		st.sendWindow.ReleaseInFlight()
+	}
 }
 
 func (st *noiseStream) SetPriority(weight uint8, dependency uint64) {

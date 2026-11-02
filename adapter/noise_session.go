@@ -269,13 +269,20 @@ type NoiseSession struct {
 	// plain uint64). Wrap is harmless — we only inspect counter % period.
 	cwndUtilCounter uint64
 
-	// inFlightBytes aggregates the on-wire size of every unacked frame
-	// across every stream's SendWindow. Each stream's SendWindow is
-	// wired into this counter via SetSessionInFlightCounter at
-	// createStream time, so SendWindow.Add / .Ack paths
-	// increment/decrement it as a side effect. writeLoop's CUBIC
-	// CanSend check reads via a single atomic.Load instead of walking
-	// every stream's window under per-stream locks.
+	// inFlightBytes is the session's count of framed plaintext bytes in
+	// flight: for every unacked frame in every stream's SendWindow,
+	// HeaderSize plus the frame's Length as it was when the window took it
+	// (SendEntry.InFlightBytes). That is the one kind of bytes it holds; it
+	// is not the committed length writeFrame gives the frame at the write
+	// boundary (compressed, then encrypted with its tag) and not the wire
+	// length after header compression, both of which are decided after the
+	// frame is charged. Each stream's SendWindow is wired into this counter
+	// via SetSessionInFlightCounter in createStream, so SendWindow.AddEntry
+	// charges it and every removal (the ACK paths; ReleaseInFlight when the
+	// stream leaves s.streams) gives the same count back. Its readers are
+	// totalInFlightBytes: the writeLoop's CanSend gate (one atomic.Load, no
+	// walk of every stream's window under per-stream locks), the
+	// cwnd-utilisation sample, and handleACK's OnAckWithPipe pipe.
 	//
 	// Consistency: each mutation is sequenced under the per-stream
 	// SendWindow.mu, so the counter never under-reports relative to the

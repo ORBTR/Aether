@@ -63,6 +63,17 @@ type SendEntry struct {
 	// so a nil read distinguishes "no sample stamped" (CUBIC active,
 	// not BBR) from "zero-value sample" without a type assertion.
 	BBRSample *congestion.DeliveryRateSample
+
+	// InFlightBytes is the framed plaintext size of this frame as it was at
+	// AddEntry: HeaderSize plus Frame.Length then, the count the session's
+	// in-flight counter (sessionInFlight) was charged for this entry.
+	// Every path that takes the entry out of the window subtracts this
+	// field, never Frame.Length: Frame is the sender's live frame, and the
+	// adapter's writeFrame replaces Frame.Payload and Frame.Length on it at
+	// the write boundary (the compressed form when shorter, then the
+	// ciphertext with its tag), after AddEntry and before the ACK, so the
+	// frame's length at removal is not the length the counter was charged.
+	InFlightBytes int64
 }
 
 // SendWindow tracks unacknowledged frames on the sender side.
@@ -86,18 +97,36 @@ type SendWindow struct {
 	// reorder doesn't manifest as silent ACK starvation with no signal.
 	staleBaseACKs uint64
 
-	// sessionInFlight, if non-nil, is updated on every Add/remove so a
-	// session-level atomic counter reflects the total in-flight bytes
-	// across all of the session's SendWindows. Lets the writeLoop's
-	// CanSend check be a single atomic.Load instead of an O(streams)
-	// lock walk per send.
+	// sessionInFlight, if non-nil, is the session's count of framed
+	// plaintext bytes in flight: the sum over every entry of every
+	// SendWindow wired to it of HeaderSize plus the frame's Length as it
+	// was at AddEntry (SendEntry.InFlightBytes). AddEntry adds that count
+	// and every removal (Ack, AckRange, ProcessCompositeACK, ReleaseInFlight)
+	// subtracts the same count, so the counter reads 0 whenever every wired
+	// window is empty. It is one kind of bytes throughout: not the committed
+	// (compressed or encrypted) length and not the wire length, which the
+	// adapter's writeFrame decides after the frame is here. The adapter's
+	// write loop reads it through one atomic.Load for its CanSend gate and
+	// handleACK passes it to OnAckWithPipe as the pipe; neither walks the
+	// streams' windows under their locks per send.
 	//
 	// Consistency model: every mutation of w.entries happens under w.mu,
-	// and the counter update happens under the same lock — readers via
-	// atomic.Load may see a slightly stale value when concurrent
-	// modifications race, but the absolute total is eventually correct
-	// and never under-reports (the CanSend gate is conservative anyway).
+	// and the counter update happens under the same lock — a reader's
+	// atomic.Load may see a value a concurrent removal is about to lower,
+	// but the total never falls under the sum of the entries the wired
+	// windows hold (the CanSend gate is conservative anyway).
 	sessionInFlight *atomic.Int64
+
+	// released is set by ReleaseInFlight and read by AddEntry, both under
+	// w.mu: once the stream that owns this window has left its session's
+	// stream map, no ACK path reaches the window again, so an entry added
+	// after the release would hold its charge in the session counter for
+	// the session's life. The adapter's noiseStream.Send checks the stream
+	// state before it calls Add and holds no lock the Reset path shares, so
+	// a Send that passed that check before Reset's state transition can
+	// reach Add after Reset's releaseInFlight; the flag makes that Add
+	// charge nothing and store nothing.
+	released bool
 }
 
 // SetSessionInFlightCounter wires this SendWindow into a session-level
@@ -114,30 +143,31 @@ func (w *SendWindow) SetSessionInFlightCounter(c *atomic.Int64) {
 	w.sessionInFlight = c
 }
 
-// addInFlightLocked / subInFlightLocked update the optional session
-// counter. Both must be called under w.mu (the SendWindow lock) so the
-// counter update is sequenced with the corresponding entries-map
-// mutation. The session-level reader is a lock-free atomic.Load so
-// these can use a non-blocking Add even without holding w.mu — but
-// keeping the call inside the lock keeps the consistency invariant
-// "counter == sum of entries[*].on-wire-size" trivially provable for
-// any moment where w.mu is held.
-func (w *SendWindow) addInFlightLocked(frame *aether.Frame) {
-	if w.sessionInFlight == nil || frame == nil {
+// addInFlightLocked / subInFlightLocked charge and release the optional
+// session counter by the entry's own InFlightBytes, the one count both
+// sides of the entry's life use. Both must be called under w.mu (the
+// SendWindow lock) so the counter update is sequenced with the
+// corresponding entries-map mutation. The session-level reader is a
+// lock-free atomic.Load so these can use a non-blocking Add even without
+// holding w.mu — but keeping the call inside the lock keeps the
+// consistency invariant "counter == sum of entries[*].InFlightBytes over
+// the wired windows" trivially provable for any moment where w.mu is held.
+func (w *SendWindow) addInFlightLocked(entry *SendEntry) {
+	if w.sessionInFlight == nil || entry == nil {
 		return
 	}
-	w.sessionInFlight.Add(int64(aether.HeaderSize) + int64(frame.Length))
+	w.sessionInFlight.Add(entry.InFlightBytes)
 }
 
 func (w *SendWindow) subInFlightLocked(entry *SendEntry) {
-	if w.sessionInFlight == nil || entry == nil || entry.Frame == nil {
+	if w.sessionInFlight == nil || entry == nil {
 		return
 	}
-	w.sessionInFlight.Add(-(int64(aether.HeaderSize) + int64(entry.Frame.Length)))
+	w.sessionInFlight.Add(-entry.InFlightBytes)
 }
 
 // removeEntryLocked deletes seq from w.entries, decrementing the
-// optional session inflight counter by the entry's on-wire size before
+// optional session inflight counter by the entry's InFlightBytes before
 // the delete. No-op if seq isn't present. Centralises the
 // counter+delete invariant so future removal call sites stay
 // consistent.
@@ -183,22 +213,64 @@ func (w *SendWindow) Add(frame *aether.Frame) uint32 {
 // instead of building a parallel record with the same frame pointer.
 // The returned entry remains owned by the SendWindow; ACK paths may
 // clear it and callers must not retain the pointer past an Ack/Drop.
+// After ReleaseInFlight the window stores nothing and the entry is nil.
 func (w *SendWindow) AddEntry(frame *aether.Frame) (uint32, *SendEntry) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	seq := w.next
 	frame.SeqNo = seq
+	w.next++
+	if w.released {
+		// The window's stream has left its session (ReleaseInFlight ran):
+		// no ACK path reaches this window again, so the frame is neither
+		// stored nor charged to the session counter, and there is no entry
+		// to return, as GetEntry would also find none for this seq. The
+		// SeqNo is still assigned so the caller's frame stays well formed.
+		// Engine.Send passes the entry on to RetransmitQueue.EnqueueFromSend,
+		// which returns on nil; the adapter's sendSingleFrame reads the entry
+		// back through GetEntry under a nil check.
+		return seq, nil
+	}
 	now := time.Now()
 	entry := &SendEntry{
 		Frame:    frame,
 		SentAt:   now,
 		XmitTime: now,
+		// Set once here, before the write loop can commit the frame: the
+		// framed plaintext size the session counter is charged.
+		InFlightBytes: int64(aether.HeaderSize) + int64(frame.Length),
 	}
 	w.entries[seq] = entry
-	w.addInFlightLocked(frame)
-	w.next++
+	w.addInFlightLocked(entry)
 	return seq, entry
+}
+
+// ReleaseInFlight takes every entry out of the window and gives its
+// InFlightBytes back to the session counter, returning the total released.
+// The adapter calls it where a stream leaves its session's stream map
+// (noiseStream.Reset, NoiseSession.handleClose and handleReset): from then
+// on the session's handleACK finds no stream for the peer's ACKs, so no
+// ACK path would ever remove these entries, and without this call their
+// charge would stay in the counter for the session's life, holding that
+// much of the congestion window against every later send the write loop's
+// CanSend gate admits. Clearing the map makes the release exact
+// and idempotent: a goroutine that still holds the stream (reliabilityTick
+// over its snapshot, a handleACK that looked the stream up before the
+// removal) finds no entry afterwards and subtracts nothing twice. It also
+// marks the window released, so an AddEntry that arrives after it (a Send
+// that passed the stream's state check before the Reset) charges nothing.
+func (w *SendWindow) ReleaseInFlight() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.released = true
+	var released int64
+	for seq, entry := range w.entries {
+		released += entry.InFlightBytes
+		w.subInFlightLocked(entry)
+		delete(w.entries, seq)
+	}
+	return released
 }
 
 // BumpXmitTime updates XmitTime on the entry for seq to t. Called by the
@@ -566,16 +638,20 @@ func (w *SendWindow) InFlight() int {
 	return len(w.entries)
 }
 
-// InFlightBytes returns the on-wire size of all unacknowledged frames in
-// this window (sum of HeaderSize + Frame.Length per entry).
+// InFlightBytes returns the framed plaintext bytes of all unacknowledged
+// frames in this window: the sum of SendEntry.InFlightBytes, the same
+// kind and the same per-entry count the session counter holds, so the
+// counter equals this sum over the wired windows at any moment w.mu is
+// held.
 //
-// Callers MUST sum InFlightBytes() across the session's live streams and
-// pass that plus the prospective frameSize into CUBIC.CanSend — CUBIC's
-// contract is `inFlight < cwnd`, so a per-frame call with frameSize
-// alone would return true unconditionally and bypass congestion control.
-// Preferred fast path is the session's sessionInFlight atomic counter
-// (wired via SetSessionInFlightCounter); this method exists for callers
-// that need the precise per-window total.
+// A caller gating sends on it must sum InFlightBytes() across the
+// session's live streams and pass that plus the prospective frameSize into
+// CUBIC.CanSend — CUBIC's contract is `inFlight < cwnd`, so a per-frame
+// call with frameSize alone would return true unconditionally and bypass
+// congestion control. The session's sessionInFlight atomic counter (wired
+// via SetSessionInFlightCounter) is the fast path the adapter's write
+// loop reads; this method is one window's total, read by this package's
+// tests and by no caller in the adapter.
 //
 // O(entries) per call under the SendWindow lock — entries count is
 // bounded by maxSize (typically a few hundred).
@@ -584,10 +660,7 @@ func (w *SendWindow) InFlightBytes() int64 {
 	defer w.mu.Unlock()
 	var total int64
 	for _, e := range w.entries {
-		if e.Frame == nil {
-			continue
-		}
-		total += int64(aether.HeaderSize) + int64(e.Frame.Length)
+		total += e.InFlightBytes
 	}
 	return total
 }
