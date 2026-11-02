@@ -339,8 +339,8 @@ func (t *WebsocketTransport) verifyMeshDial(r *http.Request, dialPrefix string) 
 }
 
 // writeVerifyMeshDialError maps a verifyMeshDial failure to the HTTP status +
-// message the inline handlers wrote before extraction. Non-VerifyMeshDialError
-// values (never produced by verifyMeshDial today) default to 400.
+// message its *VerifyMeshDialError carries. Every error verifyMeshDial returns
+// is a *VerifyMeshDialError; any other error value defaults to 400.
 func writeVerifyMeshDialError(w http.ResponseWriter, err error) {
 	var ve *VerifyMeshDialError
 	if errors.As(err, &ve) {

@@ -19,7 +19,9 @@ type TransportConfig struct {
 	STUN              STUNConfig // STUN NAT detection configuration
 }
 
-// DefaultTransportConfig reflects the timings from the design document.
+// DefaultTransportConfig returns the dial, handshake, keepalive, suspect and
+// dead timings, the path count and the STUN settings a VL1 transport runs
+// with when its consumer sets none; no caller in this repository reads it.
 func DefaultTransportConfig() TransportConfig {
 	return TransportConfig{
 		DialTimeout:       5 * time.Second,

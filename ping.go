@@ -109,9 +109,9 @@ func WaitForActivityPing(
 		// Compare against `start` (this ping's send time), NOT the pre-entry
 		// LastActivity snapshot: HandlePong calls RecordActivity() before
 		// RecordPongRecv(), so lastPongRecv is permanently >= lastActivity.
-		// Testing the pong against a LastActivity baseline therefore passed
-		// on the very first poll with no round trip, so a dead peer looked
-		// alive and every stall-probe rescue "succeeded" instantly. Only a
+		// A pong tested against a LastActivity baseline would therefore pass
+		// on the very first poll with no round trip, so a dead peer would look
+		// alive and every stall-probe rescue would "succeed" instantly. Only a
 		// pong stamped after we sent THIS ping (pendingPingSeq gates the seq
 		// match) proves the round trip.
 		if hm.LastPongReceived().After(start) {
@@ -119,8 +119,10 @@ func WaitForActivityPing(
 			return avg, nil
 		}
 		if !time.Now().Before(deadline) {
-			// Deadline reached with no Pong. The noise-UDP keepalive stream
-			// is UnreliableSequenced (FEC-1), so a single dropped Pong
+			// Deadline reached with no Pong. PING and PONG go straight
+			// through the frame writer on the keepalive stream (Ping's
+			// writeFrame, HandlePing's Writer) with no SendWindow entry, so
+			// neither is retransmitted and a single dropped Pong
 			// datagram is expected on a lossy path and must NOT tear down a
 			// session that is otherwise alive and carrying gossip/RPC:
 			// requiring the Pong would close a healthy session on one lost

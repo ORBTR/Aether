@@ -29,9 +29,8 @@ import (
 // (adapter.FragmentEnvelope.Realm, through noiseConn.RealmID).
 //
 // Partition is the grant body's partition field and Target its target node
-// field: the io/constellation signaling DialTicketBody fields Partition (JSON
-// "scope") and TargetAgentID (JSON "target"). aether reads neither from the
-// body; the consumer's GrantRealmFn does.
+// field: the consumer's grant body carries both, and aether reads neither
+// from the body; the consumer's GrantRealmFn does.
 type GrantRealm struct {
 	Partition string
 	Target    string

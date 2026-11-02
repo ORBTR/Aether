@@ -234,9 +234,10 @@ func (c *Compressor) RecordFullHeader(f *Frame) {
 // encoding as unencrypted 0x82.
 //
 // GENERAL RULE for the short forms: they have no Flags field, so ANY frame whose
-// correct interpretation depends on a flag must take the full header. Today that
-// means FlagENCRYPTED and FlagCOMPRESSED; a new flag that changes how the payload
-// is read must be added here too, or it will be lost on the wire in silence.
+// correct interpretation depends on a flag must take the full header. The flags
+// that change how the payload is read are FlagENCRYPTED and FlagCOMPRESSED
+// (frame.go); a flag added with that effect must be added here too, or it will
+// be lost on the wire in silence.
 func (c *Compressor) ShouldCompressData(f *Frame) bool {
 	if !c.ShortForms() {
 		return false
@@ -351,7 +352,10 @@ func (c *Compressor) ShouldCompressACK(f *Frame) bool {
 	// The ACK-full short form carries a 2-byte length. A frame whose
 	// Length exceeds 65535 would wrap that field while its full payload was
 	// still written, desyncing the decoder byte stream. Fall back to the full
-	// header for such frames (today's CompositeACK is <= ~375 B, so latent).
+	// header for such frames (EncodeCompositeACK writes at most 375 B — 8
+	// base bytes, a bitmap clamped to 255, MaxExtRanges and MaxDroppedRanges
+	// blocks of SACKBlockSize and the fixed extensions — so this guard is
+	// latent).
 	if f.Length > 0xFFFF {
 		return false
 	}

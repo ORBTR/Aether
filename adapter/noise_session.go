@@ -114,7 +114,7 @@ type NoiseSession struct {
 	// locally-initiated OpenStream calls. Operators reading this
 	// counter should NOT treat a rising value as exclusively-
 	// adversarial peer behaviour — a leak in the local caller (e.g.
-	// StreamPool not releasing streams fast enough) also bumps the
+	// a stream pool not releasing streams fast enough) also bumps the
 	// counter.
 	streamRefused uint64
 
@@ -264,9 +264,10 @@ type NoiseSession struct {
 	streamSendFastTotal atomic.Uint64
 
 	// cwndUtilCounter sequences writes so we sample cwnd-util every
-	// cwndUtilSamplePeriod-th send. Atomic so the writeLoop (single
-	// goroutine today, but future multi-writer designs would race on a
-	// plain uint64). Wrap is harmless — we only inspect counter % period.
+	// cwndUtilSamplePeriod-th send. The writeLoop (noise_reliability.go,
+	// atomic.AddUint64) is its one writer; the atomic keeps that sampling
+	// correct if a second writer is ever added. Wrap is harmless — we only
+	// inspect counter % period.
 	cwndUtilCounter uint64
 
 	// inFlightBytes is the session's count of framed plaintext bytes in
@@ -323,9 +324,10 @@ type NoiseSession struct {
 
 	// lastPeerStats stores the most-recent STATS frame the peer emitted.
 	// Updated by handleStats (every ~5s per the peer's reliabilityTick).
-	// Read-only consumers (monitoring, Library MeshMetrics) call
-	// LastPeerStats() to get a snapshot. atomic.Pointer for lock-free
-	// readers; nil until the peer's first STATS frame arrives.
+	// Read-only consumers (the multipath quality scorer, the consumer that
+	// sums a session's stats) call LastPeerStats() to get a snapshot.
+	// atomic.Pointer for lock-free readers; nil until the peer's first
+	// STATS frame arrives.
 	lastPeerStats atomic.Pointer[aether.SessionMetrics]
 
 	// ECN observation. The receive path increments ceObservedBytes
@@ -359,10 +361,10 @@ type NoiseSession struct {
 	// Stream GC — resets idle streams after timeout (exempts well-known 0-3)
 	streamGC *aether.StreamGC
 
-	// Stall-detection state moved onto noiseStream as atomic fields — see
-	// lastBaseACKSeen / lastProgressAtUnixNano on noiseStream. Colocation
-	// ties the tracker lifetime to the stream (no leak on close) and
-	// removes the unsynchronised map write that lived here before.
+	// Stall-detection state is per stream (noiseStream.lastBaseACKSeen,
+	// lastProgressAtUnixNano, atomic fields): the tracker's lifetime is the
+	// stream's (no leak on close), and handleACK on the readLoop writes no
+	// session-level map for it.
 
 	// FEC prune scheduling — rate-limit decoder GC to ~1/sec.
 	// Without pruning, FECDecoder.groups grows unbounded under adversarial
@@ -1044,9 +1046,9 @@ type noiseConnStats interface {
 	InboxDrops() uint64
 	// Rekey telemetry: lifetime rekey count + bytes encrypted
 	// since the last rekey. Pass-through to the embedded RekeyTracker
-	// on the noiseConn (noise/rekey.go). Older noiseConn types that
-	// haven't grown these methods miss the type assertion and the
-	// counters stay zero — graceful degradation by design.
+	// on the noiseConn (noise/rekey.go). A conn without these methods
+	// misses the type assertion and the counters stay zero — graceful
+	// degradation by design.
 	RekeyTotal() uint64
 	RekeyBytesSinceLast() uint64
 	// AEAD-decrypt latency distribution: p50/p99 of the per-call
@@ -1059,7 +1061,7 @@ type noiseConnStats interface {
 
 // noiseConnCE is the optional ECN hook exposed by *noiseConn — the
 // listener's ecnReader fills a CE-byte counter on the conn whenever a
-// CE-marked datagram is received (#15), and the adapter drains that
+// CE-marked datagram is received, and the adapter drains that
 // counter on every outbound CompositeACK so the sender's OnCE handler
 // reacts one RTT before queue overflow. Kept separate from
 // noiseConnStats because ECN support is best-effort (not all kernels /
@@ -1393,7 +1395,7 @@ func (s *NoiseSession) LastPeerStats() aether.SessionMetrics {
 //	   reconnect-LOCKOUT — strictly worse.
 //	T3 post-warmup zombie (past warmup + never app-delivered): FULL Report —
 //	   a genuine slow-loris that only ever sends garbage still scores + closes
-//	   + is blacklisted at the accept gate.
+//	   + is blacklisted for the consumer's accept path.
 //
 // Every OTHER reason (decrypt-fail / replay / protocol-violation /
 // flow-control-abuse — none cheap-guard-neutralized) enforces in every tier.
@@ -1414,7 +1416,8 @@ func (s *NoiseSession) reportAbuse(r abuse.Reason) {
 			return
 		}
 		// T3: past warmup + never delivered app data → a genuine slow-loris.
-		// Fall through to full Report (score + close + accept-gate blacklist).
+		// Fall through to full Report (score + close + blacklist for the
+		// consumer's accept path).
 	}
 	s.abuseTracker.Report(r)
 }
@@ -1422,9 +1425,11 @@ func (s *NoiseSession) reportAbuse(r abuse.Reason) {
 // ForensicSuppressedCount returns the number of guard-covered abuse events
 // (ack-validation / malformed-frame) that were RECORDED but deliberately not
 // scored/closed on this established grade-A session (reportAbuse's
-// forensic-only tier). Surfaced via
-// MeshMetrics so triage retains visibility into a genuine post-warmup attack
-// that the forensic-only tier intentionally stops closing.
+// forensic-only tier). Metrics() carries the same value
+// (SessionMetrics.ForensicSuppressed); this accessor is for the consumer that
+// sums a session's stats, with no caller in this repository, so triage
+// retains visibility into a genuine post-warmup attack that the
+// forensic-only tier intentionally stops closing.
 func (s *NoiseSession) ForensicSuppressedCount() uint64 {
 	return s.forensicSuppressed.Load()
 }

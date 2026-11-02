@@ -211,11 +211,11 @@ func (s *NoiseSession) handleCongestion(frame *aether.Frame) {
 }
 
 // handleStats processes a peer's periodic STATS frame and stores the
-// most-recent payload on the session for monitoring readers (Library
-// MeshMetrics, multipath quality scorer). The frame is informational
-// only — it never alters local protocol state and never triggers a
-// peer reply. The emit path is in noise_reliability.go
-// reliabilityTick (every 5s).
+// most-recent payload on the session for monitoring readers (the
+// multipath quality scorer, the consumer that sums a session's stats).
+// The frame is informational only — it never alters local protocol state
+// and never triggers a peer reply. The emit path is in
+// noise_reliability.go reliabilityTick (every 5s).
 func (s *NoiseSession) handleStats(frame *aether.Frame) {
 	if frame == nil || len(frame.Payload) < aether.StatsPayloadSize {
 		return
@@ -314,7 +314,7 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 	case reliability.ResultWrapAttack:
 		// Genuine forgery: SeqNo jumped past half the uint32 space, which
 		// no legitimate sender produces inside one rekey window. Drop +
-		// charge abuse (unchanged).
+		// charge abuse.
 		s.reportAbuse(abuse.ReasonReplayDetected)
 		return
 	case reliability.ResultAncient:
@@ -1009,7 +1009,7 @@ func (s *NoiseSession) handlePathProbe(frame *aether.Frame) {
 
 // sendCompositeACK sends a Composite ACK frame for a stream.
 func (s *NoiseSession) sendCompositeACK(st *noiseStream, cack *aether.CompositeACK) {
-	// ECN piggyback (#15). Two inputs feed the per-ACK CE-byte total:
+	// ECN piggyback. Two inputs feed the per-ACK CE-byte total:
 	//   1. The adapter-level ceObservedBytes — populated by test code or
 	//      by future path layers that sit above the Noise conn.
 	//   2. The transport-level counter on the underlying *noiseConn,

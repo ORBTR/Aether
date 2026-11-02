@@ -125,9 +125,8 @@ type noiseStream struct {
 	// to once per second per stream. Without the throttle, the 10ms
 	// reliability ticker calls tlp.AnyAckReceived() on every iteration
 	// where ConsecutiveProbes > 0, and TLP re-arms a fresh probe
-	// between ticks — producing a ~100Hz tlpReset/log spam loop on
-	// genuinely-stuck streams (observed live on app-orbtr-io IAD
-	// under heavy Fly 6PN packet loss). One reset per second is still
+	// between ticks — producing a ~100Hz tlpReset/log spam loop on a
+	// stuck stream under heavy loss. One reset per second is still
 	// aggressive enough to recover transient losses, while bounding the
 	// log/CPU cost when the path is durably broken.
 	lastStuckResetUnixNano atomic.Int64
@@ -367,7 +366,7 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 	s.streamGC.Register(streamID)
 
 	// Propagate cfg.LatencyClass to the scheduler. The caller's setting
-	// MUST be honoured: Library opens stream 1 (BidiRPC) with
+	// MUST be honoured: the RPC caller that opens stream 1 (BidiRPC) sets
 	// ClassINTERACTIVE and dropping it leaves RPC dispatch competing
 	// with gossip at the lowest priority.
 	//
@@ -435,9 +434,9 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 	// Both reservations must be released if any subsequent step fails —
 	// otherwise the credit that we acquired but never delivered to the
 	// wire leaks permanently (the peer never sees the bytes, so no
-	// WINDOW_UPDATE will ever return them). Without the release we
-	// reproduce the production-observed drain of a 1 MB stream window
-	// to ~40 KB after 13 failed exchanges.
+	// WINDOW_UPDATE will ever return them). Without the release every
+	// failed Send would shrink the window by its payload until Consume
+	// times out.
 	//
 	// Record per-phase timing so streamSendBlockHist's total can
 	// be attributed to per-stream credit vs conn credit vs the post-credit
@@ -483,7 +482,7 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 		}
 	}
 
-	// MTU-aware fragmentation (Task 12): split large payloads into MSS-sized
+	// MTU-aware fragmentation: split large payloads into MSS-sized
 	// fragments so each fragment is a single UDP packet (no IP fragmentation).
 	// Lost fragments are individually retransmitted by the reliability engine.
 	maxPayload := MSSToMaxPayload(st.session.pmtuProber.MSS())
@@ -572,7 +571,7 @@ func (st *noiseStream) sendSingleFrame(ctx context.Context, data []byte, extra a
 	// FEC: add to encoder (may generate repair frames) — skip if disabled for this stream.
 	// Stream's FECLevel selects which encoder to drive:
 	//   FECInterleaved → interleaved XOR (2 burst losses)
-	//   FECReedSolomon → RS(k,m) — recovers up to m losses per group (#8)
+	//   FECReedSolomon → RS(k,m) — recovers up to m losses per group
 	//   FECBasicXOR / 0 → single-loss XOR (default)
 	if st.session.opts.FEC && st.engine.FEC != nil {
 		switch reliability.FECLevel(st.config.FECLevel) {

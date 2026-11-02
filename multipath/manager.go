@@ -712,8 +712,8 @@ func (m *Manager) PathCount() int {
 }
 
 // PathFlappingCount returns the number of paths currently in the
-// PathFlapping demote tier. Library surfaces this through
-// aether_path_flapping_total so operators can correlate the
+// PathFlapping demote tier. The consumer that sums a session's stats
+// surfaces this as a metric so operators can correlate the
 // bimodal-latency tail against the demote rate. Cheap; safe to call
 // from monitoring goroutines.
 //

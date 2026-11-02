@@ -57,8 +57,8 @@ func CaptureCallerChain(skip, depth int) string {
 // DebugLogger provides conditional debug logging, enabled by the DEBUG
 // environment variable. All Aether namespaces are prefixed "aether.*"
 // (e.g. "aether", "aether.gossip", "aether.transport", "aether.flow")
-// so they coexist with the the consuming Library debug system which uses the
-// same DEBUG var.
+// so they coexist with the consuming debug system, which reads the same
+// DEBUG var.
 //
 // Matching is hierarchical with comma-separated entries:
 //

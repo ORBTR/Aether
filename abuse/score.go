@@ -5,10 +5,10 @@
 
 // Package abuse implements per-peer behavioural scoring with a circuit
 // breaker for cross-subsystem misbehaviour: every subsystem's abuse report
-// lands in one registry (Record) and the session accept gate consults it
-// (IsBlacklisted). The goal is a single dial operators can read ("this peer is
-// misbehaving, drop it") instead of relying on each subsystem to enforce
-// its own per-feature cap.
+// lands in one registry (Record), and IsBlacklisted is for the consumer that
+// accepts sessions — no caller in this repository consults it. The goal is a
+// single dial operators can read ("this peer is misbehaving, drop it")
+// instead of relying on each subsystem to enforce its own per-feature cap.
 //
 // Scores accrue on observed bad behaviour and decay exponentially while
 // the peer is quiet. When a peer exceeds its threshold, callers should
@@ -174,7 +174,8 @@ func (s *Score[K]) Record(peer K, r Reason) (current float64, justExceeded bool)
 	// guard that blacklists only on a below->over transition from a
 	// pre-decay snapshot never re-fires for a peer whose score stays >=
 	// threshold across a cool-off: once IsBlacklisted auto-clears the flag
-	// at TTL expiry (without resetting the score) the accept gate re-admits
+	// at TTL expiry (without resetting the score) the consumer's accept path
+	// re-admits
 	// a still-abusive peer for good. Clear an expired cool-off here first
 	// (so re-arming does not depend on
 	// IsBlacklisted having been polled), then re-blacklist whenever the
@@ -209,18 +210,18 @@ func (s *Score[K]) Current(peer K) float64 {
 // IsBlacklisted reports whether the peer is currently in the cool-off
 // window. Auto-clears once the TTL expires.
 //
-// This predicate is what the responder-side accept gate
-// (adapter.AcceptSessionOverConn) consults to refuse a peer for its
-// BlacklistTTL cool-off, rather than letting the peer reset its score to
-// 0 by reconnecting. That protection only holds when callers share ONE
-// node-scoped registry across sessions; a fresh per-session registry
-// carries no prior blacklist. Auto-clear here only ungates the accept
-// path once the TTL lapses; it deliberately does NOT reset the score
-// (a still-misbehaving peer keeps its accumulated evidence). Record
-// re-arms the breaker on the peer's current post-decay state regardless
-// of peak, not on a HalfLife≈BlacklistTTL decay coincidence, so a peer
-// that stays >= threshold across the cool-off is re-blacklisted on its
-// next event instead of staying latched open.
+// IsBlacklisted is for the consumer that accepts sessions: no caller in
+// this repository consults it. A consumer that shares one registry across
+// sessions refuses a peer while this reports true, so a reconnect cannot
+// reset the score; that protection only holds when callers share ONE
+// node-scoped registry across sessions, because a fresh per-session
+// registry carries no prior blacklist. Auto-clear here only ungates the
+// consumer's accept path once the TTL lapses; it deliberately does NOT
+// reset the score (a still-misbehaving peer keeps its accumulated
+// evidence). Record re-arms the breaker on the peer's current post-decay
+// state regardless of peak (nowOver && !p.blacklisted), so a peer that
+// stays >= threshold across the cool-off is re-blacklisted on its next
+// event.
 func (s *Score[K]) IsBlacklisted(peer K) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()

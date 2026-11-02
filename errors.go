@@ -55,7 +55,7 @@ var (
 	// is a transient backpressure signal, not a transport failure.
 	//
 	// Use errors.Is(err, aether.ErrStreamCapExhausted) to detect.
-	// Callers that consume Stream via pools (Library StreamPool)
+	// Callers that pool streams
 	// should arm a brief backoff when this error fires — re-dialing
 	// immediately produces a busy-loop of OpenStream → refuse →
 	// retry.
@@ -94,10 +94,13 @@ type CloseErrorReporter interface {
 }
 
 // SessionCloseErr returns the close-reason error for sessions whose
-// adapter implements CloseErrorReporter. Returns nil for adapters that
-// don't track this (QUIC, WebSocket currently) and for sessions that
-// closed cleanly. Agnostic accessor — callers never need a type switch
-// between NoiseSession/TCPSession/etc.
+// adapter implements CloseErrorReporter. Returns nil for a session that
+// closed cleanly or is still open, for a session type without CloseErr,
+// and for one whose adapter never calls SetCloseErr (QUICSession embeds
+// BaseSession and records no close reason; NoiseSession and TCPSession,
+// which WebSocketSession and GrpcSession embed, record theirs). Agnostic
+// accessor — callers never need a type switch between
+// NoiseSession/TCPSession/etc.
 func SessionCloseErr(s Session) error {
 	if r, ok := s.(CloseErrorReporter); ok {
 		return r.CloseErr()

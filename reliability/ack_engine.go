@@ -47,8 +47,9 @@ var (
 	ackEmitDuplicate  atomic.Uint64
 )
 
-// AckEmitStats returns global ACK-engine emit counters for surfacing
-// via Library MeshMetrics. Distinguishes delay-timer-driven emissions
+// AckEmitStats returns global ACK-engine emit counters; Metrics()
+// (adapter/noise_session.go) folds them into SessionMetrics for the
+// consumer that sums a session's stats. Distinguishes delay-timer-driven emissions
 // (the adaptive ack-delay floor — candidate for RPC latency
 // amplification on fast paths) from immediate emissions and
 // duplicate-triggered emits.

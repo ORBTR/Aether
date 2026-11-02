@@ -760,8 +760,7 @@ func (s *NoiseSession) reliabilityTick() {
 				// 10ms reliability ticker would otherwise call
 				// AnyAckReceived() on every iteration where TLP has just
 				// re-armed a probe between ticks, producing a ~100Hz
-				// reset/log loop on genuinely-stuck streams (observed
-				// live on app-orbtr-io IAD under heavy 6PN loss).
+				// reset/log loop on a stuck stream under heavy loss.
 				tlpState := e.st.tlp.Snapshot()
 				if tlpState.ConsecutiveProbes > 0 {
 					lastReset := e.st.lastStuckResetUnixNano.Load()

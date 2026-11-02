@@ -139,8 +139,8 @@ type StreamWindow struct {
 	initialDeficit  int64
 	dataOutstanding int64
 
-	// currentWindow is the effective max window today (after any Grow/Shrink
-	// adjustments). Tracked separately from initialSize so that autogrant
+	// currentWindow is the effective max window after any Grow/Shrink
+	// adjustments. Tracked separately from initialSize so that autogrant
 	// capping (ReceiverConsume) reflects the live target, not the
 	// construction-time value. Always equals maxSize - initialDeficit.
 	currentWindow int64
@@ -460,11 +460,10 @@ func (w *StreamWindow) ReleaseOnACK(ackedBytesDelta int64) {
 // frame serialisation errors, the stream is closed mid-Send).
 //
 // Without this release path, every failed Send permanently shrinks
-// the stream's effective window by payload-size — the "credit leak"
-// that produced the production-observed `insufficient stream credit
-// after 10s (need 76306, have 41452)` failures. The peer never
-// generates a WINDOW_UPDATE for bytes it never received, so nothing
-// else recovers the credit.
+// the stream's effective window by its payload — a credit leak:
+// Consume then fails with insufficient stream credit although the
+// peer owes nothing. The peer never generates a WINDOW_UPDATE for
+// bytes it never received, so nothing else recovers the credit.
 //
 // Capped at dataOutstanding so over-release composes safely with
 // ApplyUpdate / ReleaseOnACK paths — whichever release runs first

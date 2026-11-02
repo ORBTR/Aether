@@ -73,8 +73,8 @@ func MustParseNodeID(value string) NodeID {
 
 // NormalizeNodeID trims whitespace and canonicalizes case for a raw nodeID.
 // This is the single normalization entry point — all external nodeID inputs
-// (HTTP headers, LAD records) should pass through here before map storage or
-// lookup.
+// (HTTP headers, the consumer's directory records) should pass through here
+// before map storage or lookup.
 //
 // NewNodeID emits an all-lowercase form, but ParseNodeID accepts the
 // case-insensitive base32 body in any case; a form kept as received would let

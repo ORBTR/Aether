@@ -55,7 +55,8 @@ const DefaultRetransmitMaxBytes int64 = 512 * 1024
 // ordered by NextRetry time. Integrates with the RTTEstimator for RTO calculation.
 //
 // seqIndex maps SeqNo → current position in the heap, kept in sync by
-// Push/Pop/Swap. Remove(seqNo) becomes O(log N) instead of O(N) (#12).
+// Push/Pop/Swap, so removeBySeq finds an entry in O(1) and heap.Remove
+// runs in O(log N).
 //
 // Memory bounds: bufferedBytes + maxBytes enforce a payload-byte cap
 // on the queue in addition to any frame-count limit the caller imposes

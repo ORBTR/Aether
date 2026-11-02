@@ -129,12 +129,14 @@ func (e *FrameEncryptor) DecryptWithNonce(frame *aether.Frame, nonce []byte) err
 	// Authenticate the reconstructed frame header with the same
 	// header-AAD contract as Decrypt (aead.go Decrypt) instead of nil AAD, so
 	// the 0x87 short-encrypted path binds SenderID/ReceiverID/StreamID/SeqNo/
-	// Length to the Poly1305 tag exactly like the full-header path — a
-	// re-enabled send side then cannot leave those fields unauthenticated.
-	// NOTE: the 0x87 SEND path is currently dead (ShouldCompressData rejects
-	// FlagENCRYPTED, codec_short.go) and Encrypt() neither prepends the nonce
-	// nor carries FlagENCRYPTED into this decode. Before re-enabling
-	// EncodeEncryptedDataShort, reconcile nonce placement AND make the
+	// Length to the Poly1305 tag exactly like the full-header path — a send
+	// side that encodes 0x87 then cannot leave those fields unauthenticated.
+	// NOTE: nothing encodes 0x87: writeFrame (adapter/noise_reliability.go)
+	// reaches EncodeEncryptedDataShort only when FlagENCRYPTED is set AND
+	// ShouldCompressData returns true, and ShouldCompressData rejects
+	// FlagENCRYPTED (codec_short.go); Encrypt() neither prepends the nonce
+	// nor carries FlagENCRYPTED into this decode. TODO: before a send path
+	// encodes EncodeEncryptedDataShort, reconcile nonce placement AND make the
 	// encrypt-side AAD (including the Flags byte / FlagENCRYPTED state) match
 	// what HeaderBytes() reconstructs here, or Seal(header-AAD) and this
 	// Open(header-AAD) will disagree on the Flags byte.

@@ -115,10 +115,11 @@ func (r RouteClass) AcceptableRTT() time.Duration {
 // side's region tag. Region tags are Fly's three-letter region codes
 // (e.g. "syd", "iad", "fra"). Unknown or empty regions yield RouteUnknown.
 //
-// The continent map is intentionally narrow — only the regions the ORBTR
-// ORBTR currently deploy to. Adding a new region requires adding a row;
-// the safe-fallback (RouteInterContinental) means a missing entry won't
-// over-promote the path, only under-promote it.
+// The continent map is intentionally narrow — only the regions
+// regionContinent lists. Adding a region requires adding a row; a region
+// absent from the map classifies as RouteUnknown (the !lok || !rok return
+// below), which scores like RouteInterContinental — the lenient thresholds
+// — so a missing entry under-promotes a path, never over-promotes it.
 func ClassifyRegions(local, remote string) RouteClass {
 	local = strings.ToLower(strings.TrimSpace(local))
 	remote = strings.ToLower(strings.TrimSpace(remote))
@@ -140,9 +141,9 @@ func ClassifyRegions(local, remote string) RouteClass {
 	return RouteInterContinental
 }
 
-// regionContinent is the continent assignment for each Fly region we
-// currently deploy to. Update when adding regions; missing entries
-// classify as RouteUnknown which scores lenient.
+// regionContinent is the continent assignment for each Fly region the
+// table knows. Adding a region requires adding a row; a region absent from
+// the map classifies as RouteUnknown, which scores like RouteInterContinental.
 var regionContinent = map[string]string{
 	// North America
 	"iad": "na", // Ashburn, Virginia
