@@ -379,14 +379,13 @@ func TestConnWindow_TimedTrigger_Fires(t *testing.T) {
 	}
 }
 
-// TestStreamWindow_ReleaseUnsent verifies that bytes acquired via Consume
-// but never delivered to the wire (because a downstream layer rejected
-// them) can be returned to the credit pool without involving the
-// peer's WINDOW_UPDATE / ACK channels. This is the fix for the production
-// credit-leak observed when noise_stream.Send acquires stream credit,
-// then connWindow.Consume fails — without an explicit release path,
-// each failed Send permanently consumes payload-size bytes of the
-// stream's effective window.
+// TestStreamWindow_ReleaseUnsent: bytes Consume acquired that never reached the
+// wire go back to the window through ReleaseUnsent alone. The peer never received
+// them, so no grant (WINDOW_UPDATE or the CompositeACK piggyback) will ever return
+// them; noiseStream.Send calls ReleaseUnsent when a step after the stream
+// window's Consume fails (the stream left while Send waited, the connection
+// window's Consume, fragmentation, the frame send), and without it each failed Send would shrink the stream's window
+// by its payload for good.
 func TestStreamWindow_ReleaseUnsent(t *testing.T) {
 	w := NewStreamWindow(testCredit)
 	ctx := context.Background()
@@ -416,28 +415,27 @@ func TestStreamWindow_ReleaseUnsent(t *testing.T) {
 	}
 }
 
-// TestStreamWindow_FailedSendCreditLeak reproduces the production-observed
-// stall: 13 sequential 76 KB Consumes each followed by a "send failed"
-// (modeled as no ApplyUpdate) drain a 1 MB window to
-// permanent zero. With the ReleaseUnsent fix wired into the Send
-// failure paths, available credit must recover after every failed Send.
+// TestStreamWindow_FailedSendCreditLeak: twenty 76 KiB Consumes on a 1 MiB
+// window, each followed by a failed send that no grant answers (no ApplyUpdate)
+// and by ReleaseUnsent as Send's failure paths call it, leave the window full
+// after every cycle; thirteen such Consumes left charged would drain it below
+// one payload (the next test).
 func TestStreamWindow_FailedSendCreditLeak(t *testing.T) {
 	const (
-		initialCredit = 1 * 1024 * 1024 // 1 MB — production gossip stream sizing
-		payload       = 76 * 1024       // ~76 KB — observed gossip exchange size
+		initialCredit = 1 * 1024 * 1024 // 1 MiB
+		payload       = 76 * 1024       // 76 KiB: thirteen fit in the window, fourteen do not
 	)
 	w := NewStreamWindow(initialCredit)
 	ctx := context.Background()
 
-	// 20 cycles of "send failed after Consume" — far more than would fit
-	// in the window if credit were truly leaked.
+	// 20 cycles of "send failed after Consume": more than the window holds
+	// if a cycle's bytes stayed charged.
 	for i := 0; i < 20; i++ {
 		if err := w.Consume(ctx, payload); err != nil {
 			t.Fatalf("cycle %d Consume: %v", i, err)
 		}
-		// Simulate downstream-layer rejection (e.g. connWindow.Consume failed,
-		// or sendSingleFrame errored). The fix: release the credit we
-		// acquired but didn't actually send.
+		// A step after Consume refused the bytes (the connection window's
+		// Consume, or sendSingleFrame): give back what was acquired and not sent.
 		w.ReleaseUnsent(payload)
 
 		if avail := w.Available(); avail != initialCredit {
@@ -447,11 +445,12 @@ func TestStreamWindow_FailedSendCreditLeak(t *testing.T) {
 	}
 }
 
-// TestStreamWindow_FailedSendWithoutFix demonstrates the bug shape
-// without ReleaseUnsent — included as a guard so future refactors that
-// remove the Send-side release call would re-trigger the symptom and
-// fail this test loudly. After 13 cycles of 76 KB acquired-but-never-
-// released, available drops to roughly the production-observed ~40 KB.
+// TestStreamWindow_FailedSendWithoutFix_Demonstrates_The_Leak shows what
+// ReleaseUnsent prevents: after thirteen 76 KiB Consumes that nothing releases
+// or grants back, a 1 MiB window holds less than one payload (36 KiB), so the
+// next Consume of that size waits ConsumeTimeout for a grant that will never
+// come and fails with ErrCreditExhausted. It exercises the window alone and
+// calls no Send.
 func TestStreamWindow_FailedSendWithoutFix_Demonstrates_The_Leak(t *testing.T) {
 	const (
 		initialCredit = 1 * 1024 * 1024
@@ -464,8 +463,7 @@ func TestStreamWindow_FailedSendWithoutFix_Demonstrates_The_Leak(t *testing.T) {
 		if err := w.Consume(ctx, payload); err != nil {
 			t.Fatalf("cycle %d Consume: %v (window already drained — leak too fast?)", i, err)
 		}
-		// Deliberately DON'T release — this is the bug shape we're
-		// asserting reproduces the production drain pattern.
+		// No ReleaseUnsent: the bytes stay charged.
 	}
 
 	avail := w.Available()
@@ -473,5 +471,5 @@ func TestStreamWindow_FailedSendWithoutFix_Demonstrates_The_Leak(t *testing.T) {
 		t.Errorf("expected window drained below payload size; got avail=%d (>= %d)",
 			avail, payload)
 	}
-	t.Logf("after 13 leaked Consumes: avail=%d (production observed ~41 KB)", avail)
+	t.Logf("after 13 unreleased Consumes: avail=%d", avail)
 }
