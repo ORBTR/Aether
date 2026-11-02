@@ -133,15 +133,15 @@ func (w *ConnWindow) Consume(ctx context.Context, n int64) error {
 	return nil
 }
 
-// ReleaseUnsent returns credit reserved by Consume that never reached
-// the wire — connection-level mirror of StreamWindow.ReleaseUnsent.
-// Use when a stream-level Send fails after both stream and conn
-// credit were acquired but before the bytes were handed to the
-// transport. Without this release path, every failed Send permanently
-// leaks payload-size bytes from the connection-aggregate window, the
-// same drain pattern that produced the production
-// "insufficient stream credit" stall (the conn window participates
-// in that stall whenever a stream Send fails its second Consume).
+// ReleaseUnsent returns connection credit that no grant from the peer will
+// return: the connection-level mirror of StreamWindow.ReleaseUnsent. Its
+// callers are noiseStream.Send, when a step after this window's Consume fails
+// before the bytes reach the transport (the peer never sees them, so never
+// grants them), and noiseStream.releaseInFlight, with the bytes a leaving
+// stream still had charged (the peer's grants for them stop with the stream).
+// Without it each such Send or stream would shrink the window, which every
+// stream of the session shares, for the session's life, until Consume fails
+// with ErrCreditExhausted on every stream.
 //
 // Capped at dataOutstanding so over-release composes safely with
 // ApplyUpdate.

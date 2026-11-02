@@ -58,14 +58,15 @@ type noiseStream struct {
 	window *flow.StreamWindow
 
 	// grantDebouncer coalesces stream-level WINDOW_UPDATE emissions driven
-	// by application reads on this stream. When Receive() successfully
-	// returns a payload to the application, it records the byte count in
-	// the debouncer; the debouncer fires ReceiverConsume on a 25 ms
-	// coalesce window (or immediately for bursts above 50% of the
-	// stream's initial credit). Emission is driven by application-read,
-	// not frame-receipt inside DeliverToRecvChWithSignals, so grants
-	// advertise real application progress and a slow consumer
-	// backpressures the sender.
+	// by application reads on this stream. When Receive takes a metered
+	// message it records the message's plaintext length (recordReceive), the
+	// length Send charged; the debouncer calls ReceiverConsume after
+	// GrantCoalesceWindow, or at once when the pending bytes reach
+	// GrantImmediateFraction of the stream's initial credit. handleData's
+	// receipt of a frame records nothing, so grants advertise what the
+	// consumer took, a slow consumer backpressures the sender, and the
+	// bytes waiting in recvQ stay charged to the sender, which is what
+	// bounds recvQ.
 	grantDebouncer *grantDebouncer
 
 	// Per-stream reliability engine (Noise has NO native reliability)
@@ -284,10 +285,12 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 		return eng.RTT.SRTT()
 	})
 	// Piggyback the stream window's cumulative WINDOW_UPDATE grant on
-	// outgoing CompositeACKs via CACKHasWindowCredit. Eliminates a
-	// separate WINDOW_UPDATE frame when the receiver has granted new
-	// credit, and — because ACKs have their own cumulative retransmit
-	// path — makes the grant delivery fundamentally loss-tolerant.
+	// outgoing CompositeACKs via CACKHasWindowCredit, so a grant reaches the
+	// sender's handleACK (ApplyUpdate) on an ACK already going out. The ACK
+	// engine attaches each new cumulative value once; a CompositeACK lost on
+	// the path takes that copy with it, and refreshWindowGrants' WINDOW_UPDATE
+	// on the reliability tick re-delivers the total, which ApplyUpdate takes
+	// as a duplicate when it has already arrived.
 	st.ackEngine.SetWindowCreditFn(func() int64 {
 		return st.window.CurrentGrant()
 	})
@@ -399,9 +402,9 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 
 	n := int64(len(data))
 
-	// Flow control: consume stream + connection credit before sending.
-	// Stream window may block waiting for WINDOW_UPDATE (up to ConsumeTimeout);
-	// the connection window is non-blocking and errors immediately if exhausted.
+	// Flow control: consume stream + connection credit before sending, both in
+	// the plaintext length n. Each window blocks waiting for a grant (up to
+	// ConsumeTimeout) and then fails with ErrCreditExhausted.
 	//
 	// Both reservations must be released if any subsequent step fails —
 	// otherwise the credit that we acquired but never delivered to the

@@ -198,18 +198,15 @@ func (s *Scheduler) RegisterWithClass(streamID uint64, weight uint8, dependency 
 	s.order = append(s.order, streamID)
 }
 
-// Unregister removes a stream from the scheduler. Any queued frames are
-// dropped — but they're returned to the caller (and the pending probe,
-// if any) so upper layers can release the flow-control credit they
-// reserved at Enqueue time: the stream's own window is discarded with
-// the stream, but the connection window outlives it and keeps the credit
-// charged for every frame that never reached the wire unless the caller
-// gives it back.
-//
-// Returns (droppedFrames, droppedProbe). Both of the adapter's releaseStream
-// discard the return: NoiseSession gives the stream's outstanding connection
-// credit back through StreamWindow.ReleaseAll, which covers these frames, and a
-// TCP Send reserves no connection credit.
+// Unregister removes a stream from the scheduler and drops its queued frames
+// and its pending probe, returning them as (droppedFrames, droppedProbe) for a
+// caller that accounts for frames that will never reach the wire. Both of the
+// adapter's releaseStream discard the return, and no caller in this repository
+// reads it: the credit a dropped frame carries was charged by the stream's Send
+// before it called Enqueue, NoiseSession gives the stream's whole outstanding
+// connection credit back through noiseStream.releaseInFlight
+// (StreamWindow.ReleaseAll), which covers these frames, and a TCP Send charges
+// no connection credit.
 func (s *Scheduler) Unregister(streamID uint64) (droppedFrames []*aether.Frame, droppedProbe *aether.Frame) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

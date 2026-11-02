@@ -20,6 +20,9 @@ import (
 // charges (noiseStream.Send's n). writeFrame may shorten the frame afterwards and
 // the receiver hands the consumer the plaintext again, so what the consumer's
 // Receive grants back is exactly what Send charged, whatever the wire carried.
+// handleACK applies only the grant a CompositeACK piggybacks; the ACK itself
+// returns nothing, because the receiver's queue is bounded only while the bytes
+// it holds stay charged to the sender.
 
 func creditPair(t *testing.T, ctx context.Context, client, server *NoiseSession, id uint64, credit int64) (*noiseStream, *noiseStream) {
 	t.Helper()
@@ -63,8 +66,12 @@ func halfCompressible(t *testing.T, size int) []byte {
 }
 
 // TestNoiseStream_CreditHoldsPlaintextBytesThroughACompressedFrame: a compressed
-// message charges its plaintext length on both windows, its ACK returns none of
-// it, and the consumer's Receive returns all of it.
+// message charges its plaintext length on both sender windows, its ACK returns
+// none of it, the receiver counts nothing consumed until the consumer's Receive,
+// and that Receive counts exactly the plaintext on the receiver's stream and
+// connection windows (Stats().Consumed, what their grants are computed from) and
+// returns all of the sender's credit. The wire tap shows the frames went shorter
+// than the plaintext, which is the premise: the two kinds differ on this path.
 func TestNoiseStream_CreditHoldsPlaintextBytesThroughACompressedFrame(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -76,13 +83,27 @@ func TestNoiseStream_CreditHoldsPlaintextBytesThroughACompressedFrame(t *testing
 		{"fragments on the way", 64 * 1024, halfCompressible},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			key := uint32(7)
-			client, server := noisePairWithRealms(t, &key, &key)
+			client, server, tap := tappedPair(t)
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			cs, ss := creditPair(t, ctx, client, server, 120, 1<<20)
 			waitCredit(t, "the first message's stream credit back", func() bool { return cs.window.Outstanding() == 0 })
+			waitCredit(t, "the first message counted consumed on the receiver", func() bool {
+				return ss.window.Stats().Consumed >= 5 && server.connWindow.Stats().Consumed >= 5
+			})
+			if got := ss.window.Stats().Consumed; got != 5 {
+				t.Fatalf("the first message: receiver stream consumed %d, want its plaintext 5", got)
+			}
+			// The first message's connection grant comes on its own trigger, after
+			// its stream grant; read the baseline once it has landed, or it lands
+			// during the Send below and reads as bytes the Send did not charge.
+			waitCredit(t, "the first message's connection credit back", func() bool {
+				return client.connWindow.Stats().Outstanding == 0
+			})
 			connBefore := client.connWindow.Stats().Outstanding
+			recvStreamBefore := ss.window.Stats().Consumed
+			recvConnBefore := server.connWindow.Stats().Consumed
+			wireBefore, _ := tap.emitted()
 
 			msg := tc.make(t, tc.size)
 			if err := cs.Send(ctx, msg); err != nil {
@@ -100,6 +121,19 @@ func TestNoiseStream_CreditHoldsPlaintextBytesThroughACompressedFrame(t *testing
 			if got := cs.window.Outstanding(); got != want {
 				t.Fatalf("after the ACK with no reader: stream outstanding %d, want %d: an ACK returns no credit", got, want)
 			}
+			if got := client.connWindow.Stats().Outstanding - connBefore; got != want {
+				t.Fatalf("after the ACK with no reader: connection outstanding grew %d, want %d: an ACK returns no credit", got, want)
+			}
+			wireAfter, _ := tap.emitted()
+			if wire := wireAfter - wireBefore; wire <= 0 || wire >= want {
+				t.Fatalf("premise: the message's frames took %d wire bytes, want more than 0 and fewer than the plaintext %d", wire, want)
+			}
+			if got := ss.window.Stats().Consumed - recvStreamBefore; got != 0 {
+				t.Fatalf("before Receive: receiver stream consumed %d, want 0: receipt grants nothing", got)
+			}
+			if got := server.connWindow.Stats().Consumed - recvConnBefore; got != 0 {
+				t.Fatalf("before Receive: receiver connection consumed %d, want 0: receipt grants nothing", got)
+			}
 
 			got, err := ss.Receive(ctx)
 			if err != nil || !bytes.Equal(got, msg) {
@@ -109,6 +143,12 @@ func TestNoiseStream_CreditHoldsPlaintextBytesThroughACompressedFrame(t *testing
 			waitCredit(t, "the consumer's read returning the connection credit", func() bool {
 				return client.connWindow.Stats().Outstanding <= connBefore
 			})
+			if got := ss.window.Stats().Consumed - recvStreamBefore; got != want {
+				t.Fatalf("after Receive: receiver stream consumed %d, want the plaintext %d", got, want)
+			}
+			if got := server.connWindow.Stats().Consumed - recvConnBefore; got != want {
+				t.Fatalf("after Receive: receiver connection consumed %d, want the plaintext %d", got, want)
+			}
 		})
 	}
 }
