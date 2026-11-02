@@ -403,8 +403,7 @@ func TestStreamWindow_ReleaseUnsent(t *testing.T) {
 		t.Errorf("after ReleaseUnsent: avail=%d, want %d (full)", got, testCredit)
 	}
 
-	// Releasing more than is outstanding caps at outstanding (mirrors
-	// ReleaseOnACK semantics).
+	// Releasing more than is outstanding caps at outstanding.
 	w.ReleaseUnsent(testCredit) // double-release attempt
 	if got := w.Available(); got != testCredit {
 		t.Errorf("over-release: avail=%d, want %d (still capped)", got, testCredit)
@@ -419,7 +418,7 @@ func TestStreamWindow_ReleaseUnsent(t *testing.T) {
 
 // TestStreamWindow_FailedSendCreditLeak reproduces the production-observed
 // stall: 13 sequential 76 KB Consumes each followed by a "send failed"
-// (modeled as no ApplyUpdate, no ReleaseOnACK) drain a 1 MB window to
+// (modeled as no ApplyUpdate) drain a 1 MB window to
 // permanent zero. With the ReleaseUnsent fix wired into the Send
 // failure paths, available credit must recover after every failed Send.
 func TestStreamWindow_FailedSendCreditLeak(t *testing.T) {

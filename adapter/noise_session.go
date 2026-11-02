@@ -121,7 +121,7 @@ type NoiseSession struct {
 	// writeLoop wake telemetry — pair these two to diagnose missed
 	// wakes during cwnd backoff:
 	//   cansendFalseReenqueues — incremented every time the writeLoop's
-	//     CUBIC.CanSend check fails and the frame is re-enqueued.
+	//     CanSend check refuses the frame it holds.
 	//   wakeOnAckCalls — incremented every time handleACK wakes the
 	//     scheduler (every ACK, unconditionally).
 	// Surfaced through Metrics(); the consumer that sums a session's
@@ -141,7 +141,7 @@ type NoiseSession struct {
 	deliveryStats DeliveryStats
 
 	// bytesSentSinceLastCE is the per-ACK-interval upper bound for the
-	// peer's CEBytes claim. Each outbound payload byte (writeFrame)
+	// peer's CEBytes claim. Each outbound wire byte (emitFrameLocked)
 	// adds to this counter; each inbound CompositeACK carrying an
 	// ECN-piggyback drains it via atomic.Swap and uses the drained
 	// value as the maximum-plausible CE claim for that interval.
@@ -278,20 +278,18 @@ type NoiseSession struct {
 	// CONGESTION, so a sustained overload emits one per receiveOverloadInterval.
 	lastOverloadSignal atomic.Int64
 
-	// inFlightBytes is the session's count of framed plaintext bytes in
-	// flight: for every unacked frame in every stream's SendWindow,
-	// HeaderSize plus the frame's Length as it was when the window took it
-	// (SendEntry.InFlightBytes). That is the one kind of bytes it holds; it
-	// is not the committed length writeFrame gives the frame at the write
-	// boundary (compressed, then encrypted with its tag) and not the wire
-	// length after header compression, both of which are decided after the
-	// frame is charged. Each stream's SendWindow is wired into this counter
-	// via SetSessionInFlightCounter in createStream, so SendWindow.AddEntry
+	// inFlightBytes is the session's count of wire bytes in flight: for every
+	// frame written and not yet acked in every stream's SendWindow, the bytes
+	// conn.Write took at its first write (SendEntry.InFlightBytes). A frame
+	// still in the scheduler holds none of it, so CanSend compares the window
+	// with what is on the wire and a burst behind the gate cannot close the
+	// gate on itself. Each stream's SendWindow is wired into this counter via
+	// SetSessionInFlightCounter in createStream, so SendWindow.MarkWritten
 	// charges it and every removal (the ACK paths; ReleaseInFlight when the
 	// stream leaves s.streams) gives the same count back. Its readers are
 	// totalInFlightBytes: the writeLoop's CanSend gate (one atomic.Load, no
 	// walk of every stream's window under per-stream locks), the
-	// cwnd-utilisation sample, and handleACK's OnAckWithPipe pipe.
+	// cwnd-utilisation sample, and the pipe at handleACK and the RACK tick.
 	//
 	// Consistency: each mutation is sequenced under the per-stream
 	// SendWindow.mu, so the counter never under-reports relative to the

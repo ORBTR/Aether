@@ -19,7 +19,7 @@ import (
 )
 
 // gatedConn is a net.Conn whose Write, once armed, parks until release is
-// closed. writeFrame has already compressed and encrypted the frame under
+// closed. The write loop has already compressed and encrypted the frame under
 // writeMu when it reaches conn.Write, so a parked Write holds the write loop
 // between the commit of a queued frame and its hand-off to the wire, where
 // an RTO firing on reliabilityTick dequeues that same frame. blocked is
@@ -107,6 +107,16 @@ func TestNoiseSession_RTODequeueDoesNotReadTheFrameTheWriteLoopCommits(t *testin
 		t.Fatalf("send: %v", err)
 	}
 
+	// The frame enters the queue at its first write, under writeMu just before
+	// the Write this test parks.
+	deadline = time.Now().Add(30 * time.Second)
+	for st.retransmitQ.Len() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("premise wrong: the frame did not reach its first write within 30 s")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
 	// The parked Write keeps the ACK from ever arriving, so the frame's RTO
 	// fires at the estimator's floor. The RTO path has run once the queue's
 	// entry is due again later than the RTO it was enqueued with:
@@ -117,10 +127,11 @@ func TestNoiseSession_RTODequeueDoesNotReadTheFrameTheWriteLoopCommits(t *testin
 	// commit before this goroutine, and this goroutine's lock of the queue
 	// before reliabilityTick's, so the race would be hidden by the test's
 	// own synchronisation; the parked write is checked afterwards instead.
-	deadline = time.Now().Add(5 * time.Second)
+	// The deadline allows for a reliabilityTick ticker starved on a loaded machine.
+	deadline = time.Now().Add(30 * time.Second)
 	for st.retransmitQ.NextDueIn() <= rtoAtEnqueue+50*time.Millisecond {
 		if time.Now().After(deadline) {
-			t.Fatalf("premise wrong: the parked frame's RTO (%v at enqueue) did not fire within 5 s", rtoAtEnqueue)
+			t.Fatalf("premise wrong: the parked frame's RTO (%v at enqueue) did not fire within 30 s", rtoAtEnqueue)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

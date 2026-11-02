@@ -176,8 +176,8 @@ type SessionMetrics struct {
 	// totals since session create; the consumer that sums a session's stats
 	// surfaces them as metrics.
 	//
-	// CanSendFalseReenqueues: writeLoop re-enqueued a frame because
-	// CUBIC CanSend(inFlight+frameSize) returned false. Elevated counts
+	// CanSendFalseReenqueues: writeLoop kept a frame back because the
+	// controller's CanSend(inFlight+frameSize) returned false. Elevated counts
 	// during a latency spike window indicate the congestion controller
 	// is throttling the send path.
 	//
@@ -248,7 +248,7 @@ type SessionMetrics struct {
 	WriteloopParkP50Us uint64 `json:"writeloopParkP50Us,omitempty"`
 	WriteloopParkP99Us uint64 `json:"writeloopParkP99Us,omitempty"`
 	// CubicCwndBlockP*Us: duration that CUBIC.CanSend stayed false in a run of
-	// consecutive writeLoop re-enqueue iterations. Paired with the
+	// consecutive writeLoop refusals. Paired with the
 	// CanSendFalseReenqueues counter (above) — counter gives the
 	// frequency, percentiles give the per-event severity.
 	CubicCwndBlockP50Us uint64 `json:"cubicCwndBlockP50Us,omitempty"`

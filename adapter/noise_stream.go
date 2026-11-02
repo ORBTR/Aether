@@ -240,11 +240,11 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 		}
 	}
 	st.tlp.SetMaxAckDelay(initialAckDelay)
-	// Wire the session's in-flight counter (framed plaintext bytes in
-	// flight) into this stream's SendWindow so AddEntry charges it and every
-	// removal, including releaseInFlight when the stream leaves s.streams,
-	// gives the same count back, and the writeLoop's CUBIC CanSend gate
-	// is a single atomic.Load, not an O(streams) lock walk per send.
+	// Wire the session's in-flight counter (wire bytes in flight) into this
+	// stream's SendWindow so MarkWritten charges it and every removal,
+	// including releaseInFlight when the stream leaves s.streams, gives the
+	// same count back, and the writeLoop's CanSend gate is a single
+	// atomic.Load, not an O(streams) lock walk per send.
 	// MUST run before any Send on this stream — earlier sends would
 	// under-report by the size of their in-flight frames.
 	eng.SendWin.SetSessionInFlightCounter(&s.inFlightBytes)
@@ -488,7 +488,8 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 			}
 		}
 		// All fragments accepted — credit is now legitimately outstanding
-		// and will be released by the peer's WINDOW_UPDATE / ACK paths.
+		// and returns through the peer's grants as its consumer reads
+		// (WINDOW_UPDATE, the CompositeACK piggyback).
 		streamCredited = false
 		connCredited = false
 		recordPostCredit()
@@ -505,6 +506,42 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 	return nil
 }
 
+// recordWrite records the frame's write on the stream's send window, called by
+// emitFrameLocked under writeMu before conn.Write, and returns the byte count the
+// congestion controller is shown for this write and whether it was the frame's
+// first write. At a frame's first write the
+// window charges the session counter with wire and starts the RTT, RACK and TLP
+// clocks, the BBR sample is stamped (StampSample, because the writeLoop's OnSend is
+// the one inflight increment), and the frame enters the retransmit queue, so the RTO
+// runs from the write. A retransmit presents the count its first write recorded. A
+// frame with no entry (acknowledged while queued) is shown as the bytes it is and is
+// not a first write: no ACK will come for it.
+//
+// The GetEntry recheck closes an ACK landing between MarkWritten and EnqueueSized:
+// handleACK's Remove runs after its ProcessCompositeACK, so if the entry is still
+// there at the recheck that Remove comes later and finds the queue entry, and if it
+// is gone this Remove takes it. Without it the queue would keep retransmitting a
+// frame no ACK path would ever remove again.
+func (st *noiseStream) recordWrite(frame *aether.Frame, wire int64) (int64, bool) {
+	var sample *congestion.DeliveryRateSample
+	if bbr, ok := st.session.congestion().(*congestion.BBRController); ok {
+		stamped := bbr.StampSample()
+		sample = &stamped
+	}
+	recorded, payload, first := st.sendWindow.MarkWritten(frame, wire, time.Now(), sample)
+	if !first {
+		if recorded > 0 {
+			return recorded, false
+		}
+		return wire, false
+	}
+	st.retransmitQ.EnqueueSized(frame, payload)
+	if st.sendWindow.GetEntry(frame.SeqNo) == nil {
+		st.retransmitQ.Remove(frame.SeqNo)
+	}
+	return wire, true
+}
+
 // sendSingleFrame sends one frame: a whole small message (extra 0) or one
 // fragment envelope (extra aether.FlagFRAGMENT).
 func (st *noiseStream) sendSingleFrame(ctx context.Context, data []byte, extra aether.FrameFlags) error {
@@ -519,34 +556,11 @@ func (st *noiseStream) sendSingleFrame(ctx context.Context, data []byte, extra a
 	}
 
 	// Assign SeqNo via send window (tracks for ACK/retransmit). Add sets
-	// frame.SeqNo under the window's lock, and from here reliabilityTick's TLP
-	// can queue this frame as a probe, so the write loop may read and rewrite it
-	// at any moment: what follows does not touch the frame's fields.
-	seqNo := st.sendWindow.Add(frame)
-
-	// BBRv2 per-packet sample stamping. When the active controller is
-	// BBR, mint a per-packet DeliveryRateSample and store it on the
-	// SendEntry so OnAckSampled can recover the delivery context when
-	// the matching ACK arrives. CUBIC sessions skip this entirely (the
-	// type assertion fails) and entry.BBRSample stays nil — the ACK
-	// handler nil-checks before dereferencing.
-	if bbr, ok := st.session.congestion().(*congestion.BBRController); ok {
-		if entry := st.sendWindow.GetEntry(seqNo); entry != nil {
-			// Stamp the sample WITHOUT incrementing inflight (StampSample): the
-			// writeLoop's congestion().OnSend at actual transmission is the
-			// single authoritative on-wire inflight increment, and an increment
-			// here too would double-count every frame and wedge BBR in Drain.
-			sample := bbr.StampSample()
-			entry.BBRSample = &sample
-		}
-	}
-
-	// Enqueue for retransmission tracking with the entry's PayloadBytes from
-	// data and not from the frame: writeFrame may already be swapping
-	// frame.Payload and frame.Length (compression, encryption) under writeMu on
-	// the write loop for a TLP probe of this frame, and the queue reads only
-	// its own count afterwards.
-	st.retransmitQ.EnqueueSized(frame, int64(len(data)))
+	// frame.SeqNo under the window's lock and records the plaintext count. The
+	// frame's recovery state and in-flight charge begin at its first write
+	// (recordWrite); once the scheduler has it the write loop may rewrite it, so
+	// nothing here reads the frame's fields afterwards.
+	st.sendWindow.Add(frame)
 
 	// FEC: add to encoder (may generate repair frames) — skip if disabled for this stream.
 	// Stream's FECLevel selects which encoder to drive:

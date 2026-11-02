@@ -403,11 +403,11 @@ func TestNoiseSession_ControlFramesAreBoundedAndChargeNothing(t *testing.T) {
 	}
 }
 
-// TestNoiseStream_SendDoesNotTouchAFrameATLPProbeMayBeWriting: from the moment
-// SendWindow.Add publishes a frame, reliabilityTick's TLP can hand it to the write
-// loop, whose writeFrame rewrites Payload, Length and Flags. This goroutine plays
-// that hand-off on the newest entry while Send runs, so under -race any field
-// access Send makes after Add is reported.
+// TestNoiseStream_SendDoesNotTouchAFrameATLPProbeMayBeWriting: once Send has handed
+// a frame over, the write loop's write boundary rewrites Payload, Length and Flags.
+// This goroutine queues the newest entry's frame as a probe while Send runs, the
+// earliest the write loop could reach it, so under -race any field access Send
+// makes after SendWindow.Add is reported.
 func TestNoiseStream_SendDoesNotTouchAFrameATLPProbeMayBeWriting(t *testing.T) {
 	client, server := noisePairWithRealms(t, nil, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

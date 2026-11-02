@@ -206,10 +206,10 @@ func (s *Scheduler) RegisterWithClass(streamID uint64, weight uint8, dependency 
 // charged for every frame that never reached the wire unless the caller
 // gives it back.
 //
-// Returns (droppedFrames, droppedProbe). NoiseSession.releaseStream
-// calls connWindow.ReleaseUnsent for each metered frame's payload length;
-// TCPSession.releaseStream discards the return, since a TCP Send reserves
-// no connection credit.
+// Returns (droppedFrames, droppedProbe). Both of the adapter's releaseStream
+// discard the return: NoiseSession gives the stream's outstanding connection
+// credit back through StreamWindow.ReleaseAll, which covers these frames, and a
+// TCP Send reserves no connection credit.
 func (s *Scheduler) Unregister(streamID uint64) (droppedFrames []*aether.Frame, droppedProbe *aether.Frame) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -335,6 +335,35 @@ func (s *Scheduler) EnqueueProbe(streamID uint64, frame *aether.Frame) {
 	}
 }
 
+// DequeueProbe returns the next pending TLP probe, or nil when none is pending.
+// The writeLoop calls it in place of Dequeue while it holds a frame the CanSend
+// gate refused: a probe goes outside the congestion window (RFC 8985 §7.5), so a
+// refused frame must not stand in front of it.
+func (s *Scheduler) DequeueProbe() *aether.Frame {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.dequeueProbeLocked(s.order)
+}
+
+// dequeueProbeLocked takes the first pending probe in order. Callers hold s.mu.
+// Walks order so probes are drained in a stable, registration-ordered sequence
+// rather than map-iteration order (deterministic ordering helps tests + log
+// readability without affecting correctness). Probes do not consume the REALTIME
+// cap counters — they are recovery traffic, not application traffic.
+func (s *Scheduler) dequeueProbeLocked(order []uint64) *aether.Frame {
+	for _, streamID := range order {
+		ss, ok := s.streams[streamID]
+		if !ok || ss.probe == nil {
+			continue
+		}
+		frame := ss.probe
+		ss.probe = nil
+		s.queueDepth.Add(-1)
+		return frame
+	}
+	return nil
+}
+
 // Dequeue returns the next frame to send and whether it is a TLP probe.
 //
 // Ordering (strict, top-down):
@@ -365,20 +394,8 @@ func (s *Scheduler) Dequeue() (*aether.Frame, bool) {
 	}
 	order := append([]uint64(nil), s.order...)
 
-	// 1. TLP probes have absolute priority. Walk order so probes are
-	// drained in a stable, registration-ordered sequence rather than
-	// map-iteration order (deterministic ordering helps tests + log
-	// readability without affecting correctness).
-	for _, streamID := range order {
-		ss, ok := s.streams[streamID]
-		if !ok || ss.probe == nil {
-			continue
-		}
-		frame := ss.probe
-		ss.probe = nil
-		s.queueDepth.Add(-1)
-		// Probes do not consume the REALTIME cap counters — they are
-		// recovery traffic, not application traffic.
+	// 1. TLP probes have absolute priority.
+	if frame := s.dequeueProbeLocked(order); frame != nil {
 		return frame, true
 	}
 

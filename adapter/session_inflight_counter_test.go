@@ -17,8 +17,8 @@ import (
 )
 
 // The session's inFlightBytes counter is the pipe the write loop's CanSend
-// gate and handleACK's OnAckWithPipe read. Every frame a stream adds to its
-// SendWindow is charged to it and every frame that leaves the window is
+// gate and handleACK's OnAckWithPipe read. Every frame is charged to it at its
+// first write and every written frame that leaves the window is
 // subtracted, so after every frame a session ever sent has been acked, or
 // the stream holding them has left s.streams, the counter reads 0. These
 // tests send payloads writeFrame shortens at the write boundary (the
@@ -205,8 +205,14 @@ func TestNoiseSession_InFlightBytesReturnsToZeroWhenAStreamLeavesWithFramesInFli
 			if got := st.sendWindow.InFlight(); got != n {
 				t.Fatalf("premise: %d entries in the send window, want %d (nothing acks a dropped frame)", got, n)
 			}
-			if v := client.inFlightBytes.Load(); v <= 0 {
-				t.Fatalf("premise: session inFlightBytes reads %d with %d frames in flight, want > 0", v, n)
+			// A frame is charged at its write, so the counter rises once the write
+			// loop has reached the frames Send queued.
+			writeBy := time.Now().Add(5 * time.Second)
+			for client.inFlightBytes.Load() <= 0 {
+				if time.Now().After(writeBy) {
+					t.Fatalf("premise: session inFlightBytes reads %d 5 s after %d sends, want > 0", client.inFlightBytes.Load(), n)
+				}
+				time.Sleep(time.Millisecond)
 			}
 
 			tc.leave(t, cs, ss)

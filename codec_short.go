@@ -44,9 +44,12 @@ const (
 	// lite would desync the stream.
 	ShortACKFullIndicator byte = 0x88 // Composite ACK-full, 5-byte hdr + payload
 
-	ShortDataSize    = 9  // [indicator:1][streamID:2][seqDelta:2][length:4]
-	ShortControlSize = 8  // [indicator:1][type:1][streamID:2][seqNo:4]
-	ShortACKLiteSize = 11 // [indicator:1][streamID:2][baseACK:4][ackDelay:2][bitmapLen:1][flags:1]
+	ShortDataSize = 9 // [indicator:1][streamID:2][seqDelta:2][length:4]
+	// ShortDataVarMaxLength is the longest payload NoiseSession sends in the
+	// varint short form (EncodeVarLength's one-byte range).
+	ShortDataVarMaxLength = 127
+	ShortControlSize      = 8  // [indicator:1][type:1][streamID:2][seqNo:4]
+	ShortACKLiteSize      = 11 // [indicator:1][streamID:2][baseACK:4][ackDelay:2][bitmapLen:1][flags:1]
 
 	// Full header sent every N frames per stream for state resync
 	ShortHeaderFullInterval = 64
@@ -871,6 +874,17 @@ func VarLengthSize(v uint32) int {
 // ────────────────────────────────────────────────────────────────────────────
 // Data Short Varint Header (0x86): 6-10 bytes
 // ────────────────────────────────────────────────────────────────────────────
+
+// ShortDataWireSize returns the header bytes the encoder for a short DATA frame of
+// this length writes: EncodeDataShortVar up to ShortDataVarMaxLength, whose one-byte
+// varint fits it, and EncodeDataShort above. NoiseSession's write loop adds the
+// payload to it to know a frame's wire size before the encoder advances any state.
+func ShortDataWireSize(length uint32) int {
+	if length <= ShortDataVarMaxLength {
+		return 6 // indicator + streamID + seqLow + one varint byte
+	}
+	return ShortDataSize
+}
 
 // EncodeDataShortVar writes a varint-length data short header + payload.
 func (c *Compressor) EncodeDataShortVar(w io.Writer, f *Frame) (int, error) {

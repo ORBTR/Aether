@@ -41,38 +41,59 @@ const (
 var validBitmapLens = map[int]bool{0: true, 4: true, 8: true, 16: true, 32: true}
 
 // SendEntry tracks an in-flight frame waiting for acknowledgment.
+//
+// The fields after Frame and PayloadBytes change only under the window's lock,
+// and an ACK path reads them from an entry the window has already removed, so
+// handleACK reads them without a lock while the write loop may still hold the
+// entry's Frame. Frame.SeqNo is the one Frame field that holds still; the write
+// boundary rewrites Payload, Length and Flags.
 type SendEntry struct {
-	Frame   *aether.Frame
+	Frame *aether.Frame
+
+	// SentAt is when the frame's first write began (MarkWritten); it is zero
+	// while Written is false. handleACK takes an RTT sample only from a written
+	// entry with no retransmit, so the interval a sample closes starts at a
+	// transmission of that sequence.
 	SentAt  time.Time
 	Retries int
 	Acked   bool
 
 	// XmitTime is the wall-clock time of the most recent transmission of
-	// this entry. Equal to SentAt at first send; updated to time.Now() by
-	// BumpXmitTime when the adapter retransmits. RACK loss detection
-	// (RFC 8985) consults XmitTime — not SentAt — to decide whether a
-	// frame is older than the receiver's most recent delivery and thus
+	// this entry. MarkWritten sets it at each write; BumpXmitTime also sets it
+	// when the adapter queues a retransmit, so the RACK tick does not declare
+	// the same frame lost again while the retransmit waits for the write loop.
+	// RACK loss detection (RFC 8985) consults XmitTime — not SentAt — to decide
+	// whether a frame is older than the receiver's most recent delivery and thus
 	// presumed lost. Without this distinction RACK would mark every
 	// retransmitted frame as lost again on the very first tick.
 	XmitTime time.Time
 
-	// BBRv2 per-packet delivery-rate sample. Stamped at send time by the
-	// adapter via congestion.BBRController.OnSend, read back by the
-	// adapter when the matching ACK arrives so it can call OnAckSampled
-	// instead of the degraded OnAck path. Pointer (rather than value)
-	// so a nil read distinguishes "no sample stamped" (CUBIC active,
-	// not BBR) from "zero-value sample" without a type assertion.
+	// BBRv2 per-packet delivery-rate sample. Stamped by MarkWritten at the
+	// frame's first write from the sample the adapter passes
+	// (congestion.BBRController.StampSample), read back by the adapter when the
+	// matching ACK arrives so it can call OnAckSampled instead of the degraded
+	// OnAck path. Pointer (rather than value) so a nil read distinguishes "no
+	// sample stamped" (CUBIC active, not BBR) from "zero-value sample" without
+	// a type assertion.
 	BBRSample *congestion.DeliveryRateSample
 
-	// InFlightBytes is the framed plaintext size of this frame as it was at
-	// AddEntry: HeaderSize plus Frame.Length then, the count the session's
-	// in-flight counter (sessionInFlight) was charged for this entry.
-	// Every path that takes the entry out of the window subtracts this
-	// field, never Frame.Length: Frame is the sender's live frame, and the
-	// adapter's writeFrame replaces Frame.Payload and Frame.Length on it at
-	// the write boundary (the compressed form when shorter, then the
-	// ciphertext with its tag), after AddEntry and before the ACK, so the
-	// frame's length at removal is not the length the counter was charged.
+	// PayloadBytes is Frame.Length as AddEntry found it, the plaintext the
+	// sender handed over. The adapter passes it to RetransmitQueue.EnqueueSized
+	// at the first write, by which time Frame.Length holds the committed form.
+	PayloadBytes int64
+
+	// Written reports that MarkWritten ran for this entry. RACK, TLP, a peer's
+	// NACK and the RTT sample consider only written entries: a frame still in
+	// the scheduler has no transmission for any of them to reason about.
+	Written bool
+
+	// InFlightBytes is the frame's wire length at its first write, the bytes
+	// conn.Write took, and the count the session's in-flight counter
+	// (sessionInFlight) was charged. It is 0 until then, so an entry that leaves
+	// the window unwritten gives back nothing. Every removal subtracts this
+	// field; the congestion controller's acked bytes read it; and a retransmit
+	// presents it again whatever header form that write took, because the
+	// controller was told this number once and removal gives back this number.
 	InFlightBytes int64
 }
 
@@ -97,18 +118,16 @@ type SendWindow struct {
 	// reorder doesn't manifest as silent ACK starvation with no signal.
 	staleBaseACKs uint64
 
-	// sessionInFlight, if non-nil, is the session's count of framed
-	// plaintext bytes in flight: the sum over every entry of every
-	// SendWindow wired to it of HeaderSize plus the frame's Length as it
-	// was at AddEntry (SendEntry.InFlightBytes). AddEntry adds that count
-	// and every removal (Ack, AckRange, ProcessCompositeACK, ReleaseInFlight)
-	// subtracts the same count, so the counter reads 0 whenever every wired
-	// window is empty. It is one kind of bytes throughout: not the committed
-	// (compressed or encrypted) length and not the wire length, which the
-	// adapter's writeFrame decides after the frame is here. The adapter's
-	// write loop reads it through one atomic.Load for its CanSend gate and
-	// handleACK passes it to OnAckWithPipe as the pipe; neither walks the
-	// streams' windows under their locks per send.
+	// sessionInFlight, if non-nil, is the session's count of wire bytes in
+	// flight: the sum over every entry of every SendWindow wired to it of
+	// SendEntry.InFlightBytes. MarkWritten adds that count at the frame's first
+	// write and every removal (Ack, AckRange, ProcessCompositeACK,
+	// ReleaseInFlight) subtracts the same count, so the counter reads 0 whenever
+	// no written entry remains, and a frame still queued behind the write loop's
+	// gate holds none of it. The adapter's write loop reads it through one
+	// atomic.Load for its CanSend gate, and handleACK and the RACK tick pass it
+	// to the controller as the pipe; none walks the streams' windows under their
+	// locks per send.
 	//
 	// Consistency model: every mutation of w.entries happens under w.mu,
 	// and the counter update happens under the same lock — a reader's
@@ -120,12 +139,11 @@ type SendWindow struct {
 	// released is set by ReleaseInFlight and read by AddEntry, both under
 	// w.mu: once the stream that owns this window has left its session's
 	// stream map, no ACK path reaches the window again, so an entry added
-	// after the release would hold its charge in the session counter for
-	// the session's life. The adapter's noiseStream.Send checks the stream
-	// state before it calls Add and holds no lock the Reset path shares, so
-	// a Send that passed that check before Reset's state transition can
-	// reach Add after Reset's releaseInFlight; the flag makes that Add
-	// charge nothing and store nothing.
+	// after the release would be held for the session's life. The adapter's
+	// noiseStream.Send checks the stream state before it calls Add and holds no
+	// lock the Reset path shares, so a Send that passed that check before
+	// Reset's state transition can reach Add after Reset's releaseInFlight; the
+	// flag makes that Add store nothing, so its write charges nothing.
 	released bool
 }
 
@@ -134,7 +152,7 @@ type SendWindow struct {
 // streams. Subsequent Add/Ack operations update this counter as a
 // side effect. Pass nil to disable (default).
 //
-// Must be called BEFORE any Add — otherwise the counter will under-
+// Must be called BEFORE any MarkWritten — otherwise the counter will under-
 // report by the size of the pre-wired frames. Adapter call sites wire
 // this in createStream right after NewSendWindow.
 func (w *SendWindow) SetSessionInFlightCounter(c *atomic.Int64) {
@@ -232,18 +250,89 @@ func (w *SendWindow) AddEntry(frame *aether.Frame) (uint32, *SendEntry) {
 		// back through GetEntry under a nil check.
 		return seq, nil
 	}
-	now := time.Now()
 	entry := &SendEntry{
-		Frame:    frame,
-		SentAt:   now,
-		XmitTime: now,
-		// Set once here, before the write loop can commit the frame: the
-		// framed plaintext size the session counter is charged.
-		InFlightBytes: int64(aether.HeaderSize) + int64(frame.Length),
+		Frame: frame,
+		// Read here, before the write loop can commit the frame.
+		PayloadBytes: int64(frame.Length),
 	}
 	w.entries[seq] = entry
-	w.addInFlightLocked(entry)
 	return seq, entry
+}
+
+// MarkWritten records that frame is going to conn.Write as wireBytes. The first
+// call for an entry stamps SentAt, XmitTime and BBRSample and charges wireBytes to
+// the session counter; a later call, a retransmit, moves XmitTime only, so the
+// charge and the number the controller sees stay the first ones.
+//
+// It returns the entry's recorded wire count, its PayloadBytes, and whether this
+// was the first write. A frame the window holds no entry for (acknowledged while
+// queued, its stream gone, or a frame that was never Added) returns zeros and
+// charges nothing. The entry is matched by pointer, not by SeqNo alone, because a
+// frame beside the window (an FEC repair) can carry any SeqNo.
+//
+// The adapter's write loop calls it under writeMu before conn.Write, so an ACK
+// that follows the write finds the charge already made.
+func (w *SendWindow) MarkWritten(frame *aether.Frame, wireBytes int64, now time.Time, sample *congestion.DeliveryRateSample) (recorded, payload int64, first bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	entry, ok := w.entries[frame.SeqNo]
+	if !ok || entry.Frame != frame {
+		return 0, 0, false
+	}
+	entry.XmitTime = now
+	if entry.Written {
+		return entry.InFlightBytes, entry.PayloadBytes, false
+	}
+	entry.Written = true
+	entry.SentAt = now
+	entry.BBRSample = sample
+	entry.InFlightBytes = wireBytes
+	w.addInFlightLocked(entry)
+	return wireBytes, entry.PayloadBytes, true
+}
+
+// RecordedWireBytes returns the wire count MarkWritten recorded for frame, or 0 if
+// the frame has not been written or has left the window. The write loop reads it
+// to tell a retransmit from a first write before it reaches the CanSend gate.
+func (w *SendWindow) RecordedWireBytes(frame *aether.Frame) int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	entry, ok := w.entries[frame.SeqNo]
+	if !ok || entry.Frame != frame {
+		return 0
+	}
+	return entry.InFlightBytes
+}
+
+// WrittenFrame returns seq's frame if the entry has been written and nil otherwise.
+// The retransmit paths (a peer's NACK, RACK) use it: a frame not yet written is
+// already in the scheduler's queue and has no transmission to repeat, and the lock
+// orders this read after the write loop's commit of the frame.
+func (w *SendWindow) WrittenFrame(seq uint32) *aether.Frame {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if entry, ok := w.entries[seq]; ok && entry.Written {
+		return entry.Frame
+	}
+	return nil
+}
+
+// HighestWritten returns the highest-sequence written frame still in the window,
+// the frame a TLP probe repeats (RFC 8985 §7.4), or nil when none is written.
+func (w *SendWindow) HighestWritten() (*aether.Frame, uint32) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.next == w.base {
+		return nil, 0
+	}
+	for seq := w.next - 1; ; seq-- {
+		if entry, ok := w.entries[seq]; ok && entry.Written {
+			return entry.Frame, seq
+		}
+		if seq == w.base {
+			return nil, 0
+		}
+	}
 }
 
 // ReleaseInFlight takes every entry out of the window and gives its
@@ -275,8 +364,9 @@ func (w *SendWindow) ReleaseInFlight() int64 {
 
 // BumpXmitTime updates XmitTime on the entry for seq to t. Called by the
 // adapter immediately before re-enqueuing a retransmit so RACK's loss
-// detector (RFC 8985 §6.2) sees the freshest transmission timestamp and
-// doesn't repeatedly mark a just-retransmitted frame as lost.
+// detector (RFC 8985 §6.2) doesn't repeatedly mark a frame as lost while
+// its retransmit waits in the scheduler; MarkWritten sets the time of the
+// write itself.
 //
 // No-op if seq has left the window (already ACKed). Safe to call
 // from the reliability tick — single-mutex acquisition.
@@ -289,8 +379,9 @@ func (w *SendWindow) BumpXmitTime(seq uint32, t time.Time) {
 	}
 }
 
-// SnapshotEntries returns a copy of all in-flight (seq, XmitTime) pairs
-// for RACK iteration. The caller iterates without holding any locks
+// SnapshotEntries returns a copy of the (seq, XmitTime) pairs of every written
+// entry for RACK iteration and TLP's arm time; an unwritten entry has no
+// transmission for either to time. The caller iterates without holding any locks
 // (RACK only needs xmit times, not the underlying frames). Allocates a
 // fresh slice each call — RACK is invoked once per reliability tick on
 // streams with InFlight > 0, so allocation overhead is bounded.
@@ -299,6 +390,9 @@ func (w *SendWindow) SnapshotEntries() []SnapshotEntry {
 	defer w.mu.Unlock()
 	out := make([]SnapshotEntry, 0, len(w.entries))
 	for seq, e := range w.entries {
+		if !e.Written {
+			continue
+		}
 		out = append(out, SnapshotEntry{Seq: seq, XmitTime: e.XmitTime, Retries: e.Retries})
 	}
 	return out
@@ -610,14 +704,10 @@ func (w *SendWindow) Expired(rto time.Duration) []*SendEntry {
 	now := time.Now()
 	var expired []*SendEntry
 	for _, entry := range w.entries {
-		if entry.Acked {
+		if entry.Acked || !entry.Written {
 			continue
 		}
-		ref := entry.XmitTime
-		if ref.IsZero() {
-			ref = entry.SentAt
-		}
-		if now.Sub(ref) > rto {
+		if now.Sub(entry.XmitTime) > rto {
 			expired = append(expired, entry)
 		}
 	}
@@ -638,7 +728,7 @@ func (w *SendWindow) InFlight() int {
 	return len(w.entries)
 }
 
-// InFlightBytes returns the framed plaintext bytes of all unacknowledged
+// InFlightBytes returns the wire bytes of all unacknowledged written
 // frames in this window: the sum of SendEntry.InFlightBytes, the same
 // kind and the same per-entry count the session counter holds, so the
 // counter equals this sum over the wired windows at any moment w.mu is

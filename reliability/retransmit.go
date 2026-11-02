@@ -137,8 +137,9 @@ func (q *RetransmitQueue) SetMaxBytes(n int64) {
 // frameBytes returns the payload bytes of a frame being enqueued, the count
 // RetransmitEntry.PayloadBytes keeps for its lifetime. It reads Frame.Payload, so
 // it is for a caller whose frame no other goroutine can reach yet (Enqueue);
-// noiseStream.sendSingleFrame, whose frame the SendWindow has already published,
-// uses EnqueueSized. The header is not counted: the cap is named for payload bytes.
+// noiseStream.recordWrite, on the write loop's path, gives the plaintext count the
+// SendEntry recorded to EnqueueSized. The header is not counted: the cap is named
+// for payload bytes.
 func frameBytes(f *aether.Frame) int64 {
 	if f == nil {
 		return 0
@@ -176,8 +177,9 @@ func (q *RetransmitQueue) Enqueue(frame *aether.Frame) {
 }
 
 // EnqueueSized is Enqueue with the frame's payload size given by the caller, for
-// a frame another goroutine may already be rewriting: noiseStream.sendSingleFrame
-// has published it to reliabilityTick's TLP through the SendWindow by this point.
+// a frame whose Payload already holds its committed form: noiseStream.recordWrite
+// calls it at the frame's first write with the plaintext count from AddEntry, so
+// the RTO runs from the write and the cap counts what Enqueue counts.
 func (q *RetransmitQueue) EnqueueSized(frame *aether.Frame, incoming int64) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
