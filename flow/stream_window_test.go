@@ -6,13 +6,12 @@ package flow
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
 
-// Use sizes strictly above MinGuaranteedWindow so the metered path is exercised.
-// Small frames (≤ MinGuaranteedWindow) bypass accounting by design.
-const testCredit = 16 * 1024 // 16 KB — comfortably above the 1 KB escape hatch
+const testCredit = 16 * 1024 // 16 KB — comfortably above MinGuaranteedWindow
 
 func TestStreamWindow_ConsumeAndAvailable(t *testing.T) {
 	w := NewStreamWindow(testCredit)
@@ -37,23 +36,58 @@ func TestStreamWindow_ConsumeAndAvailable(t *testing.T) {
 		t.Errorf("after exhaust: got %d, want 0", w.Available())
 	}
 
-	// Small frames within MinGuaranteedWindow are always allowed (escape hatch,
-	// NOT metered — so they don't change Available()).
-	avail := w.Available()
-	if err := w.Consume(ctx, MinGuaranteedWindow); err != nil {
-		t.Errorf("escape-hatch frame should always succeed: %v", err)
+	// An exhausted window admits nothing, however small: the failure is the
+	// typed backpressure, and a tight deadline keeps the test fast.
+	for _, n := range []int64{1, MinGuaranteedWindow, testCredit} {
+		tctx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+		err := w.Consume(tctx, n)
+		cancel()
+		if !errors.Is(err, ErrCreditExhausted) {
+			t.Errorf("consume %d on an exhausted window: %v, want ErrCreditExhausted", n, err)
+		}
 	}
-	if w.Available() != avail {
-		t.Errorf("escape-hatch frame should not consume credit: got %d, want %d", w.Available(), avail)
-	}
+}
 
-	// Large over-consume beyond MinGuaranteedWindow must time out. Give it a
-	// tight deadline so the test is fast; we don't care about the exact
-	// wording, only that it errors.
-	tctx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
-	defer cancel()
-	if err := w.Consume(tctx, testCredit); err == nil {
-		t.Error("should error on overconsume beyond MinGuaranteedWindow")
+// A frame under MinGuaranteedWindow is charged like any other, on both
+// windows and through TryConsume.
+func TestWindows_ChargeSmallFrames(t *testing.T) {
+	ctx := context.Background()
+	w := NewStreamWindow(testCredit)
+	if err := w.Consume(ctx, 512); err != nil {
+		t.Fatalf("stream consume: %v", err)
+	}
+	if !w.TryConsume(512) {
+		t.Fatal("stream TryConsume refused with credit left")
+	}
+	if got := w.Available(); got != testCredit-1024 {
+		t.Errorf("stream Available %d, want %d", got, testCredit-1024)
+	}
+	c := NewConnWindow(testCredit)
+	if err := c.Consume(ctx, 512); err != nil {
+		t.Fatalf("conn consume: %v", err)
+	}
+	if got := c.Available(); got != testCredit-512 {
+		t.Errorf("conn Available %d, want %d", got, testCredit-512)
+	}
+}
+
+// A window holds at least MinGuaranteedWindow however it is built or shrunk,
+// so one small message can always be admitted after the peer has consumed
+// what is outstanding.
+func TestStreamWindow_HoldsAtLeastMinGuaranteedWindow(t *testing.T) {
+	w := NewStreamWindow(16)
+	if got := w.CurrentWindow(); got != MinGuaranteedWindow {
+		t.Errorf("built with 16: CurrentWindow %d, want %d", got, MinGuaranteedWindow)
+	}
+	w = NewStreamWindow(testCredit)
+	if got := w.ShrinkWindow(testCredit); got != testCredit-MinGuaranteedWindow {
+		t.Errorf("ShrinkWindow returned %d, want %d", got, testCredit-MinGuaranteedWindow)
+	}
+	if got := w.CurrentWindow(); got != MinGuaranteedWindow {
+		t.Errorf("after shrink: CurrentWindow %d, want %d", got, MinGuaranteedWindow)
+	}
+	if got := w.ShrinkWindow(1); got != 0 {
+		t.Errorf("ShrinkWindow at the floor returned %d, want 0", got)
 	}
 }
 
@@ -203,18 +237,10 @@ func TestConnWindow_ConsumeAndAvailable(t *testing.T) {
 	// test is fast; we only need to prove it errors on sustained exhaustion.
 	tctx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 	defer cancel()
-	if err := w.Consume(tctx, 3000); err == nil {
-		t.Error("should error on sustained overconsume")
+	if err := w.Consume(tctx, 3000); !errors.Is(err, ErrCreditExhausted) {
+		t.Errorf("sustained overconsume: %v, want ErrCreditExhausted", err)
 	}
 
-	// Escape hatch: tiny frames always pass without metering.
-	avail := w.Available()
-	if err := w.Consume(ctx, MinGuaranteedWindow); err != nil {
-		t.Errorf("escape-hatch frame should succeed: %v", err)
-	}
-	if w.Available() != avail {
-		t.Errorf("escape-hatch frame should not consume credit: got %d, want %d", w.Available(), avail)
-	}
 }
 
 func TestConnWindow_ReceiverAutoGrant(t *testing.T) {
@@ -323,86 +349,6 @@ func TestStreamWindow_TimedTrigger_NoConsumeNoGrant(t *testing.T) {
 	}
 	if g := w.Stats().TimedGrants; g != 0 {
 		t.Errorf("TimedGrants counter: got %d, want 0 (no consumption happened)", g)
-	}
-}
-
-// ReleaseOnACK releases sender credit via the reliability-layer ACK
-// path independent of WINDOW_UPDATE. Caps at dataOutstanding so it
-// composes safely with ApplyUpdate (both paths can fire; neither
-// over-releases).
-func TestStreamWindow_ReleaseOnACK_ReleasesCredit(t *testing.T) {
-	w := NewStreamWindow(testCredit)
-	ctx := context.Background()
-
-	if err := w.Consume(ctx, testCredit); err != nil {
-		t.Fatalf("consume: %v", err)
-	}
-	if a := w.Available(); a != 0 {
-		t.Fatalf("after full consume: Available got %d, want 0", a)
-	}
-
-	// ACK half the bytes — releases half the credit back to the sender.
-	w.ReleaseOnACK(testCredit / 2)
-	if a := w.Available(); a != testCredit/2 {
-		t.Errorf("after ReleaseOnACK(half): Available got %d, want %d", a, testCredit/2)
-	}
-
-	// ACK another half — releases the remaining half. Total released =
-	// initialCredit, dataOutstanding back to zero.
-	w.ReleaseOnACK(testCredit / 2)
-	if a := w.Available(); a != testCredit {
-		t.Errorf("after ReleaseOnACK(all): Available got %d, want %d", a, testCredit)
-	}
-}
-
-// ReleaseOnACK must never release past dataOutstanding. If a WINDOW_UPDATE
-// already freed the credit, a later ACK for the same bytes must be a no-op.
-func TestStreamWindow_ReleaseOnACK_CapsAtDataOutstanding(t *testing.T) {
-	w := NewStreamWindow(testCredit)
-	ctx := context.Background()
-
-	if err := w.Consume(ctx, testCredit); err != nil {
-		t.Fatalf("consume: %v", err)
-	}
-
-	// WINDOW_UPDATE releases everything first.
-	// Simulate receiver granting full refill via cumulative mechanism:
-	//   grantsEmitted becomes testCredit → peer sends it → ApplyUpdate(testCredit).
-	// Here we synthesize the effect directly.
-	w.ApplyUpdate(testCredit)
-	if a := w.Available(); a != testCredit {
-		t.Fatalf("after ApplyUpdate(all): Available got %d, want %d", a, testCredit)
-	}
-
-	// ACK for the same bytes arrives AFTER WINDOW_UPDATE — must be no-op.
-	w.ReleaseOnACK(testCredit)
-	if a := w.Available(); a != testCredit {
-		t.Errorf("ReleaseOnACK over-released: Available got %d, want %d", a, testCredit)
-	}
-}
-
-// Symmetric test for ConnWindow ReleaseOnACK.
-func TestConnWindow_ReleaseOnACK(t *testing.T) {
-	w := NewConnWindow(DefaultConnCredit)
-	ctx := context.Background()
-
-	if err := w.Consume(ctx, DefaultConnCredit/2); err != nil {
-		t.Fatalf("consume: %v", err)
-	}
-
-	beforeAvail := w.Available()
-	w.ReleaseOnACK(DefaultConnCredit / 4)
-	afterAvail := w.Available()
-	if afterAvail-beforeAvail != DefaultConnCredit/4 {
-		t.Errorf("ReleaseOnACK delta wrong: before=%d after=%d diff=%d, want +%d",
-			beforeAvail, afterAvail, afterAvail-beforeAvail, DefaultConnCredit/4)
-	}
-
-	// Releasing more than remaining outstanding caps correctly.
-	w.ReleaseOnACK(DefaultConnCredit) // much more than what's still outstanding
-	finalAvail := w.Available()
-	if finalAvail > DefaultConnCredit {
-		t.Errorf("Available exceeded initial credit: got %d, want ≤ %d", finalAvail, DefaultConnCredit)
 	}
 }
 

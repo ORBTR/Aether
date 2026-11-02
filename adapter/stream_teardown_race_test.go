@@ -41,16 +41,17 @@ const (
 // while the rest of the burst is still arriving.
 const teardownRaceUnreadBeforeReset = 3
 
-// unreadMessages reports how many payloads st's recvCh holds. A channel's
-// length is read without synchronising with its senders, so the hand-offs
-// that filled it stay unordered with what the test does next.
+// unreadMessages reports how many payloads st's receive queue holds. For a TCP
+// stream that is a channel's length, read without synchronising with its
+// senders, so the hand-offs that filled it stay unordered with what the test
+// does next; a noise stream's queue length is read under the queue's lock.
 func unreadMessages(t *testing.T, st aether.Stream) int {
 	t.Helper()
 	switch s := st.(type) {
 	case *tcpStream:
 		return len(s.recvCh)
 	case *noiseStream:
-		return len(s.recvCh)
+		return s.recvQ.len()
 	}
 	t.Fatalf("stream of type %T is not one of this package's", st)
 	return 0

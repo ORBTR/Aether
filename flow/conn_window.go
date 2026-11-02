@@ -114,49 +114,23 @@ func NewConnWindow(initialCredit int64) *ConnWindow {
 	}
 }
 
-// Consume reserves n bytes of connection-level credit before a Send.
-// Small frames (≤ MinGuaranteedWindow) bypass the semaphore entirely so
-// control traffic (WINDOW_UPDATE, ACK, PING/PONG) always flows. Larger
-// frames block up to ConsumeTimeout waiting for credit via sem.Acquire.
+// Consume reserves n bytes of connection-level credit before a Send, blocking
+// up to ConsumeTimeout via sem.Acquire and failing with ErrCreditExhausted.
+// Every byte is charged; control frames never call it (see MinGuaranteedWindow).
 func (w *ConnWindow) Consume(ctx context.Context, n int64) error {
 	if n <= 0 {
-		return nil
-	}
-	if n <= MinGuaranteedWindow {
 		return nil
 	}
 	acquireCtx, cancel := context.WithTimeout(ctx, ConsumeTimeout)
 	defer cancel()
 	if err := w.sem.Acquire(acquireCtx, n); err != nil {
-		return fmt.Errorf("aether flow: insufficient connection credit after %s (need %d, have %d): %w",
-			ConsumeTimeout, n, w.Available(), err)
+		return fmt.Errorf("aether flow: insufficient connection credit after %s (need %d, have %d): %w: %w",
+			ConsumeTimeout, n, w.Available(), ErrCreditExhausted, err)
 	}
 	w.mu.Lock()
 	w.dataOutstanding += n
 	w.mu.Unlock()
 	return nil
-}
-
-// ReleaseOnACK releases connection-level sender credit corresponding to
-// bytes the peer acknowledged. Delta-based (caller passes sum of newly-
-// acked Frame.Length), capped at dataOutstanding so ACK-path and
-// WINDOW_UPDATE-path together never over-release. See
-// StreamWindow.ReleaseOnACK for the full rationale (same approach at
-// stream scope).
-func (w *ConnWindow) ReleaseOnACK(ackedBytesDelta int64) {
-	if ackedBytesDelta <= 0 {
-		return
-	}
-	w.mu.Lock()
-	release := ackedBytesDelta
-	if release > w.dataOutstanding {
-		release = w.dataOutstanding
-	}
-	w.dataOutstanding -= release
-	w.mu.Unlock()
-	if release > 0 {
-		w.sem.Release(release)
-	}
 }
 
 // ReleaseUnsent returns credit reserved by Consume that never reached
@@ -170,7 +144,7 @@ func (w *ConnWindow) ReleaseOnACK(ackedBytesDelta int64) {
 // in that stall whenever a stream Send fails its second Consume).
 //
 // Capped at dataOutstanding so over-release composes safely with
-// ApplyUpdate / ReleaseOnACK paths.
+// ApplyUpdate.
 func (w *ConnWindow) ReleaseUnsent(n int64) {
 	if n <= 0 {
 		return
@@ -281,6 +255,17 @@ func (w *ConnWindow) grantLocked(sinceLastGrant int64, trigger string) int64 {
 		atomic.AddUint64(&w.timedGrants, 1)
 	}
 	return w.grantsEmitted
+}
+
+// ReceiveCeilings returns the two bounds a session's receive side holds this
+// window's peer to: initial, the credit the peer's sender starts with and the
+// most its consumer-driven grants let it keep unconsumed on any one stream;
+// and maximum, the semaphore capacity, kept above initial for the skew a
+// stream's departure leaves (the sender's ReleaseUnsent there and a grant
+// already on its way for the same byte). NoiseSession's receive queues refuse
+// a peer past them.
+func (w *ConnWindow) ReceiveCeilings() (initial, maximum int64) {
+	return w.initialSize, w.maxSize
 }
 
 // Available returns the sender's remaining connection credit.

@@ -134,14 +134,11 @@ func (q *RetransmitQueue) SetMaxBytes(n int64) {
 	q.maxBytes = n
 }
 
-// frameBytes returns the payload bytes of a frame being enqueued, the
-// count RetransmitEntry.PayloadBytes keeps for its lifetime. It is the
-// one read of Frame.Payload in this file and runs on the sender's
-// goroutine before the sender hands the frame to the scheduler
-// (noiseStream.sendSingleFrame enqueues here first), so it sees the
-// payload the sender handed over and never the compressed or encrypted
-// form writeFrame commits later. The header is not counted: the cap is
-// named for payload bytes.
+// frameBytes returns the payload bytes of a frame being enqueued, the count
+// RetransmitEntry.PayloadBytes keeps for its lifetime. It reads Frame.Payload, so
+// it is for a caller whose frame no other goroutine can reach yet (Enqueue);
+// noiseStream.sendSingleFrame, whose frame the SendWindow has already published,
+// uses EnqueueSized. The header is not counted: the cap is named for payload bytes.
 func frameBytes(f *aether.Frame) int64 {
 	if f == nil {
 		return 0
@@ -175,10 +172,16 @@ func (q *RetransmitQueue) removeBySeq(seqNo uint32) bool {
 // session layer so the caller notices the shortfall, since a dropped
 // retransmit entry is not retried by this queue again.
 func (q *RetransmitQueue) Enqueue(frame *aether.Frame) {
+	q.EnqueueSized(frame, frameBytes(frame))
+}
+
+// EnqueueSized is Enqueue with the frame's payload size given by the caller, for
+// a frame another goroutine may already be rewriting: noiseStream.sendSingleFrame
+// has published it to reliabilityTick's TLP through the SendWindow by this point.
+func (q *RetransmitQueue) EnqueueSized(frame *aether.Frame, incoming int64) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	incoming := frameBytes(frame)
 	q.evictForRoomLocked(incoming)
 
 	now := time.Now()

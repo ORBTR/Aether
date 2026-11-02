@@ -7,11 +7,13 @@
 package adapter
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/ORBTR/aether"
 	"github.com/ORBTR/aether/congestion"
+	"github.com/ORBTR/aether/flow"
 	"github.com/ORBTR/aether/reliability"
 	"github.com/ORBTR/aether/scheduler"
 )
@@ -79,7 +81,7 @@ func TestHandleACK_PeerAckDelayScaledIntoTLP(t *testing.T) {
 // burst past the safe window. The fix removes the call; send-side cwnd is
 // advanced solely by ACKs of locally-sent data in handleACK.
 func TestHandleData_DoesNotInflateCWND(t *testing.T) {
-	s := &NoiseSession{streams: make(map[uint64]*noiseStream)}
+	s := &NoiseSession{streams: make(map[uint64]*noiseStream), connWindow: flow.NewConnWindow(0)}
 	s.SetCongestionController(congestion.NewCUBICController())
 
 	eng := reliability.NewEngine(reliability.EngineConfig{StreamID: 5, WindowSize: 64})
@@ -89,10 +91,10 @@ func TestHandleData_DoesNotInflateCWND(t *testing.T) {
 		replay:     eng.Replay,
 		recvWindow: eng.RecvWin,
 		rtt:        eng.RTT,
-		// deliverCh buffered large enough that enqueueDelivery (AE-M-02)
-		// succeeds without a running deliverLoop — no consumer needed to
-		// exercise handleData end-to-end for the cwnd invariant.
-		deliverCh: make(chan []byte, 64),
+		window:     flow.NewStreamWindow(0),
+		// recvQ takes the payloads with no consumer reading: none is needed
+		// to exercise handleData end-to-end for the cwnd invariant.
+		recvQ: newRecvQueue(&s.recvQueued),
 	}
 	s.streams[5] = st
 
@@ -116,75 +118,67 @@ func TestHandleData_DoesNotInflateCWND(t *testing.T) {
 	}
 }
 
-// ─── AE-M-02 — stream delivery moved off the shared readLoop ───────────────
+// ─── stream delivery never waits on the shared readLoop ─────────────────────
 //
-// DeliverToRecvChWithSignals blocks the caller up to stream1MaxBackpressure
-// (1s) on a full stream-1 recvCh. Running it directly on the single readLoop
-// stalled the whole session — the readLoop stopped draining the noiseConn
-// inbox and silently dropped inbound ACKs for every other stream. The fix
-// hands each payload to a per-stream deliverLoop goroutine via a non-blocking
-// enqueueDelivery, so a slow consumer blocks only that goroutine.
+// The readLoop serves every stream on the session, so it must never wait on one
+// stream's consumer: it would stop draining the noiseConn inbox and inbound
+// ACKs for every other stream would be lost behind it. recvQ is what the
+// readLoop hands a message to, and enqueueDelivery takes no wait.
 
-// TestNoiseEnqueueDeliveryNonBlocking proves the readLoop path (enqueueDelivery)
-// never blocks: with no consumer draining, buffering N payloads returns
-// immediately. The pre-fix direct DeliverToRecvChWithSignals on stream 1 with
-// a full recvCh would have blocked ~1s on the very first payload.
-func TestNoiseEnqueueDeliveryNonBlocking(t *testing.T) {
-	s := &NoiseSession{}
-	st := &noiseStream{
-		streamID:  1,
-		session:   s,
-		recvCh:    make(chan []byte, 1), // tiny — the OLD path would stall here
-		deliverCh: make(chan []byte, 8), // enqueue buffers here instead
+// noiseStreamForDelivery is a stream with what enqueueDelivery and Receive read.
+func noiseStreamForDelivery(streamID uint64) *noiseStream {
+	s := &NoiseSession{
+		BaseSession: aether.NewBaseSession("a", "b", aether.ProtoNoise),
+		connWindow:  flow.NewConnWindow(0),
 	}
-
-	const n = 8
-	start := time.Now()
-	for i := 0; i < n; i++ {
-		if !st.enqueueDelivery([]byte{byte(i)}) {
-			t.Fatalf("enqueueDelivery(%d) returned false while deliverCh had room", i)
-		}
-	}
-	elapsed := time.Since(start)
-
-	// The old stream-1 path would have paid ~1s per payload once recvCh
-	// filled (>= 7s total). Non-blocking enqueue is microseconds; 500ms is a
-	// generous, flake-proof ceiling that is still far below one 1s stall.
-	if elapsed >= 500*time.Millisecond {
-		t.Fatalf("AE-M-02 regressed: enqueuing %d payloads took %v — the readLoop "+
-			"path must not block on stream-1 backpressure", n, elapsed)
+	return &noiseStream{
+		streamID: streamID,
+		session:  s,
+		window:   flow.NewStreamWindow(0),
+		recvQ:    newRecvQueue(&s.recvQueued),
+		recvDone: make(chan struct{}),
 	}
 }
 
-// TestNoiseDeliverLoopPreservesOrder exercises the real async delivery hop:
-// the deliverLoop goroutine drains deliverCh (fed in-order by the "readLoop")
-// into recvCh. Single producer + single consumer must preserve FIFO order.
-func TestNoiseDeliverLoopPreservesOrder(t *testing.T) {
-	s := &NoiseSession{}
-	st := &noiseStream{
-		streamID:    1,
-		session:     s,
-		recvCh:      make(chan []byte, 128),
-		deliverCh:   make(chan []byte, 128),
-		deliverDone: make(chan struct{}),
-	}
-	go st.deliverLoop()
-	defer st.teardown() // closes deliverDone → deliverLoop exits
-
-	const n = 100
+// TestNoiseEnqueueDeliveryNonBlocking: with no consumer reading, queueing many
+// messages returns at once.
+func TestNoiseEnqueueDeliveryNonBlocking(t *testing.T) {
+	st := noiseStreamForDelivery(1)
+	const n = 1000
+	start := time.Now()
 	for i := 0; i < n; i++ {
 		if !st.enqueueDelivery([]byte{byte(i)}) {
-			t.Fatalf("enqueueDelivery(%d) returned false unexpectedly", i)
+			t.Fatalf("enqueueDelivery(%d) returned false within the stream's credit", i)
 		}
 	}
-	for i := 0; i < n; i++ {
-		select {
-		case p := <-st.recvCh:
-			if len(p) != 1 || p[0] != byte(i) {
-				t.Fatalf("AE-M-02 regressed: out-of-order delivery: got %v want [%d]", p, i)
+	// Queueing is microseconds; 500ms is a generous, flake-proof ceiling.
+	if elapsed := time.Since(start); elapsed >= 500*time.Millisecond {
+		t.Fatalf("enqueuing %d payloads took %v — the readLoop path must not wait", n, elapsed)
+	}
+}
+
+// TestNoiseRecvQueuePreservesOrder: one producer and one consumer see FIFO
+// order, with Receive running ahead of the producer as well as behind it.
+func TestNoiseRecvQueuePreservesOrder(t *testing.T) {
+	st := noiseStreamForDelivery(1)
+	const n = 100
+	go func() {
+		for i := 0; i < n; i++ {
+			if !st.enqueueDelivery([]byte{byte(i)}) {
+				t.Errorf("enqueueDelivery(%d) returned false unexpectedly", i)
+				return
 			}
-		case <-time.After(2 * time.Second):
-			t.Fatalf("timed out waiting for payload %d via deliverLoop", i)
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for i := 0; i < n; i++ {
+		p, err := st.Receive(ctx)
+		if err != nil {
+			t.Fatalf("receive %d: %v", i, err)
+		}
+		if len(p) != 1 || p[0] != byte(i) {
+			t.Fatalf("out-of-order delivery: got %v want [%d]", p, i)
 		}
 	}
 }

@@ -10,6 +10,7 @@ package flow
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -87,12 +88,22 @@ const LowWatermarkFraction = 0.25
 // grant fires after at most GrantMaxInterval regardless of payload sizing.
 const GrantMaxInterval = 1 * time.Second
 
-// MinGuaranteedWindow is the escape hatch for flow control deadlock prevention.
-// Frames at or below this size (control headers, ACKs, keepalive hints) bypass
-// credit accounting entirely: they never block waiting for credit and never
-// consume it. This guarantees WINDOW_UPDATE and similar in-band control traffic
-// can always flow, even when the stream's send window is exhausted.
+// MinGuaranteedWindow is the least credit a stream's window ever holds:
+// NewStreamWindowWithCap raises a smaller initial credit to it and ShrinkWindow
+// stops at it, so a message of this size can always be admitted once the
+// receiver has consumed what is outstanding. It frees no frame from credit:
+// Consume charges every byte, because the receive queue is bounded only by
+// what credit admits. WINDOW_UPDATE, ACK, PING and every other control frame
+// reach the write path through writeFrame and never call Consume, so an
+// exhausted data window holds none of them back.
 const MinGuaranteedWindow int64 = 1024 // 1KB
+
+// ErrCreditExhausted is the typed backpressure a sender sees when its stream
+// or connection window stayed empty until ConsumeTimeout or its context ended:
+// the peer's consumer has not taken what is outstanding. Every Consume failure
+// wraps it, so errors.Is tells backpressure from a failed write; the bytes are
+// not sent and nothing has been lost.
+var ErrCreditExhausted = errors.New("aether flow: credit exhausted")
 
 // ConsumeTimeout is how long Consume waits for credit before returning an error.
 const ConsumeTimeout = 10 * time.Second
@@ -101,9 +112,7 @@ const ConsumeTimeout = 10 * time.Second
 //
 // Sender side: Consume blocks until credit is available (up to ConsumeTimeout)
 // using a golang.org/x/sync/semaphore — no busy polling, context-aware
-// cancellation. Small frames (≤ MinGuaranteedWindow) bypass the semaphore
-// entirely and are never charged: the escape hatch is meant for in-band
-// control traffic, not a bandwidth meter.
+// cancellation. Every byte is charged, whatever the size of the frame.
 //
 // Receiver side: grants credit via WINDOW_UPDATE once the sender has consumed
 // AutoGrantThreshold of the initial window. recvCredit tracks outstanding
@@ -167,14 +176,8 @@ type StreamWindow struct {
 	//   grantsReceived — highest cumulative value we (sender) have seen
 	//                    from peer; any incoming wire value ≤ this is stale
 	//                    and dropped by ApplyUpdate.
-	//   ackReleased    — cumulative bytes released through the ACK-driven
-	//                    (ReleaseOnACK) path. Purely observational; the
-	//                    release is still capped at dataOutstanding so
-	//                    it composes safely with ApplyUpdate's release
-	//                    path.
 	grantsEmitted  int64
 	grantsReceived int64
-	ackReleased    int64
 
 	// Auto-tuning hints — advisory data an auto-tuner reads via Stats().
 	// Updated from Consume/ApplyUpdate hot paths, guarded by mu.
@@ -271,6 +274,9 @@ func NewStreamWindowWithCap(initialCredit, maxCredit int64) *StreamWindow {
 	if initialCredit <= 0 {
 		initialCredit = DefaultStreamCredit
 	}
+	if initialCredit < MinGuaranteedWindow {
+		initialCredit = MinGuaranteedWindow
+	}
 	// Semaphore capacity is MaxGrowableWindow unless the caller asked
 	// for a larger initial window OR explicitly capped growth via
 	// maxCredit. maxCredit <= 0 means "use the package default"; a
@@ -320,14 +326,6 @@ func (w *StreamWindow) SetGrantStarveHist(h *metrics.DurationHist) {
 	w.grantStarveHist = h
 }
 
-// Consume reserves n bytes of sender credit before a Send.
-//
-// Small frames (≤ MinGuaranteedWindow) are NOT metered — they bypass the
-// semaphore entirely. See MinGuaranteedWindow's doc for rationale.
-//
-// Larger frames block waiting for credit, honouring ctx cancellation. After
-// ConsumeTimeout with no credit the call fails; higher layers (gossip)
-// surface this as "insufficient stream credit after 10s".
 // TryConsume attempts a non-blocking credit acquire (the fast path only) and
 // returns true if credit was available and consumed, false otherwise — it
 // NEVER blocks. Transports with native backpressure (TCP/WS) track
@@ -335,7 +333,7 @@ func (w *StreamWindow) SetGrantStarveHist(h *metrics.DurationHist) {
 // credit; the blocking Consume could park a TCP Send for the full
 // ConsumeTimeout (~10s) on a drained window.
 func (w *StreamWindow) TryConsume(n int64) bool {
-	if n <= 0 || n <= MinGuaranteedWindow {
+	if n <= 0 {
 		return true
 	}
 	if w.sem.TryAcquire(n) {
@@ -350,14 +348,12 @@ func (w *StreamWindow) TryConsume(n int64) bool {
 	return false
 }
 
+// Consume reserves n bytes of sender credit before a Send, blocking until
+// credit is available and honouring ctx cancellation. After ConsumeTimeout
+// with no credit the call fails with ErrCreditExhausted; higher layers (gossip)
+// surface this as "insufficient stream credit after 10s".
 func (w *StreamWindow) Consume(ctx context.Context, n int64) error {
 	if n <= 0 {
-		return nil
-	}
-	if n <= MinGuaranteedWindow {
-		// Escape hatch — small frames always pass, no metering. This prevents
-		// deadlocks where WINDOW_UPDATE and other control traffic would be
-		// stuck behind a drained data window.
 		return nil
 	}
 
@@ -405,8 +401,8 @@ func (w *StreamWindow) Consume(ctx context.Context, n int64) error {
 		avail := w.Available()
 		dbgFlow.Printf("Consume TIMEOUT need=%d have=%d outstanding=%d maxSize=%d",
 			n, avail, w.dataOutstanding, w.maxSize)
-		return fmt.Errorf("aether flow: insufficient stream credit after %s (need %d, have %d): %w",
-			ConsumeTimeout, n, avail, err)
+		return fmt.Errorf("aether flow: insufficient stream credit after %s (need %d, have %d): %w: %w",
+			ConsumeTimeout, n, avail, ErrCreditExhausted, err)
 	}
 
 	w.mu.Lock()
@@ -418,40 +414,6 @@ func (w *StreamWindow) Consume(ctx context.Context, n int64) error {
 	w.mu.Unlock()
 	dbgFlow.Printf("Consume OK n=%d outstanding=%d avail=%d", n, outstanding, w.currentWindow-outstanding)
 	return nil
-}
-
-// ReleaseOnACK releases sender-side credit corresponding to bytes the
-// peer has acknowledged via the reliability layer's CompositeACK path
-// (independent of WINDOW_UPDATE). ACKs are loss-tolerant via their own
-// retransmission, so flow-control credit delivered through them is
-// strictly more robust than credit delivered through bare WINDOW_UPDATE
-// frames which can be dropped on lossy UDP paths.
-//
-// ackedBytesDelta is the byte sum of entries newly acknowledged in this
-// ACK (not cumulative). Caller (the adapter's handleACK) computes this
-// by summing Frame.Length over the `acked` slice returned by
-// SendWindow.ProcessCompositeACK.
-//
-// The release is capped at dataOutstanding so ACK-path and WINDOW_UPDATE
-// path together never over-release. Whichever path delivers credit first
-// for a given byte wins; the other sees dataOutstanding already reduced
-// and releases nothing extra.
-func (w *StreamWindow) ReleaseOnACK(ackedBytesDelta int64) {
-	if ackedBytesDelta <= 0 {
-		return
-	}
-	w.mu.Lock()
-	release := ackedBytesDelta
-	if release > w.dataOutstanding {
-		release = w.dataOutstanding
-	}
-	w.dataOutstanding -= release
-	w.ackReleased += release
-	w.mu.Unlock()
-	if release > 0 {
-		w.sem.Release(release)
-	}
-	dbgFlow.Printf("ReleaseOnACK delta=%d released=%d ackReleasedTotal=%d", ackedBytesDelta, release, w.ackReleased)
 }
 
 // ReleaseUnsent returns credit reserved by Consume that never reached
@@ -466,9 +428,8 @@ func (w *StreamWindow) ReleaseOnACK(ackedBytesDelta int64) {
 // bytes it never received, so nothing else recovers the credit.
 //
 // Capped at dataOutstanding so over-release composes safely with
-// ApplyUpdate / ReleaseOnACK paths — whichever release runs first
-// returns its share; later releases find dataOutstanding already
-// reduced and become no-ops.
+// ApplyUpdate — whichever release runs first returns its share; later
+// releases find dataOutstanding already reduced and become no-ops.
 func (w *StreamWindow) ReleaseUnsent(n int64) {
 	if n <= 0 {
 		return
@@ -484,6 +445,23 @@ func (w *StreamWindow) ReleaseUnsent(n int64) {
 		w.sem.Release(release)
 	}
 	dbgFlow.Printf("ReleaseUnsent requested=%d released=%d", n, release)
+}
+
+// ReleaseAll returns every outstanding byte to the window and reports how many,
+// for a stream that is leaving its session: no grant for these bytes will
+// reach this window, and noiseStream.releaseInFlight gives the count back to
+// the connection window, which outlives the stream and charged the same bytes.
+// A Send blocked in Consume wakes and finds the stream's state closed. Idempotent:
+// a second call reports what was charged since, so 0 on a stream that has left.
+func (w *StreamWindow) ReleaseAll() int64 {
+	w.mu.Lock()
+	n := w.dataOutstanding
+	w.dataOutstanding = 0
+	w.mu.Unlock()
+	if n > 0 {
+		w.sem.Release(n)
+	}
+	return n
 }
 
 // ApplyUpdate processes a received WINDOW_UPDATE frame, where `credit` is
@@ -641,11 +619,11 @@ func (w *StreamWindow) Available() int64 {
 	return w.currentWindow - w.dataOutstanding
 }
 
-// Outstanding returns the bytes the sender has Consume()d but not yet
-// seen ACKed (i.e. in-flight on this stream). Consumed by the ACK
-// validator as the plausibility upper bound for peer-claimed CEBytes
-// — an inflated CE claim above the actual outstanding is a cwnd
-// collapse vector.
+// Outstanding returns the bytes the sender has Consume()d that no grant has
+// returned yet: on the wire, or held by the peer's receive queue until its
+// consumer takes them. Consumed by the ACK validator as the plausibility upper
+// bound for peer-claimed CEBytes — an inflated CE claim above the actual
+// outstanding is a cwnd collapse vector.
 func (w *StreamWindow) Outstanding() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -789,14 +767,16 @@ func (w *StreamWindow) ShrinkWindow(n int64) int64 {
 	if n <= 0 {
 		return 0
 	}
-	// Cap against current window so we never push the effective window
-	// below zero (leaves at least 0 bytes — caller policy determines if
-	// that's ever desirable; typically you want a floor well above zero).
+	// Stop at MinGuaranteedWindow, the credit a sender can always count on
+	// for one small message once what is outstanding has been consumed.
 	w.mu.Lock()
-	if n > w.currentWindow {
-		n = w.currentWindow
+	if n > w.currentWindow-MinGuaranteedWindow {
+		n = w.currentWindow - MinGuaranteedWindow
 	}
 	w.mu.Unlock()
+	if n <= 0 {
+		return 0
+	}
 
 	// Try to acquire the shrink amount from the semaphore (reclaiming the
 	// free portion). If in-flight data plus the shrink amount would exceed

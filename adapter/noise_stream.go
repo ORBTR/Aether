@@ -37,18 +37,14 @@ type noiseStream struct {
 	config   aether.StreamConfig
 	session  *NoiseSession
 	state    *aether.StreamStateMachine
-	// recvCh holds the whole messages deliverLoop has handed to the
-	// application (and the remainder handleClose hands over directly);
-	// Receive reads it. It is never closed: its end is recvDone, which
-	// closeRecvOnce closes exactly once (recvOnce) and Receive selects on,
-	// draining what recvCh still holds before it returns io.EOF. A close of
-	// recvCh would race deliverLoop's send into it, since closeRecvOnce runs
-	// on the readLoop (handleClose, handleReset) and on application
-	// goroutines (Reset) while deliverLoop runs on its own. recvDone is made
-	// in createStream with recvCh; a stream built outside createStream has
-	// neither recvDone nor deliverCh, and closeRecvOnce closes its recvCh
-	// instead.
-	recvCh   chan []byte
+	// recvQ holds the whole in-order messages between the readLoop
+	// (handleData, handleImplicitOpen, handleFECRepair and deliverToControl,
+	// through enqueueDelivery and enqueueControl) and Receive. recvDone is the
+	// end Receive selects on, draining what recvQ still holds before it
+	// returns io.EOF; closeRecvOnce closes it exactly once (recvOnce), from the
+	// readLoop (handleClose, handleReset) and from application goroutines
+	// (Reset). Both are made in createStream.
+	recvQ    *recvQueue
 	recvDone chan struct{}
 	recvOnce sync.Once
 
@@ -58,23 +54,6 @@ type noiseStream struct {
 	// once per retransmitted frame. Written and read only from the single
 	// reliabilityTick goroutine, so no lock is needed.
 	lastRTOBackoffAt time.Time
-
-	// deliverCh carries each in-order payload from the readLoop (handleData,
-	// handleImplicitOpen and deliverToStream, through enqueueDelivery) to this
-	// stream's deliverLoop, which performs the send into recvCh with its
-	// bounded backpressure off the readLoop, so one slow consumer cannot stall
-	// the readLoop that drains the noiseConn inbox for every stream. Buffered
-	// at recvChCapacity(streamID), which with recvCh gives two buffers before
-	// any drop; one producer and one consumer keep the order into recvCh. It
-	// is never closed: its end is deliverDone, which teardown closes exactly
-	// once (deliverOnce); enqueueDelivery and deliverLoop select on it. A
-	// close of deliverCh would race enqueueDelivery's send, since teardown
-	// runs on application goroutines (Close, Reset), the stream GC and
-	// CloseWithError while the readLoop is still dispatching DATA for the
-	// stream. Both are made in createStream, which starts deliverLoop.
-	deliverCh   chan []byte
-	deliverDone chan struct{}
-	deliverOnce sync.Once // closes deliverDone exactly once
 
 	window *flow.StreamWindow
 
@@ -133,7 +112,7 @@ type noiseStream struct {
 
 	// fragBuf reassembles the fragments of this stream's messages. Touched by
 	// the session's readLoop only (handleData, handleImplicitOpen,
-	// handleClose), which hands each completed message to deliverCh.
+	// handleClose), which hands each completed message to recvQ.
 	fragBuf *FragmentBuffer
 
 	// generation is this stream object's number among the session's streams
@@ -205,10 +184,8 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 		config:      cfg,
 		session:     s,
 		state:       aether.NewStreamStateMachine(),
-		recvCh:      make(chan []byte, recvChCapacity(streamID)),
+		recvQ:       newRecvQueue(&s.recvQueued),
 		recvDone:    make(chan struct{}),
-		deliverCh:   make(chan []byte, recvChCapacity(streamID)),
-		deliverDone: make(chan struct{}),
 		window:      flow.NewStreamWindowWithCap(cfg.InitialCredit, cfg.MaxCredit),
 		engine:      eng,
 		fragBuf:     NewFragmentBuffer(),
@@ -379,11 +356,6 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 		class = aether.DefaultLatencyClass(streamID)
 	}
 	s.sched.RegisterWithClass(streamID, cfg.Priority, cfg.Dependency, class)
-	// Start the per-stream delivery goroutine. This is the only
-	// return path for a newly-created stream — the duplicate-open path
-	// returns `existing` (already has a worker) and cap-refused paths return
-	// nil, so no stream ever gets a second worker or is left without one.
-	go st.deliverLoop()
 	return st
 }
 
@@ -448,6 +420,13 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 	}
 	if d := time.Since(perStreamStart); d >= streamSendBlockFloor {
 		st.session.perStreamWindowWaitHist.Record(d)
+	}
+	// A stream that left while this Send waited for credit (releaseInFlight
+	// wakes the wait) must not charge the connection window: nothing would ever
+	// return bytes charged after that release.
+	if !st.state.CanSend() {
+		st.window.ReleaseUnsent(n)
+		return fmt.Errorf("stream %d: cannot send", st.streamID)
 	}
 	streamCredited := true
 	defer func() {
@@ -539,9 +518,11 @@ func (st *noiseStream) sendSingleFrame(ctx context.Context, data []byte, extra a
 		Payload:    data,
 	}
 
-	// Assign SeqNo via send window (tracks for ACK/retransmit)
+	// Assign SeqNo via send window (tracks for ACK/retransmit). Add sets
+	// frame.SeqNo under the window's lock, and from here reliabilityTick's TLP
+	// can queue this frame as a probe, so the write loop may read and rewrite it
+	// at any moment: what follows does not touch the frame's fields.
 	seqNo := st.sendWindow.Add(frame)
-	frame.SeqNo = seqNo
 
 	// BBRv2 per-packet sample stamping. When the active controller is
 	// BBR, mint a per-packet DeliveryRateSample and store it on the
@@ -560,13 +541,12 @@ func (st *noiseStream) sendSingleFrame(ctx context.Context, data []byte, extra a
 		}
 	}
 
-	// Enqueue for retransmission tracking. This comes before the scheduler
-	// hand-off below on purpose: Enqueue fixes the entry's PayloadBytes from
-	// len(frame.Payload) now, while the frame is still this goroutine's; from
-	// the hand-off on, writeFrame may swap frame.Payload and frame.Length
-	// (compression, encryption) under writeMu on the write loop, and the
-	// queue reads only its own count.
-	st.retransmitQ.Enqueue(frame)
+	// Enqueue for retransmission tracking with the entry's PayloadBytes from
+	// data and not from the frame: writeFrame may already be swapping
+	// frame.Payload and frame.Length (compression, encryption) under writeMu on
+	// the write loop for a TLP probe of this frame, and the queue reads only
+	// its own count afterwards.
+	st.retransmitQ.EnqueueSized(frame, int64(len(data)))
 
 	// FEC: add to encoder (may generate repair frames) — skip if disabled for this stream.
 	// Stream's FECLevel selects which encoder to drive:
@@ -609,41 +589,34 @@ func (st *noiseStream) sendSingleFrame(ctx context.Context, data []byte, extra a
 	return nil
 }
 
-// Receive returns the next whole message deliverLoop (or handleClose's
-// remainder) handed to recvCh. After closeRecvOnce has closed recvDone it
-// still returns what recvCh holds, one message per call, and then io.EOF;
-// the drain comes first because a select with both recvCh and recvDone ready
-// picks either, and a message delivered before the CLOSE or RESET must not
-// be lost behind the end. A stream built without recvDone reports the same
-// end through its closed recvCh.
+// Receive returns the next whole message from recvQ. After closeRecvOnce has
+// closed recvDone it still returns what recvQ holds, one message per call, and
+// then io.EOF, so a message admitted before the CLOSE or RESET is not lost
+// behind the end. Taking a metered message records it as consumed, which is
+// what replenishes the sender's stream and connection credit: until then its
+// bytes stay charged, and that charge is what bounds the queue.
 func (st *noiseStream) Receive(ctx context.Context) ([]byte, error) {
-	consumed := func(data []byte) ([]byte, error) {
-		// recvCh holds whole messages only: the readLoop reassembles
-		// fragments (reassemble) before delivery. Record credit for the
-		// message now that the application has received it, which is the
-		// length the sender charged for it. This advances both the
-		// stream-level and conn-level flow-control windows from the
-		// application's perspective (true consume-driven grants).
-		st.recordReceive(int64(len(data)))
-		return data, nil
+	take := func() ([]byte, bool) {
+		data, credited, ok := st.recvQ.pop()
+		if ok && credited {
+			// recvQ holds whole messages only: the readLoop reassembles
+			// fragments (reassemble) before delivery, so this is the length
+			// the sender charged for the message.
+			st.recordReceive(int64(len(data)))
+		}
+		return data, ok
 	}
 	for {
+		if data, ok := take(); ok {
+			return data, nil
+		}
 		select {
-		case data, ok := <-st.recvCh:
-			if !ok {
-				return nil, io.EOF
-			}
-			return consumed(data)
+		case <-st.recvQ.wake:
 		case <-st.recvDone:
-			select {
-			case data, ok := <-st.recvCh:
-				if !ok {
-					return nil, io.EOF
-				}
-				return consumed(data)
-			default:
-				return nil, io.EOF
+			if data, ok := take(); ok {
+				return data, nil
 			}
+			return nil, io.EOF
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-st.session.CloseSignal():
@@ -701,9 +674,18 @@ func (st *noiseStream) recordReceive(n int64) {
 	}
 }
 
+// Close ends the local send side. The receive side stays up while the peer may
+// still send: its CLOSE reaches handleClose, which drains the receive window
+// and ends the stream, and until then what arrives is admitted for Receive and
+// its grants still flow. When the peer's side has already ended there is nothing
+// more to admit, so the stream's resources go now and its unread messages leave
+// the session's budget, since this caller is done with them.
 func (st *noiseStream) Close() error {
 	st.state.Transition(aether.EventSendFIN)
-	st.teardown()
+	if !st.state.IsOpen() {
+		st.teardown()
+		st.recvQ.detach(false)
+	}
 	frame := &aether.Frame{
 		SenderID:   st.session.LocalPeerID(),
 		ReceiverID: st.session.RemotePeerID(),
@@ -713,73 +695,74 @@ func (st *noiseStream) Close() error {
 	return st.session.writeFrame(frame)
 }
 
-// deliverLoop is the per-stream delivery goroutine: it takes each in-order
-// payload the readLoop put on deliverCh and performs the send into recvCh,
-// with the bounded backpressure DeliverToRecvChWithSignals applies, off the
-// readLoop, so a slow application consumer holds only this goroutine while
-// the readLoop keeps draining the noiseConn inbox and the inbound ACKs of
-// every other stream. It returns when teardown closes deliverDone, after
-// handing over what deliverCh still holds, each payload within the same
-// bound, so a message that arrived before a CLOSE reaches recvCh ahead of
-// the end Receive reports. Nothing closes recvCh while this goroutine runs
-// (closeRecvOnce closes recvDone), so the send never meets a closed channel.
-func (st *noiseStream) deliverLoop() {
+// enqueueDelivery hands one in-order message the sender charged credit for to
+// the stream's consumer without blocking: the readLoop (handleData,
+// handleImplicitOpen, handleFECRepair through deliverToStream) calls it and
+// must never wait on a stream's consumer. The message is admitted because its
+// sender holds credit for it, so a sender honouring credit always fits, however
+// far behind the consumer is, and handleData's ACK ahead of this call never
+// acknowledges a message this drops. It returns false in two cases, and neither
+// owes the sender a grant, since its connection credit returns from its own
+// side when it learns the stream ended (releaseInFlight): the stream has ended
+// here; or the sender is past every ceiling credit allows (receiveCeilings), which
+// only a peer ignoring credit reaches. That peer gets a flow-control RESET and an
+// abuse charge, and what it had queued is freed. The sender is never told to
+// back off for bytes lost here, since none are.
+func (st *noiseStream) enqueueDelivery(payload []byte) bool {
 	s := st.session
-	deliver := func(payload []byte) {
-		ok := DeliverToRecvChWithSignals(st.recvCh, payload, st.window, st.streamID, s.sendWindowUpdateAgnostic, s.SendCongestion, &s.deliveryStats)
-		if !ok {
-			if grant := s.connWindow.ReceiverConsume(int64(len(payload))); grant > 0 {
-				s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
-			}
-		}
+	streamLimit, sessionLimit := st.receiveCeilings()
+	switch st.recvQ.push(payload, streamLimit, sessionLimit) {
+	case pushQueued:
+		s.deliveryStats.recordDelivered(st.streamID)
+		s.signalReceiveOverload()
+		return true
+	case pushEnded:
+		return false
 	}
-	for {
-		select {
-		case payload := <-st.deliverCh:
-			deliver(payload)
-		case <-st.deliverDone:
-			for {
-				select {
-				case payload := <-st.deliverCh:
-					deliver(payload)
-				default:
-					return
-				}
-			}
-		}
+	s.deliveryStats.recordDropped(st.streamID, len(payload))
+	s.reportAbuse(abuse.ReasonFlowControlAbuse)
+	st.recvQ.detach(true)
+	_ = st.Reset(aether.ResetFlowCtrl)
+	return false
+}
+
+// enqueueControl queues a control-plane frame for the stream's consumer
+// (deliverToControl: WHOIS, RENDEZVOUS, NETWORK_CONFIG and application
+// HANDSHAKE frames). They arrive as their own frame types and not as DATA, and
+// Send charges credit only for what it sends as DATA, so no credit paces them
+// and handleData's sequence numbers do not let a retransmit recover them; a peer
+// that floods them meets a limit of two channels' worth of recvChCapacity, past
+// which they are dropped and counted, and taking one later replenishes nothing.
+func (st *noiseStream) enqueueControl(payload []byte) {
+	s := st.session
+	switch st.recvQ.pushUnmetered(payload, 2*recvChCapacity(st.streamID)) {
+	case pushQueued:
+		s.deliveryStats.recordDelivered(st.streamID)
+	case pushOverCredit:
+		s.deliveryStats.recordDropped(st.streamID, len(payload))
 	}
 }
 
-// enqueueDelivery hands one in-order payload to deliverLoop without
-// blocking: the readLoop (handleData, handleImplicitOpen, deliverToStream)
-// calls it and must never wait on a stream's consumer. It returns false when
-// it does not hand the payload over: deliverCh is full (deliverCh and recvCh
-// both saturated, a sustained overload), in which case the payload is
-// dropped with the accounting DeliverToRecvChWithSignals' drop path uses
-// (backpressure and dropped stats, stream-window grant, CONGESTION signal) so
-// the sender is throttled and never stalls on lost credit; or the stream has
-// been torn down (deliverDone closed), in which case the payload is dropped
-// without stream-level accounting, since the stream's window ends with the
-// RESET or CLOSE teardown sent or received. The caller grants conn-level
-// credit on false either way, as the conn window outlives the stream.
-// deliverCh is never closed, so the send cannot meet a closed channel;
-// selecting on deliverDone is what keeps a torn-down stream from filling its
-// buffer and then signalling congestion for bytes no one will read.
-func (st *noiseStream) enqueueDelivery(payload []byte) bool {
-	select {
-	case st.deliverCh <- payload:
-		return true
-	case <-st.deliverDone:
-		return false
-	default:
+// receiveCeilings returns the most this stream's queue may hold (metered bytes)
+// and the most the session's queues together may hold (queued cost) before
+// the peer is treated as ignoring credit. The queue's real bound is the sender's
+// credit, and OPEN does not carry the sender's initial credit
+// (StreamConfig.InitialCredit stays local to each side, and handleOpen builds
+// this window from the default), so this side's own window cannot be used as
+// a limit: a sender that opened with more credit than this side's window would be
+// refused for honouring its own. The connection window is the bound both sides
+// share (NewConnWindow(0) on each), and every byte a sender queues here has been
+// charged to it too, so its initial size holds any honest stream, and its capacity
+// holds the session with room for departure skew (ConnWindow.ReceiveCeilings).
+// TODO: when OPEN carries the opener's initial credit, narrow streamLimit to
+// the credit this stream's sender actually holds.
+func (st *noiseStream) receiveCeilings() (streamLimit, sessionLimit int64) {
+	initial, maximum := st.session.connWindow.ReceiveCeilings()
+	streamLimit = st.window.CurrentWindow()
+	if streamLimit < initial {
+		streamLimit = initial
 	}
-	s := st.session
-	s.deliveryStats.recordBackpressure(st.streamID)
-	dropGrantCredit(st.window, payload, st.streamID, s.sendWindowUpdateAgnostic)
-	s.deliveryStats.recordDropped(st.streamID, len(payload))
-	// deliverCh full == sustained overload tier (matches deliver.go drop path).
-	_ = s.SendCongestion(aether.CongestionPayload{Reason: aether.CongestionDownstream, Severity: 80, BackoffMs: 500})
-	return false
+	return streamLimit, maximum
 }
 
 // teardown releases per-stream resources that must not outlive the
@@ -790,33 +773,22 @@ func (st *noiseStream) teardown() {
 	if st.grantDebouncer != nil {
 		st.grantDebouncer.Close()
 	}
-	// End delivery: closing deliverDone makes deliverLoop hand over what
-	// deliverCh still holds and return, and makes enqueueDelivery drop what
-	// the readLoop dispatches from now on. deliverCh is not closed because the
-	// readLoop may be sending into it at this moment (enqueueDelivery). The
-	// nil guard covers a stream built outside createStream, which has no
-	// deliverCh and no deliverLoop.
-	if st.deliverDone != nil {
-		st.deliverOnce.Do(func() { close(st.deliverDone) })
+	// End delivery: what the readLoop dispatches from now on is not queued
+	// (enqueueDelivery returns false); what recvQ holds stays readable. The nil
+	// guard covers a stream built outside createStream.
+	if st.recvQ != nil {
+		st.recvQ.end()
 	}
 }
 
 // closeRecvOnce ends the stream's receive side exactly once: it closes
-// recvDone, on which Receive returns what recvCh still holds and then io.EOF.
+// recvDone, on which Receive returns what recvQ still holds and then io.EOF.
 // Every termination path calls it (handleClose, handleReset, Reset, the
 // stream GC through Reset), from the readLoop and from application
-// goroutines, so recvOnce keeps the close idempotent. recvCh itself is never
-// closed here because deliverLoop may be sending into it on another
-// goroutine; a stream built without recvDone (outside createStream, with no
-// deliverLoop) has its recvCh closed instead, which Receive reads as the same
-// end.
+// goroutines, so recvOnce keeps the close idempotent.
 func (st *noiseStream) closeRecvOnce() {
 	st.recvOnce.Do(func() {
-		if st.recvDone != nil {
-			close(st.recvDone)
-			return
-		}
-		close(st.recvCh)
+		close(st.recvDone)
 	})
 }
 
@@ -841,6 +813,7 @@ func (st *noiseStream) Reset(reason aether.ResetReason) error {
 	// registration behind would hold a slot and be reset again by the sweep.
 	err := st.session.writeFrame(frame)
 	st.teardown()
+	st.recvQ.detach(false)
 	st.session.mu.Lock()
 	if _, ok := st.session.streams[st.streamID]; ok {
 		delete(st.session.streams, st.streamID)
@@ -859,12 +832,24 @@ func (st *noiseStream) Reset(reason aether.ResetReason) error {
 // absent, so after the removal no ACK can take these entries out of the
 // window, and a charge left in the counter would hold that much of the
 // congestion window against every later send on the session (the write
-// loop's CanSend gate and handleACK's OnAckWithPipe read the counter). The
-// nil guard covers a stream built outside createStream, which has no
-// SendWindow. Idempotent: the window is empty after the first call.
+// loop's CanSend gate and handleACK's OnAckWithPipe read the counter).
+//
+// It also gives the connection window every byte this stream still has
+// charged, which is every byte no grant has returned: frames in the scheduler
+// or on the path, frames the peer's receive window or reassembly holds, and
+// messages in its queue. The peer's side cannot return them all, since it does
+// not see what was lost on the path and a stream's end stops its Receive
+// counting, and credit left charged would be stranded for the session's life.
+// A grant already on its way for one of these bytes is the skew
+// ConnWindow.ReceiveCeilings leaves room for; ApplyUpdate caps it at what is
+// outstanding. Nil guards cover a stream built outside createStream. Idempotent:
+// both windows are empty of this stream after the first call.
 func (st *noiseStream) releaseInFlight() {
 	if st.sendWindow != nil {
 		st.sendWindow.ReleaseInFlight()
+	}
+	if st.window != nil && st.session != nil && st.session.connWindow != nil {
+		st.session.connWindow.ReleaseUnsent(st.window.ReleaseAll())
 	}
 }
 

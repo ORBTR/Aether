@@ -31,14 +31,14 @@ type CongestionSignaler func(payload aether.CongestionPayload) error
 // Per-stream-class breakout (Stream0*, Stream1*, StreamOther*) lets the
 // caller attribute drops/backpressure to gossip (stream-0), reliable
 // RPC (stream-1), or dynamic streams without growing the map by streamID.
-// This is the verification surface used to confirm whether a recvCh
+// This is the verification surface used to confirm whether a TCPSession recvCh
 // capacity bump on a specific stream actually moves the needle: a fix
 // for stream-0 should show Stream0Dropped flattening while Stream1Dropped
 // and StreamOtherDropped continue to track their own pressure.
 type DeliveryStats struct {
-	Delivered    atomic.Int64 // frames successfully delivered to recvCh
-	Dropped      atomic.Int64 // frames dropped (recvCh full after backpressure)
-	Backpressure atomic.Int64 // frames that hit the slow path (recvCh was full initially)
+	Delivered    atomic.Int64 // frames queued for the stream's consumer
+	Dropped      atomic.Int64 // frames the session refused: a full recvCh after backpressure on a TCPSession; a credit violation or a full control-frame limit on a NoiseSession
+	Backpressure atomic.Int64 // frames that hit the slow path (a TCPSession's recvCh was full initially)
 	BytesDropped atomic.Int64 // total bytes in dropped frames
 
 	// Per-stream-class counters. Mirror the aggregate fields above so the
@@ -138,7 +138,7 @@ const (
 	// response. A silent drop here desynchronises caller and credit
 	// accounting and produces a 30s deadline-exceeded sample with no
 	// retry. Pay a per-call latency penalty of waiting up to 1s rather
-	// than burning the 30s deadline. On the noise and TCP adapters this
+	// than burning the 30s deadline. On the TCP adapter this
 	// 1s wait is paid on the per-stream deliverLoop goroutine, NOT the
 	// shared readLoop — a slow stream-1 consumer blocks only its own
 	// delivery goroutine while the readLoop keeps draining the inbox
@@ -307,8 +307,13 @@ func releaseCredit(window *flow.StreamWindow, n int64, streamID uint64, sendUpda
 	}
 }
 
-// recvChCapacity returns the receive channel buffer size for a given stream ID.
-// Sized per stream type to reduce maximum payload accumulation:
+// recvChCapacity returns the receive channel buffer size a tcpStream gives a
+// stream ID (recvCh and deliverCh): a byte-stream session charges no credit its
+// sender waits on, so these counts are what bound its queues, and a frame past
+// them meets DeliverToRecvChWithSignals' drop path. noiseStream bounds its
+// queue by the sender's credit in bytes and uses this count only for the control
+// frames no credit is charged for (enqueueControl). Sized per stream type to
+// reduce maximum payload accumulation:
 //   - Gossip (0): 128 slots. A 32-slot channel paired with the 2 ms
 //     maxBackpressure wait fills during one full-snapshot burst on UDP
 //     and the drop path then emits CongestionDownstream (sev=80,
