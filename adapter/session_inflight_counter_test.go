@@ -159,35 +159,43 @@ func TestNoiseSession_InFlightBytesReturnsToZeroAfterManyCompressedFramesAreAcke
 // frames the peer never acks (the client's writes are dropped) stay charged
 // while the stream lives; the counter returns to 0 when the stream leaves
 // s.streams, on each path that removes it: a local Reset, the peer's RESET,
-// and a CLOSE from the peer after the local Close.
+// and both sides' CLOSE. A closed stream with frames unacknowledged does not
+// leave at the peer's CLOSE: its own CLOSE waits for their ACK (finishSend), so
+// it stays to retransmit them, and leaves once the path carries them again.
 func TestNoiseSession_InFlightBytesReturnsToZeroWhenAStreamLeavesWithFramesInFlight(t *testing.T) {
 	cases := []struct {
 		name  string
-		leave func(t *testing.T, cs, ss aether.Stream)
+		leave func(t *testing.T, client *NoiseSession, cs, ss aether.Stream, drop *droppingConn)
 	}{
-		{name: "local reset", leave: func(t *testing.T, cs, ss aether.Stream) {
+		{name: "local reset", leave: func(t *testing.T, client *NoiseSession, cs, ss aether.Stream, drop *droppingConn) {
 			if err := cs.Reset(aether.ResetCancel); err != nil {
 				t.Logf("reset: %v", err)
 			}
 		}},
-		{name: "peer reset", leave: func(t *testing.T, cs, ss aether.Stream) {
+		{name: "peer reset", leave: func(t *testing.T, client *NoiseSession, cs, ss aether.Stream, drop *droppingConn) {
 			if err := ss.Reset(aether.ResetCancel); err != nil {
 				t.Fatalf("peer reset: %v", err)
 			}
 		}},
-		{name: "close from both sides", leave: func(t *testing.T, cs, ss aether.Stream) {
+		{name: "close from both sides", leave: func(t *testing.T, client *NoiseSession, cs, ss aether.Stream, drop *droppingConn) {
 			if err := cs.Close(); err != nil {
 				t.Logf("close: %v", err)
 			}
 			if err := ss.Close(); err != nil {
 				t.Fatalf("peer close: %v", err)
 			}
+			st := asNoiseStream(t, cs)
+			waitFor(t, "the server's CLOSE at the client", func() bool { return st.peerClosed.Load() })
+			if !streamPresent(client, st.streamID) || st.closeDone.Load() {
+				t.Fatalf("the stream left or wrote its CLOSE with %d frames unacknowledged", st.sendWindow.InFlight())
+			}
+			drop.dropping.Store(false)
 		}},
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			client, server, drop := noisePairWithDroppingClient(t)
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 			defer cancel()
 			cs, ss := openAccept(t, ctx, client, server, uint64(110+i))
 			st := asNoiseStream(t, cs)
@@ -215,8 +223,10 @@ func TestNoiseSession_InFlightBytesReturnsToZeroWhenAStreamLeavesWithFramesInFli
 				time.Sleep(time.Millisecond)
 			}
 
-			tc.leave(t, cs, ss)
-			deadline := time.Now().Add(5 * time.Second)
+			tc.leave(t, client, cs, ss, drop)
+			// The retransmit that follows the path's return waits out the
+			// RTO's backoff from the dropped attempts.
+			deadline := time.Now().Add(30 * time.Second)
 			for {
 				client.mu.Lock()
 				_, present := client.streams[st.streamID]
@@ -225,7 +235,7 @@ func TestNoiseSession_InFlightBytesReturnsToZeroWhenAStreamLeavesWithFramesInFli
 					break
 				}
 				if time.Now().After(deadline) {
-					t.Fatalf("the stream is still in s.streams 5 s after %s", tc.name)
+					t.Fatalf("the stream is still in s.streams 30 s after %s", tc.name)
 				}
 				time.Sleep(5 * time.Millisecond)
 			}

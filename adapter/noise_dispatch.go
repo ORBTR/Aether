@@ -434,9 +434,10 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	if !ok {
 		return
 	}
-	// A stream both sides have closed leaves the session on the ACK that
-	// empties its send window (Close's leaveIfSent).
-	defer st.leaveIfSent()
+	// A stream Close has ended writes its CLOSE on the ACK that empties its
+	// send window, and leaves the session then if the peer's CLOSE has come
+	// (finishSend).
+	defer func() { _ = st.finishSend() }()
 
 	// Decode Composite ACK
 	ack := aether.DecodeCompositeACK(frame.Payload)
@@ -632,6 +633,12 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	// CE-bearing ACK); when that drains 0, this ACK's ackedBytes; when
 	// that is 0 too, the wire bytes still in flight on the session. The
 	// peer cannot have CE-marked more bytes than it has received from us.
+	//
+	// When all three read 0, no byte this session sent stands behind the
+	// claim, so it is evidence of nothing: the controller is not told of it
+	// and no abuse is charged. A charge there could fall on an honest peer,
+	// since bytesSentSinceLastCE is drained by the first CE-bearing ACK of any
+	// stream and a second stream's ACK in the same interval finds it at 0.
 	if ack.Flags&aether.CACKHasECN != 0 && ack.CEBytes > 0 {
 		intervalBytes := int64(s.bytesSentSinceLastCE.Swap(0))
 		maxPlausibleCE := intervalBytes
@@ -642,7 +649,9 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 			maxPlausibleCE = s.totalInFlightBytes()
 		}
 		claimed := int64(ack.CEBytes)
-		if claimed > maxPlausibleCE && maxPlausibleCE > 0 {
+		if maxPlausibleCE <= 0 {
+			claimed = 0
+		} else if claimed > maxPlausibleCE {
 			if os.Getenv("AETHER_DEBUG_CE") == "1" {
 				log.Printf("aether: CEBytes claim=%d past its bound (wire bytes: interval=%d acked=%d inflight=%d) — clamping + flagging",
 					claimed, intervalBytes, ackedBytes, s.totalInFlightBytes())
@@ -710,6 +719,19 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	}
 }
 
+// handleFECRepair takes a FEC_REPAIR frame into the session's decoders and
+// delivers nothing they recover. A recovered payload carries no sequence
+// number: the encoders group the payloads of every stream on the session in the
+// order sendSingleFrame hands them over, and a DATA frame carries no group or
+// index, so nothing can place a recovered payload in its stream's receive
+// window. Queued beside that window it would reach the consumer out of order,
+// and again when the frame it stands for arrives or is retransmitted, which the
+// sender does for every frame the window has not acknowledged; the message
+// reaches the consumer once, through its DATA frame. The decoders still take
+// each repair, so their group bounds and eviction count (Metrics' fecEvicted)
+// describe the repair traffic the peer sends.
+// TODO: deliver a recovered payload through its stream's receive window once a
+// repair names the sequence numbers of the frames it covers.
 func (s *NoiseSession) handleFECRepair(frame *aether.Frame) {
 	if len(frame.Payload) < aether.FECHeaderSize {
 		return
@@ -727,9 +749,7 @@ func (s *NoiseSession) handleFECRepair(frame *aether.Frame) {
 	// shard); the other two return a single []byte.
 	if s.rsDecoder != nil {
 		if shards := s.rsDecoder.AddRepair(fecHdr, repairData); shards != nil {
-			for _, shard := range shards {
-				s.deliverToStream(frame.StreamID, shard)
-			}
+			dbgNoise.Printf("stream %d: %d FEC-recovered payloads not delivered: no sequence number", frame.StreamID, len(shards))
 			return
 		}
 	}
@@ -738,7 +758,7 @@ func (s *NoiseSession) handleFECRepair(frame *aether.Frame) {
 		recovered = s.fecDecoder.AddRepair(fecHdr, repairData)
 	}
 	if recovered != nil {
-		s.deliverToStream(frame.StreamID, recovered)
+		dbgNoise.Printf("stream %d: a FEC-recovered payload not delivered: no sequence number", frame.StreamID)
 	}
 }
 
@@ -803,46 +823,36 @@ func (s *NoiseSession) handleClose(frame *aether.Frame) {
 		return
 	}
 	st.state.Transition(aether.EventRecvFIN)
-	if st.state.IsOpen() {
-		return // half-closed; wait for local Close/Reset to tear down
+	if st.peerClosed.Swap(true) {
+		return // a repeated CLOSE ends nothing more
 	}
-	// Fully closed: flush final ACK, drain, and release all session-level
-	// trackers. Without this path the s.streams entry would linger until
-	// handleReset (the only other removal path), leaving the engine +
-	// send window + streamGC map entry pinned for the lifetime of the
-	// session.
+	// The peer's CLOSE ends the stream's receive side, whether or not this side
+	// has closed: the peer wrote it once every DATA frame it sent here was
+	// acknowledged (its finishSend), so the receive window holds the last of
+	// them and no more will come. Flush the final ACK, move what the window
+	// still holds into the queue as the last messages the reader sees, stop
+	// the queue's admission and close recvDone: Receive returns what the queue
+	// holds, then io.EOF. The sender's credit covered these messages, so they
+	// join the queue past its ceilings (pushFinal), and reading them grants
+	// credit back while the stream stays in the session.
 	if st.ackEngine != nil {
 		st.ackEngine.Flush()
 		st.ackEngine.Stop()
 	}
-	remaining := st.recvWindow.DrainMarked()
-	// The messages the receive window still held in order are the last the
-	// reader sees before the end; the sender's credit covered them, so they join
-	// the queue whatever the local Close has already ended.
-	for _, d := range remaining {
+	for _, d := range st.recvWindow.DrainMarked() {
 		payload, whole := st.reassemble(d)
 		if !whole {
 			continue
 		}
 		st.recvQ.pushFinal(payload)
 	}
+	st.recvQ.end()
 	st.closeRecvOnce()
-	st.teardown()
-	// The peer's sender takes its credit back on its own side, so taking these
-	// messages grants nothing; they stay charged to the session's budget until
-	// the reader takes them or sweepEndedQueues finds them abandoned, which is
-	// what keeps a peer that fills streams and closes them inside the ceiling.
-	st.recvQ.peerEnded()
-	s.mu.Lock()
-	delete(s.streams, frame.StreamID)
-	s.mu.Unlock()
-	// The stream is out of s.streams: no later ACK reaches its SendWindow
-	// (handleACK returns on an absent stream), so what it still holds in
-	// flight is given back to the session counter here.
-	st.releaseInFlight()
-	st.releaseReservation()
-	s.releaseStream(frame.StreamID)
-	s.trackEnded(st.recvQ)
+	// The send side stays until this side's CLOSE is written: Send works on a
+	// stream only the peer has closed, and handleACK still finds the stream for
+	// the frames it has in flight. Once both CLOSEs are done the stream leaves
+	// (leaveIfEnded), here or in finishSend.
+	st.leaveIfEnded()
 }
 
 func (s *NoiseSession) handleReset(frame *aether.Frame) {
@@ -861,11 +871,13 @@ func (s *NoiseSession) handleReset(frame *aether.Frame) {
 			st.refusedByPeer.Store(true)
 		}
 		st.state.Transition(aether.EventRecvReset)
+		// The peer's RESET ends the send side too: no CLOSE follows it.
+		st.closeDone.Store(true)
 		st.teardown()
 		st.recvQ.peerEnded()
 		st.closeRecvOnce()
-		// Out of s.streams, as in handleClose: the frames the peer's RESET
-		// leaves unacked go back to the session's in-flight counter.
+		// Out of s.streams, as in noiseStream.leaveSession: the frames the
+		// peer's RESET leaves unacked go back to the session's in-flight counter.
 		st.releaseInFlight()
 		st.releaseReservation()
 		s.releaseStream(frame.StreamID)
@@ -1063,17 +1075,4 @@ func (s *NoiseSession) deliverToControl(payload []byte) {
 	if ok {
 		st.enqueueControl(payload)
 	}
-}
-
-// deliverToStream delivers a payload FEC recovered for a stream's receive queue.
-func (s *NoiseSession) deliverToStream(streamID uint64, payload []byte) {
-	s.mu.Lock()
-	st, ok := s.streams[streamID]
-	s.mu.Unlock()
-	if !ok {
-		return
-	}
-	// Queued without waiting, as handleData. A Reset or stream GC sweep on
-	// another goroutine after the lookup above makes enqueueDelivery return false.
-	st.enqueueDelivery(payload)
 }

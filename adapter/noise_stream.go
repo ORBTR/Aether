@@ -38,8 +38,8 @@ type noiseStream struct {
 	session  *NoiseSession
 	state    *aether.StreamStateMachine
 	// recvQ holds the whole in-order messages between the readLoop
-	// (handleData, handleImplicitOpen, handleFECRepair and deliverToControl,
-	// through enqueueDelivery and enqueueControl) and Receive. recvDone is the
+	// (handleData, handleImplicitOpen and deliverToControl, through
+	// enqueueDelivery and enqueueControl) and Receive. recvDone is the
 	// end Receive selects on, draining what recvQ still holds before it
 	// returns io.EOF; closeRecvOnce closes it exactly once (recvOnce), from the
 	// readLoop (handleClose, handleReset) and from application goroutines
@@ -54,12 +54,19 @@ type noiseStream struct {
 	// out of s.streams.
 	reserved atomic.Int64
 
-	// sendClosing is set by Close once both sides have closed: the stream
-	// leaves s.streams when its send window holds nothing (leaveIfSent, from
-	// Close and from handleACK), because until then handleACK and the
-	// reliability tick, which find the stream through s.streams, are what
-	// acknowledge and retransmit its last frames.
-	sendClosing atomic.Bool
+	// The stream's end has a send half and a receive half. Close sets
+	// closeWanted, and finishSend writes the CLOSE frame once no Send is in
+	// progress (sendsActive) and every DATA frame the stream sent has been
+	// acknowledged. closeDone is set once, by the write of that CLOSE or by a
+	// RESET either side sends; no CLOSE is written after it. handleClose sets
+	// peerClosed when the peer's CLOSE arrives. The stream leaves s.streams
+	// once both are set (leaveIfEnded), because until then handleACK and the
+	// reliability tick, which find the stream through s.streams, acknowledge
+	// and retransmit its frames, and the peer's frames are delivered through it.
+	sendsActive atomic.Int64
+	closeWanted atomic.Bool
+	closeDone   atomic.Bool
+	peerClosed  atomic.Bool
 
 	// refusedByPeer is set by handleReset when the peer's RESET carries
 	// ResetRefused, so Send and Receive return aether.ErrStreamRefused.
@@ -417,7 +424,7 @@ func (st *noiseStream) discardUnpublished() {
 
 // releaseReservation gives the session's ledger back the receive credit
 // createStream reserved for the stream. Every exit that takes the stream out
-// of s.streams calls it (handleClose, handleReset, Reset, leaveSession);
+// of s.streams calls it (handleReset, Reset, leaveSession);
 // the swap makes a second call a no-op.
 func (st *noiseStream) releaseReservation() {
 	if n := st.reserved.Swap(0); n > 0 && st.session != nil && st.session.admitted != nil {
@@ -439,6 +446,15 @@ func (st *noiseStream) Conn() net.Conn {
 }
 
 func (st *noiseStream) Send(ctx context.Context, data []byte) error {
+	// A Send counts itself in sendsActive before it reads the stream's state,
+	// and its exit asks finishSend whether a Close waits on it. Close changes the
+	// state before finishSend reads sendsActive, so a Send that finishSend does
+	// not count finds the state closed and adds no frame behind the CLOSE.
+	st.sendsActive.Add(1)
+	defer func() {
+		st.sendsActive.Add(-1)
+		_ = st.finishSend()
+	}()
 	if !st.state.CanSend() {
 		return st.cannotSend()
 	}
@@ -762,40 +778,87 @@ func (st *noiseStream) recordReceive(n int64) {
 	}
 }
 
-// Close ends the local send side. The receive side stays up while the peer may
-// still send: its CLOSE reaches handleClose, which drains the receive window
-// and ends the stream, and until then what arrives is admitted for Receive and
-// its grants still flow. When the peer's side has already ended there is nothing
-// more to admit, so the receive side ends here (Receive returns what the queue
-// holds, then io.EOF), and the stream leaves the session (leaveIfSent): at once
-// when its send window is empty, else on the ACK that empties it. Leaving gives
-// the connection window back what the stream still has charged
-// (releaseInFlight): the peer, closed on its side already, ends the stream
-// when this CLOSE reaches its handleClose (peerEnded), so no grant of its
-// returns those bytes. The queued messages stay charged to the session's
-// budget until they are read.
+// Close ends the local send side: Send refuses from here on, and the CLOSE
+// frame goes to the peer once every frame already sent has been acknowledged
+// (finishSend), at once when none is outstanding. The receive side is not
+// ended by Close: what the peer sends is admitted for Receive and its grants
+// still flow until the peer's CLOSE reaches handleClose, which ends it
+// (Receive returns what the queue holds, then io.EOF). The stream leaves the
+// session once its CLOSE is written and the peer's has come (leaveIfEnded).
+// It returns the CLOSE write's error when the write happens here, and nil
+// when the write waits on an ACK or a Send in progress.
 func (st *noiseStream) Close() error {
 	st.state.Transition(aether.EventSendFIN)
-	if !st.state.IsOpen() {
-		st.teardown()
-		st.recvQ.peerEnded()
-		st.closeRecvOnce()
-		st.sendClosing.Store(true)
-		st.leaveIfSent()
+	st.closeWanted.Store(true)
+	return st.finishSend()
+}
+
+// finishSend writes the stream's CLOSE once Close has asked for it
+// (closeWanted), no Send is in progress (sendsActive) and the send window holds
+// no frame, then leaves the session if the peer's CLOSE has already come
+// (leaveIfEnded). Close, the exit of every Send and handleACK, after each ACK
+// on the stream, call it, so whichever of them meets the last condition writes
+// the CLOSE, once (closeDone).
+//
+// The CLOSE waits for the ACK of every DATA frame because the peer's
+// handleClose ends the stream's receive side at the CLOSE: it drains the
+// receive window into the queue and stops the queue's admission, so a frame
+// arriving after the CLOSE reaches no reader, and once the peer has also
+// written its own CLOSE the stream leaves its s.streams, where handleData drops
+// a later frame as one for an unknown stream. The scheduler orders a stream's
+// frames at their first write only: a DATA frame lost on the path is written
+// again, by the reliability tick or a NACK in handleACK, after a CLOSE queued
+// behind its first write, and would reach the peer after the end. The peer
+// builds each ACK from its receive window (ACKEngine reads RecvWindow), so a
+// frame acknowledged has been delivered to the queue or is held in that window
+// when the CLOSE arrives.
+// With nothing of the stream's DATA left to overtake, the CLOSE goes through
+// writeFrame beside the write loop. When no ACK ever comes, the stream GC resets
+// the stream, and the RESET takes the place of the CLOSE.
+func (st *noiseStream) finishSend() error {
+	if !st.closeWanted.Load() || st.sendsActive.Load() != 0 {
+		return nil
 	}
-	frame := &aether.Frame{
+	if st.sendWindow != nil && st.sendWindow.InFlight() != 0 {
+		return nil
+	}
+	if !st.closeDone.CompareAndSwap(false, true) {
+		return nil
+	}
+	err := st.session.writeFrame(&aether.Frame{
 		SenderID:   st.session.LocalPeerID(),
 		ReceiverID: st.session.RemotePeerID(),
 		StreamID:   st.streamID,
 		Type:       aether.TypeCLOSE,
+	})
+	st.leaveIfEnded()
+	return err
+}
+
+// leaveIfEnded takes the stream out of the session once both halves of its end
+// are done: this side's CLOSE written (closeDone, from finishSend) and the
+// peer's CLOSE received (peerClosed, from handleClose). finishSend and
+// handleClose both call it, so the second of them does the leaving. From then on
+// a read off the queue credits nothing (peerEnded): the peer leaves its own
+// session once it has written its CLOSE and received this one, and takes back
+// there what its stream still has charged (releaseInFlight), so a grant from
+// here would return those bytes twice. teardown ends the grant debouncer and the
+// queue's admission, and leaveSession gives back what the stream holds on the
+// session. The queued messages stay readable and charged to the session's
+// budget until they are read or the sweep finds them abandoned, which is what
+// keeps a peer that fills streams and closes them inside the session's ceiling.
+func (st *noiseStream) leaveIfEnded() {
+	if !st.closeDone.Load() || !st.peerClosed.Load() {
+		return
 	}
-	return st.session.writeFrame(frame)
+	st.teardown()
+	st.recvQ.peerEnded()
+	st.leaveSession()
 }
 
 // enqueueDelivery hands one in-order message the sender charged credit for to
 // the stream's consumer without blocking: the readLoop (handleData,
-// handleImplicitOpen, handleFECRepair through deliverToStream) calls it and
-// must never wait on a stream's consumer. The message is admitted because its
+// handleImplicitOpen) calls it and must never wait on a stream's consumer. The message is admitted because its
 // sender holds credit for it: the ceilings count messageCredit, the unit Send
 // charges, so a sender honouring credit always fits, however far behind the
 // consumer is, and handleData's ACK ahead of this call never acknowledges a
@@ -867,8 +930,8 @@ func (st *noiseStream) receiveCeilings() (streamLimit, sessionLimit int64) {
 // teardown releases per-stream resources that must not outlive the
 // stream itself: the grant debouncer's timer goroutine and pending flush,
 // and the receive queue's admission (recvQ.end). Idempotent; safe to call
-// from every termination path (Close, Reset, handleClose, handleReset,
-// streamGC sweep).
+// from every termination path (leaveIfEnded, Reset, handleReset, the stream
+// GC sweep through Reset).
 func (st *noiseStream) teardown() {
 	if st.grantDebouncer != nil {
 		st.grantDebouncer.Close()
@@ -894,6 +957,8 @@ func (st *noiseStream) closeRecvOnce() {
 
 func (st *noiseStream) Reset(reason aether.ResetReason) error {
 	st.state.Transition(aether.EventSendReset)
+	// The RESET ends the send side: no CLOSE follows it (finishSend).
+	st.closeDone.Store(true)
 	payload := aether.EncodeReset(reason)
 	frame := &aether.Frame{
 		SenderID:   st.session.LocalPeerID(),
@@ -940,19 +1005,6 @@ func (st *noiseStream) cannotSend() error {
 	return fmt.Errorf("stream %d: cannot send", st.streamID)
 }
 
-// leaveIfSent takes a stream both sides have closed (sendClosing) out of the
-// session once its send window holds nothing. Close calls it, and handleACK
-// after every ACK on the stream, so whichever of them sees the window empty
-// second does the leaving. Until then the stream stays in s.streams, where
-// handleACK and the reliability tick find it to acknowledge and retransmit its
-// last frames; the stream GC resets it if no ACK ever comes.
-func (st *noiseStream) leaveIfSent() {
-	if !st.sendClosing.Load() || (st.sendWindow != nil && st.sendWindow.InFlight() != 0) {
-		return
-	}
-	st.leaveSession()
-}
-
 // leaveSession takes the stream out of s.streams if this stream object is the
 // one there, then gives back what it holds on the session: the connection
 // credit and in-flight bytes (releaseInFlight), its credit reservation, its
@@ -978,8 +1030,8 @@ func (st *noiseStream) leaveSession() {
 
 // releaseInFlight gives the session's in-flight byte counter back every
 // frame this stream's SendWindow still holds. Called once the stream is out
-// of session.streams (Reset and leaveSession here; handleClose and
-// handleReset on the readLoop): handleACK looks the stream up there and returns when it is
+// of session.streams (Reset and leaveSession here; handleReset on the
+// readLoop): handleACK looks the stream up there and returns when it is
 // absent, so after the removal no ACK can take these entries out of the
 // window, and a charge left in the counter would hold that much of the
 // congestion window against every later send on the session (the write
@@ -1002,6 +1054,18 @@ func (st *noiseStream) releaseInFlight() {
 	if st.window != nil && st.session != nil && st.session.connWindow != nil {
 		st.session.connWindow.ReleaseUnsent(st.window.ReleaseAll())
 	}
+}
+
+// autoTune is the session's tuning step for this stream (autoTuneWindows, from
+// reliabilityTick): the window may shrink and grow back, never past the credit
+// createStream reserved for the stream on the session's ledger (reserved). The
+// window is this side's send credit, which only the peer's grants return, and
+// this side's grant accounting and queue ceiling (receiveCeilings), which the
+// reservation covers; growth past the reservation would be credit the peer
+// never granted and the ledger never reserved. A stream that has left the
+// session reads reserved 0 and does not grow.
+func (st *noiseStream) autoTune(rtt time.Duration) aether.AutoTuneResult {
+	return aether.AutoTuneWindowWithin(st.window, rtt, st.reserved.Load())
 }
 
 func (st *noiseStream) SetPriority(weight uint8, dependency uint64) {

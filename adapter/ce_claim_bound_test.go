@@ -94,3 +94,53 @@ func TestNoiseSession_CEClaimIsBoundedInWireBytes(t *testing.T) {
 			got, claim, wire, plain, wire)
 	}
 }
+
+// TestNoiseSession_ACEClaimNoSentByteBacksDrivesNothing: with nothing in flight,
+// the CE interval counter drained and a duplicate ACK that acknowledges
+// nothing, every bound on the peer's CEBytes claim reads 0. handleACK neither
+// tells the controller of the claim nor charges the peer, however large the
+// claim.
+func TestNoiseSession_ACEClaimNoSentByteBacksDrivesNothing(t *testing.T) {
+	key := uint32(0x5eed5eed)
+	client, server := noisePairWithRealms(t, &key, &key)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cs, _ := openAccept(t, ctx, client, server, 109)
+	st := asNoiseStream(t, cs)
+	waitStepAcked(t, st)
+	waitProbeSweepsDone(t, client, server)
+	waitSendWindowEmpty(t, st, "the opening message acknowledged")
+	waitInFlightBytesZero(t, client, "nothing in flight")
+
+	rec := &ceRecorder{Controller: client.congestion()}
+	var ctrl congestion.Controller = rec
+	client.cong.Store(&ctrl)
+	cwnd := rec.CWND()
+	score := client.PeerAbuseScore()
+
+	client.bytesSentSinceLastCE.Store(0)
+	payload := aether.EncodeCompositeACK(&aether.CompositeACK{
+		BaseACK: st.sendWindow.Next() - 1,
+		Flags:   aether.CACKHasECN,
+		CEBytes: 1 << 30,
+	})
+	client.handleACK(&aether.Frame{
+		SenderID:   client.RemotePeerID(),
+		ReceiverID: client.LocalPeerID(),
+		StreamID:   st.streamID,
+		Type:       aether.TypeACK,
+		Flags:      aether.FlagCOMPOSITE_ACK,
+		Length:     uint32(len(payload)),
+		Payload:    payload,
+	})
+
+	if got := rec.calls(); len(got) != 0 {
+		t.Fatalf("OnCE calls %v for a claim no sent byte backs", got)
+	}
+	if got := rec.CWND(); got != cwnd {
+		t.Fatalf("the controller's window moved from %d to %d", cwnd, got)
+	}
+	if got := client.PeerAbuseScore(); got != score {
+		t.Fatalf("the peer's abuse score moved from %v to %v", score, got)
+	}
+}

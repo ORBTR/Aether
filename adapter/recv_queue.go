@@ -150,9 +150,10 @@ func (q *recvQueue) pushUnmetered(payload []byte, limit int) pushResult {
 	return pushQueued
 }
 
-// pushFinal queues what handleClose drains from the receive window after the
-// local side has already closed: the stream's end has run for the local send
-// side, and these are the last messages the reader sees before the end.
+// pushFinal queues what handleClose drains from the receive window at the
+// peer's CLOSE, the last messages the reader sees before the end. It checks
+// neither the end nor the ceilings: the sender's credit covered these messages,
+// and handleClose ends the queue's admission right after.
 func (q *recvQueue) pushFinal(payload []byte) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -226,8 +227,8 @@ func (q *recvQueue) end() {
 // the session budget until they are read or discarded, so a peer that fills
 // streams and then closes or resets them cannot grow memory past the ceiling
 // behind a consumer that is not reading. Its callers are every exit of a stream
-// that has queued what it may still hold (handleClose, handleReset, Close,
-// Reset), and each then hands the queue to trackEnded. A nil queue is a stream
+// that has queued what it may still hold (noiseStream.leaveIfEnded,
+// handleReset, Reset), and each then hands the queue to trackEnded. A nil queue is a stream
 // built outside createStream, which Reset and Close may still reach.
 func (q *recvQueue) peerEnded() {
 	if q == nil {

@@ -11,13 +11,13 @@ import (
 	"github.com/ORBTR/aether"
 )
 
-// TestFECDecoder_RejectsRepairOnlyRecovery is the AE-M-13 regression: a
-// repair-only group (Total==2, so dataCount==1) that has received ZERO real
-// data frames must NOT fabricate a recovered DATA frame out of the repair
-// payload alone. Pre-fix, tryRecover fell through both the `>= dataCount` and
-// the `< dataCount-1` guards and returned the attacker-chosen repair bytes
-// verbatim, which handleFECRepair -> deliverToStream then injected into a
-// stream bypassing the per-stream anti-replay window and reorder buffer.
+// TestFECDecoder_RejectsRepairOnlyRecovery: a repair-only group (Total==2, so
+// dataCount==1) that has received ZERO real data frames must NOT fabricate a
+// recovered DATA frame out of the repair payload alone. Both the `>= dataCount`
+// and the `< dataCount-1` guards in tryRecover pass such a group, so only the
+// zero-data-frame check keeps the attacker-chosen repair bytes from coming back
+// verbatim as a recovered payload, which a caller delivering it would put into
+// a stream past the per-stream anti-replay window and reorder buffer.
 func TestFECDecoder_RejectsRepairOnlyRecovery(t *testing.T) {
 	dec := NewFECDecoder()
 	attacker := []byte{0xDE, 0xAD, 0xBE, 0xEF}
