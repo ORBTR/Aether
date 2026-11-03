@@ -94,7 +94,12 @@ func (s *QUICSession) acceptLoop() {
 			return // connection closed
 		}
 
-		// Read stream header: [StreamID:8][OpenPayload:10]
+		// Read stream header: [StreamID:8][OpenPayload:OpenPayloadSize].
+		// The payload's InitialCredit is not read: QUIC owns the stream's
+		// flow control.
+		// TODO: QUICSession exchanges no wire version preface, so a peer
+		// whose frame grammar lays out OpenPayload differently misreads this
+		// header; it needs the preface TCPSession writes and reads.
 		var hdr [8 + aether.OpenPayloadSize]byte
 		if _, err := io.ReadFull(qs, hdr[:]); err != nil {
 			qs.CancelRead(0)
@@ -162,7 +167,9 @@ func (s *QUICSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (
 		return nil, fmt.Errorf("quic open stream: %w", err)
 	}
 
-	// Write stream header: [StreamID:8][OpenPayload:10]
+	// Write stream header: [StreamID:8][OpenPayload:OpenPayloadSize]. The
+	// payload states InitialCredit zero, no aether stream credit: QUIC owns
+	// the stream's flow control, and acceptLoop does not read the field.
 	var hdr [8 + aether.OpenPayloadSize]byte
 	binary.BigEndian.PutUint64(hdr[0:8], cfg.StreamID)
 	copy(hdr[8:], aether.EncodeOpenPayload(aether.OpenPayload{

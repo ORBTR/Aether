@@ -34,7 +34,7 @@ func fullOnlyVersions(t testing.TB) NegotiatedWireVersions {
 	t.Helper()
 	peer := WireVersions{
 		{Name: WireVersionFragment, Versions: []uint16{WireVersionFragmentCurrent}, Required: true},
-		{Name: WireVersionFrame, Versions: []uint16{wireVersionFrameCurrent}, Required: true},
+		{Name: WireVersionFrame, Versions: []uint16{WireVersionFrameCurrent}, Required: true},
 		{Name: WireVersionReliability, Versions: []uint16{wireVersionReliabilityCurrent}, Required: true},
 	}
 	chosen, err := ChooseWireVersions(AetherWireVersions(), peer)

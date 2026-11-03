@@ -869,6 +869,9 @@ func (s *TCPSession) StreamRefusedCount() uint64 {
 
 func (s *TCPSession) handleOpen(frame *aether.Frame) {
 	dbgTCP.Printf("handleOpen: stream=%d", frame.StreamID)
+	// The payload's InitialCredit is not read: on a byte-stream session the
+	// transport owns flow control, and the window built below makes no send
+	// decision.
 	payload := aether.DecodeOpenPayload(frame.Payload)
 	candidate := &tcpStream{
 		streamID: frame.StreamID,
@@ -1377,6 +1380,10 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 	// Implicit OPEN via SYN flag — saves 50 bytes by combining OPEN with first DATA frame.
 	// The OPEN payload (reliability, priority, dependency) rides as the DATA frame's payload.
 	// The remote's handleImplicitOpen decodes it to configure the stream properly.
+	// Its InitialCredit is zero, the value that states no aether stream credit:
+	// on a byte-stream session the transport owns flow control, the stream's
+	// window makes no send decision (Send ignores TryConsume's result), and neither
+	// handleOpen nor handleImplicitOpen reads the field.
 	openPayload := aether.EncodeOpenPayload(aether.OpenPayload{
 		Reliability: cfg.Reliability,
 		Priority:    cfg.Priority,

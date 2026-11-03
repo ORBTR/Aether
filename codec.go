@@ -43,8 +43,8 @@ func PutPayloadBuf(b []byte) {
 	payloadPool.Put(&b)
 }
 
-// FullFrameDiscriminator is the first byte of every full frame in frame
-// grammar 2, the grammar WireVersionFrame names. The 50-byte header follows it
+// FullFrameDiscriminator is the first byte of every full frame in the frame
+// grammar WireVersionFrame names, at WireVersionFrameCurrent. The 50-byte header follows it
 // unchanged. ReadNextFrame tells a full frame from a short form by this byte
 // alone, so no header field, SenderID[0] included, is ever read as a form.
 const FullFrameDiscriminator byte = 0x01
@@ -563,24 +563,29 @@ func DecodePriority(data []byte) PriorityPayload {
 	}
 }
 
-// EncodeOpenPayload encodes an OPEN frame payload.
+// EncodeOpenPayload encodes an OPEN frame payload:
+// [1 reliability][1 priority][8 dependency, big-endian][4 initial credit, big-endian].
 func EncodeOpenPayload(o OpenPayload) []byte {
 	data := make([]byte, OpenPayloadSize)
 	data[0] = byte(o.Reliability)
 	data[1] = o.Priority
 	binary.BigEndian.PutUint64(data[2:10], o.Dependency)
+	binary.BigEndian.PutUint32(data[10:14], o.InitialCredit)
 	return data
 }
 
-// DecodeOpenPayload decodes an OPEN frame payload.
+// DecodeOpenPayload decodes an OPEN frame payload. Input shorter than
+// OpenPayloadSize decodes to the zero value, whose InitialCredit of zero a
+// NoiseSession refuses.
 func DecodeOpenPayload(data []byte) OpenPayload {
 	if len(data) < OpenPayloadSize {
 		return OpenPayload{}
 	}
 	return OpenPayload{
-		Reliability: Reliability(data[0]),
-		Priority:    data[1],
-		Dependency:  binary.BigEndian.Uint64(data[2:10]),
+		Reliability:   Reliability(data[0]),
+		Priority:      data[1],
+		Dependency:    binary.BigEndian.Uint64(data[2:10]),
+		InitialCredit: binary.BigEndian.Uint32(data[10:14]),
 	}
 }
 

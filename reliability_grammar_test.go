@@ -44,7 +44,7 @@ func TestAetherWireVersionsRegistersReliability(t *testing.T) {
 	// only another version of it.
 	agreeing := WireVersions{
 		wv(WireVersionFragment, true, WireVersionFragmentCurrent),
-		wv(WireVersionFrame, true, wireVersionFrameCurrent),
+		wv(WireVersionFrame, true, WireVersionFrameCurrent),
 		wv(WireVersionFrameShort, false, wireVersionFrameShortCurrent),
 	}
 	for _, peer := range []WireVersions{

@@ -599,14 +599,36 @@ const GoAwayPayloadMinSize = 4 // reason code only
 // OPEN payload
 // ────────────────────────────────────────────────────────────────────────────
 
-// OpenPayloadSize is the wire size of an OPEN frame payload.
-const OpenPayloadSize = 10
+// OpenPayloadSize is the wire size of an OPEN frame payload in frame grammar
+// WireVersionFrameCurrent. Validate refuses an uncompressed OPEN frame shorter
+// than this (minPayloadSizes) before either session's handleOpen runs.
+const OpenPayloadSize = 14
 
-// OpenPayload is the decoded payload of an OPEN frame.
+// MaxOpenCredit is the largest initial credit an OPEN payload can state: the
+// field is four bytes. adapter.NoiseSession's OpenStream refuses a stream
+// whose initial credit is above it with ErrStreamCreditRefused, before the
+// stream exists.
+const MaxOpenCredit int64 = 1<<32 - 1
+
+// OpenPayload is the decoded payload of an OPEN frame. The TCP-family
+// session also writes it as the payload of its SYN DATA frame, and the QUIC
+// stream adapter writes it in each QUIC stream's header.
+//
+// InitialCredit is the credit, in the bytes adapter.NoiseSession's Send
+// charges, the opener reserved for this stream: what it lets the peer queue on
+// the stream before its consumer reads, and what the peer's own window for
+// the stream starts at. The accepting NoiseSession builds the stream's window
+// and its credit reservation from it, and refuses with RESET(ResetRefused),
+// keeping no state, an OPEN whose credit is below flow.MinGuaranteedWindow or
+// above its own stream ceiling. Zero has one meaning: the opener runs no
+// aether stream credit, which the TCP-family session and the QUIC stream
+// adapter state because their transport owns flow control; they do not read
+// the field, and a NoiseSession refuses an OPEN stating zero.
 type OpenPayload struct {
-	Reliability Reliability // 1 byte: delivery guarantee
-	Priority    uint8       // 1 byte: initial weight (1-255)
-	Dependency  uint64      // 8 bytes: parent stream ID
+	Reliability   Reliability // 1 byte: delivery guarantee
+	Priority      uint8       // 1 byte: initial weight (1-255)
+	Dependency    uint64      // 8 bytes: parent stream ID
+	InitialCredit uint32      // 4 bytes: the opener's initial stream credit
 }
 
 // ────────────────────────────────────────────────────────────────────────────
