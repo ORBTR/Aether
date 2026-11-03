@@ -485,9 +485,10 @@ type NoiseSession struct {
 	// the per-peer ceiling (peerCreditCeiling) across every session to the same
 	// peer. createStream reserves a stream's credit here before publishing it;
 	// a stream's departure from s.streams releases it; CloseWithError closes
-	// the ledger, returning the rest to the peer's. peerShared says the parent is the remote node ID's entry in
-	// sessionPeerLedgers, which CloseWithError leaves; false for a session
-	// whose parent is its own (newNoiseSession).
+	// the ledger, returning the rest to the peer's. peerShared says the
+	// parent is the remote node ID's entry in sessionPeerLedgers, which
+	// CloseWithError leaves; false for a session whose parent is its own
+	// (newNoiseSession).
 	admitted   *creditLedger
 	peerShared bool
 

@@ -866,11 +866,11 @@ func (st *noiseStream) leaveIfEnded() {
 
 // enqueueDelivery hands one in-order message the sender charged credit for to
 // the stream's consumer without blocking: the readLoop (handleData,
-// handleImplicitOpen) calls it and must never wait on a stream's consumer. The message is admitted because its
-// sender holds credit for it: the ceilings count messageCredit, the unit Send
-// charges, so a sender honouring credit always fits, however far behind the
-// consumer is, and handleData's ACK ahead of this call never acknowledges a
-// message this drops. It returns false in two cases, and neither owes the
+// handleImplicitOpen) calls it and must never wait on a stream's consumer.
+// The message is admitted because its sender holds credit for it: the
+// ceilings count messageCredit, the unit Send charges, so a sender honouring
+// credit always fits, however far behind the consumer is, and handleData's
+// ACK ahead of this call never acknowledges a message this drops. It returns false in two cases, and neither owes the
 // sender a grant, since its connection credit returns from its own side when
 // it learns the stream ended (releaseInFlight): the stream has ended here; or
 // the sender is past every ceiling credit allows (receiveCeilings), which only
@@ -933,7 +933,8 @@ func (st *noiseStream) receiveCeilings() (streamLimit, sessionLimit int64) {
 // stream itself: the grant debouncer's timer goroutine and pending flush,
 // and the receive queue's admission (recvQ.end). Idempotent; safe to call
 // from every termination path (leaveIfEnded, Reset, handleReset, the stream
-// GC sweep through Reset).
+// GC sweep through Reset) and from discardUnpublished, for a stream
+// createStream built and never put in s.streams.
 func (st *noiseStream) teardown() {
 	if st.grantDebouncer != nil {
 		st.grantDebouncer.Close()

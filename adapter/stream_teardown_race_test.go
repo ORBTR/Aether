@@ -106,12 +106,12 @@ func resetUnderBurst(t *testing.T, client, server aether.Session, streamID uint6
 		}
 	}()
 
-	// Wait until several payloads sit in recvCh unread while the burst still
-	// arrives, then reset.
+	// Wait until several payloads sit in the stream's receive queue unread
+	// while the burst still arrives, then reset.
 	deadline := time.Now().Add(5 * time.Second)
 	for unreadMessages(t, ss) < teardownRaceUnreadBeforeReset {
 		if time.Now().After(deadline) {
-			t.Fatalf("premise wrong: %d payloads sat unread in recvCh after 5 s, want at least %d",
+			t.Fatalf("premise wrong: %d payloads sat unread in the receive queue after 5 s, want at least %d",
 				unreadMessages(t, ss), teardownRaceUnreadBeforeReset)
 		}
 		time.Sleep(200 * time.Microsecond)

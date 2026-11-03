@@ -445,13 +445,12 @@ func TestStreamWindow_FailedSendCreditLeak(t *testing.T) {
 	}
 }
 
-// TestStreamWindow_FailedSendWithoutFix_Demonstrates_The_Leak shows what
-// ReleaseUnsent prevents: after thirteen 76 KiB Consumes that nothing releases
-// or grants back, a 1 MiB window holds less than one payload (36 KiB), so the
-// next Consume of that size waits ConsumeTimeout for a grant that will never
-// come and fails with ErrCreditExhausted. It exercises the window alone and
-// calls no Send.
-func TestStreamWindow_FailedSendWithoutFix_Demonstrates_The_Leak(t *testing.T) {
+// TestStreamWindow_UnreleasedConsumesDrainTheWindow shows what ReleaseUnsent
+// prevents: after thirteen 76 KiB Consumes that nothing releases or grants
+// back, a 1 MiB window holds less than one payload (36 KiB), so a further
+// Consume of that size can only wait ConsumeTimeout for a grant and fail with
+// ErrCreditExhausted. It exercises the window alone and calls no Send.
+func TestStreamWindow_UnreleasedConsumesDrainTheWindow(t *testing.T) {
 	const (
 		initialCredit = 1 * 1024 * 1024
 		payload       = 76 * 1024

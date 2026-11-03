@@ -99,11 +99,10 @@ type TCPSession struct {
 
 	// Per-session delivery counters, session-aggregate across streams, the
 	// same type NoiseSession.deliveryStats is. enqueueDelivery counts each
-	// message it queues as delivered, a message that finds the queue already
-	// holding unread messages as backpressure, and the message that finds it
-	// full as dropped with its bytes (the one the stream's overrun reset
-	// refuses). Surfaced through DeliveryStats() for the consumer that sums a
-	// session's stats.
+	// message it queues as delivered, and overrun counts the message that
+	// finds the queue full, the one the stream's reset refuses, both as
+	// backpressure and as dropped with its bytes. Surfaced through
+	// DeliveryStats() for the consumer that sums a session's stats.
 	deliveryStats DeliveryStats
 
 	// wireOffer is the wire version offer this session's preface sends:
@@ -1092,16 +1091,19 @@ func (s *TCPSession) handleCongestion(frame *aether.Frame) {
 		p.Severity, p.Reason, p.BackoffMs)
 }
 
-// SendCongestion emits a CONGESTION frame to the peer. Used when this
-// side detects local pressure (memory high, recvCh backlog, etc.) and
-// wants the remote to back off before packets pile up.
+// SendCongestion emits a CONGESTION frame to the peer. No code in this
+// repository calls it: the TCP receive path answers a full delivery queue
+// by ending the stream (enqueueDelivery, overrun) and signals no backoff,
+// since a byte-stream transport carries its own flow control. It stays
+// exported for a caller outside this repository that holds the session.
 func (s *TCPSession) SendCongestion(p aether.CongestionPayload) error {
 	return s.writeFrame(aether.BuildCongestionFrame(s.LocalPeerID(), s.RemotePeerID(), p))
 }
 
-// Throttle exposes the session's congestion-throttle state. Callers
-// (e.g. gossip scheduler) can consult RateFactor/ShouldStall before
-// dispatching large sends.
+// Throttle exposes the session's congestion-throttle state. No send path in
+// this repository reads it; a sender outside this repository can consult
+// RateFactor/ShouldStall before dispatching large sends, and a session
+// monitor outside it counts TotalHits.
 func (s *TCPSession) Throttle() *aether.CongestionThrottle {
 	return &s.throttle
 }

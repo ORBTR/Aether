@@ -228,8 +228,9 @@ func (q *recvQueue) end() {
 // streams and then closes or resets them cannot grow memory past the ceiling
 // behind a consumer that is not reading. Its callers are every exit of a stream
 // that has queued what it may still hold (noiseStream.leaveIfEnded,
-// handleReset, Reset), and each then hands the queue to trackEnded. A nil queue is a stream
-// built outside createStream, which Reset and Close may still reach.
+// handleReset, Reset), and each then hands the queue to trackEnded. A nil
+// queue is a stream built outside createStream, which Reset and Close may
+// still reach.
 func (q *recvQueue) peerEnded() {
 	if q == nil {
 		return

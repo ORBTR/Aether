@@ -12,9 +12,9 @@
 // decryptAndDeliver adds the decrypted DATA packet's payload length, the
 // frame bytes the sender wrote, to the conn's counter through
 // `noiseConn.RecordCEBytes(n)`; the aether adapter drains it (DrainCEBytes)
-// into the next outbound CompositeACK via the CACKHasECN flag + CEBytes field. The remote sender's adapter calls
-// `congestion.Controller.OnCE(bytes)`, which CUBIC/BBR use to react one
-// RTT before queue overflow.
+// into the next outbound CompositeACK via the CACKHasECN flag + CEBytes
+// field. The remote sender's adapter calls `congestion.Controller.OnCE(bytes)`,
+// which CUBIC/BBR use to react one RTT before queue overflow.
 //
 // Socket layer (this file and the build-tag siblings): on the receive
 // path the kernel must deliver the IP TOS byte alongside each datagram.
