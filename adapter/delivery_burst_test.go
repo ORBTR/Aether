@@ -313,7 +313,9 @@ func TestNoiseStream_APeerIgnoringCreditIsResetAndGrowsNoMemory(t *testing.T) {
 // with messages unread and frames in flight gives its bytes back, by the local
 // Reset, by a RESET from the peer, and by the peer's side reading nothing. Churn
 // that stranded them would end in "insufficient connection credit" for the
-// session's other streams.
+// session's other streams. The server's consumer reads none of its streams'
+// messages: they stay charged to its budget until the sweep finds the queues
+// abandoned, which returns all of it.
 func TestNoiseStream_DepartingStreamsReturnEveryConnectionByte(t *testing.T) {
 	client, server := noisePairWithRealms(t, nil, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -353,7 +355,21 @@ func TestNoiseStream_DepartingStreamsReturnEveryConnectionByte(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	waitFor(t, "the server's queues out of the budget", func() bool { return server.recvQueued.Load() == 0 })
+	waitFor(t, "every server stream out of the session", func() bool {
+		for i := uint64(0); i < 12; i++ {
+			if streamPresent(server, 200+i) {
+				return false
+			}
+		}
+		return true
+	})
+	if server.recvQueued.Load() == 0 {
+		t.Fatalf("premise: the server's unread messages hold nothing of its budget")
+	}
+	server.sweepEndedQueues(time.Now().Add(aether.DefaultStreamIdleTimeout + time.Second))
+	if got := server.recvQueued.Load(); got != 0 {
+		t.Errorf("after the sweep of abandoned queues the server's budget reads %d, want 0", got)
+	}
 }
 
 // TestNoiseStream_LocalCloseKeepsReceiving: Close ends the send side only; what

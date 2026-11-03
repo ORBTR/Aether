@@ -832,10 +832,12 @@ func (s *NoiseSession) reliabilityTick() {
 			// Flow-control auto-tune. Rate-limited to every 10s (the 10ms
 			// tick is far too chatty for window adjustments). Disabled via
 			// AETHER_AUTOTUNE=off. Feeds session RTT into each stream's
-			// window then applies a bounded grow/shrink.
+			// window then applies a bounded grow/shrink. The same cadence
+			// sweeps the queues of departed streams (sweepEndedQueues).
 			if now := time.Now(); now.Sub(s.lastAutoTune) >= 10*time.Second {
 				s.lastAutoTune = now
 				s.autoTuneWindows()
+				s.sweepEndedQueues(now)
 			}
 
 			// Periodic WINDOW_UPDATE re-emission — breaks the UDP-loss

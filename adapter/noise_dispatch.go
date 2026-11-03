@@ -434,6 +434,9 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	if !ok {
 		return
 	}
+	// A stream both sides have closed leaves the session on the ACK that
+	// empties its send window (Close's leaveIfSent).
+	defer st.leaveIfSent()
 
 	// Decode Composite ACK
 	ack := aether.DecodeCompositeACK(frame.Payload)
@@ -741,14 +744,14 @@ func (s *NoiseSession) handleFECRepair(frame *aether.Frame) {
 
 func (s *NoiseSession) handleOpen(frame *aether.Frame) {
 	payload := aether.DecodeOpenPayload(frame.Payload)
-	st := s.createStream(frame.StreamID, aether.StreamConfig{
+	st, _ := s.createStream(frame.StreamID, aether.StreamConfig{
 		StreamID:    frame.StreamID,
 		Reliability: payload.Reliability,
 		Priority:    payload.Priority,
 		Dependency:  payload.Dependency,
 	}, true /* enforceRemoteCap */)
 	if st == nil {
-		return // refused by cap; RESET already sent
+		return // refused by the cap or the credit reservation; RESET already sent
 	}
 	st.state.Transition(aether.EventRecvOpen)
 
@@ -759,7 +762,7 @@ func (s *NoiseSession) handleOpen(frame *aether.Frame) {
 }
 
 func (s *NoiseSession) handleImplicitOpen(frame *aether.Frame) {
-	st := s.createStream(frame.StreamID, aether.DefaultStreamConfig(frame.StreamID), true /* enforceRemoteCap */)
+	st, _ := s.createStream(frame.StreamID, aether.DefaultStreamConfig(frame.StreamID), true /* enforceRemoteCap */)
 	if st == nil {
 		return
 	}
@@ -825,7 +828,11 @@ func (s *NoiseSession) handleClose(frame *aether.Frame) {
 	}
 	st.closeRecvOnce()
 	st.teardown()
-	st.recvQ.detach(false)
+	// The peer's sender takes its credit back on its own side, so taking these
+	// messages grants nothing; they stay charged to the session's budget until
+	// the reader takes them or sweepEndedQueues finds them abandoned, which is
+	// what keeps a peer that fills streams and closes them inside the ceiling.
+	st.recvQ.peerEnded()
 	s.mu.Lock()
 	delete(s.streams, frame.StreamID)
 	s.mu.Unlock()
@@ -833,7 +840,9 @@ func (s *NoiseSession) handleClose(frame *aether.Frame) {
 	// (handleACK returns on an absent stream), so what it still holds in
 	// flight is given back to the session counter here.
 	st.releaseInFlight()
+	st.releaseReservation()
 	s.releaseStream(frame.StreamID)
+	s.trackEnded(st.recvQ)
 }
 
 func (s *NoiseSession) handleReset(frame *aether.Frame) {
@@ -846,6 +855,11 @@ func (s *NoiseSession) handleReset(frame *aether.Frame) {
 	}
 	s.mu.Unlock()
 	if ok {
+		// A refusal (createStream's cap or credit reservation on the peer) is
+		// recorded first, so Send and Receive name it once the stream ends.
+		if aether.DecodeReset(frame.Payload) == aether.ResetRefused {
+			st.refusedByPeer.Store(true)
+		}
 		st.state.Transition(aether.EventRecvReset)
 		st.teardown()
 		st.recvQ.peerEnded()
@@ -853,7 +867,9 @@ func (s *NoiseSession) handleReset(frame *aether.Frame) {
 		// Out of s.streams, as in handleClose: the frames the peer's RESET
 		// leaves unacked go back to the session's in-flight counter.
 		st.releaseInFlight()
+		st.releaseReservation()
 		s.releaseStream(frame.StreamID)
+		s.trackEnded(st.recvQ)
 	}
 }
 

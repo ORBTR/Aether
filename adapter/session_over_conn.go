@@ -88,10 +88,13 @@ func AcceptSessionOverConn(ctx context.Context, cfg noise.AcceptConnConfig, conn
 // BaseConnection implements net.Conn with decrypting Read / encrypting
 // Write, so feeding it into NewNoiseSession gives a session that
 // operates on plaintext Aether frames — exactly the contract
-// NewNoiseSession expects.
+// NewNoiseSession expects. The remote node ID here is the one the peer wrote
+// into its own handshake payload, which the over-conn handshake reports
+// unchecked (noise's buildAetherConnectionOverConn), so the session gets a
+// per-peer credit ledger of its own rather than the one that ID would share.
 func wrapPostHandshakeAsSession(aetherConn aether.Connection, localNodeID aether.NodeID, opts aether.SessionOptions) *NoiseSession {
 	postHandshakeConn := aetherConn.NetConn()
-	return NewNoiseSession(postHandshakeConn, localNodeID, aetherConn.RemoteNodeID(), opts)
+	return newNoiseSession(postHandshakeConn, localNodeID, aetherConn.RemoteNodeID(), opts, false)
 }
 
 // DialSessionOverBrowserWS wraps an already-open browser WebSocket
