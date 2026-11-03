@@ -255,10 +255,11 @@ func (d *FECDecoder) tryRecover(groupID uint32, g *fecGroup) []byte {
 	// frames — e.g. a Total==2 repair where dataCount==1, so `0 < dataCount-1`
 	// is `0 < 0` = false and the `>= dataCount` check above is also false —
 	// would otherwise fall through and return the repair payload verbatim as a
-	// fabricated DATA frame. Delivered via handleFECRepair -> deliverToStream,
-	// those bytes bypass the per-stream anti-replay window and reorder buffer,
-	// letting an authenticated peer inject or replay arbitrary SeqNo-less bytes
-	// into any stream. Require at least one real data frame before recovering.
+	// fabricated DATA frame. A caller that delivered it as a stream's message
+	// would pass those bytes around the per-stream anti-replay window and
+	// reorder buffer, letting an authenticated peer inject or replay arbitrary
+	// SeqNo-less bytes into any stream. Require at least one real data frame
+	// before recovering.
 	if len(g.received) == 0 {
 		return nil
 	}

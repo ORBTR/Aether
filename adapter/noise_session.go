@@ -879,8 +879,8 @@ func (s *NoiseSession) releaseStream(streamID uint64) {
 }
 
 // trackEnded puts the queue of a stream leaving s.streams on endedQueues when
-// it still holds messages. Its callers are the stream's exits (handleClose,
-// handleReset, Reset, noiseStream.leaveSession): from then on the stream GC
+// it still holds messages. Its callers are the stream's exits (handleReset,
+// Reset, noiseStream.leaveSession): from then on the stream GC
 // does not see the stream, and the queue's cost stays in recvQueued until
 // the consumer takes its messages or sweepEndedQueues discards them.
 func (s *NoiseSession) trackEnded(q *recvQueue) {
@@ -1656,7 +1656,8 @@ func (s *NoiseSession) refreshWindowGrants() {
 }
 
 // autoTuneWindows feeds per-stream RTT into each stream's flow window and
-// applies a bounded grow/shrink based on SuggestedWindow. Called from
+// applies a bounded grow/shrink based on SuggestedWindow, growth stopping at
+// the stream's admitted credit (noiseStream.autoTune). Called from
 // reliabilityTick at 10s cadence. Disabled when AETHER_AUTOTUNE=off.
 // Uses per-stream reliability-engine SRTT (more accurate than session RTT
 // for Noise); falls back to healthMon RTT if the stream has no samples yet.
@@ -1680,7 +1681,7 @@ func (s *NoiseSession) autoTuneWindows() {
 		if rtt <= 0 {
 			rtt = sessionAvgRTT
 		}
-		res := aether.AutoTuneWindow(st.window, rtt)
+		res := st.autoTune(rtt)
 		switch res.Action {
 		case "grow":
 			if res.Applied > 0 {

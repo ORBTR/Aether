@@ -37,14 +37,27 @@ type AutoTuneResult struct {
 // emit a per-stream log line. ResetPeak() is invoked regardless so the
 // next pass starts from a fresh peak measurement.
 //
-// Both adapters' autoTuneWindows call this for every stream; they differ
-// only in where the RTT comes from and how they log, and those concerns
-// stay in the adapter (the per-stream snapshot under s.mu happens there).
-// AutoTuneWindow is the pure inner step.
+// It is AutoTuneWindowWithin with flow.MaxGrowableWindow as the ceiling, which
+// GrowWindow never passes anyway. The TCP adapter's autoTuneWindows calls it.
 //
 // Returns the zero AutoTuneResult{Action:"noop"} when rtt <= 0 or when
 // suggested == current — i.e. no work needed.
 func AutoTuneWindow(w *flow.StreamWindow, rtt time.Duration) AutoTuneResult {
+	return AutoTuneWindowWithin(w, rtt, flow.MaxGrowableWindow)
+}
+
+// AutoTuneWindowWithin is the tuning step with growth stopped at ceiling: a
+// grow step takes the window to ceiling at most, and a window at or above
+// ceiling does not grow; shrinking is unchanged. The step is pure: the adapter
+// supplies the RTT and the ceiling, and logs the result.
+//
+// The Noise adapter passes the credit its session reserved for the stream at
+// admission (noiseStream.autoTune). That one window is both the sender's credit,
+// which Send consumes, and the receiver's grant accounting and per-stream queue
+// ceiling (noiseStream.receiveCeilings), so growing it past the reservation
+// would let one side take or admit credit the other side never granted and the
+// session's ledger never reserved.
+func AutoTuneWindowWithin(w *flow.StreamWindow, rtt time.Duration, ceiling int64) AutoTuneResult {
 	if w == nil || rtt <= 0 {
 		return AutoTuneResult{Action: "noop"}
 	}
@@ -63,7 +76,13 @@ func AutoTuneWindow(w *flow.StreamWindow, rtt time.Duration) AutoTuneResult {
 	} else if delta < -maxStep {
 		delta = -maxStep
 	}
-	res := AutoTuneResult{Delta: delta, Current: current}
+	if room := ceiling - current; delta > 0 && delta > room {
+		delta = room
+		if delta < 0 {
+			delta = 0
+		}
+	}
+	res := AutoTuneResult{Action: "noop", Delta: delta, Current: current}
 	if delta > 0 {
 		res.Applied = w.GrowWindow(delta)
 		res.Action = "grow"

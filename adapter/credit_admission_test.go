@@ -220,28 +220,34 @@ func TestNoiseStream_GracefulCloseReturnsConnectionCredit(t *testing.T) {
 	}
 }
 
-// TestNoiseStream_ASendClosingStreamLeavesOnTheACKThatEmptiesItsWindow: a stream
-// both sides have closed with a frame still unacknowledged stays in the session,
-// where handleACK and the reliability tick reach it, and leaves on the ACK that
-// empties its send window, giving its connection credit back.
-func TestNoiseStream_ASendClosingStreamLeavesOnTheACKThatEmptiesItsWindow(t *testing.T) {
+// TestNoiseStream_AClosedStreamWritesItsCloseAndLeavesOnTheACKThatEmptiesItsWindow:
+// the client has closed; the server sends a frame and closes at once. While the
+// frame is unacknowledged the server's CLOSE is not written and the stream stays
+// in the session, where handleACK and the reliability tick reach it; the ACK
+// that empties its send window writes the CLOSE (finishSend), the stream leaves,
+// and its connection credit comes back.
+func TestNoiseStream_AClosedStreamWritesItsCloseAndLeavesOnTheACKThatEmptiesItsWindow(t *testing.T) {
 	key := uint32(0x5eed5eed)
 	client, server := noisePairWithRealms(t, &key, &key)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	initial, _ := server.connWindow.ReceiveCeilings()
-	_, ss := openWithCredit(t, ctx, client, server, 450, 0)
+	cs, ss := openWithCredit(t, ctx, client, server, 450, 0)
+	if err := cs.Close(); err != nil {
+		t.Fatalf("client close: %v", err)
+	}
+	waitFor(t, "the client's CLOSE at the server", func() bool { return ss.peerClosed.Load() })
 	if err := ss.Send(ctx, make([]byte, 8*1024)); err != nil {
 		t.Fatalf("send: %v", err)
 	}
-	ss.sendClosing.Store(true)
-	if ss.sendWindow.InFlight() == 0 {
-		t.Skip("the frame was acknowledged before the close was marked; nothing left to wait on")
+	_ = ss.Close()
+	if ss.closeDone.Load() {
+		t.Skip("the frame was acknowledged before Close; nothing left to wait on")
 	}
-	ss.leaveIfSent()
 	if !streamPresent(server, 450) {
 		t.Fatalf("the stream left the session with %d frames unacknowledged", ss.sendWindow.InFlight())
 	}
+	waitFor(t, "the CLOSE written after the last ACK", func() bool { return ss.closeDone.Load() })
 	waitFor(t, "the stream out of the session after its last ACK", func() bool { return !streamPresent(server, 450) })
 	waitFor(t, "the connection credit back", func() bool { return server.connWindow.Available() == initial })
 }

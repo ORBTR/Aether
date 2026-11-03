@@ -128,13 +128,13 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 // reads, every message is there in order and credit is back. A session with a
 // realm, since the path's MSS may send the larger size as fragments.
 //
-// The credit is the window as it stands: reliabilityTick runs autoTuneWindows on
-// the session's first tick and every 10 s after, and for a stream with an RTT
-// its aether.AutoTuneWindow step grows the sender's window by up to a quarter
-// when the peak outstanding is above two thirds of it. The test runs that step
-// itself, with an RTT given, once three quarters of the initial credit is
-// outstanding, so the window grows mid-burst on every run, and each bound is
-// read from cs.window when it is asserted.
+// reliabilityTick runs autoTuneWindows on the session's first tick and every
+// 10 s after. The test runs the same per-stream step (noiseStream.autoTune),
+// with an RTT given, once three quarters of the initial credit is outstanding,
+// where the window's suggestion is to grow, and the window stays at the credit
+// the stream was admitted with: the sender's credit is what the peer granted,
+// and tuning does not add to it. Each bound is read from cs.window when it is
+// asserted.
 func TestNoiseStream_SenderPastItsCreditMeetsTypedBackpressure(t *testing.T) {
 	for _, size := range []int{512, 2048} {
 		key := uint32(0x5eed5eed)
@@ -149,7 +149,11 @@ func TestNoiseStream_SenderPastItsCreditMeetsTypedBackpressure(t *testing.T) {
 		var sendErr error
 		for int64(sent*size) <= cs.window.CurrentWindow() {
 			if sent*size == credit*3/4 {
-				aether.AutoTuneWindow(cs.window, 50*time.Millisecond)
+				cs.window.SetRTT(50 * time.Millisecond)
+				if suggested := cs.window.SuggestedWindow(); suggested <= credit {
+					t.Fatalf("premise wrong: with %d bytes outstanding the window suggests %d, no growth past %d", sent*size, suggested, credit)
+				}
+				cs.autoTune(50 * time.Millisecond)
 			}
 			sendCtx, sendCancel := context.WithTimeout(ctx, 300*time.Millisecond)
 			sendErr = cs.Send(sendCtx, burstMessage(sent, size))
@@ -166,8 +170,8 @@ func TestNoiseStream_SenderPastItsCreditMeetsTypedBackpressure(t *testing.T) {
 		if int64(sent*size) > window {
 			t.Fatalf("size %d: %d messages of %d bytes admitted past a %d-byte window", size, sent, size, window)
 		}
-		if window <= credit {
-			t.Fatalf("premise wrong: the window stayed at %d after the auto-tune step with %d bytes outstanding", window, credit*3/4)
+		if window != credit {
+			t.Fatalf("size %d: the tuning step moved the window to %d from its admitted %d with %d bytes outstanding", size, window, credit, credit*3/4)
 		}
 		waitSendWindowEmpty(t, cs, "acks of everything admitted")
 		got := cs.window.Available()
