@@ -238,11 +238,12 @@ func (l *noiseListener) run(ctx context.Context) {
 //
 // ECN integration: the read path uses ecnReader which enables
 // IP_RECVTOS / IPV6_RECVTCLASS at socket open and extracts the IP TOS
-// byte on every datagram. A CE-marked packet (TOS bits 0-1 == 0b11) that
-// dispatchToSession claims feeds its noiseConn's RecordCEBytes; the aether
-// adapter drains that counter (DrainCEBytes) into the next outbound
-// CompositeACK's CEBytes extension and the remote sender reacts via
-// cong.OnCE.
+// byte on every datagram. dispatchToSession passes whether the datagram is
+// CE-marked (TOS bits 0-1 == 0b11) to decryptAndDeliver, which records an
+// authenticated DATA packet's payload bytes through its noiseConn's
+// RecordCEBytes; the aether adapter drains that counter (DrainCEBytes) into
+// the next outbound CompositeACK's CEBytes extension and the remote sender
+// reacts via cong.OnCE.
 func (l *noiseListener) runReader(ctx context.Context, conn *net.UDPConn) {
 	buf := make([]byte, l.transport.maxPacket)
 	reader := newECNReader(conn)
@@ -404,12 +405,7 @@ func (l *noiseListener) runReader(ctx context.Context, conn *net.UDPConn) {
 			continue
 		}
 
-		if l.dispatchToSession(key, msg) {
-			if isCEMarked(tos) {
-				if nc := connFromSession(l.sessions.GetByAddr(key)); nc != nil {
-					nc.RecordCEBytes(n)
-				}
-			}
+		if l.dispatchToSession(key, msg, isCEMarked(tos)) {
 			continue
 		}
 
@@ -455,7 +451,11 @@ func (l *noiseListener) runReader(ctx context.Context, conn *net.UDPConn) {
 	}
 }
 
-func (l *noiseListener) dispatchToSession(key string, msg []byte) bool {
+// dispatchToSession hands msg to the session mapped at key, if any, and
+// reports whether it claimed the packet. ceMarked is whether the datagram's
+// TOS byte carried the CE codepoint, which decryptAndDeliver records only for
+// a DATA packet that authenticates.
+func (l *noiseListener) dispatchToSession(key string, msg []byte, ceMarked bool) bool {
 	nc := connFromSession(l.sessions.GetByAddr(key))
 	if nc == nil {
 		return false
@@ -464,7 +464,7 @@ func (l *noiseListener) dispatchToSession(key string, msg []byte) bool {
 	defer func() {
 		_ = recover()
 	}()
-	err := nc.decryptAndDeliver(msg)
+	err := nc.decryptAndDeliver(msg, ceMarked)
 	if err != nil && len(msg) > 0 && msg[0] == dialNoncePrefix {
 		// AEAD failed AND this is a nonce-tagged handshake packet (0xFD):
 		// almost certainly a fresh msg1 from a peer that restarted on the

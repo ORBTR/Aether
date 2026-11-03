@@ -144,7 +144,10 @@ type NoiseSession struct {
 	// peer's CEBytes claim. Each outbound wire byte (emitFrameLocked)
 	// adds to this counter; each inbound CompositeACK carrying an
 	// ECN-piggyback drains it via atomic.Swap and uses the drained
-	// value as the maximum-plausible CE claim for that interval.
+	// value as the maximum-plausible CE claim for that interval. The
+	// claim is in the same bytes: the peer's noiseConn counts a CE-marked
+	// datagram as the DATA packet payload it decrypts, which is the
+	// buffer emitFrameLocked passed to conn.Write.
 	// Without this cap a bad-faith peer can advertise CEBytes far
 	// larger than anything they could have actually received from us,
 	// driving our congestion controller into spurious cwnd collapses
@@ -297,12 +300,13 @@ type NoiseSession struct {
 	inFlightBytes atomic.Int64
 
 	// Session-aggregate frame and byte counters consumed by Metrics().
-	// bytesSent/framesSent are bumped in writeFrame (counts every send
-	// attempt — see writeFrame for the at-attempt-vs-at-success
-	// rationale). bytesRecv/framesRecv are bumped at dispatchFrame on
-	// the receive path. Payload-byte semantics (matches
-	// aether.SessionMetrics.BytesSent / BytesRecv), not on-wire bytes
-	// including frame headers.
+	// bytesSent/framesSent are bumped in countFrameSent, once per write by
+	// the write loop and by writeFrame (counts every send attempt — see
+	// countFrameSent for the at-attempt-vs-at-success rationale).
+	// bytesRecv/framesRecv are bumped at dispatchFrame on the receive
+	// path. Payload-byte semantics (matches aether.SessionMetrics.BytesSent
+	// / BytesRecv): a frame's payload before deflate and encryption, on a
+	// retransmit too, not on-wire bytes including frame headers.
 	bytesSent  atomic.Uint64
 	bytesRecv  atomic.Uint64
 	framesSent atomic.Uint64
@@ -337,7 +341,7 @@ type NoiseSession struct {
 	lastPeerStats atomic.Pointer[aether.SessionMetrics]
 
 	// ECN observation from above the Noise conn. RecordCEBytes adds the
-	// bytes of inbound packets whose IP/IPv6 TOS field carried the CE
+	// frame bytes of inbound packets whose IP/IPv6 TOS field carried the CE
 	// codepoint (0x03); no caller in this repository calls it, so this
 	// counter stays 0 unless a consumer does. The next outbound
 	// CompositeACK reads-and-resets it, adds the noiseConn's own counter
@@ -1081,11 +1085,12 @@ type noiseConnStats interface {
 	DecryptLatencySnapshot() (p50Us, p99Us uint64)
 }
 
-// noiseConnCE is the optional ECN hook exposed by *noiseConn — the
-// listener's ecnReader fills a CE-byte counter on the conn whenever a
-// CE-marked datagram is received, and the adapter drains that
-// counter on every outbound CompositeACK so the sender's OnCE handler
-// reacts one RTT before queue overflow. Kept separate from
+// noiseConnCE is the optional ECN hook exposed by *noiseConn — when the
+// listener's ecnReader returns a CE-marked datagram, the conn adds the
+// decrypted DATA packet's payload length (the frame bytes the peer wrote) to
+// a CE-byte counter, and the adapter drains that counter on every outbound
+// CompositeACK so the sender's OnCE handler reacts one RTT before queue
+// overflow. Kept separate from
 // noiseConnStats because ECN support is best-effort (not all kernels /
 // build tags enable it); a conn without it leaves only the adapter's own
 // ceObservedBytes, which RecordCEBytes fills for a consumer that observes

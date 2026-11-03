@@ -289,7 +289,7 @@ func TestSendProbe_ErrorDoesNotDerailStateMachine(t *testing.T) {
 func TestNilSendCallback_DoesNotPanic(t *testing.T) {
 	p := NewProber(nil)
 
-	// sendNextProbe guards on sendProbe != nil, so this must be safe.
+	// pendingProbe.send guards on sendProbe != nil, so this must be safe.
 	p.StartProbe()
 	if !p.IsProbing() {
 		t.Error("nil-callback prober should still enter probing state")

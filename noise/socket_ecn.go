@@ -8,10 +8,11 @@
 // ECN (Explicit Congestion Notification) receive-side plumbing for the
 // Noise-UDP transport.
 //
-// Protocol layer: `noiseConn.RecordCEBytes(n)` (session.go runReader) adds
-// CE-marked byte counts to the conn's counter, which the aether adapter
-// drains (DrainCEBytes) into the next outbound CompositeACK via the
-// CACKHasECN flag + CEBytes field. The remote sender's adapter calls
+// Protocol layer: for a CE-marked datagram runReader reads (session.go),
+// decryptAndDeliver adds the decrypted DATA packet's payload length, the
+// frame bytes the sender wrote, to the conn's counter through
+// `noiseConn.RecordCEBytes(n)`; the aether adapter drains it (DrainCEBytes)
+// into the next outbound CompositeACK via the CACKHasECN flag + CEBytes field. The remote sender's adapter calls
 // `congestion.Controller.OnCE(bytes)`, which CUBIC/BBR use to react one
 // RTT before queue overflow.
 //
