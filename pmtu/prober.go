@@ -11,6 +11,7 @@ package pmtu
 import (
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -53,11 +54,21 @@ const (
 )
 
 // Prober discovers the Path MTU for a connection.
+//
+// mu guards the sweep's state and is never held across sendProbe. The sendProbe
+// NewNoiseSession passes writes the PATH_PROBE frame through
+// NoiseSession.writeFrame, which waits on the session's writeMu and on
+// conn.Write, and noiseStream.Send reads MSS for every message under its
+// caller's context, so a probe write made under mu would hold every Send on the
+// session, and the state reads reliabilityTick makes, for as long as that write
+// waits. Each method that sends decides the probe under mu and calls sendProbe
+// after releasing it.
 type Prober struct {
 	mu sync.Mutex
 
-	// Current PMTU estimate
-	mss int
+	// mss is the current PMTU estimate. It is stored under mu, beside the sweep
+	// state that decides it, and loaded without mu, so MSS waits on nothing.
+	mss atomic.Int64
 
 	// Probing state
 	state      ProbeState
@@ -73,52 +84,67 @@ type Prober struct {
 
 // NewProber creates a PMTU prober with a callback for sending probes.
 func NewProber(sendProbe func(probeID uint32, paddingSize uint16) error) *Prober {
-	return &Prober{
-		// Start at the safe floor so data flows immediately even on a sub-1400
-		// path (Fly 6PN = 1280); probeSizes then discover the real max upward.
-		mss:        SafeFloorMSS,
+	p := &Prober{
 		state:      ProbeIdle,
 		probeSizes: []int{SafeFloorMSS, 1280, 1400, 1500, 2000, 4000, 8000},
 		sendProbe:  sendProbe,
 	}
+	// Start at the safe floor so data flows immediately even on a path under
+	// 1400 bytes, such as a 1280-byte IPv6 tunnel; probeSizes then discover the
+	// real max upward.
+	p.mss.Store(SafeFloorMSS)
+	return p
 }
 
-// MSS returns the current path MTU estimate.
+// MSS returns the current path MTU estimate. It takes no lock, so it never
+// waits on a probe's write.
 func (p *Prober) MSS() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.mss
+	return int(p.mss.Load())
 }
 
 // StartProbe begins PMTU discovery by sending probes with increasing sizes.
+// The first probe's write happens after mu is released.
 func (p *Prober) StartProbe() {
+	p.beginSweep().send()
+}
+
+// beginSweep moves an idle or finished sweep to active and returns its first
+// probe for StartProbe to send once mu is released.
+func (p *Prober) beginSweep() pendingProbe {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if p.state == ProbeActive {
-		return // already probing
+		return pendingProbe{} // already probing
 	}
 
 	p.state = ProbeActive
 	p.probeIndex = 0
 	p.probeID++
-	p.sendNextProbe()
+	return p.nextProbeLocked()
 }
 
 // OnProbeResponse handles a PATH_PROBE response (echoed ProbeID).
-// If the response matches our probe, the path supports that size.
+// If the response matches our probe, the path supports that size. The next
+// probe's write happens after mu is released.
 func (p *Prober) OnProbeResponse(probeID uint32) {
+	p.recordResponse(probeID).send()
+}
+
+// recordResponse records a matching response's size as the MSS and returns the
+// sweep's next probe, if any, for OnProbeResponse to send once mu is released.
+func (p *Prober) recordResponse(probeID uint32) pendingProbe {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if p.state != ProbeActive || probeID != p.probeID {
-		return // not our probe
+		return pendingProbe{} // not our probe
 	}
 
 	// This size worked — try next
 	if p.probeIndex < len(p.probeSizes) {
-		p.mss = p.probeSizes[p.probeIndex]
-		dbgPMTU.Printf("Probe %d succeeded: MSS=%d", probeID, p.mss)
+		p.mss.Store(int64(p.probeSizes[p.probeIndex]))
+		dbgPMTU.Printf("Probe %d succeeded: MSS=%d", probeID, p.mss.Load())
 	}
 
 	p.probeIndex++
@@ -126,13 +152,13 @@ func (p *Prober) OnProbeResponse(probeID uint32) {
 		// All probes done
 		p.state = ProbeComplete
 		p.lastProbe = time.Now()
-		dbgPMTU.Printf("Discovery complete: MSS=%d", p.mss)
-		return
+		dbgPMTU.Printf("Discovery complete: MSS=%d", p.mss.Load())
+		return pendingProbe{}
 	}
 
 	// Send next probe
 	p.probeID++
-	p.sendNextProbe()
+	return p.nextProbeLocked()
 }
 
 // OnProbeTimeout handles no response to a probe.
@@ -149,7 +175,7 @@ func (p *Prober) OnProbeTimeout() {
 	p.state = ProbeComplete
 	p.lastProbe = time.Now()
 	dbgPMTU.Printf("Probe timed out at size %d: MSS=%d (using last successful)",
-		p.probeSizes[p.probeIndex], p.mss)
+		p.probeSizes[p.probeIndex], p.mss.Load())
 }
 
 // IsProbing returns true if a probe is currently in-flight.
@@ -173,10 +199,23 @@ func (p *Prober) ShouldReprobe() bool {
 	return p.state == ProbeComplete && time.Since(p.lastProbe) > ProbeInterval
 }
 
-// sendNextProbe sends the next probe in the sequence. Must hold mu.
-func (p *Prober) sendNextProbe() {
+// pendingProbe is a probe decided under mu and sent after mu is released. The
+// zero value sends nothing.
+type pendingProbe struct {
+	sendProbe func(probeID uint32, paddingSize uint16) error
+	probeID   uint32
+	padding   uint16
+	size      int
+}
+
+// nextProbeLocked stamps probeSent for the probe at probeIndex and returns it.
+// Caller holds mu. probeSent is stamped before the write, so a write that waits
+// past ProbeTimeout reads as a timed-out probe to ProbeTimedOut and the sweep
+// ends at the last size answered; a response to that probe's ID that arrives
+// after OnProbeTimeout finds the sweep no longer active and changes nothing.
+func (p *Prober) nextProbeLocked() pendingProbe {
 	if p.probeIndex >= len(p.probeSizes) {
-		return
+		return pendingProbe{}
 	}
 	size := p.probeSizes[p.probeIndex]
 	paddingSize := uint16(size - 50) // subtract header
@@ -185,9 +224,15 @@ func (p *Prober) sendNextProbe() {
 	}
 
 	p.probeSent = time.Now()
-	if p.sendProbe != nil {
-		if err := p.sendProbe(p.probeID, paddingSize); err != nil {
-			log.Printf("[PMTU] Failed to send probe %d (size %d): %v", p.probeID, size, err)
-		}
+	return pendingProbe{sendProbe: p.sendProbe, probeID: p.probeID, padding: paddingSize, size: size}
+}
+
+// send calls sendProbe for the probe. Callers hold no lock of the Prober's.
+func (pp pendingProbe) send() {
+	if pp.sendProbe == nil {
+		return
+	}
+	if err := pp.sendProbe(pp.probeID, pp.padding); err != nil {
+		log.Printf("[PMTU] Failed to send probe %d (size %d): %v", pp.probeID, pp.size, err)
 	}
 }

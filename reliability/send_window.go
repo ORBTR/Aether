@@ -294,16 +294,25 @@ func (w *SendWindow) MarkWritten(frame *aether.Frame, wireBytes int64, now time.
 }
 
 // RecordedWireBytes returns the wire count MarkWritten recorded for frame, or 0 if
-// the frame has not been written or has left the window. The write loop reads it
-// to tell a retransmit from a first write before it reaches the CanSend gate.
+// the frame has not been written or has left the window.
 func (w *SendWindow) RecordedWireBytes(frame *aether.Frame) int64 {
+	wire, _ := w.RecordedBytes(frame)
+	return wire
+}
+
+// RecordedBytes returns the wire count MarkWritten recorded for frame, 0 before
+// its first write, and the entry's PayloadBytes, or zeros if the frame has left
+// the window. The write loop reads it to tell a retransmit from a first write
+// before it reaches the CanSend gate, and counts a retransmit's payload from it,
+// since the frame's Length by then is its committed (compressed) length.
+func (w *SendWindow) RecordedBytes(frame *aether.Frame) (wire, payload int64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	entry, ok := w.entries[frame.SeqNo]
 	if !ok || entry.Frame != frame {
-		return 0
+		return 0, 0
 	}
-	return entry.InFlightBytes
+	return entry.InFlightBytes, entry.PayloadBytes
 }
 
 // WrittenFrame returns seq's frame if the entry has been written and nil otherwise.

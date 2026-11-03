@@ -105,14 +105,15 @@ func (s *NoiseSession) writeLoop() {
 				continue
 			}
 
-			// recorded is the frame's count from its first write, 0 before that.
-			var recorded int64
+			// recorded is the frame's wire count from its first write, 0 before
+			// that, and recordedPlain the payload count its window entry holds.
+			var recorded, recordedPlain int64
 			if st != nil {
-				recorded = st.sendWindow.RecordedWireBytes(frame)
+				recorded, recordedPlain = st.sendWindow.RecordedBytes(frame)
 			}
 			frameSize, plain := heldSize, heldPlain
 			if frame != held {
-				frameSize, plain = s.prepareFrame(frame, recorded)
+				frameSize, plain = s.prepareFrame(frame, recorded, recordedPlain)
 			}
 
 			// RFC 8985 §7.5: TLP loss probes MUST be transmitted outside
@@ -970,9 +971,10 @@ func (s *NoiseSession) dataFrameStream(frame *aether.Frame) *noiseStream {
 // at attempt-time rather than at conn.Write success so the "bytes the session
 // tried to send" is what gets surfaced — the difference vs at-success is
 // negligible since a write only errors during teardown / panicked conn. plain is the
-// frame's length before deflate, for the payload-byte semantics these counters
-// document; the write loop counts once per write, so a frame the gate or pacer kept
-// back is counted when it goes.
+// frame's payload length before deflate and encryption, for the payload-byte
+// semantics these counters document, on a first write and on every retransmit
+// alike; the write loop counts once per write, so a frame the gate or pacer kept
+// back is counted when it goes, and writeFrame counts its caller's frame.
 func (s *NoiseSession) countFrameSent(plain int64) {
 	s.framesSent.Add(1)
 	s.bytesSent.Add(uint64(plain))
@@ -980,16 +982,18 @@ func (s *NoiseSession) countFrameSent(plain int64) {
 
 // prepareFrame readies a frame the write loop took from the scheduler and returns
 // the wire size CanSend and the pacer are given, and the frame's length before
-// deflate for countFrameSent. A retransmit (recorded > 0) keeps
-// the frame's committed form and presents the recorded count. A first write
+// deflate for countFrameSent. A retransmit (recorded > 0) keeps the frame's
+// committed form and presents the recorded wire count and recordedPlain, the
+// payload count its window entry took at Add: its Length is the committed
+// (deflated) length by then, which is not a payload count. A first write
 // compresses here, before the gate, because deflate is the one step that changes
 // the size by an amount only running it can tell; it advances no state, so a frame
 // the gate refuses has committed nothing. Encryption and the header stay at the
 // write: Encrypt takes a nonce and the short-form encoders advance the directional
 // compressor, and neither may happen for a frame that is not written.
-func (s *NoiseSession) prepareFrame(frame *aether.Frame, recorded int64) (wire, plain int64) {
+func (s *NoiseSession) prepareFrame(frame *aether.Frame, recorded, recordedPlain int64) (wire, plain int64) {
 	if recorded > 0 {
-		return recorded, recorded
+		return recorded, recordedPlain
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -1076,8 +1080,14 @@ func (s *NoiseSession) writeFrame(frame *aether.Frame) error {
 }
 
 // compressFrameLocked swaps the payload for its DEFLATE form when that is shorter.
-// Caller holds writeMu.
+// Caller holds writeMu. A PATH_PROBE frame is never compressed: its payload is
+// zero padding sized by the pmtu.Prober to the path size it tests, which DEFLATE
+// would shrink to a few bytes, so the probe and its echo would cross any path and
+// the sweep would raise MSS to the largest size whatever the path carries.
 func (s *NoiseSession) compressFrameLocked(frame *aether.Frame) {
+	if frame.Type == aether.TypePATH_PROBE {
+		return
+	}
 	if s.compressionEnabled.Load() && len(frame.Payload) > 64 && !frame.Flags.Has(aether.FlagCOMPRESSED) {
 		compressed := compressPayload(frame.Payload)
 		if len(compressed) < len(frame.Payload) { // only use if smaller

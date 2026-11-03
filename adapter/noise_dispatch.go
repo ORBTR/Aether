@@ -145,7 +145,7 @@ func (s *NoiseSession) processIncomingFrame(frame *aether.Frame, indicator byte)
 	//      stream's bit 0.
 	s.Health().RecordActivity()
 	// Per-session frame and byte counters consumed by Metrics() — the
-	// receive-side companions to writeFrame's framesSent/bytesSent.
+	// receive-side companions to countFrameSent's framesSent/bytesSent.
 	// Counted at dispatchFrame so the payload reflects what reached
 	// application-level decoding (not on-wire size including headers).
 	s.framesRecv.Add(1)
@@ -620,14 +620,15 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	//
 	// CEBytes is peer-supplied data — an inflated claim ("you sent 1GB
 	// and 1GB got CE-marked" when we sent 1KB) would drive cwnd
-	// collapses on a bad-faith peer. Cap against the strongest
-	// upper bound available — the total bytes WE sent in this CE
-	// interval (bytesSentSinceLastCE, drained per CE-bearing ACK). The
-	// per-ACK ackedBytes and per-stream Outstanding() are used as a
-	// fallback for sessions where the counter has been deliberately
-	// reset (paranoid handlers / tests) but the interval counter is
-	// the authoritative bound — the peer cannot have CE-marked more
-	// bytes than they have actually received from us.
+	// collapses on a bad-faith peer. The claim and every bound it is
+	// compared with count frame wire bytes, the buffer emitFrameLocked
+	// passes to conn.Write and the unit OnAck and OnCE read: the peer's
+	// noiseConn records a CE-marked datagram as the DATA packet payload
+	// it decrypts, which is that buffer. The bound is the wire bytes this
+	// session wrote in the CE interval (bytesSentSinceLastCE, drained per
+	// CE-bearing ACK); when that drains 0, this ACK's ackedBytes; when
+	// that is 0 too, the wire bytes still in flight on the session. The
+	// peer cannot have CE-marked more bytes than it has received from us.
 	if ack.Flags&aether.CACKHasECN != 0 && ack.CEBytes > 0 {
 		intervalBytes := int64(s.bytesSentSinceLastCE.Swap(0))
 		maxPlausibleCE := intervalBytes
@@ -635,13 +636,13 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 			maxPlausibleCE = ackedBytes
 		}
 		if maxPlausibleCE <= 0 {
-			maxPlausibleCE = st.window.Outstanding()
+			maxPlausibleCE = s.totalInFlightBytes()
 		}
 		claimed := int64(ack.CEBytes)
 		if claimed > maxPlausibleCE && maxPlausibleCE > 0 {
 			if os.Getenv("AETHER_DEBUG_CE") == "1" {
-				log.Printf("aether: A4 cap CEBytes claim=%d > interval=%d acked=%d outstanding=%d — clamping + flagging",
-					claimed, intervalBytes, ackedBytes, st.window.Outstanding())
+				log.Printf("aether: CEBytes claim=%d past its bound (wire bytes: interval=%d acked=%d inflight=%d) — clamping + flagging",
+					claimed, intervalBytes, ackedBytes, s.totalInFlightBytes())
 			}
 			s.reportAbuse(abuse.ReasonACKValidation)
 			claimed = maxPlausibleCE
@@ -974,10 +975,11 @@ func (s *NoiseSession) sendCompositeACK(st *noiseStream, cack *aether.CompositeA
 	//      that observes CE itself; no caller in this repository writes
 	//      it, so this input is 0 unless a consumer calls RecordCEBytes.
 	//   2. The transport-level counter on the underlying *noiseConn,
-	//      drained via the noiseConnCE interface. The listener's read
-	//      loop (noise/session.go runReader) adds a datagram's size to
-	//      it through noiseConn.RecordCEBytes when the TOS byte the
-	//      ecnReader returns carries the CE codepoint.
+	//      drained via the noiseConnCE interface. When the TOS byte the
+	//      listener's ecnReader returns carries the CE codepoint, the
+	//      conn's decryptAndDeliver adds the decrypted DATA packet's
+	//      payload length, the frame bytes the peer wrote, through
+	//      noiseConn.RecordCEBytes.
 	// Summing both lets either source reach the sender's OnCE through
 	// the same CompositeACK, whichever layer observed the mark.
 	ce := atomic.SwapUint64(&s.ceObservedBytes, 0)
@@ -1012,7 +1014,10 @@ func (s *NoiseSession) sendCompositeACK(st *noiseStream, cack *aether.CompositeA
 // carried the CE codepoint (0x03), for a consumer that observes CE above the
 // Noise conn; no caller in this repository calls it (the listener's socket
 // path feeds the noiseConn's own counter, which sendCompositeACK drains
-// through noiseConnCE). The bytes are folded into the next outbound
+// through noiseConnCE). n counts frame bytes, what this session's conn.Read
+// returns for those packets, because the peer caps the claim against the
+// frame bytes it wrote (bytesSentSinceLastCE); a datagram's size would add the
+// transport's own header and tag. The bytes are folded into the next outbound
 // CompositeACK via CEBytes/CACKHasECN so the sender's congestion controller
 // sees the ECN signal.
 func (s *NoiseSession) RecordCEBytes(n int) {

@@ -171,12 +171,13 @@ type noiseConn struct {
 	decryptErrors uint64 // atomic: failed decrypt attempts
 	inboxDrops    uint64 // atomic: inbox-full drops
 
-	// ECN CE-byte counter. Socket reader (ecnReader) updates this
-	// when a CE-marked datagram arrives; the aether adapter drains it
-	// through DrainCEBytes (its noiseConnCE interface) and folds the
-	// total into the next outbound CompositeACK. Atomic read/reset
-	// pattern mirrors the adapter's own `ceObservedBytes` counter so the
-	// two layers compose without extra locking.
+	// ECN CE-byte counter, in the frame bytes the peer's adapter wrote:
+	// decryptAndDeliver adds a CE-marked DATA packet's payload length
+	// (RecordCEBytes); the aether adapter drains it through DrainCEBytes
+	// (its noiseConnCE interface) and folds the total into the next
+	// outbound CompositeACK. Atomic read/reset pattern mirrors the
+	// adapter's own `ceObservedBytes` counter so the two layers compose
+	// without extra locking.
 	ceBytes uint64
 
 	// Per-decrypt AEAD latency distribution. Records the wall-
@@ -258,7 +259,8 @@ func (c *noiseConn) runReader() {
 			_ = c.Close()
 			return
 		}
-		if err := c.decryptAndDeliver(buf[:n]); err != nil {
+		// conn.Read returns no TOS byte, so this reader records no CE mark.
+		if err := c.decryptAndDeliver(buf[:n], false); err != nil {
 			dbgSession.Printf("decrypt failed from %s: %v", c.remote, err)
 			atomic.AddUint64(&c.decryptErrors, 1)
 			continue
@@ -266,7 +268,16 @@ func (c *noiseConn) runReader() {
 	}
 }
 
-func (c *noiseConn) decryptAndDeliver(msg []byte) error {
+// decryptAndDeliver opens one datagram and hands its packet to the inbox or
+// the packet type's handler. ceMarked is whether the datagram's TOS byte
+// carried the CE codepoint; a marked DATA packet that authenticates adds its
+// payload length to the CE counter. That payload is the bytes the peer's adapter
+// passed to conn.Write for one frame (its emitFrameLocked), the unit in which
+// the peer caps the CEBytes claim against bytesSentSinceLastCE and its
+// congestion controller counts; the datagram's own length adds the packet type
+// byte, the AEAD tag and any explicit nonce, and a datagram that fails AEAD is
+// no evidence of anything the peer sent.
+func (c *noiseConn) decryptAndDeliver(msg []byte, ceMarked bool) error {
 	var plaintext []byte
 	var err error
 
@@ -303,6 +314,9 @@ func (c *noiseConn) decryptAndDeliver(msg []byte) error {
 
 	switch msgType {
 	case relay.PacketTypeData:
+		if ceMarked {
+			c.RecordCEBytes(len(payload))
+		}
 		// Double-select pattern: check closed first, then try send. This
 		// avoids the race between Close() and inbox send that would
 		// otherwise require defer recover() to swallow sends on a closed
@@ -712,11 +726,11 @@ func (c *noiseConn) RecordResumeMaterial(data []byte) {
 	c.transport.recordInitiatorResume(c.remoteNode, data)
 }
 
-// RecordCEBytes folds a CE-marked datagram's size into the session's
-// ECN counter. Called by the listener's read loop (runReader) when the IP
-// TOS byte its ecnReader returns carries the ECN "Congestion Experienced"
-// codepoint (RFC 3168). The adapter drains this via DrainCEBytes on every
-// outbound ACK.
+// RecordCEBytes adds n CE-marked frame bytes to the session's ECN counter.
+// decryptAndDeliver calls it with a DATA packet's payload length when the
+// datagram's IP TOS byte, which the listener's ecnReader returns, carries the
+// ECN "Congestion Experienced" codepoint (RFC 3168). The adapter drains this
+// via DrainCEBytes on every outbound ACK.
 func (c *noiseConn) RecordCEBytes(n int) {
 	if n <= 0 {
 		return

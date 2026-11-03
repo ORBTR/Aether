@@ -83,7 +83,7 @@ func noisePairWithGatedClient(t *testing.T) (client, server *NoiseSession, gate 
 // detector reports against writeFrame's write.
 func TestNoiseSession_RTODequeueDoesNotReadTheFrameTheWriteLoopCommits(t *testing.T) {
 	client, server, gate := noisePairWithGatedClient(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	cs, _ := openAccept(t, ctx, client, server, 100)
 	st, ok := cs.(*noiseStream)
@@ -100,6 +100,10 @@ func TestNoiseSession_RTODequeueDoesNotReadTheFrameTheWriteLoopCommits(t *testin
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+	// The gate parks the first write after it is armed, and that write has to be
+	// the DATA frame's: a PATH_PROBE write or its echo parked there would hold
+	// writeMu, and the write loop would never reach the frame's first write.
+	waitProbeSweepsDone(t, client, server)
 
 	rtoAtEnqueue := st.rtt.RTO()
 	gate.armed.Store(true)

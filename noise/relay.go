@@ -160,8 +160,10 @@ func (t *NoiseTransport) handleRelayData(c *noiseConn, payload []byte) error {
 		if nc := connFromSession(t.listener.sessions.Get(aether.NodeID(sourceNodeID))); nc != nil {
 			t.listenerMu.Unlock()
 			// Inject data into the session
-			// Note: data is the raw encrypted packet from A to B
-			return nc.decryptAndDeliver(data)
+			// Note: data is the raw encrypted packet from A to B. This path
+			// has no TOS byte for that packet's path from A, so it records
+			// no CE mark.
+			return nc.decryptAndDeliver(data, false)
 		}
 	}
 	t.listenerMu.Unlock()

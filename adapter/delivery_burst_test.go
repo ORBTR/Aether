@@ -127,6 +127,14 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 // meanwhile and return nothing, no CONGESTION reaches it, and once the consumer
 // reads, every message is there in order and credit is back. A session with a
 // realm, since the path's MSS may send the larger size as fragments.
+//
+// The credit is the window as it stands: reliabilityTick runs autoTuneWindows on
+// the session's first tick and every 10 s after, and for a stream with an RTT
+// its aether.AutoTuneWindow step grows the sender's window by up to a quarter
+// when the peak outstanding is above two thirds of it. The test runs that step
+// itself, with an RTT given, once three quarters of the initial credit is
+// outstanding, so the window grows mid-burst on every run, and each bound is
+// read from cs.window when it is asserted.
 func TestNoiseStream_SenderPastItsCreditMeetsTypedBackpressure(t *testing.T) {
 	for _, size := range []int{512, 2048} {
 		key := uint32(0x5eed5eed)
@@ -139,7 +147,10 @@ func TestNoiseStream_SenderPastItsCreditMeetsTypedBackpressure(t *testing.T) {
 
 		sent := 0
 		var sendErr error
-		for sent*size <= credit {
+		for int64(sent*size) <= cs.window.CurrentWindow() {
+			if sent*size == credit*3/4 {
+				aether.AutoTuneWindow(cs.window, 50*time.Millisecond)
+			}
 			sendCtx, sendCancel := context.WithTimeout(ctx, 300*time.Millisecond)
 			sendErr = cs.Send(sendCtx, burstMessage(sent, size))
 			sendCancel()
@@ -148,18 +159,23 @@ func TestNoiseStream_SenderPastItsCreditMeetsTypedBackpressure(t *testing.T) {
 			}
 			sent++
 		}
+		window := cs.window.CurrentWindow()
 		if !errors.Is(sendErr, flow.ErrCreditExhausted) {
 			t.Fatalf("size %d: after %d messages Send returned %v, want ErrCreditExhausted", size, sent, sendErr)
 		}
-		if int64(sent*size) > credit {
-			t.Fatalf("size %d: %d messages of %d bytes admitted past %d of credit", size, sent, size, credit)
+		if int64(sent*size) > window {
+			t.Fatalf("size %d: %d messages of %d bytes admitted past a %d-byte window", size, sent, size, window)
+		}
+		if window <= credit {
+			t.Fatalf("premise wrong: the window stayed at %d after the auto-tune step with %d bytes outstanding", window, credit*3/4)
 		}
 		waitSendWindowEmpty(t, cs, "acks of everything admitted")
-		if got := cs.window.Available(); got > credit-int64(sent*size)+5 {
-			t.Fatalf("size %d: ACKs alone returned credit: %d available after %d charged", size, got, sent*size)
+		got := cs.window.Available()
+		if window = cs.window.CurrentWindow(); got > window-int64(sent*size)+5 {
+			t.Fatalf("size %d: ACKs alone returned credit: %d available of a %d-byte window after %d charged", size, got, window, sent*size)
 		}
-		if q := ss.recvQ.queuedBytes(); q > credit {
-			t.Fatalf("size %d: receive queue holds %d bytes past the sender's %d of credit", size, q, credit)
+		if q := ss.recvQ.queuedBytes(); q > window {
+			t.Fatalf("size %d: receive queue holds %d bytes past the sender's %d-byte window", size, q, window)
 		}
 		if hits := client.Throttle().TotalHits() - hitsBefore; hits != 0 {
 			t.Fatalf("size %d: sender saw %d CONGESTION frames with no byte lost", size, hits)

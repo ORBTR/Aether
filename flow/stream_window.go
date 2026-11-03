@@ -625,9 +625,8 @@ func (w *StreamWindow) Available() int64 {
 
 // Outstanding returns the bytes the sender has Consume()d that no grant has
 // returned yet: on the wire, or held by the peer's receive queue until its
-// consumer takes them. Consumed by the ACK validator as the plausibility upper
-// bound for peer-claimed CEBytes — an inflated CE claim above the actual
-// outstanding is a cwnd collapse vector.
+// consumer takes them, in what Consume charges: the plaintext length a Send
+// passes, not the frame wire bytes a CEBytes claim counts.
 func (w *StreamWindow) Outstanding() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()
