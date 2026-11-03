@@ -36,7 +36,7 @@ const (
 )
 
 // teardownRaceUnreadBeforeReset is how many payloads must sit in the
-// stream's recvCh, handed over by its deliverLoop and not yet read, when
+// stream's receive queue, put there by the readLoop and not yet read, when
 // the reset runs: those hand-offs are then unordered with the teardown,
 // while the rest of the burst is still arriving.
 const teardownRaceUnreadBeforeReset = 3
@@ -59,12 +59,11 @@ func unreadMessages(t *testing.T, st aether.Stream) int {
 
 // resetUnderBurst opens a stream from client to server, has the client send
 // teardownRaceBurst paced messages on its own goroutine, waits until the
-// server's deliverLoop has handed several of them into recvCh unread with
-// more still arriving, resets the server's stream from this goroutine, and
-// then requires every later Receive on the reset stream to end with io.EOF
-// within the bound. The reset therefore races the readLoop's hand-off to the
-// deliverLoop and the deliverLoop's hand-off to recvCh the way an
-// application's Reset does.
+// server's readLoop has put several of them on the stream's receive queue
+// unread with more still arriving, resets the server's stream from this
+// goroutine, and then requires every later Receive on the reset stream to end
+// with io.EOF within the bound. The reset therefore races the readLoop's
+// hand-off to the receive queue the way an application's Reset does.
 func resetUnderBurst(t *testing.T, client, server aether.Session, streamID uint64) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -144,10 +143,9 @@ func resetUnderBurst(t *testing.T, client, server aether.Session, streamID uint6
 
 // TestTCPStream_ResetUnderABurstFromThePeer resets a TCP stream from the
 // application's goroutine while the peer is still sending into it. The
-// readLoop is then handing payloads to the stream's deliverLoop, and the
-// deliverLoop to recvCh, while the reset tears the stream down; neither
-// hand-off may race the teardown, and Receive after the reset ends with
-// io.EOF.
+// readLoop is then putting payloads on the stream's recvCh while the reset
+// tears the stream down; that hand-off may not race the teardown, and
+// Receive after the reset ends with io.EOF.
 func TestTCPStream_ResetUnderABurstFromThePeer(t *testing.T) {
 	for round := 0; round < teardownRaceRounds; round++ {
 		t.Run(fmt.Sprintf("round%02d", round), func(t *testing.T) {
@@ -167,8 +165,8 @@ func TestTCPStream_ResetUnderABurstFromThePeer(t *testing.T) {
 
 // TestNoiseStream_ResetUnderABurstFromThePeer is the same drive against the
 // Noise adapter over a loopback connection: the reset tears the stream down
-// while the readLoop's handleData is still enqueueing and the stream's
-// deliverLoop still delivering.
+// while the readLoop's handleData is still pushing payloads onto the stream's
+// receive queue (recvQ) and Receive is taking them.
 func TestNoiseStream_ResetUnderABurstFromThePeer(t *testing.T) {
 	for round := 0; round < teardownRaceRounds; round++ {
 		t.Run(fmt.Sprintf("round%02d", round), func(t *testing.T) {
