@@ -6,6 +6,7 @@ package adapter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -478,6 +479,25 @@ type NoiseSession struct {
 	// stream ID opened again carries a higher generation on its fragments than
 	// the stream that used the ID before (FragmentBinding.Generation).
 	streamGenerations atomic.Uint64
+
+	// admitted is the receive credit this session's streams hold, against the
+	// session's ceiling (sessionCreditCeiling) and, through its parent, against
+	// the per-peer ceiling (peerCreditCeiling) across every session to the same
+	// peer. createStream reserves a stream's credit here before publishing it;
+	// a stream's departure from s.streams releases it; CloseWithError closes
+	// the ledger, returning the rest to the peer's. peerShared says the parent is the remote node ID's entry in
+	// sessionPeerLedgers, which CloseWithError leaves; false for a session
+	// whose parent is its own (newNoiseSession).
+	admitted   *creditLedger
+	peerShared bool
+
+	// endedQueues are the receive queues of streams that have left s.streams
+	// with messages still unread. Their cost stays in recvQueued until the
+	// consumer takes them; sweepEndedQueues, on the reliability tick, discards
+	// a queue nobody has taken from for aether.DefaultStreamIdleTimeout, so a
+	// consumer that abandons a stream does not hold the session's budget for
+	// the session's life. Guarded by mu.
+	endedQueues map[*recvQueue]struct{}
 }
 
 // NewNoiseSession creates an Aether session over a Noise-encrypted
@@ -491,7 +511,20 @@ type NoiseSession struct {
 // fields are honoured as-supplied — start from
 // aether.DefaultSessionOptions() if you want features enabled and only
 // want to override specific fields.
+//
+// remoteNodeID keys the per-peer credit ledger (sessionPeerLedgers), so it
+// must be the identity conn's handshake authenticated; a session whose remote
+// ID is a stated label is built through newNoiseSession with its own ledger.
 func NewNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opts aether.SessionOptions) *NoiseSession {
+	return newNoiseSession(conn, localNodeID, remoteNodeID, opts, true)
+}
+
+// newNoiseSession is NewNoiseSession with the choice of per-peer ledger:
+// sharedPeer joins the remote node ID's entry in sessionPeerLedgers; false
+// gives the session a peer ledger of its own at the same ceiling, for
+// wrapPostHandshakeAsSession, whose remote node ID the over-conn handshake
+// reports unchecked, so sharing it would let one peer spend another's credit.
+func newNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opts aether.SessionOptions, sharedPeer bool) *NoiseSession {
 	opts = aether.NormalizeSessionOptions(opts)
 	base := aether.NewBaseSession(localNodeID, remoteNodeID, aether.ProtoNoise)
 	base.SetHealthMonitor(health.NewMonitor(0.2))
@@ -513,7 +546,17 @@ func NewNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 		interleavedDecoder: reliability.NewInterleavedFECDecoder(),
 		txCompressor:       aether.NewCompressor(),
 		rxCompressor:       aether.NewCompressor(),
+		endedQueues:        make(map[*recvQueue]struct{}),
 	}
+	sessionCeiling := sessionCreditCeiling(opts)
+	var peerLedger *creditLedger
+	if sharedPeer {
+		peerLedger = sessionPeerLedgers.join(remoteNodeID, peerCreditCeiling(sessionCeiling))
+		s.peerShared = true
+	} else {
+		peerLedger = newCreditLedger("peer", peerCreditCeiling(sessionCeiling), nil)
+	}
+	s.admitted = newCreditLedger("session", sessionCeiling, peerLedger)
 	// Reed-Solomon encoder/decoder — instantiated even when no stream is
 	// using FECReedSolomon, because the cost is just a small Galois-field
 	// table. Streams opt in via StreamConfig.FECLevel = FECReedSolomon.
@@ -695,22 +738,33 @@ func (s *NoiseSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) 
 		return nil, fmt.Errorf("stream ID %d exceeds MaxStreamID (%d) — send GOAWAY", cfg.StreamID, aether.MaxStreamID)
 	}
 
+	// The stream's own ceiling: an initial credit above it is refused, since
+	// flow.NewStreamWindowWithCap would otherwise raise the window's growth
+	// ceiling to the initial credit.
+	if ceiling := streamCreditCeiling(cfg); cfg.InitialCredit > ceiling {
+		return nil, fmt.Errorf("OpenStream stream=%d: initial credit %d above the stream ceiling %d: %w",
+			cfg.StreamID, cfg.InitialCredit, ceiling, aether.ErrStreamCreditRefused)
+	}
+
 	// Locally-initiated open. enforceRemoteCap=false means: enforce
-	// the MaxConcurrentStreams cap but do NOT send a RESET back (no
-	// peer to RESET — the caller gets the error directly). The cap
-	// applies universally so a leaking local caller can't exhaust the
-	// session's stream-slot table.
-	st := s.createStream(cfg.StreamID, cfg, false)
-	if st == nil {
-		// Cap reached. streamRefused counter already incremented inside
-		// createStream; abuse signal recorded. Surface the typed
-		// sentinel ErrStreamCapExhausted so callers can detect cap-hit
-		// via errors.Is and back off instead of closing the session.
-		cap := s.opts.MaxConcurrentStreams
-		if cap <= 0 {
-			cap = aether.DefaultMaxConcurrentStreams
+	// the MaxConcurrentStreams cap and the credit reservation but do NOT
+	// send a RESET back (no peer to RESET — the caller gets the error
+	// directly). Both apply universally so a leaking local caller can't
+	// exhaust the session's stream-slot table or its admitted credit.
+	st, err := s.createStream(cfg.StreamID, cfg, false)
+	if err != nil {
+		// Refused. streamRefused counter already incremented inside
+		// createStream. Surface the typed sentinel (ErrStreamCapExhausted
+		// or ErrStreamCreditRefused) so callers can detect it via
+		// errors.Is and back off instead of closing the session.
+		if errors.Is(err, aether.ErrStreamCapExhausted) {
+			cap := s.opts.MaxConcurrentStreams
+			if cap <= 0 {
+				cap = aether.DefaultMaxConcurrentStreams
+			}
+			return nil, fmt.Errorf("OpenStream cap=%d: %w", cap, err)
 		}
-		return nil, fmt.Errorf("OpenStream cap=%d: %w", cap, aether.ErrStreamCapExhausted)
+		return nil, fmt.Errorf("OpenStream stream=%d: %w", cfg.StreamID, err)
 	}
 	st.state.Transition(aether.EventSendOpen)
 
@@ -824,6 +878,46 @@ func (s *NoiseSession) releaseStream(streamID uint64) {
 	}
 }
 
+// trackEnded puts the queue of a stream leaving s.streams on endedQueues when
+// it still holds messages. Its callers are the stream's exits (handleClose,
+// handleReset, Reset, noiseStream.leaveSession): from then on the stream GC
+// does not see the stream, and the queue's cost stays in recvQueued until
+// the consumer takes its messages or sweepEndedQueues discards them.
+func (s *NoiseSession) trackEnded(q *recvQueue) {
+	if q == nil || q.len() == 0 {
+		return
+	}
+	s.mu.Lock()
+	s.endedQueues[q] = struct{}{}
+	s.mu.Unlock()
+}
+
+// sweepEndedQueues runs on the reliability tick every ten seconds. It drops
+// endedQueues entries the consumer has emptied, and discards the messages of
+// a queue nobody has taken from for aether.DefaultStreamIdleTimeout, the same
+// idle bound the stream GC gives a stream still in s.streams; the discard
+// takes their cost off recvQueued.
+func (s *NoiseSession) sweepEndedQueues(now time.Time) {
+	s.mu.Lock()
+	queues := make([]*recvQueue, 0, len(s.endedQueues))
+	for q := range s.endedQueues {
+		queues = append(queues, q)
+	}
+	s.mu.Unlock()
+	for _, q := range queues {
+		empty, idle := q.idleSince(now)
+		if !empty && idle < aether.DefaultStreamIdleTimeout {
+			continue
+		}
+		if !empty {
+			q.discard()
+		}
+		s.mu.Lock()
+		delete(s.endedQueues, q)
+		s.mu.Unlock()
+	}
+}
+
 // receiveOverloadInterval spaces signalReceiveOverload's CONGESTION frames; it
 // matches the advisory's BackoffMs, so a held overload keeps the hint alive
 // and a passing one lets it lapse.
@@ -894,6 +988,13 @@ func (s *NoiseSession) CloseWithError(err error) error {
 	}
 	if s.streamGC != nil {
 		s.streamGC.Stop()
+	}
+	// The streams still in s.streams keep their entries, so their credit goes
+	// back to the peer's ledger here in one step, and a createStream racing
+	// this close is refused by the closed ledger.
+	s.admitted.close()
+	if s.peerShared {
+		sessionPeerLedgers.leave(s.RemoteNodeID(), s.admitted.parent)
 	}
 	// Flush any pending conn-level grant so the peer gets credit for
 	// bytes the application did consume, even if the session is

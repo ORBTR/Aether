@@ -625,8 +625,10 @@ func (w *StreamWindow) Available() int64 {
 
 // Outstanding returns the bytes the sender has Consume()d that no grant has
 // returned yet: on the wire, or held by the peer's receive queue until its
-// consumer takes them, in what Consume charges: the plaintext length a Send
-// passes, not the frame wire bytes a CEBytes claim counts.
+// consumer takes them, in what Consume charges: the count its Send passes
+// (the adapter's noiseStream.Send passes the plaintext length plus a fixed
+// per-message cost, tcpStream.Send's TryConsume the plaintext length), not the
+// frame wire bytes a CEBytes claim counts.
 func (w *StreamWindow) Outstanding() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()

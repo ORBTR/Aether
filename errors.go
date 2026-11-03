@@ -71,6 +71,26 @@ var (
 	// Use errors.Is(err, aether.ErrDuplicateStreamID) to detect.
 	ErrDuplicateStreamID = errors.New("transport: duplicate stream id")
 
+	// ErrStreamCreditRefused signals that a stream was not admitted because
+	// its receive credit does not fit what the session's admitted streams,
+	// or every session to the same peer together, already hold against
+	// their aggregate ceiling, or because its initial credit is above the
+	// stream's own ceiling. OpenStream returns it before the stream exists;
+	// a stream the peer opens past an aggregate ceiling is answered with
+	// RESET(ResetRefused) and reaches no acceptor. Like
+	// ErrStreamCapExhausted it is backpressure, not a transport failure:
+	// the session stays up and the open may succeed once streams end.
+	// Use errors.Is(err, aether.ErrStreamCreditRefused) to detect.
+	ErrStreamCreditRefused = errors.New("transport: stream credit refused")
+
+	// ErrStreamRefused signals that the peer answered this stream with
+	// RESET(ResetRefused): it refused to admit it (its stream cap or its
+	// aggregate credit ceiling), so nothing sent on it is delivered.
+	// Send and Receive on such a stream return it, so the opener reads a
+	// refusal as a refusal and not as an ordinary end.
+	// Use errors.Is(err, aether.ErrStreamRefused) to detect.
+	ErrStreamRefused = errors.New("transport: stream refused by peer")
+
 	// ErrSessionStuck signals that a session has persistently been unable
 	// to make forward progress (e.g. sustained Consume timeouts on the
 	// send path while in-flight frames sit unACKed) long past any
