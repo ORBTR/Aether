@@ -762,14 +762,41 @@ func (s *NoiseSession) handleFECRepair(frame *aether.Frame) {
 	}
 }
 
+// handleOpen admits a stream the peer opened. The OPEN states the credit the
+// opener reserved for the stream (OpenPayload.InitialCredit), and the stream's
+// window, its credit reservation and its queue bound (receiveCeilings) are
+// built from it, so the sender's credit on each side is the credit the other
+// side holds for it. A credit below flow.MinGuaranteedWindow, zero included, or
+// above this side's stream ceiling (streamCreditCeiling) is refused with
+// RESET(ResetRefused) and an abuse charge, and no state is kept:
+// flow.NewStreamWindowWithCap would raise a smaller credit to the minimum,
+// leaving this window larger than the opener's, and would take a larger one
+// as its growth ceiling, so a peer's declaration would raise this side's
+// ceiling. An OPEN for a stream already in s.streams changes nothing: that
+// stream keeps its window and reservation, and the acceptor is not handed it a
+// second time.
 func (s *NoiseSession) handleOpen(frame *aether.Frame) {
+	s.mu.Lock()
+	_, live := s.streams[frame.StreamID]
+	s.mu.Unlock()
+	if live {
+		return
+	}
 	payload := aether.DecodeOpenPayload(frame.Payload)
-	st, _ := s.createStream(frame.StreamID, aether.StreamConfig{
-		StreamID:    frame.StreamID,
-		Reliability: payload.Reliability,
-		Priority:    payload.Priority,
-		Dependency:  payload.Dependency,
-	}, true /* enforceRemoteCap */)
+	cfg := aether.StreamConfig{
+		StreamID:      frame.StreamID,
+		Reliability:   payload.Reliability,
+		Priority:      payload.Priority,
+		Dependency:    payload.Dependency,
+		InitialCredit: int64(payload.InitialCredit),
+	}
+	if cfg.InitialCredit < flow.MinGuaranteedWindow || cfg.InitialCredit > streamCreditCeiling(cfg) {
+		atomic.AddUint64(&s.streamRefused, 1)
+		s.reportAbuse(abuse.ReasonStreamRefused)
+		s.sendRefused(frame.StreamID)
+		return
+	}
+	st, _ := s.createStream(frame.StreamID, cfg, true /* enforceRemoteCap */)
 	if st == nil {
 		return // refused by the cap or the credit reservation; RESET already sent
 	}

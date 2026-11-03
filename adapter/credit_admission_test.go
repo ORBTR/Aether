@@ -37,7 +37,9 @@ func streamPresent(s *NoiseSession, id uint64) bool {
 // TestNoiseStream_APeerClosingFilledStreamsStaysInsideTheSessionCeiling: the
 // local side half-closes each stream first, as the reply side of an RPC does, and
 // does not read yet; a peer that ignores credit fills each stream to three
-// quarters of its ceiling and CLOSEs it, over eight streams. The messages stay
+// quarters of its ceiling and CLOSEs it, over eight streams, each opened with
+// the connection window's initial credit, the stream ceiling the OPEN gives
+// the server. The messages stay
 // charged to the session's budget after the peer's CLOSE, so the ceiling refuses
 // the stream that would pass it: what the queues hold never exceeds the session
 // ceiling, the budget equals what the queues hold, and a late reader still
@@ -49,9 +51,10 @@ func TestNoiseStream_APeerClosingFilledStreamsStaysInsideTheSessionCeiling(t *te
 	const size = 64 * 1024
 	var held []*noiseStream
 	var streamLimit, sessionLimit int64
+	connInitial, _ := server.connWindow.ReceiveCeilings()
 	for k := 0; k < 8; k++ {
 		id := uint64(300 + k)
-		cs, ss := openWithCredit(t, ctx, client, server, id, 0)
+		cs, ss := openWithCredit(t, ctx, client, server, id, connInitial)
 		waitSendWindowEmpty(t, cs, "the opening message")
 		streamLimit, sessionLimit = ss.receiveCeilings()
 		if err := ss.Close(); err != nil {
@@ -258,13 +261,21 @@ func TestNoiseStream_AClosedStreamWritesItsCloseAndLeavesOnTheACKThatEmptiesItsW
 // other test uses, so the two sessions' peer ledgers are this pair's alone.
 func creditPairWithStreamCap(t *testing.T, streams int, tag string) (client, server *NoiseSession) {
 	t.Helper()
+	return creditPairWithStreamCaps(t, streams, streams, tag)
+}
+
+// creditPairWithStreamCaps is creditPairWithStreamCap with a stream cap, and
+// so a credit ceiling, for each side.
+func creditPairWithStreamCaps(t *testing.T, clientStreams, serverStreams int, tag string) (client, server *NoiseSession) {
+	t.Helper()
 	chosen := aetherChosen(t)
 	c, s := loopbackPair(t)
-	opts := aether.DefaultSessionOptions()
-	opts.MaxConcurrentStreams = streams
+	clientOpts, serverOpts := aether.DefaultSessionOptions(), aether.DefaultSessionOptions()
+	clientOpts.MaxConcurrentStreams = clientStreams
+	serverOpts.MaxConcurrentStreams = serverStreams
 	clientID, serverID := aether.NodeID("vl1_credit_client_"+tag), aether.NodeID("vl1_credit_server_"+tag)
-	client = NewNoiseSession(realmConn{Conn: c, chosen: chosen}, clientID, serverID, opts)
-	server = NewNoiseSession(realmConn{Conn: s, chosen: chosen}, serverID, clientID, opts)
+	client = NewNoiseSession(realmConn{Conn: c, chosen: chosen}, clientID, serverID, clientOpts)
+	server = NewNoiseSession(realmConn{Conn: s, chosen: chosen}, serverID, clientID, serverOpts)
 	t.Cleanup(func() { _ = client.Close(); _ = server.Close() })
 	return client, server
 }
@@ -358,8 +369,11 @@ func TestNoiseSession_OpenPastTheSessionCreditCeilingIsRefusedBeforePublication(
 // RESET(ResetRefused) before the stream is published, so the server's acceptor
 // never sees it, and the client's Send and Receive on it return
 // aether.ErrStreamRefused while the client's reservation for it goes back.
+// The client's stream cap, and so its credit ceiling, is twice the server's:
+// a stream reserves its opener's credit on both sides, so the server's streams
+// hold as much of the client's ceiling as of the server's own.
 func TestNoiseSession_PeerOpenPastTheCreditCeilingIsResetAndReachesNoAcceptor(t *testing.T) {
-	client, server := creditPairWithStreamCap(t, 8, "remote")
+	client, server := creditPairWithStreamCaps(t, 16, 8, "remote")
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	const credit = 2 << 20

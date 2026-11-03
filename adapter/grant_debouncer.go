@@ -399,10 +399,13 @@ func (d *grantDebouncer) Close() {
 //
 // With nothing pending it still asks the window when the last flush's bytes met
 // no trigger (ungranted), and credit returns only through grants. A sender whose
-// own initial credit is under a quarter of this window (StreamConfig.InitialCredit
-// is local to each side) can exhaust it without reaching this window's threshold,
-// and then sends nothing that would make another Record happen, so the
-// window's TIMED trigger is reached only from here.
+// own initial credit is under a quarter of this window can exhaust it without
+// reaching this window's threshold, and then sends nothing that would make
+// another Record happen, so the window's TIMED trigger is reached only from
+// here. A NoiseSession's two ends of a stream start at the one credit its OPEN
+// states (handleOpen); a TCPSession's accepting side builds this window from
+// its own default credit, since its OPEN states none, so there the sender's
+// credit and this window can differ.
 func (d *grantDebouncer) checkAndFlushStuck(gapThreshold time.Duration) {
 	d.mu.Lock()
 	defer d.mu.Unlock()

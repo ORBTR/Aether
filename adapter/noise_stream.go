@@ -401,11 +401,19 @@ func (s *NoiseSession) refuseStream(st *noiseStream, toPeer bool) {
 	if !toPeer {
 		return
 	}
+	s.sendRefused(st.streamID)
+}
+
+// sendRefused answers a peer's open of streamID with RESET(ResetRefused), which
+// the peer's handleReset turns into aether.ErrStreamRefused on that stream.
+// refuseStream sends it for a stream createStream did not admit, and handleOpen
+// for an OPEN whose credit it refuses before any stream is built.
+func (s *NoiseSession) sendRefused(streamID uint64) {
 	payload := aether.EncodeReset(aether.ResetRefused)
 	s.writeFrame(&aether.Frame{
 		SenderID:   s.LocalPeerID(),
 		ReceiverID: s.RemotePeerID(),
-		StreamID:   st.streamID,
+		StreamID:   streamID,
 		Type:       aether.TypeRESET,
 		Length:     uint32(len(payload)),
 		Payload:    payload,
@@ -907,24 +915,18 @@ func (st *noiseStream) enqueueControl(payload []byte) {
 // receiveCeilings returns the most this stream's queue may hold (metered
 // credit) and the most the session's queues together may hold (queued cost),
 // both in messageCredit, before the peer is treated as ignoring credit. The
-// queue's real bound is the sender's credit, and OPEN does not carry the
-// sender's initial credit (StreamConfig.InitialCredit stays local to each side,
-// and handleOpen builds this window from the default), so this side's own
-// window cannot be used as a limit: a sender that opened with more credit than
-// this side's window would be refused for honouring its own. The connection
-// window is the bound both sides share (NewConnWindow(0) on each), and every
-// message a sender queues here has been charged to it too, at the same
-// messageCredit, so its initial size holds any honest stream, and its capacity
-// holds the session with room for departure skew (ConnWindow.ReceiveCeilings).
-// TODO: when OPEN carries the opener's initial credit, narrow streamLimit to
-// the credit this stream's sender actually holds.
+// stream's bound is the credit its sender holds, and this window is that
+// credit: the opener's OpenStream builds it from its configuration and states
+// it in OPEN, and the accepting handleOpen builds its own window from the
+// stated credit, so both ends of a stream start at one credit, and the
+// sender's grants come only from this side's consumption. The session's bound
+// is the connection window's capacity, which both sides build alike
+// (NewConnWindow(0) on each) and every queued message has been charged to at
+// the same messageCredit, with room for departure skew
+// (ConnWindow.ReceiveCeilings).
 func (st *noiseStream) receiveCeilings() (streamLimit, sessionLimit int64) {
-	initial, maximum := st.session.connWindow.ReceiveCeilings()
-	streamLimit = st.window.CurrentWindow()
-	if streamLimit < initial {
-		streamLimit = initial
-	}
-	return streamLimit, maximum
+	_, maximum := st.session.connWindow.ReceiveCeilings()
+	return st.window.CurrentWindow(), maximum
 }
 
 // teardown releases per-stream resources that must not outlive the

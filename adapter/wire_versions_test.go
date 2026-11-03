@@ -138,7 +138,7 @@ func TestTCPSession_CompatibleWireVersionsSameSetBothEnds(t *testing.T) {
 			if !okA || !okB || !a.Equal(b) {
 				t.Fatalf("client %v (%v) server %v (%v)", a, okA, b, okB)
 			}
-			for name, want := range map[string]uint16{"frame": 2, "frame.short": 1, "gossip.codec": 2} {
+			for name, want := range map[string]uint16{"frame": aether.WireVersionFrameCurrent, "frame.short": 1, "gossip.codec": 2} {
 				if v, ok := a.Version(name); !ok || v != want {
 					t.Fatalf("%s = %d, %v; want %d", name, v, ok, want)
 				}

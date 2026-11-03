@@ -745,6 +745,13 @@ func (s *NoiseSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) 
 		return nil, fmt.Errorf("OpenStream stream=%d: initial credit %d above the stream ceiling %d: %w",
 			cfg.StreamID, cfg.InitialCredit, ceiling, aether.ErrStreamCreditRefused)
 	}
+	// The OPEN payload states the credit in four bytes (aether.MaxOpenCredit);
+	// a credit it cannot state is refused here, before the stream exists, so
+	// the peer never builds a window other than this one.
+	if cfg.InitialCredit > aether.MaxOpenCredit {
+		return nil, fmt.Errorf("OpenStream stream=%d: initial credit %d above what OPEN states (%d): %w",
+			cfg.StreamID, cfg.InitialCredit, aether.MaxOpenCredit, aether.ErrStreamCreditRefused)
+	}
 
 	// Locally-initiated open. enforceRemoteCap=false means: enforce
 	// the MaxConcurrentStreams cap and the credit reservation but do NOT
@@ -768,11 +775,17 @@ func (s *NoiseSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) 
 	}
 	st.state.Transition(aether.EventSendOpen)
 
-	// Send OPEN frame
+	// Send OPEN frame. It states the credit createStream reserved for the
+	// stream, the window's size after flow.NewStreamWindowWithCap resolved the
+	// configured credit (zero to the default, a small one up to
+	// flow.MinGuaranteedWindow): the peer's handleOpen builds its window and
+	// its reservation for the stream from it, so each side's sends on the
+	// stream are bounded by the credit the other side holds for them.
 	openPayload := aether.EncodeOpenPayload(aether.OpenPayload{
-		Reliability: cfg.Reliability,
-		Priority:    cfg.Priority,
-		Dependency:  cfg.Dependency,
+		Reliability:   cfg.Reliability,
+		Priority:      cfg.Priority,
+		Dependency:    cfg.Dependency,
+		InitialCredit: uint32(st.window.CurrentWindow()),
 	})
 	frame := &aether.Frame{
 		SenderID:   s.LocalPeerID(),

@@ -1,7 +1,7 @@
 # Aether Wire Protocol — Wire Specification v6.1
 
 > **v6.1 changes from v6.0:**
-> - **§15 Version Negotiation REMOVED** — no pre-handshake negotiation; Aether is the only wire protocol. Identity comes from transport crypto.
+> - **§15 Version Negotiation** — no 4-byte negotiation header before the handshake; each named wire grammar is negotiated inside the handshake (§15). Identity comes from transport crypto.
 > - **ECN complete** (§9.3) — IP_RECVTOS / IPV6_RECVTCLASS cmsg plumbing shipped for Linux/Darwin/BSD + Winsock IP_RECVECN for Windows + js/wasm stub.
 > - **0.5-RTT session resume complete** (§31) — wire protocol for cross-host ticket delivery via `HandshakeResumeMaterial` HANDSHAKE frame, initiator cache, replay guard, AEAD proof tags, accept/reject prefixes (0xFA/0xF8/0xF9).
 > - **NAT RFC 5780 wired end-to-end** (§14) — `Runtime.NATBehaviour()` / `NATStrategy()` / `PickTraversalMethod(remote)` exposed; Strategy engine orchestrates direct / hole-punch / UPnP / relay per peer classification.
@@ -109,7 +109,7 @@ All multi-byte fields are **big-endian** (network byte order).
 
 | Code | Name | Payload | Description |
 |------|------|---------|-------------|
-| 0x02 | OPEN | `[Reliability:1][Priority:1][Dependency:8]` | Opens a new stream with specified QoS parameters. |
+| 0x02 | OPEN | `[Reliability:1][Priority:1][Dependency:8][InitialCredit:4]` | Opens a new stream with specified QoS parameters. `InitialCredit` (big-endian) is the credit the opener reserved for the stream; a Noise (Full profile) receiver builds its window and reservation for the stream from it and refuses (RESET Refused) a value below 1024 or above its stream ceiling. Zero states no aether stream credit: TCP-family and QUIC openers write it and their receivers do not read it. Frame grammar 3 (§15). |
 | 0x03 | CLOSE | (empty) | Graceful stream close (FIN). Sender will send no more data. Receiver continues until its own CLOSE. |
 | 0x04 | RESET | `[ReasonCode:4]` | Immediate stream abort. Both sides receive error on next Send/Receive. Reason codes: Cancel(0), Refused(1), Internal(2), FlowCtrl(3), Timeout(4). |
 
@@ -796,11 +796,13 @@ Dial-path integration points: `peer_connections.go:833` in HSTLES, `wire/peers.g
 
 ---
 
-## 15. Version Negotiation — REMOVED
+## 15. Version Negotiation
 
-Aether has no wire-level version negotiation. There is one wire protocol; identity and version are established by the underlying transport crypto layer (Noise XX/XK static keys, QUIC TLS handshake, WebSocket Ed25519 header, gRPC metadata). The `NegotiateMode` / `ModeAether` / `ModeString` APIs that existed in v5.x / v6.0 were removed in the HWP→Aether consolidation — they served a world where multiple wire formats coexisted, which no longer exists.
+There is no negotiation header before the handshake; identity is established by the underlying transport crypto layer (Noise XX/XK static keys, QUIC TLS handshake, WebSocket Ed25519 header, gRPC metadata). The `NegotiateMode` / `ModeAether` / `ModeString` APIs are gone, and a peer that sends a 4-byte negotiation header fails at the first read.
 
-Backward-compat note: peers running v5.x or v6.0 code that tried to exchange a 4-byte negotiation header will now see the first 4 bytes of an Aether frame instead. The session will fail with a codec error at the first read — this is the expected behaviour because those older peers also speak a different frame codec, so they could not interoperate anyway.
+Wire grammars are negotiated per session generation as a named set (`wire_versions.go`). Each side offers entries in name order, each a list of versions and a required flag; aether registers `fragment` (envelope version 2, required), `frame` (full-frame grammar 3, required), `frame.short` (version 1, optional) and `reliability` (version 1, required), and an application adds its own names through its options. For each name both sides list, the choice is the highest version in both lists; a required name with no common version, or one a side omits, refuses the session with `ErrWireVersionMismatch` (a `*WireVersionMismatchError` naming the entry and both lists) before any session or stream state exists; an optional one is left out. Under Noise the offer rides the NodeInfo inside the encrypted handshake; a TCP, WebSocket or gRPC session, and QUIC built through `NewSessionForProtocol` (all `TCPSession`), writes it as a bounded `AEWV` preface before its first frame and reads the peer's before decoding any; `adapter.QUICSession` exchanges none. Sessions report the choice through `aether.SessionWireVersions`.
+
+Frame grammar 3 is the grammar whose OPEN payload carries the opener's initial credit (§2.2). A build lists only the grammar it writes, so a peer offering only grammar 2 is refused before any state.
 
 ---
 

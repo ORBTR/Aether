@@ -139,8 +139,8 @@ func TestNoiseHandshake_CompatibleWireVersionsChosenOnBothEnds(t *testing.T) {
 	if v, ok := a.Version("gossip.codec"); !ok || v != 2 {
 		t.Fatalf("gossip.codec = %d, %v; want 2", v, ok)
 	}
-	if v, ok := a.Version(aether.WireVersionFrame); !ok || v != 2 {
-		t.Fatalf("frame = %d, %v; want 2", v, ok)
+	if v, ok := a.Version(aether.WireVersionFrame); !ok || v != aether.WireVersionFrameCurrent {
+		t.Fatalf("frame = %d, %v; want %d", v, ok, aether.WireVersionFrameCurrent)
 	}
 }
 

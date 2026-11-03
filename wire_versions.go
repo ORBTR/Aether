@@ -37,6 +37,13 @@ type WireVersions []WireVersion
 // because a session that cannot read its peer's fragments cannot carry the
 // messages they make up. frame is the full-frame grammar a session's frames are
 // read and written in; it is required because no frame can be read without it.
+// Its version 3 is the grammar whose OPEN payload carries the opener's initial
+// stream credit (OpenPayload.InitialCredit): adapter.NoiseSession's handleOpen
+// builds the accepted stream's window and credit reservation from it, and its
+// queue bound (receiveCeilings) is that window, so a peer that writes OPEN
+// without the credit cannot share a session with this build. This build lists
+// only version 3, so ChooseWireVersions refuses a peer that offers frame
+// grammar 2 alone before either side creates a session or a stream.
 // frame.short is the short-frame table; it is optional because a session that
 // does not choose it writes full frames only. reliability is the profile a
 // session's streams run: version 1 is the Full profile (adapter.NoiseSession's
@@ -54,8 +61,11 @@ const (
 
 	// WireVersionFragmentCurrent is the fragment envelope version this build
 	// writes and reads; adapter.FragmentEnvelope's version byte carries it.
-	WireVersionFragmentCurrent    uint16 = 2
-	wireVersionFrameCurrent       uint16 = 2
+	WireVersionFragmentCurrent uint16 = 2
+	// WireVersionFrameCurrent is the full-frame grammar version this build
+	// writes and reads (the OPEN payload's layout, OpenPayloadSize, is part
+	// of it); tests outside this package build peer offers from it.
+	WireVersionFrameCurrent       uint16 = 3
 	wireVersionFrameShortCurrent  uint16 = 1
 	wireVersionReliabilityCurrent uint16 = 1
 )
@@ -112,7 +122,7 @@ func (e *WireVersionMismatchError) Is(target error) bool { return target == ErrW
 func AetherWireVersions() WireVersions {
 	return WireVersions{
 		{Name: WireVersionFragment, Versions: []uint16{WireVersionFragmentCurrent}, Required: true},
-		{Name: WireVersionFrame, Versions: []uint16{wireVersionFrameCurrent}, Required: true},
+		{Name: WireVersionFrame, Versions: []uint16{WireVersionFrameCurrent}, Required: true},
 		{Name: WireVersionFrameShort, Versions: []uint16{wireVersionFrameShortCurrent}},
 		{Name: WireVersionReliability, Versions: []uint16{wireVersionReliabilityCurrent}, Required: true},
 	}
