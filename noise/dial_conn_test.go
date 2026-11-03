@@ -38,10 +38,11 @@ func newTestKeypair(t *testing.T) ([]byte, []byte) {
 	return kp.Private, kp.Public
 }
 
-// realmFromGrant is the GrantRealmFn the tests give both ends: it reads the
-// partition and the target the test grants carry, as a consumer's
-// GrantRealmFn reads them from its own signed grant body (outside this
-// repository; grant_realm.go).
+// realmFromGrant is the GrantRealmFn (DialConnConfig and AcceptConnConfig)
+// the tests give both ends: it reads the partition and the target the test
+// grants carry into a GrantRealm (grant_realm.go), as the grant issuer's
+// GrantRealmFn, outside this repository, reads them from its own signed grant
+// body.
 func realmFromGrant(body []byte) (GrantRealm, error) {
 	var g struct {
 		Scope  string `json:"scope"`

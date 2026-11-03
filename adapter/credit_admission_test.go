@@ -39,11 +39,11 @@ func streamPresent(s *NoiseSession, id uint64) bool {
 // does not read yet; a peer that ignores credit fills each stream to three
 // quarters of its ceiling and CLOSEs it, over eight streams, each opened with
 // the connection window's initial credit, the stream ceiling the OPEN gives
-// the server. The messages stay
-// charged to the session's budget after the peer's CLOSE, so the ceiling refuses
-// the stream that would pass it: what the queues hold never exceeds the session
-// ceiling, the budget equals what the queues hold, and a late reader still
-// drains a closed stream to io.EOF, which takes its cost off the budget.
+// the server. The messages stay charged to the session's budget after the
+// peer's CLOSE, so the ceiling refuses the stream that would pass it: what the
+// queues hold never exceeds the session ceiling, the budget equals what the
+// queues hold, and a late reader still drains a closed stream to io.EOF, which
+// takes its cost off the budget.
 func TestNoiseStream_APeerClosingFilledStreamsStaysInsideTheSessionCeiling(t *testing.T) {
 	client, server := noisePairWithRealms(t, nil, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
