@@ -377,6 +377,11 @@ type FragmentBuffer struct {
 	maxBufferedBytes int64
 	groupMaxAge      time.Duration
 	bufferedBytes    int64
+	// groupCharge is what the sender charged per message beyond its bytes, which
+	// no fragment carries: discardLocked adds it to what it reports released, so
+	// a discarded group gives it back once. noiseStream charges
+	// recvQueueEntryCost (newChargedFragmentBuffer); 0 otherwise.
+	groupCharge int64
 }
 
 // streamFragmentState is one stream's reassembly state: the sending stream
@@ -408,6 +413,14 @@ func NewFragmentBuffer() *FragmentBuffer {
 		maxBufferedBytes: DefaultFragBufferMaxBytes,
 		groupMaxAge:      DefaultFragGroupMaxAge,
 	}
+}
+
+// newChargedFragmentBuffer is NewFragmentBuffer for a stream whose sender charges
+// perMessage for each message on top of its bytes (noiseStream, messageCredit).
+func newChargedFragmentBuffer(perMessage int64) *FragmentBuffer {
+	fb := NewFragmentBuffer()
+	fb.groupCharge = perMessage
+	return fb
 }
 
 // SetMaxBufferedBytes overrides the cumulative byte cap across all
@@ -624,7 +637,7 @@ func (fb *FragmentBuffer) discardLocked(ss *streamFragmentState, id uint64, g *f
 	if fb.bufferedBytes < 0 {
 		fb.bufferedBytes = 0
 	}
-	return g.bytes
+	return g.bytes + fb.groupCharge
 }
 
 // pruneLocked drops every group older than the shorter of timeout and

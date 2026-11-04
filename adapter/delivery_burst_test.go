@@ -270,9 +270,10 @@ func overCreditFrames(t *testing.T, server *NoiseSession, st *noiseStream, first
 }
 
 // TestNoiseStream_APeerIgnoringCreditIsResetAndGrowsNoMemory: DATA past what any
-// honest sender can hold gets a flow-control RESET and an abuse charge, the queue
-// never passes the ceiling on the way there and is freed after it, and the
-// session's budget returns to zero. Empty messages charge no credit, and the
+// honest sender can hold gets a flow-control RESET and an abuse charge, and the
+// queue never passes the ceiling on the way there. What the queue took stays for
+// its consumer, who reads it and then ErrStreamOverrun, and the session's budget
+// returns to zero with that read. Empty messages cost no payload, and the
 // per-message cost still stops them.
 func TestNoiseStream_APeerIgnoringCreditIsResetAndGrowsNoMemory(t *testing.T) {
 	for _, tc := range []struct {
@@ -296,17 +297,26 @@ func TestNoiseStream_APeerIgnoringCreditIsResetAndGrowsNoMemory(t *testing.T) {
 			overCreditFrames(t, server, ss, 1, tc.frames, tc.size, tc.direct, func() bool {
 				return ss.recvQ.queuedBytes() <= streamLimit && server.recvQueued.Load() <= sessionLimit
 			})
-			if got := server.recvQueued.Load(); got != 0 {
-				t.Errorf("session budget after the refusal: %d, want 0", got)
-			}
-			if got := ss.recvQ.len(); got != 0 {
-				t.Errorf("refused queue still holds %d messages", got)
+			if got := server.recvQueued.Load(); got > streamLimit {
+				t.Errorf("session budget after the refusal: %d, past the stream's %d", got, streamLimit)
 			}
 			if got := server.deliveryStats.StreamOtherDropped.Load(); got != 1 {
 				t.Errorf("StreamOtherDropped %d, want 1", got)
 			}
-			if _, err := ss.Receive(ctx); !errors.Is(err, io.EOF) {
-				t.Errorf("receive on the refused stream: %v, want io.EOF", err)
+			held := ss.recvQ.len()
+			if held == 0 {
+				t.Errorf("the queue kept nothing for its consumer")
+			}
+			for i := 0; i < held; i++ {
+				if _, err := ss.Receive(ctx); err != nil {
+					t.Fatalf("receive %d of the %d the queue held: %v", i, held, err)
+				}
+			}
+			if _, err := ss.Receive(ctx); !errors.Is(err, aether.ErrStreamOverrun) {
+				t.Errorf("receive on the refused stream after what it held: %v, want ErrStreamOverrun", err)
+			}
+			if got := server.recvQueued.Load(); got != 0 {
+				t.Errorf("session budget after the consumer read: %d, want 0", got)
 			}
 			waitFor(t, "the peer's stream reset", func() bool { return !cs.IsOpen() })
 		})

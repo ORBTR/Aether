@@ -8,6 +8,8 @@ import (
 	"io"
 	"net"
 	"time"
+
+	"github.com/ORBTR/aether/flow"
 )
 
 // NodeID identifies a node in the mesh.
@@ -230,8 +232,9 @@ type SessionOptions struct {
 }
 
 // DefaultMaxConcurrentStreams is the default per-session stream cap for
-// Noise-UDP sessions. TCP/WS use a lower default in their own adapters.
-const DefaultMaxConcurrentStreams = 1024
+// Noise-UDP sessions, the bounds profile's (flow.CurrentBounds). The byte-stream
+// adapters' own default is adapter.DefaultTCPMaxConcurrentStreams.
+const DefaultMaxConcurrentStreams = flow.DefaultStreamCap
 
 // DefaultMaxFECGroups is the default in-flight FEC decoder group budget.
 const DefaultMaxFECGroups = 256

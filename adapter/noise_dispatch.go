@@ -384,7 +384,8 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 	// the consumer. It is safe ahead of delivery because enqueueDelivery always
 	// admits what a sender's credit covered: the acknowledged frame sits in a
 	// queue bounded by that credit and only a stream's end or a peer past its
-	// credit (reset by enqueueDelivery) can lose it. The ACK engine does
+	// credit (reset by enqueueDelivery, whose reader and sender both read it as
+	// aether.ErrStreamOverrun) can lose it. The ACK engine does
 	// in-memory state updates and may emit a CompositeACK, which never waits
 	// on a stream's consumer.
 	if st.ackEngine != nil {
@@ -859,9 +860,11 @@ func (s *NoiseSession) handleClose(frame *aether.Frame) {
 	// them and no more will come. Flush the final ACK, move what the window
 	// still holds into the queue as the last messages the reader sees, stop
 	// the queue's admission and close recvDone: Receive returns what the queue
-	// holds, then io.EOF. The sender's credit covered these messages, so they
-	// join the queue past its ceilings (pushFinal), and reading them grants
-	// credit back while the stream stays in the session.
+	// holds, then io.EOF. They join the queue through enqueueDelivery like any
+	// other message: an honest sender's credit covered them, so they fit, and a
+	// peer that buffers past its credit behind a gap and closes meets the same
+	// ceilings as one that sends in order. Reading them grants credit back,
+	// after the stream has left too (recvQueue.leftSession).
 	if st.ackEngine != nil {
 		st.ackEngine.Flush()
 		st.ackEngine.Stop()
@@ -871,7 +874,9 @@ func (s *NoiseSession) handleClose(frame *aether.Frame) {
 		if !whole {
 			continue
 		}
-		st.recvQ.pushFinal(payload)
+		if !st.enqueueDelivery(payload) {
+			break
+		}
 	}
 	st.recvQ.end()
 	st.closeRecvOnce()
@@ -892,19 +897,25 @@ func (s *NoiseSession) handleReset(frame *aether.Frame) {
 	}
 	s.mu.Unlock()
 	if ok {
-		// A refusal (createStream's cap or credit reservation on the peer) is
-		// recorded first, so Send and Receive name it once the stream ends.
-		if aether.DecodeReset(frame.Payload) == aether.ResetRefused {
+		// A refusal (createStream's cap or credit reservation on the peer) and
+		// an overrun (the peer's enqueueDelivery) are recorded first, so Send
+		// and Receive name them once the stream ends.
+		switch aether.DecodeReset(frame.Payload) {
+		case aether.ResetRefused:
 			st.refusedByPeer.Store(true)
+		case aether.ResetFlowCtrl:
+			st.overrun.Store(true)
 		}
+		st.left.Store(true)
 		st.state.Transition(aether.EventRecvReset)
 		// The peer's RESET ends the send side too: no CLOSE follows it.
 		st.closeDone.Store(true)
 		st.teardown()
 		st.recvQ.peerEnded()
 		st.closeRecvOnce()
-		// Out of s.streams, as in noiseStream.leaveSession: the frames the
-		// peer's RESET leaves unacked go back to the session's in-flight counter.
+		// Out of s.streams, so no ACK reaches this stream again: what the
+		// peer's RESET leaves charged goes back to the session's in-flight
+		// counter and connection window.
 		st.releaseInFlight()
 		st.releaseReservation()
 		s.releaseStream(frame.StreamID)

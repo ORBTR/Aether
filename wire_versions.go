@@ -11,6 +11,8 @@ import (
 	"io"
 	"sort"
 	"strings"
+
+	"github.com/ORBTR/aether/flow"
 )
 
 // WireVersion is one named wire grammar or envelope a peer offers in its
@@ -32,7 +34,12 @@ type WireVersion struct {
 // encoding Encode writes.
 type WireVersions []WireVersion
 
-// The entries aether registers for itself. fragment is the envelope a message
+// The entries aether registers for itself. bounds is the credit and queue
+// profile (flow.CurrentBounds): it is required because a sender's connection
+// credit equals the session ceiling of a receiver on the same profile, and
+// across two profiles a sender inside its credit could overrun its receiver
+// (NoiseSession's receive queues reset a sender past the ceiling). fragment is
+// the envelope a message
 // larger than one frame travels in (adapter.FragmentEnvelope); it is required
 // because a session that cannot read its peer's fragments cannot carry the
 // messages they make up. frame is the full-frame grammar a session's frames are
@@ -54,6 +61,7 @@ type WireVersions []WireVersion
 // retransmit and flow frames of this one differently, so no stream could be
 // published between the two.
 const (
+	WireVersionBounds      = "bounds"
 	WireVersionFragment    = "fragment"
 	WireVersionFrame       = "frame"
 	WireVersionFrameShort  = "frame.short"
@@ -121,6 +129,7 @@ func (e *WireVersionMismatchError) Is(target error) bool { return target == ErrW
 // offer.
 func AetherWireVersions() WireVersions {
 	return WireVersions{
+		{Name: WireVersionBounds, Versions: []uint16{flow.BoundsProfileVersion}, Required: true},
 		{Name: WireVersionFragment, Versions: []uint16{WireVersionFragmentCurrent}, Required: true},
 		{Name: WireVersionFrame, Versions: []uint16{WireVersionFrameCurrent}, Required: true},
 		{Name: WireVersionFrameShort, Versions: []uint16{wireVersionFrameShortCurrent}},

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/ORBTR/aether"
+	"github.com/ORBTR/aether/flow"
 	"github.com/ORBTR/aether/reliability"
 )
 
@@ -44,9 +45,12 @@ func receiveAsync(ctx context.Context, st aether.Stream, within time.Duration) <
 // request, sends a reply and closes at once. Every reply reaches the caller
 // whole, then io.EOF. The server's CLOSE waits for the ACK of the reply's last
 // frame (finishSend), so the caller's handleClose, which ends the stream on
-// both sides here, finds the reply already in its queue.
+// both sides here, finds the reply already in its queue. The largest reply fits
+// the fragment count at the MSS a session starts at (pmtu.SafeFloorMSS): nothing
+// here waits for the PMTU sweep to raise it, and Send refuses a message that does
+// not fit.
 func TestNoiseStream_AReplyThenCloseReachesAHalfClosedCaller(t *testing.T) {
-	for _, size := range []int{512, 64 * 1024, 512 * 1024} {
+	for _, size := range []int{512, 64 * 1024, 256 * 1024} {
 		t.Run(fmt.Sprintf("size=%d", size), func(t *testing.T) {
 			key := uint32(0x5eed5eed)
 			client, server := noisePairWithRealms(t, &key, &key)
@@ -247,12 +251,12 @@ func TestNoiseStream_NoCloseFollowsAReset(t *testing.T) {
 	}
 }
 
-// TestNoiseStream_AStreamThatLeftCreditsNoRead: the client sends two messages
-// and closes; the server, not reading, closes too, and its stream leaves the
-// session once both CLOSEs are done. A message read off its queue afterwards
-// credits nothing: the client took the credit back when its own stream left
-// (releaseInFlight), and a grant from here would return those bytes twice.
-func TestNoiseStream_AStreamThatLeftCreditsNoRead(t *testing.T) {
+// TestNoiseStream_AStreamThatLeftOnBothClosesCreditsItsReads: the client sends two
+// messages and closes; the server, not reading, closes too, and its stream leaves
+// the session once both CLOSEs are done. A message read off its queue afterwards
+// is credited: the client's own leave returned no connection credit
+// (leaveSession), so the grant this read makes is what returns those bytes.
+func TestNoiseStream_AStreamThatLeftOnBothClosesCreditsItsReads(t *testing.T) {
 	key := uint32(0x5eed5eed)
 	client, server := noisePairWithRealms(t, &key, &key)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -271,8 +275,34 @@ func TestNoiseStream_AStreamThatLeftCreditsNoRead(t *testing.T) {
 	if !ok || len(got) != 300 {
 		t.Fatalf("the queue gave %d bytes, ok %v; want the first message", len(got), ok)
 	}
+	if !credited {
+		t.Fatal("a read after the stream left on both CLOSEs is not credited: the client's credit would be stranded")
+	}
+}
+
+// TestNoiseStream_AStreamAResetEndedCreditsNoRead: after the peer's RESET a read
+// off the queue credits nothing: the RESET's sender took back all the stream had
+// charged (releaseInFlight), and a grant from here would return those bytes twice.
+func TestNoiseStream_AStreamAResetEndedCreditsNoRead(t *testing.T) {
+	key := uint32(0x5eed5eed)
+	client, server := noisePairWithRealms(t, &key, &key)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cs, ss := openWithCredit(t, ctx, client, server, 571, 0)
+	if err := cs.Send(ctx, burstMessage(0, 300)); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	waitSendWindowEmpty(t, cs, "the message acknowledged")
+	if err := cs.Reset(aether.ResetCancel); err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+	waitFor(t, "the stream out of the server's session", func() bool { return !streamPresent(server, 571) })
+	got, credited, ok := ss.recvQ.pop()
+	if !ok || len(got) != 300 {
+		t.Fatalf("the queue gave %d bytes, ok %v; want the message", len(got), ok)
+	}
 	if credited {
-		t.Fatal("a read after the stream left the session is credited")
+		t.Fatal("a read after a RESET is credited")
 	}
 }
 
@@ -286,12 +316,26 @@ func TestNoiseStream_ASendInProgressPrecedesTheClose(t *testing.T) {
 	client, server := noisePairWithRealms(t, &key, &key)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	initial, _ := client.connWindow.ReceiveCeilings()
-	filler, fs := openWithCredit(t, ctx, client, server, 580, 2*initial)
+	// Enough streams at the most credit one stream can hold to spend the
+	// connection window, which is larger than that.
+	var fillers, fillerReaders []*noiseStream
+	for id := uint64(582); int64(len(fillers))*flow.MaxGrowableWindow <= flow.CurrentBounds().ConnCredit(); id++ {
+		f, fs := openWithCredit(t, ctx, client, server, id, flow.MaxGrowableWindow)
+		fillers, fillerReaders = append(fillers, f), append(fillerReaders, fs)
+	}
 	bs, bss := openWithCredit(t, ctx, client, server, 581, 0)
 	msg := burstMessage(5, 1024)
 	for avail := client.connWindow.Available(); avail >= messageCredit(int64(len(msg))); avail = client.connWindow.Available() {
-		n := avail - recvQueueEntryCost
+		filler := fillers[0]
+		if filler.window.Available() < avail && filler.window.Available() < messageCredit(64*1024) {
+			fillers = fillers[1:]
+			filler = fillers[0]
+		}
+		n := avail
+		if w := filler.window.Available(); w < n {
+			n = w
+		}
+		n -= recvQueueEntryCost
 		if n > 64*1024 {
 			n = 64 * 1024
 		}
@@ -317,12 +361,14 @@ func TestNoiseStream_ASendInProgressPrecedesTheClose(t *testing.T) {
 	if bs.closeDone.Load() {
 		t.Fatal("the CLOSE was written while a Send was in progress")
 	}
-	for {
-		rctx, rcancel := context.WithTimeout(ctx, 200*time.Millisecond)
-		_, err := fs.Receive(rctx)
-		rcancel()
-		if err != nil {
-			break
+	for _, fs := range fillerReaders {
+		for {
+			rctx, rcancel := context.WithTimeout(ctx, 200*time.Millisecond)
+			_, err := fs.Receive(rctx)
+			rcancel()
+			if err != nil {
+				break
+			}
 		}
 	}
 	if err := <-sent; err != nil {
