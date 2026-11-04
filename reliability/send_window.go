@@ -348,8 +348,8 @@ func (w *SendWindow) HighestWritten() (*aether.Frame, uint32) {
 
 // ReleaseInFlight takes every entry out of the window and gives its
 // InFlightBytes back to the session counter, returning the total released.
-// The adapter calls it where a stream leaves its session's stream map
-// (noiseStream.Reset, NoiseSession.handleClose and handleReset): from then
+// The adapter calls it where a RESET takes a stream out of its session's stream
+// map (noiseStream.Reset, NoiseSession.handleReset): from then
 // on the session's handleACK finds no stream for the peer's ACKs, so no
 // ACK path would ever remove these entries, and without this call their
 // charge would stay in the counter for the session's life, holding that

@@ -564,13 +564,14 @@ func DecodePriority(data []byte) PriorityPayload {
 }
 
 // EncodeOpenPayload encodes an OPEN frame payload:
-// [1 reliability][1 priority][8 dependency, big-endian][4 initial credit, big-endian].
+// [1 reliability][1 priority][8 dependency, big-endian][4 initial credit, big-endian][1 FEC level].
 func EncodeOpenPayload(o OpenPayload) []byte {
 	data := make([]byte, OpenPayloadSize)
 	data[0] = byte(o.Reliability)
 	data[1] = o.Priority
 	binary.BigEndian.PutUint64(data[2:10], o.Dependency)
 	binary.BigEndian.PutUint32(data[10:14], o.InitialCredit)
+	data[14] = o.FECLevel
 	return data
 }
 
@@ -586,6 +587,7 @@ func DecodeOpenPayload(data []byte) OpenPayload {
 		Priority:      data[1],
 		Dependency:    binary.BigEndian.Uint64(data[2:10]),
 		InitialCredit: binary.BigEndian.Uint32(data[10:14]),
+		FECLevel:      data[14],
 	}
 }
 
@@ -610,40 +612,103 @@ func DecodeGoAway(data []byte) (GoAwayReason, string) {
 	return reason, message
 }
 
-// EncodeFECHeader encodes an FEC_REPAIR frame header.
+// EncodeFECHeader encodes an FEC_REPAIR payload's header and table of covered
+// frames; the repair bytes follow what it returns.
 func EncodeFECHeader(h FECHeader) []byte {
-	data := make([]byte, FECHeaderSize)
+	data := make([]byte, FECRepairOverhead(len(h.Covered)))
 	binary.BigEndian.PutUint32(data[0:4], h.GroupID)
 	data[4] = h.Index
 	data[5] = h.Total
+	data[6] = h.Level
+	data[7] = uint8(len(h.Covered))
+	for i, c := range h.Covered {
+		entry := data[FECHeaderSize+i*FECCoveredSize:]
+		binary.BigEndian.PutUint32(entry[0:4], c.SeqNo)
+		binary.BigEndian.PutUint16(entry[4:6], c.Length)
+		if c.Fragment {
+			entry[6] = 1
+		}
+	}
 	return data
 }
 
-// DecodeFECHeader decodes an FEC_REPAIR frame header.
-func DecodeFECHeader(data []byte) FECHeader {
+// DecodeFECHeader decodes an FEC_REPAIR payload into its header and the repair
+// bytes behind the table. It returns aether.ErrFECRepairMalformed, before it
+// allocates the table, for input shorter than the header, a covered count of zero
+// or past MaxFECCovered, or a table the input cannot hold, and after reading the
+// table for a frame it names twice, which no group of the sender's encoders holds.
+func DecodeFECHeader(data []byte) (FECHeader, []byte, error) {
 	if len(data) < FECHeaderSize {
-		return FECHeader{}
+		return FECHeader{}, nil, fmt.Errorf("%w: %d bytes", ErrFECRepairMalformed, len(data))
 	}
-	return FECHeader{
+	count := int(data[7])
+	if count == 0 || count > MaxFECCovered {
+		return FECHeader{}, nil, fmt.Errorf("%w: %d covered frames", ErrFECRepairMalformed, count)
+	}
+	end := FECRepairOverhead(count)
+	if len(data) < end {
+		return FECHeader{}, nil, fmt.Errorf("%w: %d bytes for %d covered frames", ErrFECRepairMalformed, len(data), count)
+	}
+	h := FECHeader{
 		GroupID: binary.BigEndian.Uint32(data[0:4]),
 		Index:   data[4],
 		Total:   data[5],
+		Level:   data[6],
+		Covered: make([]FECCovered, count),
 	}
+	seen := make(map[uint32]struct{}, count)
+	for i := range h.Covered {
+		entry := data[FECHeaderSize+i*FECCoveredSize:]
+		c := FECCovered{
+			SeqNo:    binary.BigEndian.Uint32(entry[0:4]),
+			Length:   binary.BigEndian.Uint16(entry[4:6]),
+			Fragment: entry[6]&1 != 0,
+		}
+		if _, dup := seen[c.SeqNo]; dup {
+			return FECHeader{}, nil, fmt.Errorf("%w: frame %d named twice", ErrFECRepairMalformed, c.SeqNo)
+		}
+		seen[c.SeqNo] = struct{}{}
+		h.Covered[i] = c
+	}
+	return h, data[end:], nil
 }
 
-// EncodeReset encodes a RESET frame payload.
+// EncodeReset encodes the RESET payload of a writer that states no credit counts:
+// a refusal, which holds no stream, and the TCP-family and QUIC sessions, which
+// run no aether credit.
 func EncodeReset(reason ResetReason) []byte {
+	return EncodeResetPayload(ResetPayload{Reason: reason})
+}
+
+// EncodeResetPayload encodes a RESET frame payload.
+func EncodeResetPayload(p ResetPayload) []byte {
 	data := make([]byte, ResetPayloadSize)
-	binary.BigEndian.PutUint32(data, uint32(reason))
+	binary.BigEndian.PutUint32(data[0:4], uint32(p.Reason))
+	binary.BigEndian.PutUint64(data[4:12], p.Charged)
+	binary.BigEndian.PutUint64(data[12:20], p.Released)
+	binary.BigEndian.PutUint64(data[20:28], p.Consumed)
 	return data
 }
 
-// DecodeReset decodes a RESET frame payload.
+// DecodeReset decodes a RESET frame payload's reason, for a reader of no count.
 func DecodeReset(data []byte) ResetReason {
+	return DecodeResetPayload(data).Reason
+}
+
+// DecodeResetPayload decodes a RESET frame payload. Input shorter than
+// ResetPayloadSize decodes to the zero value: Validate has refused such a frame on
+// every session path that reads one, and this is a second guard for a caller that
+// did not run it.
+func DecodeResetPayload(data []byte) ResetPayload {
 	if len(data) < ResetPayloadSize {
-		return ResetCancel
+		return ResetPayload{}
 	}
-	return ResetReason(binary.BigEndian.Uint32(data))
+	return ResetPayload{
+		Reason:   ResetReason(binary.BigEndian.Uint32(data[0:4])),
+		Charged:  binary.BigEndian.Uint64(data[4:12]),
+		Released: binary.BigEndian.Uint64(data[12:20]),
+		Consumed: binary.BigEndian.Uint64(data[20:28]),
+	}
 }
 
 // ────────────────────────────────────────────────────────────────────────────

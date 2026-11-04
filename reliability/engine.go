@@ -5,8 +5,8 @@
 
 // Engine composes all per-stream reliability components into a single
 // state machine. This is the integration layer that adapters use instead
-// of wiring SendWindow, RecvWindow, RetransmitQueue, RTTEstimator,
-// FECEncoder, and ReplayWindow individually.
+// of wiring SendWindow, RecvWindow, RetransmitQueue, RTTEstimator and
+// ReplayWindow individually.
 
 package reliability
 
@@ -19,13 +19,8 @@ import (
 
 // Engine manages the full reliability lifecycle for a single stream.
 // It orchestrates: sequence assignment, ACK/SACK processing, retransmission,
-// RTT estimation, FEC encoding/decoding, and anti-replay protection.
-//
-// FEC mode: when EngineConfig.FECMode == FECReedSolomon, `RSEnc` /
-// `RSDec` are populated and the XOR `FEC`/`FECDec` fields stay nil.
-// When the mode is FECBasicXOR (or zero), the XOR fields are populated
-// and `RSEnc`/`RSDec` stay nil. Callers that touch these fields
-// directly should check both.
+// RTT estimation and anti-replay protection. A stream's FEC state is StreamFEC,
+// which adapter.NoiseSession's createStream builds beside it.
 //
 // Locking model: split into send-side and recv-side locks so a busy
 // receiver doesn't block the sender (and vice-versa) on high-throughput
@@ -48,10 +43,6 @@ type Engine struct {
 	RecvWin     *RecvWindow
 	RetransmitQ *RetransmitQueue
 	RTT         *RTTEstimator
-	FEC         *FECEncoder // populated when FECMode is XOR or zero
-	FECDec      *FECDecoder
-	RSEnc       *RSEncoder // populated when FECMode == FECReedSolomon
-	RSDec       *RSDecoder
 	Replay      *ReplayWindow
 
 	// Configuration
@@ -66,19 +57,11 @@ type Engine struct {
 
 // EngineConfig holds configuration for creating a reliability engine.
 type EngineConfig struct {
-	StreamID     uint64
-	Reliability  aether.Reliability
-	WindowSize   int           // send/recv window size (default: 256)
-	MaxRetries   int           // 0 = unlimited
-	MaxAge       time.Duration // 0 = no deadline
-	FECGroupSize int           // 0 = no FEC, >0 = XOR group size
-	// FECMode selects the FEC implementation. Defaults to FECBasicXOR
-	// when FECGroupSize > 0. Set to FECReedSolomon to switch the engine
-	// to k=FECGroupSize, m=FECParityShards Reed-Solomon.
-	FECMode FECLevel
-	// FECParityShards is the m parameter for Reed-Solomon. Ignored when
-	// FECMode != FECReedSolomon. Default: DefaultRSParityShards.
-	FECParityShards int
+	StreamID    uint64
+	Reliability aether.Reliability
+	WindowSize  int           // send/recv window size (default: 256)
+	MaxRetries  int           // 0 = unlimited
+	MaxAge      time.Duration // 0 = no deadline
 }
 
 // NewEngine creates a reliability engine with the given configuration.
@@ -102,37 +85,11 @@ func NewEngine(cfg EngineConfig) *Engine {
 		maxAge:      cfg.MaxAge,
 	}
 
-	// FECGroupSize 0 = FEC disabled (gossip, keepalive, control streams).
-	// FECGroupSize > 0 = FEC enabled with the specified mode + group size.
-	if cfg.FECGroupSize > 0 {
-		switch cfg.FECMode {
-		case FECReedSolomon:
-			parity := cfg.FECParityShards
-			if parity <= 0 {
-				parity = DefaultRSParityShards
-			}
-			if rs, err := NewRSEncoder(cfg.FECGroupSize, parity); err == nil {
-				e.RSEnc = rs
-			}
-			if rs, err := NewRSDecoder(cfg.FECGroupSize, parity); err == nil {
-				e.RSDec = rs
-			}
-		default:
-			e.FEC = NewFECEncoder(cfg.FECGroupSize)
-			e.FECDec = NewFECDecoder()
-		}
-	}
-
-	if cfg.MaxAge > 0 {
-		e.RetransmitQ.SetMaxAge(cfg.MaxAge)
-		e.RecvWin.SetMaxAge(cfg.MaxAge)
-	}
-
 	return e
 }
 
-// Send prepares a frame for sending: assigns SeqNo, enqueues for retransmission,
-// generates FEC repair if applicable. Returns the assigned SeqNo.
+// Send prepares a frame for sending: assigns SeqNo and enqueues it for
+// retransmission. Returns the assigned SeqNo.
 // Send-path orchestration → sendMu.
 func (e *Engine) Send(frame *aether.Frame) uint32 {
 	e.sendMu.Lock()

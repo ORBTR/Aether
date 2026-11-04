@@ -29,6 +29,7 @@ type RecvWindow struct {
 	buffer        map[uint32][]byte    // out-of-order frames: SeqNo → payload
 	bufTime       map[uint32]time.Time // out-of-order frames: SeqNo → buffer arrival time
 	marked        map[uint32]bool      // out-of-order frames inserted marked (InsertMarked); absent = unmarked
+	ends          map[uint32]bool      // out-of-order frames inserted as the stream's end (InsertEnd)
 	maxGap        int                  // max reorder buffer size (frame count)
 	maxBytes      int64                // max total bytes buffered (0 = unlimited)
 	bufferedBytes int64                // current sum of buffered payload bytes
@@ -67,6 +68,7 @@ func NewRecvWindowWithCap(maxGap int, maxBytes int64) *RecvWindow {
 		buffer:   make(map[uint32][]byte),
 		bufTime:  make(map[uint32]time.Time),
 		marked:   make(map[uint32]bool),
+		ends:     make(map[uint32]bool),
 		maxGap:   maxGap,
 		maxBytes: maxBytes,
 	}
@@ -96,10 +98,13 @@ func (w *RecvWindow) SetHOLHist(h *metrics.DurationHist) {
 // back, with the mark its frame was inserted under. The Noise adapter marks a
 // DATA frame that carries one fragment envelope (aether.Frame.IsFragment), so
 // the flag the frame header carried reaches reassembly after reordering, which
-// sees payloads only.
+// sees payloads only. End says the frame carries no message and is the peer's
+// CLOSE (InsertEnd), which reaches its reader behind every frame sequenced before
+// it.
 type RecvDelivery struct {
 	Payload []byte
 	Marked  bool
+	End     bool
 }
 
 // Insert records a received frame. Returns the list of in-order payloads
@@ -125,6 +130,20 @@ func (w *RecvWindow) InsertChecked(seqNo uint32, payload []byte) (delivered [][]
 // its own frame was inserted under. A re-insert of a still-buffered frame takes
 // the latest mark; a frame dropped for age drops its mark with it.
 func (w *RecvWindow) InsertMarked(seqNo uint32, payload []byte, mark bool) (delivered []RecvDelivery, accepted bool) {
+	return w.insert(seqNo, payload, mark, false)
+}
+
+// InsertEnd is InsertMarked for a frame that carries no message and takes a
+// sequence number to end the stream's receive side: the adapter's handleClose
+// inserts the peer's CLOSE here, and its RecvDelivery comes back End once every
+// frame before it has been delivered. A CLOSE that overtook a frame, or whose
+// predecessor is lost, waits in the buffer like any frame, and the ACK engine reads
+// its sequence number from this window like any frame's.
+func (w *RecvWindow) InsertEnd(seqNo uint32) (delivered []RecvDelivery, accepted bool) {
+	return w.insert(seqNo, nil, false, true)
+}
+
+func (w *RecvWindow) insert(seqNo uint32, payload []byte, mark, end bool) (delivered []RecvDelivery, accepted bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -136,7 +155,7 @@ func (w *RecvWindow) InsertMarked(seqNo uint32, payload []byte, mark bool) (deli
 
 	if seqNo == w.expected {
 		// In-order: deliver immediately + flush any buffered successors
-		delivered := []RecvDelivery{{Payload: copyPayload(payload), Marked: mark}}
+		delivered := []RecvDelivery{{Payload: copyPayload(payload), Marked: mark, End: end}}
 		w.expected++
 
 		// Flush buffered successors, skipping expired frames.
@@ -158,6 +177,7 @@ func (w *RecvWindow) InsertMarked(seqNo uint32, payload []byte, mark bool) (deli
 					delete(w.buffer, w.expected)
 					delete(w.bufTime, w.expected)
 					delete(w.marked, w.expected)
+					delete(w.ends, w.expected)
 					w.expected++
 					continue // skip expired frame
 				}
@@ -168,11 +188,12 @@ func (w *RecvWindow) InsertMarked(seqNo uint32, payload []byte, mark bool) (deli
 					w.holHist.Record(now.Sub(arrived))
 				}
 			}
-			delivered = append(delivered, RecvDelivery{Payload: p, Marked: w.marked[w.expected]})
+			delivered = append(delivered, RecvDelivery{Payload: p, Marked: w.marked[w.expected], End: w.ends[w.expected]})
 			w.bufferedBytes -= int64(len(p))
 			delete(w.buffer, w.expected)
 			delete(w.bufTime, w.expected)
 			delete(w.marked, w.expected)
+			delete(w.ends, w.expected)
 			w.expected++
 		}
 		if w.bufferedBytes < 0 {
@@ -212,6 +233,11 @@ func (w *RecvWindow) InsertMarked(seqNo uint32, payload []byte, mark bool) (deli
 		w.marked[seqNo] = true
 	} else {
 		delete(w.marked, seqNo)
+	}
+	if end {
+		w.ends[seqNo] = true
+	} else {
+		delete(w.ends, seqNo)
 	}
 	w.bufferedBytes += payloadLen
 	return nil, true
@@ -396,8 +422,10 @@ func (w *RecvWindow) Spread() int {
 }
 
 // Drain returns all buffered out-of-order payloads in SeqNo order,
-// regardless of gaps. Used during stream close to deliver remaining data.
-// After drain, the buffer is empty and expected advances past all drained frames.
+// regardless of gaps, for a caller that ends a stream without waiting for the
+// gaps to fill. After drain, the buffer is empty and expected advances past all
+// drained frames. The adapter's sessions do not call it: a peer's CLOSE reaches
+// its reader in sequence (InsertEnd), behind every frame before it.
 func (w *RecvWindow) Drain() [][]byte {
 	return payloadsOf(w.DrainMarked())
 }
@@ -421,7 +449,7 @@ func (w *RecvWindow) DrainMarked() []RecvDelivery {
 	// Deliver all in order
 	delivered := make([]RecvDelivery, 0, len(seqs))
 	for _, seq := range seqs {
-		delivered = append(delivered, RecvDelivery{Payload: w.buffer[seq], Marked: w.marked[seq]})
+		delivered = append(delivered, RecvDelivery{Payload: w.buffer[seq], Marked: w.marked[seq], End: w.ends[seq]})
 	}
 
 	// Clear buffer and advance expected

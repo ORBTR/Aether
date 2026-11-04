@@ -265,6 +265,23 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 		return // unknown stream
 	}
 
+	// The payload joins the stream's FEC decoder first, so what it lets a held
+	// repair rebuild follows it into the receive window.
+	var recovered []reliability.FECRecovered
+	if st.fec != nil {
+		recovered = st.fec.AddData(frame.SeqNo, frame.Payload)
+	}
+	s.admitSequenced(st, frame.SeqNo, frame.Payload, frame.IsFragment(), false)
+	s.admitRecovered(st, recovered)
+}
+
+// admitSequenced takes one frame of the stream's sequence number space through
+// the replay window and the receive window, acknowledges it and delivers what its
+// arrival puts in order: a DATA frame (handleData), a frame the FEC decoder rebuilt
+// (admitRecovered) and a CLOSE (handleClose, end set). A payload recovered and then
+// retransmitted, or the reverse, meets the replay window here and reaches its
+// consumer once, in its place. Runs on the session's readLoop.
+func (s *NoiseSession) admitSequenced(st *noiseStream, seq uint32, payload []byte, fragment, end bool) {
 	// Anti-replay classification — distinguishes legitimate retransmits
 	// (drop silently, NO abuse) from genuine anomalies (drop AND feed
 	// abuse score). The two must be told apart because aether's own
@@ -287,7 +304,7 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 	// durably buffered by recvWindow below. If we marked it seen here and the
 	// reorder buffer then dropped it for capacity, every retransmit would
 	// classify ResultDuplicate and be discarded forever, wedging the stream.
-	switch result := st.replay.Classify(frame.SeqNo); result {
+	switch result := st.replay.Classify(seq); result {
 	case reliability.ResultNew:
 		// fall through to delivery below; commit after a durable insert
 	case reliability.ResultDuplicate:
@@ -311,7 +328,7 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 		// Skip recvWindow.Insert (already delivered) and
 		// congestion.OnAck (would double-count bytes).
 		if st.ackEngine != nil {
-			st.ackEngine.OnDuplicateReceived(frame.SeqNo)
+			st.ackEngine.OnDuplicateReceived(seq)
 		}
 		return
 	case reliability.ResultWrapAttack:
@@ -340,7 +357,7 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 		// idempotent recvWindow (recv_window.go dedups < expected and
 		// already-buffered SeqNos harmlessly) instead of dropping it --
 		// preserving delivery (no stream stall) with no false abuse.
-		if frame.SeqNo < st.recvWindow.ExpectedSeqNo() {
+		if seq < st.recvWindow.ExpectedSeqNo() {
 			// Genuinely below the delivery floor: already delivered. Almost
 			// always a retransmit whose cumulative ACK was lost and which
 			// arrived >64 behind an advanced topSeq. Force an eager ACK to
@@ -357,7 +374,7 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 			// ResultWrapAttack; a genuine replay flood is bounded by the
 			// eager-ACK cost, not an abuse kill.
 			if st.ackEngine != nil {
-				st.ackEngine.OnDuplicateReceived(frame.SeqNo)
+				st.ackEngine.OnDuplicateReceived(seq)
 			}
 			return
 		}
@@ -373,9 +390,17 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 	// A capacity drop leaves it un-committed so its retransmit is still
 	// deliverable. Commit is idempotent and a no-op for below-floor/ancient
 	// SeqNos, so the ResultAncient-at/above-floor fall-through is safe.
-	delivered, accepted := st.recvWindow.InsertMarked(frame.SeqNo, frame.Payload, frame.IsFragment())
+	var (
+		delivered []reliability.RecvDelivery
+		accepted  bool
+	)
+	if end {
+		delivered, accepted = st.recvWindow.InsertEnd(seq)
+	} else {
+		delivered, accepted = st.recvWindow.InsertMarked(seq, payload, fragment)
+	}
 	if accepted {
-		st.replay.Commit(frame.SeqNo)
+		st.replay.Commit(seq)
 	}
 
 	// Notify the ACK engine before delivery. An ACK says the frame reached
@@ -389,13 +414,18 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 	// in-memory state updates and may emit a CompositeACK, which never waits
 	// on a stream's consumer.
 	if st.ackEngine != nil {
-		st.ackEngine.OnDataReceived(frame.SeqNo, s.isAckImmediateStream(frame.StreamID))
+		st.ackEngine.OnDataReceived(seq, end || s.isAckImmediateStream(st.streamID))
 	}
 
 	// Delivery: each whole in-order message goes to the stream's recvQ through
-	// enqueueDelivery. A Reset or stream GC sweep on another goroutine may tear
+	// enqueueDelivery, and a CLOSE, once every frame before it has gone, ends the
+	// receive side. A Reset or stream GC sweep on another goroutine may tear
 	// the stream down after the lookup above; enqueueDelivery then returns false.
 	for _, d := range delivered {
+		if d.End {
+			s.endReceive(st)
+			continue
+		}
 		payload, whole := st.reassemble(d)
 		if !whole {
 			continue // a fragment of a message not yet complete, or refused
@@ -435,9 +465,9 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	if !ok {
 		return
 	}
-	// A stream Close has ended writes its CLOSE on the ACK that empties its
-	// send window, and leaves the session then if the peer's CLOSE has come
-	// (finishSend).
+	// A stream Close has ended queues its CLOSE on the ACK that empties its send
+	// window, and on that CLOSE's own ACK leaves the session if the peer's CLOSE
+	// has come (finishSend).
 	defer func() { _ = st.finishSend() }()
 
 	// Decode Composite ACK
@@ -720,47 +750,40 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	}
 }
 
-// handleFECRepair takes a FEC_REPAIR frame into the session's decoders and
-// delivers nothing they recover. A recovered payload carries no sequence
-// number: the encoders group the payloads of every stream on the session in the
-// order sendSingleFrame hands them over, and a DATA frame carries no group or
-// index, so nothing can place a recovered payload in its stream's receive
-// window. Queued beside that window it would reach the consumer out of order,
-// and again when the frame it stands for arrives or is retransmitted, which the
-// sender does for every frame the window has not acknowledged; the message
-// reaches the consumer once, through its DATA frame. The decoders still take
-// each repair, so their group bounds and eviction count (Metrics' fecEvicted)
-// describe the repair traffic the peer sends.
-// TODO: deliver a recovered payload through its stream's receive window once a
-// repair names the sequence numbers of the frames it covers.
+// admitRecovered puts frames the stream's FEC decoder rebuilt through the path a
+// frame from the wire takes.
+func (s *NoiseSession) admitRecovered(st *noiseStream, recovered []reliability.FECRecovered) {
+	for _, r := range recovered {
+		s.fecRecovered.Add(1)
+		s.admitSequenced(st, r.SeqNo, r.Payload, r.Fragment, false)
+	}
+}
+
+// handleFECRepair takes a FEC_REPAIR frame into its stream's decoder and delivers
+// what it recovers. The repair names the frames it covers by sequence number, so a
+// recovered payload takes its place in the stream's receive window: the sender stops
+// retransmitting it on the ACK that window now produces, and a retransmit already on
+// its way meets the replay window. A stream with no FEC state ignores the repair: its
+// session has FEC disabled, or the stream has left and the frame came too late to
+// matter. A repair that cannot be read or does not fit the stream is charged to the
+// peer, which writes neither.
 func (s *NoiseSession) handleFECRepair(frame *aether.Frame) {
-	if len(frame.Payload) < aether.FECHeaderSize {
+	s.mu.Lock()
+	st, ok := s.streams[frame.StreamID]
+	s.mu.Unlock()
+	if !ok || st.fec == nil {
 		return
 	}
-	fecHdr := aether.DecodeFECHeader(frame.Payload[:aether.FECHeaderSize])
-	repairData := frame.Payload[aether.FECHeaderSize:]
-
-	// The receiver doesn't know which FEC mode the sender used for this
-	// group until it sees the repair frame, so we feed the repair into
-	// every decoder; at most one actually reconstructs.
-	//   1. Reed-Solomon — RS(k,m) recovers up to m losses
-	//   2. Interleaved XOR — burst loss across offset groups
-	//   3. Basic XOR — single loss per group
-	// RSDecoder.AddRepair returns [][]byte (one slice per recovered data
-	// shard); the other two return a single []byte.
-	if s.rsDecoder != nil {
-		if shards := s.rsDecoder.AddRepair(fecHdr, repairData); shards != nil {
-			dbgNoise.Printf("stream %d: %d FEC-recovered payloads not delivered: no sequence number", frame.StreamID, len(shards))
+	header, repair, err := aether.DecodeFECHeader(frame.Payload)
+	if err == nil {
+		var recovered []reliability.FECRecovered
+		if recovered, err = st.fec.AddRepair(header, repair); err == nil {
+			s.admitRecovered(st, recovered)
 			return
 		}
 	}
-	recovered := s.interleavedDecoder.AddRepair(fecHdr, repairData)
-	if recovered == nil {
-		recovered = s.fecDecoder.AddRepair(fecHdr, repairData)
-	}
-	if recovered != nil {
-		dbgNoise.Printf("stream %d: a FEC-recovered payload not delivered: no sequence number", frame.StreamID)
-	}
+	dbgNoise.Printf("stream %d: FEC repair refused: %v", frame.StreamID, err)
+	s.reportAbuse(abuse.ReasonMalformedFrame)
 }
 
 // handleOpen admits a stream the peer opened. The OPEN states the credit the
@@ -773,7 +796,8 @@ func (s *NoiseSession) handleFECRepair(frame *aether.Frame) {
 // flow.NewStreamWindowWithCap would raise a smaller credit to the minimum,
 // leaving this window larger than the opener's, and would take a larger one
 // as its growth ceiling, so a peer's declaration would raise this side's
-// ceiling. An OPEN for a stream already in s.streams changes nothing: that
+// ceiling. An FEC level outside the registry is refused the same way: the
+// opener would write repairs this side cannot read. An OPEN for a stream already in s.streams changes nothing: that
 // stream keeps its window and reservation, and the acceptor is not handed it a
 // second time.
 func (s *NoiseSession) handleOpen(frame *aether.Frame) {
@@ -790,8 +814,10 @@ func (s *NoiseSession) handleOpen(frame *aether.Frame) {
 		Priority:      payload.Priority,
 		Dependency:    payload.Dependency,
 		InitialCredit: int64(payload.InitialCredit),
+		FECLevel:      payload.FECLevel,
 	}
-	if cfg.InitialCredit < flow.MinGuaranteedWindow || cfg.InitialCredit > streamCreditCeiling(cfg) {
+	if cfg.InitialCredit < flow.MinGuaranteedWindow || cfg.InitialCredit > streamCreditCeiling(cfg) ||
+		!reliability.ValidFECLevel(cfg.FECLevel) {
 		atomic.AddUint64(&s.streamRefused, 1)
 		s.reportAbuse(abuse.ReasonStreamRefused)
 		s.sendRefused(frame.StreamID)
@@ -841,85 +867,154 @@ func (s *NoiseSession) handleImplicitOpen(frame *aether.Frame) {
 	}
 }
 
+// handleClose takes the peer's CLOSE, which holds the next sequence number of the
+// peer's frames on the stream: it goes through the receive window like a frame of
+// DATA, so it is acknowledged like one, a retransmit of it is answered like one, and
+// it ends the receive side only once every frame before it has been delivered
+// (endReceive). A CLOSE for a stream this side no longer holds is a retransmit whose
+// ACK was lost, of a stream that has left on both CLOSEs, or a stream this side never
+// held, its OPEN lost: the peer writes its CLOSE only once all its frames are
+// acknowledged (finishSend), so a cumulative ACK up to the CLOSE says only that and
+// lets the peer's stream end, at the cost of a frame answering a frame.
 func (s *NoiseSession) handleClose(frame *aether.Frame) {
-	s.txCompressor.RemoveStream(frame.StreamID)
-	s.rxCompressor.RemoveStream(frame.StreamID)
 	s.mu.Lock()
 	st, ok := s.streams[frame.StreamID]
 	s.mu.Unlock()
 	if !ok {
+		s.txCompressor.RemoveStream(frame.StreamID)
+		s.rxCompressor.RemoveStream(frame.StreamID)
+		s.sendCompositeACK(frame.StreamID, &aether.CompositeACK{BaseACK: frame.SeqNo})
 		return
 	}
+	s.admitSequenced(st, frame.SeqNo, nil, false, true)
+}
+
+// endReceive ends the stream's receive side at the peer's CLOSE, whether or not
+// this side has closed: every frame sequenced before the CLOSE has been delivered
+// (admitSequenced) and no more will come. Flush the final ACK, stop the queue's
+// admission and close recvDone: Receive returns what the queue holds, then io.EOF.
+// Reading them grants credit back, after the stream has left too
+// (recvQueue.leftSession). A retransmit of the CLOSE whose ACK was lost meets the
+// replay window in admitSequenced, which acknowledges it at once.
+func (s *NoiseSession) endReceive(st *noiseStream) {
 	st.state.Transition(aether.EventRecvFIN)
 	if st.peerClosed.Swap(true) {
 		return // a repeated CLOSE ends nothing more
 	}
-	// The peer's CLOSE ends the stream's receive side, whether or not this side
-	// has closed: the peer wrote it once every DATA frame it sent here was
-	// acknowledged (its finishSend), so the receive window holds the last of
-	// them and no more will come. Flush the final ACK, move what the window
-	// still holds into the queue as the last messages the reader sees, stop
-	// the queue's admission and close recvDone: Receive returns what the queue
-	// holds, then io.EOF. They join the queue through enqueueDelivery like any
-	// other message: an honest sender's credit covered them, so they fit, and a
-	// peer that buffers past its credit behind a gap and closes meets the same
-	// ceilings as one that sends in order. Reading them grants credit back,
-	// after the stream has left too (recvQueue.leftSession).
+	s.txCompressor.RemoveStream(st.streamID)
+	s.rxCompressor.RemoveStream(st.streamID)
 	if st.ackEngine != nil {
 		st.ackEngine.Flush()
-		st.ackEngine.Stop()
-	}
-	for _, d := range st.recvWindow.DrainMarked() {
-		payload, whole := st.reassemble(d)
-		if !whole {
-			continue
-		}
-		if !st.enqueueDelivery(payload) {
-			break
-		}
 	}
 	st.recvQ.end()
 	st.closeRecvOnce()
-	// The send side stays until this side's CLOSE is written: Send works on a
+	// The send side stays until this side's CLOSE is acknowledged: Send works on a
 	// stream only the peer has closed, and handleACK still finds the stream for
 	// the frames it has in flight. Once both CLOSEs are done the stream leaves
 	// (leaveIfEnded), here or in finishSend.
 	st.leaveIfEnded()
 }
 
+// handleReset takes the peer's RESET, which ends both halves of the stream. A RESET
+// for a stream this side has itself reset crossed this side's on the path, and each
+// side's corrects the other's settlement from the count this side kept
+// (noteResetGrants). A RESET for any other stream this side does not hold has
+// nothing to end: this side kept no grants for it.
 func (s *NoiseSession) handleReset(frame *aether.Frame) {
 	s.txCompressor.RemoveStream(frame.StreamID)
 	s.rxCompressor.RemoveStream(frame.StreamID)
+	payload := aether.DecodeResetPayload(frame.Payload)
 	s.mu.Lock()
 	st, ok := s.streams[frame.StreamID]
 	if ok {
 		delete(s.streams, frame.StreamID)
 	}
+	crossed, wasReset := s.resetGrants[frame.StreamID]
+	delete(s.resetGrants, frame.StreamID)
 	s.mu.Unlock()
-	if ok {
-		// A refusal (createStream's cap or credit reservation on the peer) and
-		// an overrun (the peer's enqueueDelivery) are recorded first, so Send
-		// and Receive name them once the stream ends.
-		switch aether.DecodeReset(frame.Payload) {
-		case aether.ResetRefused:
-			st.refusedByPeer.Store(true)
-		case aether.ResetFlowCtrl:
-			st.overrun.Store(true)
+	if !ok {
+		if wasReset {
+			s.withholdGranted(crossed.granted, payload)
 		}
-		st.left.Store(true)
-		st.state.Transition(aether.EventRecvReset)
-		// The peer's RESET ends the send side too: no CLOSE follows it.
-		st.closeDone.Store(true)
-		st.teardown()
-		st.recvQ.peerEnded()
-		st.closeRecvOnce()
-		// Out of s.streams, so no ACK reaches this stream again: what the
-		// peer's RESET leaves charged goes back to the session's in-flight
-		// counter and connection window.
-		st.releaseInFlight()
-		st.releaseReservation()
-		s.releaseStream(frame.StreamID)
-		s.trackEnded(st.recvQ)
+		return
+	}
+	// A refusal (createStream's cap or credit reservation on the peer) and
+	// an overrun (the peer's enqueueDelivery) are recorded first, so Send
+	// and Receive name them once the stream ends.
+	switch payload.Reason {
+	case aether.ResetRefused:
+		st.refusedByPeer.Store(true)
+	case aether.ResetFlowCtrl:
+		st.overrun.Store(true)
+	}
+	st.left.Store(true)
+	st.state.Transition(aether.EventRecvReset)
+	// The peer's RESET ends the send side too: no CLOSE follows it.
+	st.closeSent.Store(true)
+	st.closeDone.Store(true)
+	st.teardown()
+	granted := st.recvQ.peerEnded()
+	st.closeRecvOnce()
+	st.settlePeerReset(payload, granted)
+	// Out of s.streams, so no ACK reaches this stream again: what the
+	// peer's RESET leaves charged goes back to the session's in-flight
+	// counter and connection window.
+	st.releaseInFlight()
+	st.releaseReservation()
+	s.releaseStream(frame.StreamID)
+	s.trackEnded(st.recvQ)
+}
+
+// withholdGranted takes off this session's later connection grants what it granted
+// on a stream past what the peer's RESET says its grants had returned there
+// (aether.ResetPayload, Charged minus Released): the peer took those bytes back at
+// its RESET. A release above the charge cannot be true of any stream, so the
+// statement is charged to the peer and withholds nothing.
+func (s *NoiseSession) withholdGranted(granted int64, p aether.ResetPayload) {
+	if p.Released > p.Charged {
+		s.reportAbuse(abuse.ReasonMalformedFrame)
+		return
+	}
+	returned := p.Charged - p.Released
+	if uint64(granted) > returned {
+		s.connWindow.Withhold(granted - int64(returned))
+	}
+}
+
+// noteResetGrants keeps what a stream this side has reset granted, for a RESET of
+// the peer's that crosses this side's on the path and so finds the stream gone
+// (handleReset). A count of zero needs no note, nothing can have been granted twice;
+// the map is bounded by the session's stream cap, past which a note is dropped and
+// a crossing costs the sender only the credit it held twice, and by
+// sweepResetGrants' lifetime. createStream drops the note when the ID is reused.
+func (s *NoiseSession) noteResetGrants(streamID uint64, granted int64) {
+	if granted <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	limit := s.opts.MaxConcurrentStreams
+	if limit <= 0 {
+		limit = aether.DefaultMaxConcurrentStreams
+	}
+	if s.resetGrants == nil {
+		s.resetGrants = make(map[uint64]resetGrant)
+	}
+	if len(s.resetGrants) >= limit {
+		return
+	}
+	s.resetGrants[streamID] = resetGrant{granted: granted, at: time.Now()}
+}
+
+// sweepResetGrants drops notes older than resetGrantLifetime: the peer's RESET was
+// not crossing this side's.
+func (s *NoiseSession) sweepResetGrants(now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, g := range s.resetGrants {
+		if now.Sub(g.at) > resetGrantLifetime {
+			delete(s.resetGrants, id)
+		}
 	}
 }
 
@@ -1034,7 +1129,7 @@ func (s *NoiseSession) handlePathProbe(frame *aether.Frame) {
 }
 
 // sendCompositeACK sends a Composite ACK frame for a stream.
-func (s *NoiseSession) sendCompositeACK(st *noiseStream, cack *aether.CompositeACK) {
+func (s *NoiseSession) sendCompositeACK(streamID uint64, cack *aether.CompositeACK) {
 	// ECN piggyback. Two inputs feed the per-ACK CE-byte total:
 	//   1. The adapter-level ceObservedBytes, written by
 	//      NoiseSession.RecordCEBytes for a layer above the Noise conn
@@ -1066,7 +1161,7 @@ func (s *NoiseSession) sendCompositeACK(st *noiseStream, cack *aether.CompositeA
 	frame := &aether.Frame{
 		SenderID:   s.LocalPeerID(),
 		ReceiverID: s.RemotePeerID(),
-		StreamID:   st.streamID,
+		StreamID:   streamID,
 		Type:       aether.TypeACK,
 		Flags:      aether.FlagCOMPOSITE_ACK, // marks as Composite ACK format
 		AckNo:      cack.BaseACK,             // mirror the cumulative ACK in the header field for peers that only decode the header

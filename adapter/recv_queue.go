@@ -71,11 +71,11 @@ const (
 // so taking it or sweeping it replenishes the sender even after the stream has
 // left the session (a late reader of a closed stream, noiseStream.leaveIfEnded).
 // A RESET is the one exit that settles the credit otherwise: the sender takes
-// back all the stream had charged (noiseStream.releaseInFlight), since it cannot
-// tell what reached this queue, so peerEnded takes the queue out of charged and
-// nothing taken after it is credited. Such a queue's cost is memory no sender
-// is paying for, and NoiseSession.makeQueueRoom discards it when a credited
-// message needs the room.
+// back what the stream still had charged and what its grants do not cover, since
+// it cannot tell what reached this queue (aether.ResetPayload), so peerEnded takes
+// the queue out of charged and nothing taken after it is credited. Such a queue's
+// cost is memory no sender is paying for, and NoiseSession.makeQueueRoom discards it
+// when a credited message needs the room.
 type recvQueue struct {
 	mu        sync.Mutex
 	items     []recvItem
@@ -87,6 +87,11 @@ type recvQueue struct {
 	ended     bool
 	noCredit  bool
 	discarded bool
+	// granted is the credit of this stream's messages the receiver has returned
+	// or will return through connection grants: each credited pop, and what
+	// reassembly gave back (addGranted). peerEnded reads it at the moment the
+	// grants stop, which is what a RESET states as Consumed (aether.ResetPayload).
+	granted int64
 	// lastTake is the UnixNano of the last pop or of the stream's leaving the
 	// session (leftSession, peerEnded), whichever is later: sweepEndedQueues
 	// reads it to tell an abandoned queue from one a late consumer is still
@@ -219,6 +224,7 @@ func (q *recvQueue) pop() (payload []byte, credited, ok bool) {
 		q.credit -= c
 		if !q.noCredit {
 			q.charged.Add(-c)
+			q.granted += c
 		}
 	} else {
 		q.unmetered--
@@ -253,23 +259,40 @@ func (q *recvQueue) leftSession() {
 }
 
 // peerEnded records that a RESET has ended the stream, sent by either side: the
-// sender takes back all the stream had charged (noiseStream.releaseInFlight), so
-// a later pop replenishes nothing and the queue leaves the session's charged
-// count. The messages stay in its budget until they are read or discarded, so a
-// peer that fills streams and resets them cannot grow memory past the ceiling
-// behind a consumer that is not reading. Its callers are the RESET exits
-// (handleReset, Reset), and each then hands the queue to trackEnded. A nil
-// queue is a stream built outside createStream, which Reset may still reach.
-func (q *recvQueue) peerEnded() {
+// sender takes back what the stream had charged beyond the grants this side has
+// made (aether.ResetPayload), so a later pop replenishes nothing and the queue
+// leaves the session's charged count. The messages stay in its budget until they
+// are read or discarded, so a peer that fills streams and resets them cannot grow
+// memory past the ceiling behind a consumer that is not reading. It returns the
+// credit this queue's stream granted, final from here on (granted). Its callers are
+// the RESET exits (handleReset, Reset), and each then hands the queue to trackEnded.
+// A nil queue is a stream built outside createStream, which Reset may still reach.
+func (q *recvQueue) peerEnded() (granted int64) {
 	if q == nil {
-		return
+		return 0
 	}
 	q.mu.Lock()
+	defer q.mu.Unlock()
+	// The queue takes nothing more: a push behind this would count in charged for a
+	// sender that has taken its credit back, and in the count this returns.
+	q.ended = true
 	if !q.noCredit {
 		q.noCredit = true
 		q.charged.Add(-q.credit)
 	}
 	q.lastTake = time.Now().UnixNano()
+	return q.granted
+}
+
+// addGranted records credit of this stream's messages returned other than by a
+// pop: the bytes noiseStream.reassemble gives back when reassembly will not deliver
+// them. Nil-safe like peerEnded.
+func (q *recvQueue) addGranted(n int64) {
+	if q == nil {
+		return
+	}
+	q.mu.Lock()
+	q.granted += n
 	q.mu.Unlock()
 }
 

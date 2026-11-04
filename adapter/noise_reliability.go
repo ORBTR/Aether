@@ -96,8 +96,8 @@ func (s *NoiseSession) writeLoop() {
 				break // empty — fall through to park on wake/closed
 			}
 
-			st := s.dataFrameStream(frame)
-			if frame == held && st == nil && frame.Type == aether.TypeDATA {
+			st := s.sequencedFrameStream(frame)
+			if frame == held && st == nil && sequencedFrame(frame) {
 				// The stream left while its frame waited here. Scheduler.Unregister
 				// dropped every frame still in the stream's queue for the same reason.
 				held = nil
@@ -838,6 +838,7 @@ func (s *NoiseSession) reliabilityTick() {
 				s.lastAutoTune = now
 				s.autoTuneWindows()
 				s.sweepEndedQueues(now)
+				s.sweepResetGrants(now)
 			}
 
 			// Periodic WINDOW_UPDATE re-emission — breaks the UDP-loss
@@ -856,24 +857,12 @@ func (s *NoiseSession) reliabilityTick() {
 				s.refreshWindowGrants()
 			}
 
-			// FEC decoder pruning. Without this, FEC_REPAIR flooding
-			// with unique GroupIDs causes unbounded memory growth.
+			// FEC decoder pruning by age. Each stream's decoder bounds its groups
+			// and bytes as they arrive (reliability.FECBudget); a slow trickle below
+			// those bounds would still hold its memory for the stream's life.
 			// Rate-limited to once per second so the 10ms tick stays cheap.
-			// Both count-based (budget) and age-based (2×SRTT) pruning
-			// must run — a slow trickle below the count cap still
-			// accumulates memory over time.
 			now := time.Now()
 			if now.Sub(s.lastFECPrune) >= time.Second {
-				maxGroups := s.opts.MaxFECGroups
-				if maxGroups <= 0 {
-					maxGroups = aether.DefaultMaxFECGroups
-				}
-				s.fecDecoder.Prune(maxGroups)
-				s.interleavedDecoder.Prune(maxGroups)
-				if s.rsDecoder != nil {
-					s.rsDecoder.Prune(maxGroups)
-				}
-
 				// Age-based cutoff = 2×max(SRTT) across live streams, with
 				// a floor to avoid over-pruning when RTT is unmeasured.
 				// FEC recovery is useless after 2 RTTs — the sender's
@@ -882,10 +871,10 @@ func (s *NoiseSession) reliabilityTick() {
 				if age < 2*time.Second {
 					age = 2 * time.Second
 				}
-				s.fecDecoder.PruneOlderThan(age)
-				s.interleavedDecoder.PruneOlderThan(age)
-				if s.rsDecoder != nil {
-					s.rsDecoder.PruneOlderThan(age)
+				for _, e := range snap {
+					if e.st.fec != nil {
+						e.st.fec.PruneOlderThan(age)
+					}
 				}
 				s.lastFECPrune = now
 			}
@@ -956,12 +945,18 @@ func (s *NoiseSession) connWrite(b []byte) error {
 	return nil
 }
 
-// dataFrameStream returns the stream whose send window may hold frame, or nil for
-// any other frame or a stream that has left s.streams. The write loop calls it per
-// frame before the CanSend gate, which needs the frame's recorded count from that
+// sequencedFrame reports whether a frame takes a sequence number from its stream's
+// send window: DATA, and the CLOSE finishSend queues.
+func sequencedFrame(frame *aether.Frame) bool {
+	return frame.Type == aether.TypeDATA || frame.Type == aether.TypeCLOSE
+}
+
+// sequencedFrameStream returns the stream whose send window may hold frame, or nil
+// for any other frame or a stream that has left s.streams. The write loop calls it
+// per frame before the CanSend gate, which needs the frame's recorded count from that
 // window, and passes the stream on to the write boundary.
-func (s *NoiseSession) dataFrameStream(frame *aether.Frame) *noiseStream {
-	if frame.Type != aether.TypeDATA {
+func (s *NoiseSession) sequencedFrameStream(frame *aether.Frame) *noiseStream {
+	if !sequencedFrame(frame) {
 		return nil
 	}
 	s.mu.Lock()
@@ -1005,7 +1000,8 @@ func (s *NoiseSession) prepareFrame(frame *aether.Frame, recorded, recordedPlain
 }
 
 // wireSizeLocked predicts the bytes emitFrameLocked would write for a frame the
-// scheduler holds (DATA or FEC_REPAIR, whose short forms are the data ones) with
+// scheduler holds (DATA or FEC_REPAIR, whose short forms are the data ones, or a
+// CLOSE, whose short form is smaller than the full header counted for it) with
 // the compressor as it stands, reading no state it would advance. Caller holds
 // writeMu. Another writer's frame can change the header form before the write, so
 // the count the frame is charged is the one emitFrameLocked measures.
@@ -1068,7 +1064,7 @@ func (s *NoiseSession) writeFrame(frame *aether.Frame) error {
 	// the receiver inflates and decrypts each copy once (processIncomingFrame),
 	// so every copy must carry the bytes the first pass produced, and
 	// writeFrame has callers beside the writeLoop (reliabilityTick's STATS
-	// frame, Ping, the control handlers, Close and Reset) while
+	// frame, Ping, the control handlers and Reset) while
 	// FrameEncryptor.Encrypt advances the session's nonce counter, so the
 	// flag check, the payload swap and the write stay inside the one lock
 	// every caller takes. CPU cost: compressPayload + Encrypt run under a

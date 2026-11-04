@@ -91,6 +91,18 @@ var (
 	// Use errors.Is(err, aether.ErrStreamRefused) to detect.
 	ErrStreamRefused = errors.New("transport: stream refused by peer")
 
+	// ErrFECRepairMalformed signals an FEC_REPAIR payload that cannot be read or
+	// does not fit the stream it arrived on: DecodeFECHeader and
+	// reliability.StreamFEC return it, and adapter.NoiseSession's handleFECRepair
+	// charges the peer for it and keeps nothing of the repair.
+	ErrFECRepairMalformed = errors.New("transport: FEC repair malformed")
+
+	// ErrFECLevelUnsupported signals a stream configuration whose FEC level is
+	// outside the registry (reliability.FECLevel). adapter.NoiseSession's
+	// OpenStream returns it before the stream exists, so a level this build cannot
+	// run is refused and never read as no FEC.
+	ErrFECLevelUnsupported = errors.New("transport: FEC level unsupported")
+
 	// ErrStreamOverrun signals that a stream ended with messages it could not
 	// deliver. On a byte-stream session (TCP, WebSocket, gRPC) the receiver's
 	// delivery queue was full: the sender sent more bytes than the receiving

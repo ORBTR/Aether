@@ -330,12 +330,12 @@ func TestNoiseStream_AnOverrunIsTypedAtBothEndsAndTheReaderKeepsWhatItHeld(t *te
 	}
 }
 
-// TestNoiseSession_FramesHeldBehindAGapMeetTheCeilingAtClose: a peer ignoring
+// TestNoiseSession_FramesHeldBehindAGapMeetTheCeilingWhenItFills: a peer ignoring
 // credit holds frames in each stream's receive window behind a sequence gap and
-// closes, so handleClose drains them to the queue. Each stream is held to its
-// credit there as in order, and the streams to the session's ceiling, however
+// a CLOSE behind them, which ends nothing until the gap fills. Then each stream is
+// held to its credit as in order, and the streams to the session's ceiling, however
 // many streams the peer does this on.
-func TestNoiseSession_FramesHeldBehindAGapMeetTheCeilingAtClose(t *testing.T) {
+func TestNoiseSession_FramesHeldBehindAGapMeetTheCeilingWhenItFills(t *testing.T) {
 	client, server := noisePairWithRealms(t, nil, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -346,7 +346,11 @@ func TestNoiseSession_FramesHeldBehindAGapMeetTheCeilingAtClose(t *testing.T) {
 		cs, ss := openWithCredit(t, ctx, client, server, id, 0)
 		waitSendWindowEmpty(t, cs, "the opening message")
 		injectData(server, id, 2, 30, size)
-		server.handleClose(&aether.Frame{Type: aether.TypeCLOSE, StreamID: id})
+		server.handleClose(&aether.Frame{Type: aether.TypeCLOSE, StreamID: id, SeqNo: 32})
+		if ss.peerClosed.Load() {
+			t.Fatalf("stream %d: a CLOSE behind a gap ended the receive side", id)
+		}
+		injectData(server, id, 1, 1, size)
 		if q := ss.recvQ.queuedBytes(); messageCreditOf(q, size) > ss.window.CurrentWindow() {
 			t.Fatalf("stream %d queued %d at close, past its credit %d", id, q, ss.window.CurrentWindow())
 		}

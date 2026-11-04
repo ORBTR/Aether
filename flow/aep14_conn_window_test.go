@@ -81,3 +81,31 @@ func TestAEP14_BoundaryExactly16MB(t *testing.T) {
 		t.Fatalf("grant %d at exactly 16 MB, want > 0", g)
 	}
 }
+
+// TestConnWindow_WithholdTakesOffLaterGrants: what is withheld is taken off the
+// cumulative grants the window goes on to emit, and consumption past it grants again.
+func TestConnWindow_WithholdTakesOffLaterGrants(t *testing.T) {
+	const size = int64(16 << 20)
+	w := NewConnWindow(size)
+	big := size / 2 // past every grant trigger's threshold
+	if got := w.ReceiverConsume(big); got != big {
+		t.Fatalf("first grant %d", got)
+	}
+	w.Withhold(1000)
+	if got := w.ReceiverConsume(400); got != 0 {
+		t.Fatalf("consumption inside what is withheld granted, cumulative %d", got)
+	}
+	if got := w.ReceiverConsume(big); got != big+big+400-1000 {
+		t.Fatalf("cumulative %d, want %d", got, big+big+400-1000)
+	}
+	w.Withhold(0)
+	w.Withhold(-5)
+	if got := w.CurrentGrant(); got != big+big+400-1000 {
+		t.Fatalf("a count at or below zero moved the grant to %d", got)
+	}
+	r := w.Stats().RecvCredit
+	w.Withhold(1 << 62)
+	if got := w.Stats().RecvCredit; got != size || got < r {
+		t.Fatalf("receive credit %d past the window's size", got)
+	}
+}

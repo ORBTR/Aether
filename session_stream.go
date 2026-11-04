@@ -138,7 +138,8 @@ type SessionMetrics struct {
 	// SuspiciousACKs); surfaced per-node by the consumer that sums a
 	// session's stats.
 	ForensicSuppressed uint64
-	FECGroupsEvicted   uint64 // FEC groups evicted by count/age pruning (reliabilityTick)
+	FECGroupsEvicted   uint64 // FEC groups dropped undecided: for room, by age or on a conflicting repair
+	FECRecovered       uint64 // DATA frames FEC repairs rebuilt on this side (handleFECRepair, handleData); STATS does not carry it
 	StreamRefused      uint64 // incoming stream opens rejected at MaxConcurrentStreams
 	SeqNoWraps         uint64 // SeqNo jumps past SeqNoWrapThreshold rejected by ReplayWindow
 	RecvWindowDrops    uint64 // reorder-buffer overflow drops (total across streams)
@@ -492,8 +493,12 @@ type StreamConfig struct {
 	// take them up to the package default.
 	MaxCredit int64
 
-	// FECLevel sets the forward error correction level for this stream.
-	// Default: FECBasicXOR for Noise-UDP, FECNone for others.
+	// FECLevel sets the forward error correction level for this stream, a
+	// reliability.FECLevel value: 0 runs no FEC, and it is what a stream that
+	// states none gets. A NoiseSession with FEC enabled (SessionOptions.FEC) builds
+	// the level's state on both ends of the stream from its OPEN, and refuses a
+	// level outside the registry. A TCP-family or QUIC session ignores it: FEC
+	// belongs to their transport.
 	FECLevel uint8
 
 	// Compressed enables per-frame DEFLATE compression on this stream.

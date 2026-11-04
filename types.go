@@ -172,11 +172,11 @@ type SessionOptions struct {
 	// 0 = use DefaultMaxConcurrentStreams.
 	MaxConcurrentStreams int
 
-	// MaxFECGroups caps the FEC decoder's in-flight group count. Older
-	// groups are pruned from the decoder once this many are buffered
-	// (the noise adapter's reliabilityTick prunes once a second).
-	// Protects against unbounded memory growth from FEC_REPAIR flooding
-	// with unique GroupIDs.
+	// MaxFECGroups caps each stream's FEC decoder's in-flight group count: a
+	// repair past it evicts the oldest (reliability.RepairDecoder), and the
+	// decoder's byte budget holds it to less on large frames. Protects
+	// against unbounded memory growth from FEC_REPAIR flooding with unique
+	// GroupIDs.
 	// 0 = use DefaultMaxFECGroups.
 	MaxFECGroups int
 
