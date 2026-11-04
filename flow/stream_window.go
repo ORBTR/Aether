@@ -103,7 +103,10 @@ const MinGuaranteedWindow int64 = 1024 // 1KB
 // or connection window stayed empty until ConsumeTimeout or its context ended:
 // the peer's consumer has not taken what is outstanding. Every Consume failure
 // wraps it, so errors.Is tells backpressure from a failed write; the bytes are
-// not sent and nothing has been lost.
+// not sent and nothing has been lost. A byte-stream session holds no credit and
+// answers with the same error when the queue between its Send and the conn stays
+// full the same way (tcpStream.awaitSendRoom), so a caller reads one backpressure on
+// every profile.
 var ErrCreditExhausted = errors.New("aether flow: credit exhausted")
 
 // ConsumeTimeout is how long Consume waits for credit before returning an error.
