@@ -39,12 +39,13 @@ type wireResult struct {
 // failed or the session closed first. wireResult then holds the chosen set or the
 // reason. OpenStream waits on it and nothing decodes a frame before it, which is
 // what puts the refusal of a mismatched peer ahead of every stream. wireTimer ends
-// an exchange the peer leaves unanswered.
+// an exchange the peer leaves unanswered; it is atomic because its own callback can
+// run finishWireVersions before the session has finished storing it.
 type wireExchange struct {
 	wireDone   chan struct{}
 	wireOnce   sync.Once
 	wireResult atomic.Pointer[wireResult]
-	wireTimer  *time.Timer
+	wireTimer  atomic.Pointer[time.Timer]
 }
 
 func newWireExchange() wireExchange {
@@ -59,8 +60,8 @@ func (x *wireExchange) finishWireVersions(chosen aether.NegotiatedWireVersions, 
 	x.wireOnce.Do(func() {
 		first = true
 		x.wireResult.Store(&wireResult{chosen: chosen, err: err})
-		if x.wireTimer != nil {
-			x.wireTimer.Stop()
+		if t := x.wireTimer.Load(); t != nil {
+			t.Stop()
 		}
 		close(x.wireDone)
 	})

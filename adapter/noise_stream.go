@@ -233,7 +233,7 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 		config:      cfg,
 		session:     s,
 		state:       aether.NewStreamStateMachine(),
-		recvQ:       newRecvQueue(&s.recvQueued, &s.recvCharged),
+		recvQ:       s.newQueue(),
 		recvDone:    make(chan struct{}),
 		window:      flow.NewStreamWindowWithCap(cfg.InitialCredit, cfg.MaxCredit),
 		engine:      eng,
@@ -948,10 +948,13 @@ func (st *noiseStream) peerReopened() bool {
 // false in two cases. The stream's queue has ended: an honest sender's CLOSE
 // follows its last message in sequence, and past that a RESET has settled its
 // credit (aether.ResetPayload). Or the sender is past a ceiling credit allows
-// (receiveCeilings), which a peer ignoring credit reaches: that peer gets a flow-control RESET it reads as
-// aether.ErrStreamOverrun and an abuse charge, and this stream's consumer reads
-// what the queue holds and then the same error, so nothing acknowledged goes
-// missing without its reader and its sender being told.
+// (receiveCeilings), which a peer ignoring credit reaches: that peer gets a
+// flow-control RESET it reads as aether.ErrStreamOverrun and an abuse charge, and this
+// stream's consumer reads what the queue holds and then the same error, so nothing
+// acknowledged goes missing without its reader and its sender being told. The per-peer
+// ceiling (flow.BoundsProfile.PeerMemoryCeiling) ends a stream the same way with no
+// charge: connection credit is per session, so a sender with several sessions can meet
+// it inside its credit.
 func (st *noiseStream) enqueueDelivery(payload []byte) bool {
 	s := st.session
 	streamLimit, sessionLimit := st.receiveCeilings()
@@ -963,9 +966,10 @@ func (st *noiseStream) enqueueDelivery(payload []byte) bool {
 		return true
 	case pushEnded:
 		return false
+	case pushOverCredit:
+		s.reportAbuse(abuse.ReasonFlowControlAbuse)
 	}
 	s.deliveryStats.recordDropped(st.streamID, len(payload))
-	s.reportAbuse(abuse.ReasonFlowControlAbuse)
 	st.overrun.Store(true)
 	_ = st.Reset(aether.ResetFlowCtrl)
 	return false

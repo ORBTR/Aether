@@ -5,9 +5,12 @@
 package adapter
 
 import (
+	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/ORBTR/aether"
 )
 
 // recvQueueEntryCost is what one queued message holds beyond its payload
@@ -43,6 +46,10 @@ const (
 	// pushOverCredit: the message would take the stream or the session past
 	// the ceiling a sender honouring its credit cannot reach.
 	pushOverCredit
+	// pushOverPeer: the message would take what every session to the peer holds
+	// past the peer's ceiling (peerShare), which a sender inside its credit on
+	// several sessions can reach.
+	pushOverPeer
 )
 
 // recvQueue holds a stream's whole in-order messages between the session's
@@ -52,8 +59,8 @@ const (
 // and not in a count of messages, because credit is what the sender has been
 // admitted by and a count would turn a sender within its credit into a loss. A
 // tcpStream's sender holds no credit: the same count bounds its queue at the
-// bounds profile's stream credit (enqueueDelivery), and it uses neither session
-// total nor the credit a pop reports.
+// bounds profile's stream credit and session ceiling (enqueueDelivery), and it does
+// not read the credit a pop reports.
 //
 // Receive takes messages off under mu, and a stream's end does not lose what
 // the queue holds: pop keeps returning it after end, which only stops further
@@ -99,6 +106,9 @@ type recvQueue struct {
 	lastTake int64
 	budget   *atomic.Int64
 	charged  *atomic.Int64
+	// peerShare, set by recvMemory.newQueue, takes each metered message's cost
+	// against the peer's ceiling; a queue built outside a session has none.
+	peerShare *creditLedger
 
 	// wake holds one token while a Receive may find a message. push and pop
 	// (for the next of several consumers) leave it non-blocking; a stale token
@@ -107,8 +117,8 @@ type recvQueue struct {
 }
 
 // newRecvQueue builds a queue counting into the session's two totals
-// (NoiseSession.recvQueued and recvCharged); a nil total counts to itself, which
-// is what a tcpStream's queue passes.
+// (recvMemory.recvQueued and recvCharged); a nil total counts to itself, which is
+// what a queue built outside a session passes.
 func newRecvQueue(budget, charged *atomic.Int64) *recvQueue {
 	if budget == nil {
 		budget = new(atomic.Int64)
@@ -157,6 +167,14 @@ func (q *recvQueue) push(payload []byte, streamLimit, sessionLimit int64) pushRe
 	}
 	if sessionLimit > 0 && q.charged.Load()+c > sessionLimit {
 		return pushOverCredit
+	}
+	if q.peerShare != nil {
+		switch err := q.peerShare.reserve(c); {
+		case errors.Is(err, aether.ErrSessionClosed):
+			return pushEnded
+		case err != nil:
+			return pushOverPeer
+		}
 	}
 	q.appendLocked(recvItem{payload: retained(payload), metered: true}, c)
 	return pushQueued
@@ -222,6 +240,9 @@ func (q *recvQueue) pop() (payload []byte, credited, ok bool) {
 	if it.metered {
 		q.bytes -= int64(len(it.payload))
 		q.credit -= c
+		if q.peerShare != nil {
+			q.peerShare.release(c)
+		}
 		if !q.noCredit {
 			q.charged.Add(-c)
 			q.granted += c
@@ -258,14 +279,15 @@ func (q *recvQueue) leftSession() {
 	q.mu.Unlock()
 }
 
-// peerEnded records that a RESET has ended the stream, sent by either side: the
-// sender takes back what the stream had charged beyond the grants this side has
-// made (aether.ResetPayload), so a later pop replenishes nothing and the queue
-// leaves the session's charged count. The messages stay in its budget until they
-// are read or discarded, so a peer that fills streams and resets them cannot grow
-// memory past the ceiling behind a consumer that is not reading. It returns the
+// peerEnded records that a RESET has ended the stream, sent by either side: on a
+// NoiseSession the sender takes back what the stream had charged beyond the grants this
+// side has made (aether.ResetPayload), so a later pop replenishes nothing, and on either
+// session the queue leaves the session's charged count. The messages stay in its budget
+// until they are read or discarded, so a peer that fills streams and resets them cannot
+// grow memory past the ceiling behind a consumer that is not reading. It returns the
 // credit this queue's stream granted, final from here on (granted). Its callers are
-// the RESET exits (handleReset, Reset), and each then hands the queue to trackEnded.
+// the RESET exits (handleReset, Reset, TCPSession's sendReset), and each then hands the
+// queue to trackEnded.
 // A nil queue is a stream built outside createStream, which Reset may still reach.
 func (q *recvQueue) peerEnded() (granted int64) {
 	if q == nil {
@@ -317,10 +339,10 @@ func (q *recvQueue) releaseCharge() (grant int64) {
 }
 
 // discard throws away what the queue holds, returns its cost to the session
-// budget and ends it for good, and returns the credit its sender still has
-// charged for those messages, which the caller grants back. Its callers are
-// sweepEndedQueues, for a queue its consumer abandoned, and makeQueueRoom. A
-// consumer that comes back reads aether.ErrStreamOverrun (discardedMessages).
+// budget and the peer's ceiling and ends it for good, and returns the credit its
+// sender still has charged for those messages, which the caller grants back. Its
+// callers are sweepEndedQueues, for a queue its consumer abandoned, and makeQueueRoom.
+// A consumer that comes back reads aether.ErrStreamOverrun (discardedMessages).
 // Idempotent; nil-safe like peerEnded.
 func (q *recvQueue) discard() (grant int64) {
 	if q == nil {
@@ -335,6 +357,9 @@ func (q *recvQueue) discard() (grant int64) {
 	q.ended = true
 	q.noCredit = true
 	q.discarded = true
+	if q.peerShare != nil {
+		q.peerShare.release(q.credit)
+	}
 	q.budget.Add(-q.cost)
 	q.cost = 0
 	q.items, q.head, q.bytes, q.credit, q.unmetered = nil, 0, 0, 0, 0
