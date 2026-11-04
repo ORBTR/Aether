@@ -66,7 +66,7 @@ func TestNoiseStream_APeerClosingFilledStreamsStaysInsideTheSessionCeiling(t *te
 				Flags: aether.FlagANTIREPLAY, Length: size, Payload: make([]byte, size),
 			})
 		}
-		server.handleClose(&aether.Frame{Type: aether.TypeCLOSE, StreamID: id})
+		server.handleClose(&aether.Frame{Type: aether.TypeCLOSE, StreamID: id, SeqNo: uint32(1 + frames)})
 		held = append(held, ss)
 	}
 	var retained, charged int64

@@ -119,50 +119,6 @@ func TestS8_LegitimateForwardStepAccepted(t *testing.T) {
 	}
 }
 
-// ─── S2 — FEC decoder eviction ────────────────────────────────────────
-// Addresses _SECURITY.md §3.5. The decoder must evict old groups so an
-// attacker cannot fill memory with unique GroupIDs.
-
-func TestS2_PruneEvictsOldest(t *testing.T) {
-	d := NewFECDecoder()
-	// Insert 300 incomplete groups. Total=3 means "2 data + 1 repair",
-	// so receiving only the repair leaves the group stuck (can't recover
-	// with 2 frames missing) — no auto-deletion by tryRecover.
-	for i := uint32(0); i < 300; i++ {
-		d.AddRepair(aether.FECHeader{GroupID: i, Index: 2, Total: 3}, []byte("x"))
-	}
-	d.Prune(256)
-	if len(d.groups) != 256 {
-		t.Fatalf("Prune: got %d groups, want 256", len(d.groups))
-	}
-	// Oldest IDs (0..43) should be gone.
-	for i := uint32(0); i < 44; i++ {
-		if _, ok := d.groups[i]; ok {
-			t.Errorf("oldest group %d not evicted", i)
-		}
-	}
-	if got := d.EvictedCount(); got != 44 {
-		t.Errorf("EvictedCount = %d, want 44", got)
-	}
-}
-
-func TestS2_PruneOlderThan(t *testing.T) {
-	d := NewFECDecoder()
-	// Use Total=3 so repair alone won't trigger auto-recovery.
-	d.AddRepair(aether.FECHeader{GroupID: 1, Index: 2, Total: 3}, []byte("x"))
-	// Force the group's firstSeen into the past.
-	if g, ok := d.groups[1]; ok {
-		g.firstSeen = g.firstSeen.Add(-10 * 1e9) // -10 seconds
-	}
-	d.PruneOlderThan(5 * 1e9) // drop anything older than 5s
-	if _, ok := d.groups[1]; ok {
-		t.Fatal("aged group was not evicted")
-	}
-	if got := d.EvictedCount(); got != 1 {
-		t.Errorf("EvictedCount = %d, want 1", got)
-	}
-}
-
 // ─── AE-C-02 — ExtRanges uint32 wraparound infinite loop ───────────────
 // An ExtRange whose End is at/beyond w.next (e.g. 0xFFFFFFFF) must be
 // rejected. Without the `block.End >= w.next` guard the scan loop

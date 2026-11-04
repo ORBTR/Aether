@@ -5,10 +5,8 @@
 package reliability
 
 import (
-	"sort"
+	"math"
 	"sync"
-	"sync/atomic"
-	"time"
 
 	"github.com/ORBTR/aether"
 )
@@ -17,41 +15,52 @@ import (
 // With N=4, one repair packet is generated per 4 data packets (25% overhead).
 const DefaultFECGroupSize = 4
 
-// FECEncoder generates XOR-based forward error correction repair packets.
-// For every N data frames, it produces one FEC_REPAIR frame containing the
-// XOR of all N payloads. If any single frame in the group is lost, it can
-// be recovered from the repair frame + the remaining N-1 frames.
+// FECEncoder generates XOR-based forward error correction repair packets for one
+// stream's frames (StreamFEC). For every N data frames, it produces one
+// FEC_REPAIR frame containing the XOR of all N payloads and the sequence number,
+// length and fragment flag of each. If any single frame in the group is lost, a
+// RepairDecoder recovers it from the repair frame + the remaining N-1 frames.
 type FECEncoder struct {
 	mu        sync.Mutex
-	groupSize int      // N data frames per FEC group
-	groupID   uint32   // current group identifier
-	buffer    [][]byte // payloads in the current group
-	maxLen    int      // max payload length in current group (for XOR padding)
+	groupSize int                 // N data frames per FEC group
+	level     FECLevel            // the code the repair's header names
+	groupID   uint32              // current group identifier
+	covered   []aether.FECCovered // the frames of the current group
+	buffer    [][]byte            // payloads in the current group
+	maxLen    int                 // max payload length in current group (for XOR padding)
 }
 
-// NewFECEncoder creates an encoder with the specified group size.
-// groupSize must be >= 2. A group size of 4 gives 25% overhead.
+// NewFECEncoder creates an encoder with the specified group size, 2 to
+// aether.MaxFECCovered; any other size takes DefaultFECGroupSize. A group size
+// of 4 gives 25% overhead.
 func NewFECEncoder(groupSize int) *FECEncoder {
-	if groupSize < 2 {
+	if groupSize < 2 || groupSize > aether.MaxFECCovered {
 		groupSize = DefaultFECGroupSize
 	}
 	return &FECEncoder{
 		groupSize: groupSize,
+		level:     FECBasicXOR,
 		buffer:    make([][]byte, 0, groupSize),
 	}
 }
 
-// Add records a data payload and returns an FEC_REPAIR frame when the group is complete.
-// Returns nil if more data frames are needed to complete the group.
-// The returned Frame has Type=TypeFEC_REPAIR with the XOR repair payload.
-func (e *FECEncoder) Add(payload []byte) *aether.Frame {
+// Add records one data frame by its sequence number, payload and fragment flag,
+// and returns an FEC_REPAIR frame when the group is complete, nil if more data
+// frames are needed. A payload longer than a table entry can state joins no
+// group: a repair could not name it, and its retransmit still recovers it. The
+// returned Frame has Type=TypeFEC_REPAIR with the header, table and XOR bytes.
+func (e *FECEncoder) Add(seq uint32, payload []byte, fragment bool) *aether.Frame {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	if len(payload) > math.MaxUint16 {
+		return nil
+	}
 	// Copy payload to avoid aliasing
 	cp := make([]byte, len(payload))
 	copy(cp, payload)
 	e.buffer = append(e.buffer, cp)
+	e.covered = append(e.covered, aether.FECCovered{SeqNo: seq, Length: uint16(len(cp)), Fragment: fragment})
 
 	if len(cp) > e.maxLen {
 		e.maxLen = len(cp)
@@ -60,13 +69,7 @@ func (e *FECEncoder) Add(payload []byte) *aether.Frame {
 	if len(e.buffer) < e.groupSize {
 		return nil // group not complete
 	}
-
-	// Group complete — generate repair frame
-	repair := e.generateRepair()
-	e.groupID++
-	e.buffer = e.buffer[:0]
-	e.maxLen = 0
-	return repair
+	return e.finishGroupLocked()
 }
 
 // Flush forces generation of a repair frame for the current partial group.
@@ -78,17 +81,12 @@ func (e *FECEncoder) Flush() *aether.Frame {
 	if len(e.buffer) == 0 {
 		return nil
 	}
-
-	repair := e.generateRepair()
-	e.groupID++
-	e.buffer = e.buffer[:0]
-	e.maxLen = 0
-	return repair
+	return e.finishGroupLocked()
 }
 
-// generateRepair XORs all buffered payloads to produce the repair data.
-// Shorter payloads are zero-padded to maxLen before XOR.
-func (e *FECEncoder) generateRepair() *aether.Frame {
+// finishGroupLocked XORs the buffered payloads, each zero-padded to maxLen, into
+// the repair frame for the group and starts the next group.
+func (e *FECEncoder) finishGroupLocked() *aether.Frame {
 	xor := make([]byte, e.maxLen)
 	for _, payload := range e.buffer {
 		for i, b := range payload {
@@ -96,195 +94,24 @@ func (e *FECEncoder) generateRepair() *aether.Frame {
 		}
 	}
 
-	fecHeader := aether.EncodeFECHeader(aether.FECHeader{
+	covered := make([]aether.FECCovered, len(e.covered))
+	copy(covered, e.covered)
+	header := aether.EncodeFECHeader(aether.FECHeader{
 		GroupID: e.groupID,
 		Index:   uint8(len(e.buffer)), // repair is at index N (after data 0..N-1)
 		Total:   uint8(len(e.buffer) + 1),
+		Level:   uint8(e.level),
+		Covered: covered,
 	})
+	repairPayload := append(header, xor...)
 
-	repairPayload := append(fecHeader, xor...)
-
+	e.groupID++
+	e.buffer = e.buffer[:0]
+	e.covered = e.covered[:0]
+	e.maxLen = 0
 	return &aether.Frame{
 		Type:    aether.TypeFEC_REPAIR,
 		Length:  uint32(len(repairPayload)),
 		Payload: repairPayload,
 	}
-}
-
-// FECDecoder recovers lost frames using XOR-based FEC repair packets.
-// When a repair packet arrives and exactly one data frame from its group is
-// missing, the missing frame is recovered by XORing the repair with all
-// received frames.
-type FECDecoder struct {
-	mu      sync.Mutex
-	groups  map[uint32]*fecGroup
-	evicted uint64 // atomic: total groups evicted by Prune / PruneOlderThan
-}
-
-type fecGroup struct {
-	total     int              // total frames in group (data + repair)
-	received  map[uint8][]byte // index → payload
-	repair    []byte           // XOR repair payload (nil until received)
-	firstSeen time.Time        // when the first frame of this group arrived (PruneOlderThan evicts on it)
-}
-
-// NewFECDecoder creates a decoder.
-func NewFECDecoder() *FECDecoder {
-	return &FECDecoder{
-		groups: make(map[uint32]*fecGroup),
-	}
-}
-
-// AddData records a received data frame in its FEC group.
-// index is the frame's position (0-based) within the group.
-// Returns a recovered payload if the addition completes recovery, nil otherwise.
-func (d *FECDecoder) AddData(groupID uint32, index uint8, total uint8, payload []byte) []byte {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	g := d.getOrCreateGroup(groupID, int(total))
-	cp := make([]byte, len(payload))
-	copy(cp, payload)
-	g.received[index] = cp
-
-	return d.tryRecover(groupID, g)
-}
-
-// AddRepair records a received FEC_REPAIR frame.
-// Returns a recovered payload if the repair completes recovery, nil otherwise.
-func (d *FECDecoder) AddRepair(header aether.FECHeader, repairPayload []byte) []byte {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	g := d.getOrCreateGroup(header.GroupID, int(header.Total))
-	cp := make([]byte, len(repairPayload))
-	copy(cp, repairPayload)
-	g.repair = cp
-
-	return d.tryRecover(header.GroupID, g)
-}
-
-// Prune removes completed or stale groups to prevent unbounded memory growth.
-// Call periodically (e.g., every 10 seconds).
-// Evicts the lowest groupIDs first (deterministic, oldest-first).
-func (d *FECDecoder) Prune(maxGroups int) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	if len(d.groups) <= maxGroups {
-		return
-	}
-
-	// Collect and sort group IDs for deterministic eviction (lowest = oldest)
-	ids := make([]uint32, 0, len(d.groups))
-	for id := range d.groups {
-		ids = append(ids, id)
-	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-
-	// Evict from the front (oldest) until within budget
-	toRemove := len(d.groups) - maxGroups
-	for i := 0; i < toRemove && i < len(ids); i++ {
-		delete(d.groups, ids[i])
-		atomic.AddUint64(&d.evicted, 1)
-	}
-}
-
-// PruneOlderThan removes groups first seen more than maxAge ago. Complements
-// count-based Prune: a slow trickle of FEC_REPAIR frames with unique
-// GroupIDs can stay under the count cap but still accumulate memory over
-// time. The noise adapter's reliabilityTick passes twice the session's
-// largest stream SRTT (floor 2 s): after two RTTs the sender's retransmit
-// has covered any frame a group could still repair.
-func (d *FECDecoder) PruneOlderThan(maxAge time.Duration) {
-	if maxAge <= 0 {
-		return
-	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	cutoff := time.Now().Add(-maxAge)
-	for id, g := range d.groups {
-		if !g.firstSeen.IsZero() && g.firstSeen.Before(cutoff) {
-			delete(d.groups, id)
-			atomic.AddUint64(&d.evicted, 1)
-		}
-	}
-}
-
-// EvictedCount returns the total number of groups pruned (count-based or
-// age-based) over the decoder's lifetime. The noise adapter's Metrics()
-// sums it into SessionMetrics.FECGroupsEvicted.
-func (d *FECDecoder) EvictedCount() uint64 {
-	return atomic.LoadUint64(&d.evicted)
-}
-
-func (d *FECDecoder) getOrCreateGroup(groupID uint32, total int) *fecGroup {
-	g, ok := d.groups[groupID]
-	if !ok {
-		g = &fecGroup{
-			total:     total,
-			received:  make(map[uint8][]byte),
-			firstSeen: time.Now(),
-		}
-		d.groups[groupID] = g
-	}
-	return g
-}
-
-// tryRecover attempts to recover a missing frame using XOR.
-// Returns the recovered payload if exactly one data frame is missing and
-// the repair frame is available. Otherwise returns nil.
-func (d *FECDecoder) tryRecover(groupID uint32, g *fecGroup) []byte {
-	if g.repair == nil {
-		return nil // no repair frame yet
-	}
-
-	dataCount := g.total - 1 // total includes repair
-	if len(g.received) >= dataCount {
-		// All data frames received — no recovery needed
-		delete(d.groups, groupID)
-		return nil
-	}
-
-	if len(g.received) < dataCount-1 {
-		return nil // more than one frame missing — can't recover with XOR
-	}
-
-	// XOR reconstruction requires the exact (dataCount-1) surviving
-	// data frames to XOR against the repair. A group with zero received data
-	// frames — e.g. a Total==2 repair where dataCount==1, so `0 < dataCount-1`
-	// is `0 < 0` = false and the `>= dataCount` check above is also false —
-	// would otherwise fall through and return the repair payload verbatim as a
-	// fabricated DATA frame. A caller that delivered it as a stream's message
-	// would pass those bytes around the per-stream anti-replay window and
-	// reorder buffer, letting an authenticated peer inject or replay arbitrary
-	// SeqNo-less bytes into any stream. Require at least one real data frame
-	// before recovering.
-	if len(g.received) == 0 {
-		return nil
-	}
-
-	// Exactly one frame missing — recover it
-	var missingIndex uint8
-	for i := uint8(0); i < uint8(dataCount); i++ {
-		if _, ok := g.received[i]; !ok {
-			missingIndex = i
-			break
-		}
-	}
-
-	// XOR the repair with all received data frames
-	recovered := make([]byte, len(g.repair))
-	copy(recovered, g.repair)
-	for _, payload := range g.received {
-		for i := 0; i < len(payload) && i < len(recovered); i++ {
-			recovered[i] ^= payload[i]
-		}
-	}
-
-	// Store recovered frame and clean up
-	g.received[missingIndex] = recovered
-	delete(d.groups, groupID)
-
-	return recovered
 }

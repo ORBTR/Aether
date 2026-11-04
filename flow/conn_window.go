@@ -135,8 +135,9 @@ func (w *ConnWindow) Consume(ctx context.Context, n int64) error {
 // return: the connection-level mirror of StreamWindow.ReleaseUnsent. Its
 // callers are noiseStream.Send, when a step after this window's Consume fails
 // before the bytes reach the transport (the peer never sees them, so never
-// grants them), and noiseStream.releaseInFlight, with the bytes a RESET left
-// charged on a stream (the peer's queue stops granting for that stream).
+// grants them), and the RESET exits (noiseStream.Reset, handleReset), with the
+// bytes a RESET left charged on a stream that no grant covers (the peer's queue
+// stops granting for that stream at the RESET).
 // Without it each such Send or stream would shrink the window, which every
 // stream of the session shares, for the session's life, until Consume fails
 // with ErrCreditExhausted on every stream.
@@ -263,6 +264,29 @@ func (w *ConnWindow) grantLocked(sinceLastGrant int64, trigger string) int64 {
 // and signalReceiveOverload reads the fraction of it they hold.
 func (w *ConnWindow) ReceiveCeilings() (initial, maximum int64) {
 	return w.initialSize, w.maxSize
+}
+
+// Withhold takes n bytes off the grants this window has yet to emit, for bytes the
+// consumer has returned or will return here that the peer's sender has already taken
+// back itself: handleReset passes what it granted on a stream past what the peer's
+// RESET says its grants had returned, since that sender released the rest of the
+// stream's charge at the RESET, those bytes among them. A grant past that would give
+// the sender the same credit twice, and a sender holding more credit than this
+// session's queues can admit is reset as if it ignored credit. Cumulative: the next
+// grants wait until consumption passes what is withheld, and the receive window
+// counts the bytes as granted. Overflow-safe: a count at or below zero is ignored.
+func (w *ConnWindow) Withhold(n int64) {
+	if n <= 0 {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if n > w.maxSize-w.recvCredit {
+		w.recvCredit = w.maxSize
+	} else {
+		w.recvCredit += n
+	}
+	w.lastGrant += n
 }
 
 // Available returns the sender's remaining connection credit.

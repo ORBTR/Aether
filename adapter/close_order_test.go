@@ -44,7 +44,7 @@ func receiveAsync(ctx context.Context, st aether.Stream, within time.Duration) <
 // request and closes its send side, as an RPC caller does; the server takes the
 // request, sends a reply and closes at once. Every reply reaches the caller
 // whole, then io.EOF. The server's CLOSE waits for the ACK of the reply's last
-// frame (finishSend), so the caller's handleClose, which ends the stream on
+// frame (finishSend), so the caller's endReceive, which ends the stream on
 // both sides here, finds the reply already in its queue. The largest reply fits
 // the fragment count at the MSS a session starts at (pmtu.SafeFloorMSS): nothing
 // here waits for the PMTU sweep to raise it, and Send refuses a message that does
@@ -99,7 +99,7 @@ func TestNoiseStream_AReplyThenCloseReachesAHalfClosedCaller(t *testing.T) {
 // the client closes at once. The reply arrives by retransmit and is read before
 // io.EOF. The client's CLOSE is written only after the reply's ACK: written
 // behind the reply's first write it would reach the server first, and the
-// server's handleClose would end the stream on both sides there before the
+// server's endReceive would end the stream on both sides there before the
 // retransmit came.
 func TestNoiseStream_AReplyWhoseFirstWriteIsLostStillPrecedesTheEnd(t *testing.T) {
 	client, server, drop := noisePairWithDroppingClient(t)
@@ -228,7 +228,7 @@ func TestNoiseSession_AFECRecoveredPayloadIsNotDeliveredBesideItsDATAFrame(t *te
 }
 
 // TestNoiseStream_NoCloseFollowsAReset: a stream reset with frames unacknowledged
-// and then closed writes no CLOSE. The RESET ended the send side (closeDone), and
+// and then closed writes no CLOSE. The RESET ended the send side (closeSent), and
 // the reset emptied the send window, which would otherwise let Close's
 // finishSend write a CLOSE the peer would read for a stream it no longer has.
 func TestNoiseStream_NoCloseFollowsAReset(t *testing.T) {
@@ -282,7 +282,7 @@ func TestNoiseStream_AStreamThatLeftOnBothClosesCreditsItsReads(t *testing.T) {
 
 // TestNoiseStream_AStreamAResetEndedCreditsNoRead: after the peer's RESET a read
 // off the queue credits nothing: the RESET's sender took back all the stream had
-// charged (releaseInFlight), and a grant from here would return those bytes twice.
+// charged (settleLocalReset), and a grant from here would return those bytes twice.
 func TestNoiseStream_AStreamAResetEndedCreditsNoRead(t *testing.T) {
 	key := uint32(0x5eed5eed)
 	client, server := noisePairWithRealms(t, &key, &key)
@@ -358,8 +358,8 @@ func TestNoiseStream_ASendInProgressPrecedesTheClose(t *testing.T) {
 	default:
 	}
 	_ = bs.Close()
-	if bs.closeDone.Load() {
-		t.Fatal("the CLOSE was written while a Send was in progress")
+	if bs.closeSent.Load() {
+		t.Fatal("the CLOSE was queued while a Send was in progress")
 	}
 	for _, fs := range fillerReaders {
 		for {

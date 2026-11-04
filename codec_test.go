@@ -6,6 +6,7 @@ package aether
 
 import (
 	"bytes"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -281,13 +282,19 @@ func TestEncodeDecodeWindowUpdate_RoundTrip(t *testing.T) {
 }
 
 func TestEncodeDecodeFECHeader_RoundTrip(t *testing.T) {
-	h := FECHeader{GroupID: 0xCAFEBABE, Index: 5, Total: 10}
-	encoded := EncodeFECHeader(h)
-	if len(encoded) != FECHeaderSize {
+	h := FECHeader{GroupID: 0xCAFEBABE, Index: 2, Total: 3, Level: 1, Covered: []FECCovered{
+		{SeqNo: 7, Length: 1200}, {SeqNo: 9, Length: 3, Fragment: true},
+	}}
+	encoded := append(EncodeFECHeader(h), 0xAA, 0xBB)
+	if len(encoded) != FECRepairOverhead(2)+2 {
 		t.Fatalf("encoded size: %d", len(encoded))
 	}
-	if got := DecodeFECHeader(encoded); got != h {
-		t.Errorf("round-trip: got %+v want %+v", got, h)
+	got, repair, err := DecodeFECHeader(encoded)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !reflect.DeepEqual(got, h) || !bytes.Equal(repair, []byte{0xAA, 0xBB}) {
+		t.Errorf("round-trip: got %+v, %x; want %+v", got, repair, h)
 	}
 }
 

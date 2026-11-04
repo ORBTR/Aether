@@ -86,17 +86,18 @@ type NoiseSession struct {
 	cong  atomic.Pointer[congestion.Controller]
 	pacer congestion.PacingPolicy
 
-	// FEC (shared encoder/decoder). Three modes co-exist on the session
-	// because each stream independently chooses its FECLevel:
-	//   FECBasicXOR    → fecEncoder       / fecDecoder
-	//   FECInterleaved → interleavedEnc/Dec
-	//   FECReedSolomon → rsEncoder        / rsDecoder
-	fecEncoder         *reliability.FECEncoder
-	fecDecoder         *reliability.FECDecoder
-	interleavedEncoder *reliability.InterleavedFECEncoder
-	interleavedDecoder *reliability.InterleavedFECDecoder
-	rsEncoder          *reliability.RSEncoder
-	rsDecoder          *reliability.RSDecoder
+	// FEC state lives on each stream (noiseStream.fec). fecCached is what all of
+	// this session's decoders hold together, the count each one's budget compares
+	// with fecSessionCacheBytes. fecEvictedLeft keeps the undecided groups of
+	// streams that have gone, and fecRecovered the frames decoders rebuilt, for
+	// Metrics.
+	fecCached      atomic.Int64
+	fecEvictedLeft atomic.Uint64
+	fecRecovered   atomic.Uint64
+
+	// resetGrants keeps, for a stream this side reset, what it had granted, for the
+	// peer's RESET crossing it (noteResetGrants, handleReset). Guarded by mu.
+	resetGrants map[uint64]resetGrant
 
 	// PMTU discovery (UDP only)
 	pmtuProber *pmtu.Prober
@@ -383,10 +384,8 @@ type NoiseSession struct {
 	// stream's (no leak on close), and handleACK on the readLoop writes no
 	// session-level map for it.
 
-	// FEC prune scheduling — rate-limit decoder GC to ~1/sec.
-	// Without pruning, FECDecoder.groups grows unbounded under adversarial
-	// FEC_REPAIR flooding with unique GroupIDs. reliabilityTick reads and
-	// advances this.
+	// FEC prune scheduling — rate-limit each stream decoder's age prune to ~1/sec.
+	// reliabilityTick reads and advances this.
 	lastFECPrune time.Time
 
 	// Connection identity and transport class
@@ -546,13 +545,9 @@ func newNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 		pacer:       selectPacer(opts),
 		// connGrantDebouncer initialized below after s is assigned, because
 		// the grantable + sendUpdate bindings reference s itself.
-		fecEncoder:         reliability.NewFECEncoder(reliability.DefaultFECGroupSize),
-		fecDecoder:         reliability.NewFECDecoder(),
-		interleavedEncoder: reliability.NewInterleavedFECEncoder(reliability.DefaultFECGroupSize),
-		interleavedDecoder: reliability.NewInterleavedFECDecoder(),
-		txCompressor:       aether.NewCompressor(),
-		rxCompressor:       aether.NewCompressor(),
-		endedQueues:        make(map[*recvQueue]struct{}),
+		txCompressor: aether.NewCompressor(),
+		rxCompressor: aether.NewCompressor(),
+		endedQueues:  make(map[*recvQueue]struct{}),
 	}
 	sessionCeiling := flow.CurrentBounds().AdmittedCreditCeiling(opts.MaxConcurrentStreams)
 	var peerLedger *creditLedger
@@ -563,12 +558,6 @@ func newNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 		peerLedger = newCreditLedger("peer", peerCreditCeiling(sessionCeiling), nil)
 	}
 	s.admitted = newCreditLedger("session", sessionCeiling, peerLedger)
-	// Reed-Solomon encoder/decoder — instantiated even when no stream is
-	// using FECReedSolomon, because the cost is just a small Galois-field
-	// table. Streams opt in via StreamConfig.FECLevel = FECReedSolomon.
-	s.rsEncoder, _ = reliability.NewRSEncoder(reliability.DefaultRSDataShards, reliability.DefaultRSParityShards)
-	s.rsDecoder, _ = reliability.NewRSDecoder(reliability.DefaultRSDataShards, reliability.DefaultRSParityShards)
-
 	// Lift the peer's advertised max_ack_delay off the underlying
 	// noiseConn (when the substrate supports the handshake-capability
 	// surface). createStream uses this to seed each stream's TLP PTO
@@ -745,6 +734,11 @@ func (s *NoiseSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) 
 		return nil, fmt.Errorf("stream ID %d exceeds MaxStreamID (%d) — send GOAWAY", cfg.StreamID, aether.MaxStreamID)
 	}
 
+	// An FEC level outside the registry is refused, and never read as no FEC.
+	if !reliability.ValidFECLevel(cfg.FECLevel) {
+		return nil, fmt.Errorf("OpenStream stream=%d: FEC level %d: %w", cfg.StreamID, cfg.FECLevel, aether.ErrFECLevelUnsupported)
+	}
+
 	// The stream's own ceiling: an initial credit above it is refused, since
 	// flow.NewStreamWindowWithCap would otherwise raise the window's growth
 	// ceiling to the initial credit.
@@ -787,12 +781,19 @@ func (s *NoiseSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) 
 	// configured credit (zero to the default, a small one up to
 	// flow.MinGuaranteedWindow): the peer's handleOpen builds its window and
 	// its reservation for the stream from it, so each side's sends on the
-	// stream are bounded by the credit the other side holds for them.
+	// stream are bounded by the credit the other side holds for them. It states
+	// the FEC level the stream runs here, none on a session with FEC disabled,
+	// which the peer builds its own state from.
+	var fecLevel reliability.FECLevel
+	if st.fec != nil {
+		fecLevel = st.fec.Level()
+	}
 	openPayload := aether.EncodeOpenPayload(aether.OpenPayload{
 		Reliability:   cfg.Reliability,
 		Priority:      cfg.Priority,
 		Dependency:    cfg.Dependency,
 		InitialCredit: uint32(st.window.CurrentWindow()),
+		FECLevel:      uint8(fecLevel),
 	})
 	frame := &aether.Frame{
 		SenderID:   s.LocalPeerID(),
@@ -890,9 +891,9 @@ func (s *NoiseSession) GoAway(ctx context.Context, reason aether.GoAwayReason, m
 // already unregistered is a no-op on both the scheduler and the GC.
 func (s *NoiseSession) releaseStream(streamID uint64) {
 	// The frames Unregister hands back need no credit returned here: a RESET's
-	// exit has run noiseStream.releaseInFlight, which gives the connection window
-	// all this stream had charged, these included, and leaveSession's stream has
-	// none, its send window being empty when its CLOSE was written.
+	// exit has settled the connection window for all this stream had charged, these
+	// included (noiseStream.settleLocalReset, settlePeerReset), and leaveSession's
+	// stream has none, its send window having emptied on its CLOSE's ACK.
 	s.sched.Unregister(streamID)
 	if s.streamGC != nil {
 		s.streamGC.Unregister(streamID)
@@ -984,6 +985,18 @@ func (s *NoiseSession) forgetEnded(q *recvQueue) {
 	delete(s.endedQueues, q)
 	s.mu.Unlock()
 }
+
+// resetGrant is what a stream this side reset had granted when it did
+// (noteResetGrants).
+type resetGrant struct {
+	granted int64
+	at      time.Time
+}
+
+// resetGrantLifetime is how long a note waits for a crossing RESET. Two RESETs cross
+// within a path's delay, and a RESET is written once, so a note past this has no
+// RESET coming.
+const resetGrantLifetime = 30 * time.Second
 
 // grantConnCredit returns n bytes of the peer's connection credit that no
 // Receive will record, through the debouncer Receive's records go through.
@@ -1335,7 +1348,7 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 	_, avg := s.Health().RTT()
 	s.mu.Lock()
 	streamCount := len(s.streams)
-	var suspiciousACKs, recvDrops, seqWraps, replayDup, replayAncient uint64
+	var suspiciousACKs, recvDrops, seqWraps, replayDup, replayAncient, fecEvictedLive uint64
 	// rttSrc is the stream we read percentile RTT from for the
 	// session-level snapshot. Pick the FIRST stream whose RTT estimator
 	// is initialised — any data-carrying stream produces samples on
@@ -1351,6 +1364,9 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 	for _, st := range s.streams {
 		if st.sendWindow != nil {
 			suspiciousACKs += st.sendWindow.SuspiciousACKsCount()
+		}
+		if st.fec != nil {
+			fecEvictedLive += st.fec.EvictedCount()
 		}
 		if st.recvWindow != nil {
 			recvDrops += st.recvWindow.DropsCount()
@@ -1386,12 +1402,10 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 		decryptLatencyP50Us, decryptLatencyP99Us = stats.DecryptLatencySnapshot()
 	}
 
-	// FEC eviction total must include all three decoders — XOR, interleaved,
-	// and Reed-Solomon — otherwise operators under-count when RS is in use.
-	fecEvicted := s.fecDecoder.EvictedCount() + s.interleavedDecoder.EvictedCount()
-	if s.rsDecoder != nil {
-		fecEvicted += s.rsDecoder.EvictedCount()
-	}
+	// The FEC eviction total: the streams still here, whichever level each runs,
+	// and those that have gone. Each stream's decoder added its own count to
+	// fecEvictedLeft when it released.
+	fecEvicted := fecEvictedLive + s.fecEvictedLeft.Load()
 
 	// ACK-emit triggers — global counters across all engines on this
 	// process (not per-session). Reveal which ACK path dominates when
@@ -1422,6 +1436,7 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 		SuspiciousACKs:     suspiciousACKs,
 		ForensicSuppressed: s.forensicSuppressed.Load(),
 		FECGroupsEvicted:   fecEvicted,
+		FECRecovered:       s.fecRecovered.Load(),
 		StreamRefused:      s.StreamRefusedCount(),
 		SeqNoWraps:         seqWraps,
 		RecvWindowDrops:    recvDrops,

@@ -472,3 +472,34 @@ func TestStreamWindow_UnreleasedConsumesDrainTheWindow(t *testing.T) {
 	}
 	t.Logf("after 13 unreleased Consumes: avail=%d", avail)
 }
+
+// TestStreamWindow_ChargedCountsWhatSendsCharged: Charged grows with each send and
+// gives back what ReleaseUnsent returns for bytes that never reached the wire; a
+// grant or ReleaseAll does not change it, so Charged less what ReleaseAll reports is
+// what grants had returned.
+func TestStreamWindow_ChargedCountsWhatSendsCharged(t *testing.T) {
+	w := NewStreamWindow(4096)
+	if err := w.Consume(context.Background(), 1000); err != nil {
+		t.Fatal(err)
+	}
+	if !w.TryConsume(500) {
+		t.Fatal("TryConsume refused")
+	}
+	if got := w.Charged(); got != 1500 {
+		t.Fatalf("Charged %d", got)
+	}
+	w.ReleaseUnsent(200)
+	if got := w.Charged(); got != 1300 {
+		t.Fatalf("Charged %d after ReleaseUnsent", got)
+	}
+	w.ApplyUpdate(300)
+	if got := w.Charged(); got != 1300 {
+		t.Fatalf("Charged %d after a grant", got)
+	}
+	if got := w.ReleaseAll(); got != 1000 {
+		t.Fatalf("ReleaseAll reported %d", got)
+	}
+	if got := w.Charged(); got != 1300 {
+		t.Fatalf("Charged %d after ReleaseAll", got)
+	}
+}

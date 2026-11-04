@@ -400,6 +400,7 @@ var minPayloadSizes = map[FrameType]uint32{
 	TypeRESET:      ResetPayloadSize,
 	TypeWINDOW:     WindowUpdateSize,
 	TypeCONGESTION: CongestionPayloadSize,
+	TypeFEC_REPAIR: FECHeaderSize,
 	// STATS is fixed-size — gate undersized payloads at Validate so the
 	// abuse path fires instead of the handler silently dropping. Pairs
 	// with the StatsPayloadSize guard in noise_dispatch.handleStats
@@ -568,14 +569,48 @@ type PriorityPayload struct {
 // FEC_REPAIR payload header
 // ────────────────────────────────────────────────────────────────────────────
 
-// FECHeaderSize is the wire size of the FEC_REPAIR header before the XOR payload.
-const FECHeaderSize = 6
+// FECHeaderSize is the wire size of the fixed part of an FEC_REPAIR payload:
+// [4 group ID][1 index][1 total][1 level][1 covered count]. The table of the
+// frames the repair covers follows it (FECCoveredSize each), then the repair
+// bytes. Validate refuses an uncompressed FEC_REPAIR frame shorter than this.
+const FECHeaderSize = 8
 
-// FECHeader is the decoded header of an FEC_REPAIR frame.
+// FECCoveredSize is the wire size of one FEC_REPAIR table entry:
+// [4 sequence number][2 payload length][1 flags, bit 0 fragment].
+const FECCoveredSize = 7
+
+// MaxFECCovered is the most frames one repair may cover. DecodeFECHeader refuses
+// a larger count before it allocates the table.
+const MaxFECCovered = 32
+
+// FECCovered names one DATA frame a repair covers: its sequence number, the
+// payload length that strips the zero padding off a recovered payload, and
+// whether the frame carried aether.FlagFRAGMENT, which reassembly needs and a
+// repair is otherwise the only source of for a frame that never arrived.
+type FECCovered struct {
+	SeqNo    uint32
+	Length   uint16
+	Fragment bool
+}
+
+// FECHeader is the decoded header of an FEC_REPAIR frame. Covered is what lets
+// adapter.NoiseSession's handleFECRepair place a recovered payload in its
+// stream's receive window, where it is delivered once and in order whichever of
+// the repair and a retransmit arrives first.
 type FECHeader struct {
-	GroupID uint32 // FEC group identifier
-	Index   uint8  // position within the group (0-based)
-	Total   uint8  // total frames in the group (including this repair)
+	GroupID uint32       // FEC group identifier, unique per sender stream
+	Index   uint8        // this repair's position in the group: the covered frames take 0..len(Covered)-1
+	Total   uint8        // total frames in the group, repairs included
+	Level   uint8        // the group's code, a reliability.FECLevel value
+	Covered []FECCovered // the DATA frames the repair covers, in group order
+}
+
+// FECRepairOverhead is what an FEC_REPAIR payload holds beyond its repair bytes
+// when it covers covered frames. A repair's bytes are as long as the longest
+// frame it covers, so noiseStream.Send takes this off the largest frame payload
+// of a stream with FEC, which keeps the repair inside the MSS its frames fit.
+func FECRepairOverhead(covered int) int {
+	return FECHeaderSize + covered*FECCoveredSize
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -602,7 +637,7 @@ const GoAwayPayloadMinSize = 4 // reason code only
 // OpenPayloadSize is the wire size of an OPEN frame payload in frame grammar
 // WireVersionFrameCurrent. Validate refuses an uncompressed OPEN frame shorter
 // than this (minPayloadSizes) before either session's handleOpen runs.
-const OpenPayloadSize = 14
+const OpenPayloadSize = 15
 
 // MaxOpenCredit is the largest initial credit an OPEN payload can state: the
 // field is four bytes. adapter.NoiseSession's OpenStream refuses a stream
@@ -624,19 +659,52 @@ const MaxOpenCredit int64 = 1<<32 - 1
 // aether stream credit, which the TCP-family session and the QUIC stream
 // adapter state because their transport owns flow control; they do not read
 // the field, and a NoiseSession refuses an OPEN stating zero.
+//
+// FECLevel is the reliability.FECLevel both ends of the stream run: each side
+// encodes repairs for what it sends at this level, and the accepting
+// NoiseSession keeps the recent payloads a repair is decoded against only when
+// the OPEN states one. Zero is no FEC. A level outside the registry is refused
+// with RESET(ResetRefused) and no state. The TCP-family session and the QUIC
+// stream adapter state zero: FEC belongs to their transport.
 type OpenPayload struct {
 	Reliability   Reliability // 1 byte: delivery guarantee
 	Priority      uint8       // 1 byte: initial weight (1-255)
 	Dependency    uint64      // 8 bytes: parent stream ID
 	InitialCredit uint32      // 4 bytes: the opener's initial stream credit
+	FECLevel      uint8       // 1 byte: the stream's FEC level
 }
 
 // ────────────────────────────────────────────────────────────────────────────
 // RESET payload
 // ────────────────────────────────────────────────────────────────────────────
 
-// ResetPayloadSize is the wire size of a RESET frame payload.
-const ResetPayloadSize = 4
+// ResetPayloadSize is the wire size of a RESET frame payload:
+// [4 reason][8 charged][8 released][8 consumed], all big-endian.
+const ResetPayloadSize = 28
+
+// ResetPayload is the decoded payload of a RESET frame. The three counts say what
+// the stream's connection credit stood at when its sender wrote the RESET, in the
+// credit adapter.NoiseSession's Send charges, so the two sides settle that credit
+// exactly once whichever grants were on the path at the time:
+//
+//   - Charged is all the writer's sends on the stream have charged.
+//   - Released is the part of Charged the writer took back at this RESET, what no
+//     grant had returned by then. Charged-Released is what its grants had returned.
+//   - Consumed is the credit of the peer's messages on this stream the writer's
+//     consumer has returned through connection grants, which stop at this RESET.
+//
+// A stream's peer that reads it (handleReset) takes back of its own charge only
+// what Consumed does not cover, since those grants still arrive, and takes off its
+// later connection grants what it has granted past Charged-Released, since the
+// writer has taken that back already. A refusal, which holds no stream, and a
+// TCP-family or QUIC session, whose transport owns flow control, state zeros (and
+// those sessions do not read them).
+type ResetPayload struct {
+	Reason   ResetReason
+	Charged  uint64
+	Released uint64
+	Consumed uint64
+}
 
 // ResetReason codes for RESET frames.
 type ResetReason uint32

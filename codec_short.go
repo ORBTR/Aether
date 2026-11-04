@@ -269,6 +269,14 @@ func (c *Compressor) ShouldCompressData(f *Frame) bool {
 	if f.Flags.Has(FlagFRAGMENT) {
 		return false
 	}
+	// A SYN is what opens the stream at the peer (TCPSession's OpenStream writes it,
+	// deliverToStream reads the flag), and a short DATA form would drop the flag, so
+	// the peer would discard the frame as DATA for an unknown stream. The sender's
+	// state for a reopened ID can still be here: a stream's leave removes it only
+	// after taking the stream out of the session, and OpenStream can run in between.
+	if f.Flags.Has(FlagSYN) {
+		return false
+	}
 	// The short-header StreamID field is uint16; a stream above
 	// MaxShortHeaderStreamID would truncate on the wire and misroute on decode.
 	// Fall back to the full 50-byte header (capability preserved) rather than

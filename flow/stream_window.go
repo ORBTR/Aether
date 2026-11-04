@@ -182,6 +182,7 @@ type StreamWindow struct {
 	// Auto-tuning hints — advisory data an auto-tuner reads via Stats().
 	// Updated from Consume/ApplyUpdate hot paths, guarded by mu.
 	peakOutstanding int64         // max dataOutstanding observed since last tune
+	charged         int64         // bytes sends have charged over the window's life, what Charged reports
 	lastRTT         time.Duration // most recent observed RTT (from SetRTT)
 
 	// Grant-trigger telemetry — count how often each of the four
@@ -339,6 +340,7 @@ func (w *StreamWindow) TryConsume(n int64) bool {
 	if w.sem.TryAcquire(n) {
 		w.mu.Lock()
 		w.dataOutstanding += n
+		w.charged += n
 		if w.dataOutstanding > w.peakOutstanding {
 			w.peakOutstanding = w.dataOutstanding
 		}
@@ -367,6 +369,7 @@ func (w *StreamWindow) Consume(ctx context.Context, n int64) error {
 	if w.sem.TryAcquire(n) {
 		w.mu.Lock()
 		w.dataOutstanding += n
+		w.charged += n
 		if w.dataOutstanding > w.peakOutstanding {
 			w.peakOutstanding = w.dataOutstanding
 		}
@@ -408,6 +411,7 @@ func (w *StreamWindow) Consume(ctx context.Context, n int64) error {
 
 	w.mu.Lock()
 	w.dataOutstanding += n
+	w.charged += n
 	if w.dataOutstanding > w.peakOutstanding {
 		w.peakOutstanding = w.dataOutstanding
 	}
@@ -441,6 +445,7 @@ func (w *StreamWindow) ReleaseUnsent(n int64) {
 		release = w.dataOutstanding
 	}
 	w.dataOutstanding -= release
+	w.charged -= release
 	w.mu.Unlock()
 	if release > 0 {
 		w.sem.Release(release)
@@ -448,12 +453,23 @@ func (w *StreamWindow) ReleaseUnsent(n int64) {
 	dbgFlow.Printf("ReleaseUnsent requested=%d released=%d", n, release)
 }
 
+// Charged returns the bytes this window's sends have charged over its life, less
+// what ReleaseUnsent gave back for bytes that never reached the wire: what a RESET
+// states as its stream's charge (aether.ResetPayload.Charged). Charged minus what
+// ReleaseAll reports is what grants had returned by then.
+func (w *StreamWindow) Charged() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.charged
+}
+
 // ReleaseAll returns every outstanding byte to the window and reports how many,
 // for a stream a RESET has ended: no grant for these bytes will reach this
-// window, and noiseStream.releaseInFlight gives the count back to the
-// connection window, which outlives the stream and charged the same bytes.
-// A Send blocked in Consume wakes and finds the stream's state closed. Idempotent:
-// a second call reports what was charged since, so 0 on a stream that has left.
+// window. noiseStream.Reset and handleReset settle the connection window, which
+// outlives the stream and charged the same bytes, from this count and the counts
+// the RESET states. A Send blocked in Consume wakes and finds the stream's state
+// closed. Idempotent: a second call reports what was charged since, so 0 on a
+// stream that has left.
 func (w *StreamWindow) ReleaseAll() int64 {
 	w.mu.Lock()
 	n := w.dataOutstanding

@@ -103,15 +103,15 @@ All multi-byte fields are **big-endian** (network byte order).
 | Code | Name | Payload | Description |
 |------|------|---------|-------------|
 | 0x01 | DATA | Application data | Primary data transport. May carry SYN flag for zero-RTT stream open. |
-| 0x0C | FEC_REPAIR | `[GroupID:4][Index:1][Total:1][XOR_payload:var]` | Forward error correction repair packet. XOR of all data frames in the group. Enables single-frame recovery without retransmission. |
+| 0x0C | FEC_REPAIR | `[GroupID:4][Index:1][Total:1][Level:1][Count:1][Covered:7 x Count][Repair:var]` | Forward error correction repair packet over a stream's own frames, each named in the table by sequence number, length and fragment flag (§11.6). A recovered frame takes its place in the receive window, so it is delivered once and in order, with no retransmission. |
 
 ### 2.2 Stream Lifecycle
 
 | Code | Name | Payload | Description |
 |------|------|---------|-------------|
-| 0x02 | OPEN | `[Reliability:1][Priority:1][Dependency:8][InitialCredit:4]` | Opens a new stream with specified QoS parameters. `InitialCredit` (big-endian) is the credit the opener reserved for the stream; a Noise (Full profile) receiver builds its window and reservation for the stream from it and refuses (RESET Refused) a value below 1024 or above its stream ceiling. Zero states no aether stream credit: TCP-family and QUIC openers write it and their receivers do not read it. Frame grammar 3 (§15). |
-| 0x03 | CLOSE | (empty) | Graceful stream close (FIN). Sender will send no more data; it follows all the stream's DATA, and the receiver's `Receive` returns what it holds and then the end without a local close. The receiver may go on sending until its own CLOSE. |
-| 0x04 | RESET | `[ReasonCode:4]` | Immediate stream abort. Both sides receive error on next Send/Receive. Reason codes: Cancel(0), Refused(1), Internal(2), FlowCtrl(3), Timeout(4). |
+| 0x02 | OPEN | `[Reliability:1][Priority:1][Dependency:8][InitialCredit:4][FECLevel:1]` | Opens a new stream with specified QoS parameters. `InitialCredit` (big-endian) is the credit the opener reserved for the stream; a Noise (Full profile) receiver builds its window and reservation for the stream from it and refuses (RESET Refused) a value below 1024 or above its stream ceiling. Zero states no aether stream credit: TCP-family and QUIC openers write it and their receivers do not read it. Frame grammar 3 (§15). |
+| 0x03 | CLOSE | (empty) | Graceful stream close (FIN). Sender will send no more data; it follows all the stream's DATA, and the receiver's `Receive` returns what it holds and then the end without a local close. The receiver may go on sending until its own CLOSE. On a Noise (Full profile) session it takes the stream's next SeqNo, is written once every DATA frame is acknowledged, is retransmitted until acknowledged like DATA, and ends the receive side in sequence; its sender leaves only on its ACK and the peer's CLOSE. A CLOSE for a stream the receiver no longer holds is answered with a cumulative ACK up to it. A byte-stream session's CLOSE follows its DATA through the scheduler and its SeqNo is not read. |
+| 0x04 | RESET | `[ReasonCode:4][Charged:8][Released:8][Consumed:8]` | Immediate stream abort. Both sides receive error on next Send/Receive. Reason codes: Cancel(0), Refused(1), Internal(2), FlowCtrl(3), Timeout(4). On a Noise (Full profile) session the three counts settle the stream's connection credit once (§8.2): `Charged` is all the writer's sends charged, `Released` the part it took back at this RESET, `Consumed` the credit of the peer's messages its consumer has returned by grants. A refusal and a byte-stream or QUIC session state zeros, and those sessions do not read them. |
 
 ### 2.3 Reliability
 
@@ -381,7 +381,7 @@ A 128-bit packet-level replay window operates per connection, BEFORE stream demu
 - **Bitmap:** `[2]uint64` (two 64-bit words)
 - **Sequence type:** `uint64` (packet sequence, not stream SeqNo)
 - **Scope:** Connection-level (all streams combined)
-- **DATA frames only:** Control frames (WINDOW, ACK, PING, PONG, GOAWAY, CLOSE, RESET, PRIORITY) have SeqNo=0 and are exempt from replay checking. Applying anti-replay to control frames caused WINDOW_UPDATE frames to be silently dropped after the first one (SeqNo=0 seen as duplicate), permanently draining flow control credit and stalling streams.
+- **DATA frames and CLOSE only:** a Noise session's CLOSE takes the stream's next SeqNo and meets the stream's replay window like DATA. Other control frames (WINDOW, ACK, PING, PONG, GOAWAY, RESET, PRIORITY) have SeqNo=0 and are exempt from replay checking. Applying anti-replay to control frames caused WINDOW_UPDATE frames to be silently dropped after the first one (SeqNo=0 seen as duplicate), permanently draining flow control credit and stalling streams.
 
 AE-P-25: The standalone `reliability/packet_replay.go:PacketReplayWindow` was removed — it was an allocated-but-never-read layer that misused per-stream `frame.SeqNo` as a connection-level packet counter (silently dropping streams 1-4). Connection-level replay protection is provided pre-decryption by `noise/nonce_window.go` (each encrypted UDP packet carries an 8-byte explicit nonce; a sliding 64-bit bitmap rejects duplicates before decrypt), and per-stream reordering is caught by `reliability/antireplay.go:ReplayWindow` (checked via `reliability/engine.go` `Replay.Check`).
 
@@ -409,7 +409,7 @@ Implementation: `flow/stream_window.go`
 - **Auto-grant threshold:** 25% consumed
 - **Signal:** WINDOW frame with StreamID = `0xFFFFFFFFFFFFFFFF`
 - **Purpose:** Prevents any single stream from starving the connection. All stream sends also consume connection credit.
-- **Replenishment (Noise):** credit returns by the receiver's grant when its consumer takes a message, or when it discards one on the sweep of an abandoned queue, whether the stream is live or has ended on both CLOSEs: a sender's CLOSE is written only once every DATA frame is acknowledged, so its stream's leave returns no credit, and a late reader holds its sender to the credit it has not yet read. A RESET, sent by either side, settles otherwise: the RESET's sender cannot tell what reached the peer's queue, so the stream's sender takes back all the stream still has charged and the receiver grants nothing further for that stream.
+- **Replenishment (Noise):** credit returns by the receiver's grant when its consumer takes a message, or when it discards one on the sweep of an abandoned queue, whether the stream is live or has ended on both CLOSEs: a sender's CLOSE is written only once every DATA frame is acknowledged, so its stream's leave returns no credit, and a late reader holds its sender to the credit it has not yet read. A RESET, sent by either side, settles otherwise: its writer takes back all the stream still has charged, since it cannot tell what reached the peer's queue, and states `Charged`, `Released` and `Consumed`. Its reader takes back of its own charge only what `Consumed` does not cover, since those grants still arrive, and takes off its later connection grants what it has granted past `Charged - Released`, which the writer has already taken back. Each side's queue grants nothing after the RESET. Two RESETs that cross correct each other the same way from a count each side keeps briefly at its own RESET.
 - **Receiver's ceiling (Noise):** a message past the stream's credit, or past the session ceiling counted over what its sender still has charged, is a sender ignoring credit: the receiver resets the stream with RESET(ResetFlowCtrl) and charges abuse; its consumer reads what the queue holds and then `ErrStreamOverrun`, and the sender's Send and Receive return `ErrStreamOverrun`. A queue a RESET ended is memory no sender's credit pays for: when a credited message needs its room, the longest-idle such queue is discarded and its consumer reads `ErrStreamOverrun`.
 
 Implementation: `flow/conn_window.go`
@@ -596,7 +596,7 @@ Losing 2 consecutive frames (e.g., frames 3 and 4) puts each in a different grou
 - **Burst recovery:** 2 consecutive packet losses
 - **Per-group size:** Configurable (default 4 per sub-group, 8 total)
 - **Encoder:** `InterleavedFECEncoder` tracks frame index and routes even/odd frames to separate `FECEncoder` instances
-- **Decoder:** `InterleavedFECDecoder` uses two independent `FECDecoder` instances, one per interleave group
+- **Decoder:** the stream's `RepairDecoder`: each repair names its own sub-group's frames
 
 Implementation: `reliability/fec_interleaved.go`
 
@@ -608,8 +608,8 @@ Reed-Solomon erasure coding via GF(2⁸) Galois field arithmetic. Default config
 - **Recovery:** Any 2 lost frames per group (vs XOR's 1), regardless of position
 - **Performance:** SIMD-accelerated encoding/decoding (AVX2/AVX-512/NEON) via `klauspost/reedsolomon`
 - **Encoder:** `RSEncoder` encodes k data frames into m parity frames using Vandermonde matrix
-- **Decoder:** `RSDecoder` tracks received data+parity shards per group, calls `Reconstruct()` when ≥k shards received
-- **Group tracking:** Groups keyed by GroupID; deterministic eviction (min-groupID) when exceeding max groups
+- **Decoder:** the stream's `RepairDecoder` reconstructs when the frames it holds plus the parity shards reach k
+- **Group tracking:** Groups keyed by GroupID; the oldest is evicted past the stream's group or byte budget
 - **Shard alignment:** All shards zero-padded to max payload length in group
 
 Implementation: `reliability/fec_rs.go`
@@ -619,15 +619,23 @@ Implementation: `reliability/fec_rs.go`
 FEC_REPAIR frame (Type 0x0C) payload:
 
 ```
-[GroupID:4]  — FEC group identifier (monotonically increasing)
+[GroupID:4]  — FEC group identifier, per stream (interleaved: low bit = sub-group)
 [Index:1]    — Repair packet index (for XOR: always = group_size. For RS: k, k+1, ..., k+m-1)
 [Total:1]    — Total frames in group (data + repair)
-[Repair:var] — XOR of all data payloads (XOR modes) or RS parity shard (RS mode)
+[Level:1]    — The group's code: FECBasicXOR(1), FECInterleaved(2), FECReedSolomon(3)
+[Count:1]    — Frames the repair covers, 1 to 32
+Count x:
+  [SeqNo:4]  — A covered DATA frame's sequence number on this stream
+  [Length:2] — Its payload length, which strips the padding off a recovered payload
+  [Flags:1]  — Bit 0: the frame carried FlagFRAGMENT
+[Repair:var] — XOR of all data payloads (XOR modes) or RS parity shard (RS mode), as long as the longest covered frame
 ```
 
-RS parity shards are the same size as the largest data payload in the group.
+Encoders and decoders are per stream: OPEN states the stream's level, both sides build their state from it, and a session with FEC disabled states level 0. A stream with FEC keeps its frames shorter by the repair's header and table, so a repair fits the MSS its frames fit. A repair that does not parse, does not fit the stream's level or conflicts with one already held discards its group and is charged as a malformed frame.
 
 ### 11.7 Recovery
+
+A receiver holds a stream's recent payloads by sequence number, within a per-stream entry and byte budget and a per-session byte budget. A recovered payload goes through the replay window and the receive window at the sequence number the table names, like a frame from the wire: it is acknowledged, its sender stops retransmitting it, and a retransmit that arrives later is a duplicate. A message is delivered once, in order, whichever comes first.
 
 **XOR modes:** When exactly one data frame from a group is missing:
 
@@ -814,9 +822,9 @@ Dial-path integration points: `peer_connections.go:833` in HSTLES, `wire/peers.g
 
 There is no negotiation header before the handshake; identity is established by the underlying transport crypto layer (Noise XX/XK static keys, QUIC TLS handshake, WebSocket Ed25519 header, gRPC metadata). The `NegotiateMode` / `ModeAether` / `ModeString` APIs are gone, and a peer that sends a 4-byte negotiation header fails at the first read.
 
-Wire grammars are negotiated per session generation as a named set (`wire_versions.go`). Each side offers entries in name order, each a list of versions and a required flag; aether registers `bounds` (credit and queue profile version 1, required: section 8.5), `fragment` (envelope version 2, required), `frame` (full-frame grammar 3, required), `frame.short` (version 1, optional) and `reliability` (version 2, required), and an application adds its own names through its options. For each name both sides list, the choice is the highest version in both lists; a required name with no common version, or one a side omits, refuses the session with `ErrWireVersionMismatch` (a `*WireVersionMismatchError` naming the entry and both lists) before any session or stream state exists; an optional one is left out. Under Noise the offer rides the NodeInfo inside the encrypted handshake; a TCP, WebSocket or gRPC session, and QUIC built through `NewSessionForProtocol` (all `TCPSession`), writes it as a bounded `AEWV` preface before its first frame and reads the peer's before decoding any; `adapter.QUICSession` exchanges none. Sessions report the choice through `aether.SessionWireVersions`.
+Wire grammars are negotiated per session generation as a named set (`wire_versions.go`). Each side offers entries in name order, each a list of versions and a required flag; aether registers `bounds` (credit and queue profile version 1, required: section 8.5), `fragment` (envelope version 2, required), `frame` (full-frame grammar 4, required), `frame.short` (version 1, optional) and `reliability` (version 2, required), and an application adds its own names through its options. For each name both sides list, the choice is the highest version in both lists; a required name with no common version, or one a side omits, refuses the session with `ErrWireVersionMismatch` (a `*WireVersionMismatchError` naming the entry and both lists) before any session or stream state exists; an optional one is left out. Under Noise the offer rides the NodeInfo inside the encrypted handshake; a TCP, WebSocket or gRPC session, and QUIC built through `NewSessionForProtocol` (all `TCPSession`), writes it as a bounded `AEWV` preface before its first frame and reads the peer's before decoding any; `adapter.QUICSession` exchanges none. Sessions report the choice through `aether.SessionWireVersions`.
 
-Frame grammar 3 is the grammar whose OPEN payload carries the opener's initial credit (§2.2). A build lists only the grammar it writes, so a peer offering only grammar 2 is refused before any state.
+Frame grammar 4 is the grammar in which a Noise session's CLOSE takes a sequence number and is acknowledged and retransmitted, FEC_REPAIR names the frames it covers, OPEN carries the opener's initial credit and the stream's FEC level, and RESET carries the stream's credit counts (§2.2, §11.6). A build lists only the grammar it writes, so a peer offering only an earlier grammar is refused before any state.
 
 ---
 
@@ -1009,7 +1017,7 @@ After session establishment, most frames can use compact short headers instead o
 | Indicator | Format | Size | Use Case |
 |:-:|--------|:-:|----------|
 | `0x82` | Data short | 9 bytes | Unencrypted DATA, uint16 StreamID + uint32 Length |
-| `0x83` | Control short | 4 bytes | PING/PONG/CLOSE/RESET (no payload) |
+| `0x83` | Control short | 8 bytes | PING/PONG/CLOSE/RESET with no payload, SeqNo carried |
 | `0x84` | ACK short | 11 bytes (lite) or 3+N (full) | Composite ACK |
 | `0x85` | Batch | 2+N x sub | Multiple frames per write |
 | `0x86` | Data varint | 6-10 bytes | Small DATA, varint Length |
@@ -1030,14 +1038,14 @@ After session establishment, most frames can use compact short headers instead o
 
 Implementation: `codec_short.go` — `ShortDataSize = 9`, field at offset [3:5] is `seqDelta`
 
-#### 23.2.2 Control Short (`0x83`) — 4 bytes
+#### 23.2.2 Control Short (`0x83`) — 8 bytes
 
 ```
-[0x83:1][Type:1][StreamID:2]
+[0x83:1][Type:1][StreamID:2][SeqNo:4]
 ```
 
 - Type: PING(0x06), PONG(0x07), CLOSE(0x03), RESET(0x04)
-- No payload, no SeqNo, no Length
+- No payload, no Length; `[indicator:1][type:1][streamID:2][seqNo:4]`, which carries PING/PONG correlation and a CLOSE's sequence number
 - Used for high-frequency keepalive without header overhead
 
 #### 23.2.3 ACK Short (`0x84`) — 11 bytes (lite) or 3+N (full)
