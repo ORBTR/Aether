@@ -141,6 +141,12 @@ func TestNoiseSession_ASYNPayloadIsNeverAMessage(t *testing.T) {
 	if !same || st.recvQ.len() != 0 {
 		t.Fatalf("a SYN frame on the live stream: same stream %v, %d messages queued", same, st.recvQ.len())
 	}
+	if st.closeDone.Load() {
+		t.Error("a SYN frame on a stream with no CLOSE out settled the stream's CLOSE")
+	}
+	if got := atomic.LoadUint64(&s.streamRefused); got != 1 {
+		t.Errorf("streamRefused = %d, want 1: a SYN frame on a live stream refuses nothing", got)
+	}
 }
 
 // TestUnknownStream_NoSYNIsDroppedSilently: the flag is what decides it. A DATA frame
