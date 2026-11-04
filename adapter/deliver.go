@@ -28,7 +28,7 @@ type WindowUpdater func(streamID uint64, credit uint64)
 // their own.
 type DeliveryStats struct {
 	Delivered    atomic.Int64 // frames queued for the stream's consumer
-	Dropped      atomic.Int64 // frames the session refused: on a TCPSession the message that did not fit its stream's delivery queue and ended the stream (overrun); on a NoiseSession a credit violation or a full control-frame limit
+	Dropped      atomic.Int64 // frames the session refused: on a TCPSession the message that did not fit its stream's delivery queue or the session's or peer's ceiling and ended the stream (overrun); on a NoiseSession a credit violation or a full control-frame limit
 	Backpressure atomic.Int64 // frames that did not fit their stream's delivery queue: on a TCPSession each is also counted in Dropped (overrun); a NoiseSession counts none
 	BytesDropped atomic.Int64 // total bytes in dropped frames
 

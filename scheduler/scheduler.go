@@ -200,13 +200,14 @@ func (s *Scheduler) RegisterWithClass(streamID uint64, weight uint8, dependency 
 
 // Unregister removes a stream from the scheduler and drops its queued frames
 // and its pending probe, returning them as (droppedFrames, droppedProbe) for a
-// caller that accounts for frames that will never reach the wire. Both of the
-// adapter's releaseStream discard the return, and no caller in this repository
-// reads it: the credit a dropped frame carries was charged by the stream's Send
-// before it called Enqueue, NoiseSession settles a reset stream's whole outstanding
-// connection credit at the RESET (noiseStream.settleLocalReset, settlePeerReset, by
-// StreamWindow.ReleaseAll), which covers these frames, a stream that leaves on
-// both CLOSEs has no frame left here, and a TCP Send charges no connection credit.
+// caller that accounts for frames that will never reach the wire.
+// TCPSession.releaseStream gives each dropped frame's room back to its stream's
+// Send (releaseSendRoom). NoiseSession.releaseStream discards the return: the credit
+// a dropped frame carries was charged by the stream's Send before it called Enqueue,
+// NoiseSession settles a reset stream's whole outstanding connection credit at the
+// RESET (noiseStream.settleLocalReset, settlePeerReset, by StreamWindow.ReleaseAll),
+// which covers these frames, and a stream that leaves on both CLOSEs has no frame
+// left here.
 func (s *Scheduler) Unregister(streamID uint64) (droppedFrames []*aether.Frame, droppedProbe *aether.Frame) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -246,9 +247,10 @@ func (s *Scheduler) SetWeight(streamID uint64, weight uint8) {
 	}
 }
 
-// Enqueue adds a frame to a stream's send queue and wakes the writeLoop.
-// If the stream is not registered, the frame is dropped silently.
-func (s *Scheduler) Enqueue(streamID uint64, frame *aether.Frame) {
+// Enqueue adds a frame to a stream's send queue and wakes the writeLoop, and
+// reports whether it did: a stream that is not registered takes no frame, and a
+// caller that promised the frame to someone (tcpStream.Send) tells them.
+func (s *Scheduler) Enqueue(streamID uint64, frame *aether.Frame) bool {
 	s.mu.Lock()
 	queued := false
 	if ss, ok := s.streams[streamID]; ok {
@@ -278,6 +280,7 @@ func (s *Scheduler) Enqueue(streamID uint64, frame *aether.Frame) {
 	if queued {
 		s.signalWake()
 	}
+	return queued
 }
 
 // classVirtualStartLocked returns the WFQ virtual start time for a latency

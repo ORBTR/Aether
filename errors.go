@@ -66,10 +66,22 @@ var (
 	// recycling a caller-assigned ID before the prior stream closed. The
 	// pre-existing stream is left intact; there is no new stream to
 	// return, so the caller must pick a fresh StreamID or close the prior
-	// stream first. A transient caller-side signal, not a transport
+	// stream first. A NoiseSession also answers it for an ID whose stream
+	// left on both CLOSEs a moment ago, whose ID opens again a few RTOs later
+	// (reopenQuietRTOs in adapter), because the peer may still be writing its
+	// CLOSE again. A transient caller-side signal, not a transport
 	// failure — do NOT close the session in response.
 	// Use errors.Is(err, aether.ErrDuplicateStreamID) to detect.
 	ErrDuplicateStreamID = errors.New("transport: duplicate stream id")
+
+	// ErrSessionWriteFailed signals that a byte-stream session could not write to
+	// its transport: a non-temporary error, or a temporary one that outlasted the
+	// session's retry. The transport carries the session's frames in one sequence
+	// with no retransmit, so a frame not written is a frame lost and the next would
+	// be misread; the session ends with this as its close reason (CloseErr), and Send
+	// and Receive on its streams return it.
+	// Use errors.Is(err, aether.ErrSessionWriteFailed) to detect.
+	ErrSessionWriteFailed = errors.New("transport: session write failed")
 
 	// ErrStreamCreditRefused signals that a stream was not admitted because
 	// its receive credit does not fit what the session's admitted streams,
@@ -107,15 +119,17 @@ var (
 	// deliver. On a byte-stream session (TCP, WebSocket, gRPC) the receiver's
 	// delivery queue was full: the sender sent more bytes than the receiving
 	// consumer had read and the queue holds, the bounds profile's stream credit
-	// (flow.BoundsProfile.StreamCredit). On a Noise session the sender went
-	// past the credit it holds. Either way the receiver reset the stream with
+	// (flow.BoundsProfile.StreamCredit), or the session's queues together had
+	// reached its session ceiling. On a Noise session the sender went past the
+	// credit it holds. On either, what every session to one peer holds had reached
+	// the profile's per-peer ceiling. Each way the receiver reset the stream with
 	// RESET(ResetFlowCtrl) rather than drop a message unannounced: on the
 	// receiver, Receive returns every message the queue held and then this
 	// error; on the sender, Send and Receive return it once that RESET arrives.
 	// The messages the sender sent after the last one the queue took are not
-	// delivered. A Noise receiver also returns it when messages it had queued
-	// on a stream already ended were thrown away because their consumer did not
-	// read them in time or a credited message needed their room. It is a refusal
+	// delivered. A receiver also returns it when messages it had queued on a
+	// stream already ended were thrown away because their consumer did not read
+	// them in time or a later message needed their room. It is a refusal
 	// of the stream, not a transport failure: the session stays up.
 	// Use errors.Is(err, aether.ErrStreamOverrun) to detect.
 	ErrStreamOverrun = errors.New("transport: stream reset, receiver's delivery queue full")

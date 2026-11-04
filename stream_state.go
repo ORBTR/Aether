@@ -46,8 +46,8 @@ const (
 	EventRecvFIN                      // remote: received FIN
 	EventSendReset                    // local: sent RESET
 	EventRecvReset                    // remote: received RESET
-	EventSendData                     // local: sent DATA (implicit open with SYN)
-	EventRecvData                     // remote: received DATA (implicit open with SYN)
+	EventSendData                     // local: sent DATA
+	EventRecvData                     // remote: received DATA
 )
 
 // String returns a human-readable event name.
