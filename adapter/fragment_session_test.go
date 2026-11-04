@@ -219,8 +219,10 @@ func TestNoiseSession_FrameMarksFragments(t *testing.T) {
 	sess, peer := noiseRawWriter(t, 0x1234)
 	raw := aether.PeerID{9, 9, 9, 9, 9, 9, 9, 9}
 	frBytes := append([]byte{'F', 'R', 0, 1}, "hello"...)
-	open := &aether.Frame{SenderID: raw, StreamID: 10, Type: aether.TypeDATA, Flags: aether.FlagSYN, SeqNo: 0, Payload: frBytes}
-	writeFrames(t, peer, open)
+	openPayload := aether.EncodeOpenPayload(aether.OpenPayload{Reliability: aether.ReliableOrdered, InitialCredit: 1 << 20})
+	writeFrames(t, peer,
+		&aether.Frame{SenderID: raw, StreamID: 10, Type: aether.TypeOPEN, Payload: openPayload},
+		&aether.Frame{SenderID: raw, StreamID: 10, Type: aether.TypeDATA, SeqNo: 0, Payload: frBytes})
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	st, err := sess.AcceptStream(ctx)

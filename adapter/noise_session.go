@@ -58,8 +58,8 @@ type NoiseSession struct {
 	// per-ID backlog, and the FIFO that AcceptStream drains. Lives in
 	// the root aether package so all three transport adapters (Noise,
 	// TCP, QUIC) share one implementation rather than each carrying
-	// their own channel + push-mode shim. handleOpen /
-	// handleImplicitOpen call acceptor.Notify on every accepted
+	// their own channel + push-mode shim. handleOpen
+	// calls acceptor.Notify on every accepted
 	// stream; AcceptStream and AcceptStreamByID delegate to it.
 	acceptor *aether.StreamAcceptor
 
@@ -495,6 +495,11 @@ type NoiseSession struct {
 	admitted   *creditLedger
 	peerShared bool
 
+	// recentlyLeft holds, per stream ID, when a stream that left on both CLOSEs
+	// stops being a reason to refuse a local OpenStream of its ID (noteLeft,
+	// reopenQuietLocked). Guarded by s.mu, pruned by sweepRecentlyLeft.
+	recentlyLeft map[uint64]time.Time
+
 	// endedQueues are the receive queues of streams that have left s.streams
 	// with messages still unread. Their cost stays in recvQueued until the
 	// consumer takes them; sweepEndedQueues, on the reliability tick, discards
@@ -548,6 +553,7 @@ func newNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 		txCompressor: aether.NewCompressor(),
 		rxCompressor: aether.NewCompressor(),
 		endedQueues:  make(map[*recvQueue]struct{}),
+		recentlyLeft: make(map[uint64]time.Time),
 	}
 	sessionCeiling := flow.CurrentBounds().AdmittedCreditCeiling(opts.MaxConcurrentStreams)
 	var peerLedger *creditLedger
@@ -595,7 +601,7 @@ func newNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 	// Per-StreamID accept dispatch + AcceptStream FIFO — shared
 	// implementation in the root aether package. NonBlockingDrop: when the
 	// FIFO is full the OPEN-frame handler drops the stream rather than hold
-	// the readLoop, which runs handleOpen and handleImplicitOpen.
+	// the readLoop, which runs handleOpen.
 	s.acceptor = aether.NewStreamAcceptor(aether.StreamAcceptorConfig{
 		Mode:      aether.NonBlockingDrop,
 		Closed:    base.CloseSignal(),
@@ -758,13 +764,16 @@ func (s *NoiseSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) 
 	// the MaxConcurrentStreams cap and the credit reservation but do NOT
 	// send a RESET back (no peer to RESET — the caller gets the error
 	// directly). Both apply universally so a leaking local caller can't
-	// exhaust the session's stream-slot table or its admitted credit.
+	// exhaust the session's stream-slot table or its admitted credit. An ID
+	// still in use, or just left on both CLOSEs (reopenQuietLocked), is refused
+	// too, and no second OPEN goes to the peer.
 	st, err := s.createStream(cfg.StreamID, cfg, false)
 	if err != nil {
 		// Refused. streamRefused counter already incremented inside
-		// createStream. Surface the typed sentinel (ErrStreamCapExhausted
-		// or ErrStreamCreditRefused) so callers can detect it via
-		// errors.Is and back off instead of closing the session.
+		// createStream for a cap or credit refusal. Surface the typed sentinel
+		// (ErrStreamCapExhausted, ErrStreamCreditRefused or ErrDuplicateStreamID)
+		// so callers can detect it via errors.Is and back off instead of closing
+		// the session.
 		if errors.Is(err, aether.ErrStreamCapExhausted) {
 			cap := s.opts.MaxConcurrentStreams
 			if cap <= 0 {
@@ -831,8 +840,7 @@ func (s *NoiseSession) AcceptStreamByID(ctx context.Context, streamID uint64) (a
 // notifyStreamAccepted hands a freshly-accepted stream to the shared
 // StreamAcceptor. The acceptor picks between a pinned ByID waiter, a
 // per-ID backlog slot, or the internal FIFO that AcceptStream drains.
-// Called by handleOpen / handleImplicitOpen — the two paths that
-// produce a remotely-initiated stream.
+// Called by handleOpen, the path that produces a remotely-initiated stream.
 func (s *NoiseSession) notifyStreamAccepted(st *noiseStream) {
 	s.acceptor.Notify(st)
 }
@@ -897,6 +905,53 @@ func (s *NoiseSession) releaseStream(streamID uint64) {
 	s.sched.Unregister(streamID)
 	if s.streamGC != nil {
 		s.streamGC.Unregister(streamID)
+	}
+}
+
+// reopenQuietRTOs is how many of the leaving stream's RTOs a stream ID stays closed
+// to a local OpenStream after the stream left on both CLOSEs. The peer retransmits
+// its CLOSE until this side's ACK of it arrives, and a frame says nothing of which
+// stream under an ID it belongs to: a copy reaching a new stream under the ID would
+// end that stream's receive side at the old stream's sequence number. An ACK and the
+// copy after it take one RTO each way to settle, which three RTOs cover unless every
+// ACK of a run of them is lost.
+// TODO: state the stream's generation on OPEN and CLOSE under a frame grammar
+// version, so a stale CLOSE is refused however late it comes and no ID waits.
+const reopenQuietRTOs = 3
+
+// noteLeft records that the stream under id has just left on both CLOSEs
+// (noiseStream.leaveIfEnded), starting its ID's quiet time.
+func (s *NoiseSession) noteLeft(id uint64, rto time.Duration) {
+	s.mu.Lock()
+	s.recentlyLeft[id] = time.Now().Add(reopenQuietRTOs * rto)
+	s.mu.Unlock()
+}
+
+// reopenQuietLocked reports whether id is in its quiet time (reopenQuietRTOs).
+// createStream, under s.mu, refuses a local OpenStream of such an ID; a peer's OPEN
+// is not refused, since the peer has seen this side's CLOSE and its own acknowledged.
+func (s *NoiseSession) reopenQuietLocked(id uint64) bool {
+	until, ok := s.recentlyLeft[id]
+	if !ok {
+		return false
+	}
+	if time.Now().Before(until) {
+		return true
+	}
+	delete(s.recentlyLeft, id)
+	return false
+}
+
+// sweepRecentlyLeft drops the IDs whose quiet time is over. It runs on the
+// reliability tick beside sweepEndedQueues, so the map holds at most the streams
+// that left within one tick and one quiet time.
+func (s *NoiseSession) sweepRecentlyLeft(now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, until := range s.recentlyLeft {
+		if now.After(until) {
+			delete(s.recentlyLeft, id)
+		}
 	}
 }
 

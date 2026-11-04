@@ -102,7 +102,7 @@ All multi-byte fields are **big-endian** (network byte order).
 
 | Code | Name | Payload | Description |
 |------|------|---------|-------------|
-| 0x01 | DATA | Application data | Primary data transport. May carry SYN flag for zero-RTT stream open. |
+| 0x01 | DATA | Application data | Primary data transport. A frame flagged SYN opens its stream and carries the OPEN payload, no message. |
 | 0x0C | FEC_REPAIR | `[GroupID:4][Index:1][Total:1][Level:1][Count:1][Covered:7 x Count][Repair:var]` | Forward error correction repair packet over a stream's own frames, each named in the table by sequence number, length and fragment flag (§11.6). A recovered frame takes its place in the receive window, so it is delivered once and in order, with no retransmission. |
 
 ### 2.2 Stream Lifecycle
@@ -214,7 +214,7 @@ ACKs are not sent after every packet. The ACK engine uses:
 | Bit | Name | Description |
 |-----|------|-------------|
 | 0x01 | FIN | Last frame in stream. After FIN, sender will send no more DATA on this stream. |
-| 0x02 | SYN | Stream open. When set on a DATA frame, implicitly opens the stream (zero-RTT, no separate OPEN frame needed). |
+| 0x02 | SYN | Stream open. When set on a DATA frame, the frame opens the stream: its payload is the OPEN payload, never a message, on every profile. |
 | 0x04 | ACK | Acknowledgment piggyback. AckNo field is meaningful (cumulative ACK for peer's data). Reduces standalone ACK frames. |
 | 0x08 | PRIORITY | Priority field present in payload (for DATA frames carrying inline priority hints). |
 | 0x10 | ENCRYPTED | Payload is encrypted with ChaCha20-Poly1305. Nonce field is meaningful. Header bytes 0-37 are AEAD additional data (authenticated but not encrypted). |
@@ -904,7 +904,7 @@ Relay nodes can inspect `SenderID` and `ReceiverID` for routing decisions withou
 
 | Error | Response |
 |-------|----------|
-| Unknown StreamID in DATA frame | Drop silently (unless SYN flag set -> implicit open) |
+| Unknown StreamID in DATA frame | Drop silently (unless SYN flag set -> the frame opens the stream) |
 | RESET received | Close stream, deliver error to application |
 | Flow control violation (send without credit) | Send RESET with reason FlowCtrl(3) |
 | Stream idle timeout | Send RESET with reason Timeout(4) |
@@ -1118,22 +1118,22 @@ Each stream tracks its own independent sequence state for delta compression:
 - **Receiver side:** Reconstructs full SeqNo: `seqNo = lastSeqNo + seqDelta`.
 - SeqDelta in short headers is uint16 (max delta 65535). If the delta exceeds 65535, a full header is used.
 - SeqNo is scoped to a stream — each stream has independent tracking starting at 0.
-- On stream OPEN (or implicit open via FlagSYN), SeqNo resets to 0.
+- On stream OPEN (or a DATA frame flagged FlagSYN), SeqNo resets to 0.
 
-### 23.5 Implicit OPEN via FlagSYN
+### 23.5 OPEN via FlagSYN
 
-Streams can be opened implicitly by sending a DATA frame with `FlagSYN` (0x02) set in a full 50-byte header. This combines OPEN + DATA into a single frame, avoiding a separate OPEN round-trip. Short headers do NOT carry flags, so the first frame on a new stream MUST use a full header with FlagSYN set. Subsequent frames on that stream can use short headers.
+A stream can be opened by a DATA frame with `FlagSYN` (0x02) set in a full 50-byte header. Its payload is the OPEN payload and it carries no message, on every profile: a TCP-family `OpenStream` writes this frame, and a Noise `OpenStream` writes a TYPE OPEN frame, and a receiver of either profile takes both through the one admission. A payload that is not an OPEN payload is refused with RESET(Refused). A SYN frame takes no sequence number of the stream. For a stream ID already live it changes nothing, except that a stream both sides have closed goes and the frame opens the next one. Short headers do NOT carry flags, so this frame always uses a full header.
 
 Sequence:
-1. Sender sends full header DATA frame with `FlagSYN | reliability | priority` on new StreamID
-2. Receiver sees FlagSYN, opens stream with specified parameters, delivers payload
-3. All subsequent frames on that stream use short headers
+1. Sender sends full header DATA frame with `FlagSYN` and the OPEN payload on a new StreamID
+2. Receiver sees FlagSYN, opens stream with the stated parameters, delivers nothing
+3. All subsequent frames on that stream may use short headers
 
 ### 23.6 When to Use Full Headers
 
 The full 50-byte header remains the canonical format for:
 
-- **First frame on a new stream** (FlagSYN required for implicit open)
+- **First frame on a new stream** (a frame flagged FlagSYN always has one)
 - **Resynchronization** (after connection migration, long idle, or error recovery)
 - **Periodic resync** (every 64 frames per stream — `ShortHeaderFullInterval`)
 - **WINDOW_UPDATE** frames (Type 0x05 — not representable as short header)

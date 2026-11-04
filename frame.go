@@ -128,7 +128,7 @@ type FrameFlags byte
 
 const (
 	FlagFIN        FrameFlags = 0x01 // Last frame in stream
-	FlagSYN        FrameFlags = 0x02 // Stream open (zero-RTT in DATA frame)
+	FlagSYN        FrameFlags = 0x02 // This DATA frame opens its stream: its payload is the stream's OpenPayload, never a message, on every profile
 	FlagACK        FrameFlags = 0x04 // Acknowledgment piggyback
 	FlagPRIORITY   FrameFlags = 0x08 // Priority field present in payload
 	FlagENCRYPTED  FrameFlags = 0x10 // Payload is AEAD encrypted

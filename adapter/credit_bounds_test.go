@@ -389,7 +389,13 @@ func TestNoiseStream_ResetAfterBothClosesGrantsWhatItWillNotRead(t *testing.T) {
 	waitLong(t, "the stream gone from both sessions", func() bool {
 		return !streamPresent(server, 630) && !streamPresent(client, 630)
 	})
-	// A new stream on the ID: a RESET from either old stream would end it.
+	// A new stream on the ID, once the ID's quiet time is over: a RESET from either
+	// old stream would end it.
+	waitLong(t, "the ID's quiet time ending", func() bool {
+		client.mu.Lock()
+		defer client.mu.Unlock()
+		return !client.reopenQuietLocked(630)
+	})
 	ncs, nss := openWithCredit(t, ctx, client, server, 630, 0)
 	if err := ss.Reset(aether.ResetCancel); err != nil {
 		t.Fatalf("Reset after the stream left: %v", err)

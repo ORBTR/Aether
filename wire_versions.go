@@ -438,11 +438,11 @@ func highestCommon(a, b []uint16) (uint16, bool) {
 	return 0, false
 }
 
-// WriteWireVersionsPreface writes the byte-stream session preface: "AEWV", a
-// big-endian u16 length, then w's canonical encoding. TCPSession writes it
-// before its first frame and its peer reads it with ReadWireVersionsPreface
-// before decoding any frame, which gives TCP, WebSocket, gRPC and QUIC stream
-// sessions the negotiation the Noise handshake carries in NodeInfo.
+// WriteWireVersionsPreface writes the session preface: "AEWV", a big-endian u16
+// length, then w's canonical encoding. TCPSession writes it before its first frame
+// and QUICSession on a unidirectional stream of its own, and the peer reads it with
+// ReadWireVersionsPreface before decoding any frame, which gives TCP, WebSocket,
+// gRPC and QUIC sessions the negotiation the Noise handshake carries in NodeInfo.
 func WriteWireVersionsPreface(w io.Writer, set WireVersions) error {
 	enc, err := set.Encode()
 	if err != nil {
@@ -484,8 +484,9 @@ func ReadWireVersionsPreface(r io.Reader) (WireVersions, error) {
 }
 
 // WireVersionsReporter is implemented by sessions that negotiated a wire
-// version set: NoiseSession over a Noise handshake and TCPSession, which
-// serves TCP, WebSocket, gRPC and QUIC streams. SessionWireVersions is the
+// version set: NoiseSession over a Noise handshake, TCPSession, which serves
+// TCP, WebSocket, gRPC and QUIC streams, and QUICSession over native QUIC
+// streams. SessionWireVersions is the
 // accessor; it is an optional interface so that Session implementations
 // outside this module are not obliged to grow the method.
 type WireVersionsReporter interface {

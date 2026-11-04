@@ -620,3 +620,66 @@ func TestTCPStream_NoSendLandsBehindItsClose(t *testing.T) {
 		_ = ss.Close()
 	}
 }
+
+// TestTCPStream_ASYNPayloadIsNeverAMessage: a SYN frame whose payload is not an OPEN
+// payload is refused with RESET(ResetRefused) and keeps no state, and a SYN frame on a
+// live stream delivers nothing to its consumer.
+func TestTCPStream_ASYNPayloadIsNeverAMessage(t *testing.T) {
+	p := newLiteRawPeer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	writeFrames(t, p.conn, &aether.Frame{StreamID: 50, Type: aether.TypeDATA, Flags: aether.FlagSYN, Payload: []byte("hello")})
+	if f := p.next(); f.Type != aether.TypeRESET || f.StreamID != 50 || aether.DecodeReset(f.Payload) != aether.ResetRefused {
+		t.Fatalf("frame on the wire: %+v, want RESET(ResetRefused)", f)
+	}
+	if inSession(p.sess, 50) {
+		t.Fatal("a SYN frame carrying message bytes kept a stream")
+	}
+
+	writeFrames(t, p.conn,
+		synFrame(52),
+		synFrame(52),
+		&aether.Frame{StreamID: 52, Type: aether.TypeDATA, Flags: aether.FlagSYN, Payload: []byte("hello")},
+		&aether.Frame{StreamID: 52, Type: aether.TypeDATA, Payload: []byte("one")})
+	st, err := p.sess.AcceptStream(ctx)
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	if got, err := st.Receive(ctx); err != nil || string(got) != "one" {
+		t.Fatalf("first message: %q, %v; want the DATA frame, no SYN payload", got, err)
+	}
+	if got := p.sess.DeliveryStats().Delivered.Load(); got != 1 {
+		t.Fatalf("Delivered = %d, want 1", got)
+	}
+}
+
+// TestTCPStream_DataBehindAResetIsRefused: the peer's RESET ends the stream, whose
+// consumer reads what it holds and then the end, and DATA behind the RESET is not a
+// message.
+func TestTCPStream_DataBehindAResetIsRefused(t *testing.T) {
+	p := newLiteRawPeer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	writeFrames(t, p.conn,
+		synFrame(54),
+		&aether.Frame{StreamID: 54, Type: aether.TypeDATA, Payload: []byte("one")},
+		&aether.Frame{StreamID: 54, Type: aether.TypeRESET, Payload: aether.EncodeReset(aether.ResetCancel)},
+		&aether.Frame{StreamID: 54, Type: aether.TypeDATA, Payload: []byte("behind")},
+		&aether.Frame{StreamID: 2, Type: aether.TypePING})
+	if f := p.next(); f.Type != aether.TypePONG {
+		t.Fatalf("frame on the wire: type %v, want PONG", f.Type)
+	}
+	st, err := p.sess.AcceptStream(ctx)
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	if got, err := st.Receive(ctx); err != nil || string(got) != "one" {
+		t.Fatalf("receive: %q, %v", got, err)
+	}
+	if _, err := st.Receive(ctx); !errors.Is(err, io.EOF) {
+		t.Fatalf("after the RESET: %v, want io.EOF", err)
+	}
+	if got := p.sess.DeliveryStats().Delivered.Load(); got != 1 {
+		t.Errorf("Delivered = %d, want 1: the DATA behind the RESET is not a message", got)
+	}
+}

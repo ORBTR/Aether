@@ -257,11 +257,14 @@ func (s *NoiseSession) handleData(frame *aether.Frame) {
 	st, ok := s.streams[frame.StreamID]
 	s.mu.Unlock()
 
+	// A SYN frame opens its stream and carries no message, the meaning TCPSession
+	// reads too: it goes through the one admission OPEN has, which leaves a live
+	// stream as it is and takes the frame's payload as the stream's OpenPayload.
+	if frame.Flags.Has(aether.FlagSYN) {
+		s.handleOpen(frame)
+		return
+	}
 	if !ok {
-		if frame.Flags.Has(aether.FlagSYN) {
-			s.handleImplicitOpen(frame)
-			return
-		}
 		return // unknown stream
 	}
 
@@ -424,6 +427,10 @@ func (s *NoiseSession) admitSequenced(st *noiseStream, seq uint32, payload []byt
 	for _, d := range delivered {
 		if d.End {
 			s.endReceive(st)
+			continue
+		}
+		if d.Expired {
+			st.settleExpired(d)
 			continue
 		}
 		payload, whole := st.reassemble(d)
@@ -797,14 +804,19 @@ func (s *NoiseSession) handleFECRepair(frame *aether.Frame) {
 // leaving this window larger than the opener's, and would take a larger one
 // as its growth ceiling, so a peer's declaration would raise this side's
 // ceiling. An FEC level outside the registry is refused the same way: the
-// opener would write repairs this side cannot read. An OPEN for a stream already in s.streams changes nothing: that
-// stream keeps its window and reservation, and the acceptor is not handed it a
-// second time.
+// opener would write repairs this side cannot read. An OPEN for a stream already in
+// s.streams changes nothing: that stream keeps its window and reservation, and the
+// acceptor is not handed it a second time. The exception is a stream both sides have
+// closed: an opener reuses an ID only once its own stream under it has left, which
+// takes this side's CLOSE and the ACK of its own, so the stream goes (peerReopened)
+// and the OPEN admits the next one. Left in place, it would take the new stream's
+// frames after its own end and acknowledge them. A DATA frame flagged aether.FlagSYN
+// comes here from handleData.
 func (s *NoiseSession) handleOpen(frame *aether.Frame) {
 	s.mu.Lock()
-	_, live := s.streams[frame.StreamID]
+	live, ok := s.streams[frame.StreamID]
 	s.mu.Unlock()
-	if live {
+	if ok && !live.peerReopened() {
 		return
 	}
 	payload := aether.DecodeOpenPayload(frame.Payload)
@@ -825,7 +837,9 @@ func (s *NoiseSession) handleOpen(frame *aether.Frame) {
 	}
 	st, _ := s.createStream(frame.StreamID, cfg, true /* enforceRemoteCap */)
 	if st == nil {
-		return // refused by the cap or the credit reservation; RESET already sent
+		// Refused by the cap or the credit reservation, with the RESET sent; or a
+		// local OpenStream of the ID took it first, whose OPEN the peer will meet.
+		return
 	}
 	st.state.Transition(aether.EventRecvOpen)
 
@@ -833,38 +847,6 @@ func (s *NoiseSession) handleOpen(frame *aether.Frame) {
 	// (AcceptStreamByID) claims its stream regardless of wire order;
 	// fallbacks to per-ID backlog then FIFO acceptCh.
 	s.notifyStreamAccepted(st)
-}
-
-func (s *NoiseSession) handleImplicitOpen(frame *aether.Frame) {
-	st, _ := s.createStream(frame.StreamID, aether.DefaultStreamConfig(frame.StreamID), true /* enforceRemoteCap */)
-	if st == nil {
-		return
-	}
-	st.state.Transition(aether.EventRecvData)
-
-	s.notifyStreamAccepted(st)
-
-	// Reliability: insert into recv window.
-	delivered, _ := st.recvWindow.InsertMarked(frame.SeqNo, frame.Payload, frame.IsFragment())
-
-	// Prime the ACK engine for the implicit-open's first frame BEFORE
-	// the delivery loop — otherwise the first frame on a peer-initiated
-	// stream sits un-ACKed until a SECOND frame arrives and triggers
-	// handleData's notify, wasting a round-trip on every stream open.
-	// Mirrors the ordering in handleData above.
-	if st.ackEngine != nil {
-		st.ackEngine.OnDataReceived(frame.SeqNo, s.isAckImmediateStream(frame.StreamID))
-	}
-
-	// Delivery through the stream's recvQ, as handleData: a teardown on another
-	// goroutine makes enqueueDelivery return false.
-	for _, d := range delivered {
-		payload, whole := st.reassemble(d)
-		if !whole {
-			continue
-		}
-		st.enqueueDelivery(payload)
-	}
 }
 
 // handleClose takes the peer's CLOSE, which holds the next sequence number of the
