@@ -23,13 +23,13 @@ type WindowUpdater func(streamID uint64, credit uint64)
 // caller attribute refusals to gossip (stream-0), reliable RPC (stream-1),
 // or dynamic streams without growing the map by streamID. One class's
 // counters move with that class's own pressure: a TCPSession whose stream-0
-// delivery queue (tcpDeliveryQueueCapacity) is the one filling shows
+// delivery queue (tcpStream.recvQ) is the one that overruns shows
 // Stream0Dropped rising while Stream1Dropped and StreamOtherDropped track
 // their own.
 type DeliveryStats struct {
 	Delivered    atomic.Int64 // frames queued for the stream's consumer
-	Dropped      atomic.Int64 // frames the session refused: on a TCPSession the message that found its stream's delivery queue full and ended the stream (overrun); on a NoiseSession a credit violation or a full control-frame limit
-	Backpressure atomic.Int64 // frames that found their stream's delivery queue full: on a TCPSession each is also counted in Dropped (overrun); a NoiseSession counts none
+	Dropped      atomic.Int64 // frames the session refused: on a TCPSession the message that did not fit its stream's delivery queue and ended the stream (overrun); on a NoiseSession a credit violation or a full control-frame limit
+	Backpressure atomic.Int64 // frames that did not fit their stream's delivery queue: on a TCPSession each is also counted in Dropped (overrun); a NoiseSession counts none
 	BytesDropped atomic.Int64 // total bytes in dropped frames
 
 	// Per-stream-class counters. Mirror the aggregate fields above so the
@@ -37,15 +37,15 @@ type DeliveryStats struct {
 	// without dividing by guesswork.
 	Stream0Delivered    atomic.Int64 // gossip frames delivered
 	Stream0Dropped      atomic.Int64 // gossip frames refused
-	Stream0Backpressure atomic.Int64 // gossip frames that found the queue full
+	Stream0Backpressure atomic.Int64 // gossip frames that did not fit the queue
 
 	Stream1Delivered    atomic.Int64 // reliable-RPC frames delivered
 	Stream1Dropped      atomic.Int64 // reliable-RPC frames refused
-	Stream1Backpressure atomic.Int64 // reliable-RPC frames that found the queue full
+	Stream1Backpressure atomic.Int64 // reliable-RPC frames that did not fit the queue
 
 	StreamOtherDelivered    atomic.Int64 // keepalive/control/dynamic frames delivered
 	StreamOtherDropped      atomic.Int64 // keepalive/control/dynamic frames refused
-	StreamOtherBackpressure atomic.Int64 // keepalive/control/dynamic frames that found the queue full
+	StreamOtherBackpressure atomic.Int64 // keepalive/control/dynamic frames that did not fit the queue
 }
 
 // recordDelivered increments the aggregate and per-stream-class delivered
@@ -101,10 +101,9 @@ func (s *DeliveryStats) DropRate() float64 {
 }
 
 // releaseCredit grants back n bytes that will never reach the application,
-// through ReceiverConsume and a WINDOW_UPDATE if a trigger fires. The fragment
-// paths (noiseStream.reassemble, TCPSession.deliverToStream) use it for bytes
-// the sender charged that the reader's debouncer will never see, because they
-// never become a message Receive returns.
+// through ReceiverConsume and a WINDOW_UPDATE if a trigger fires.
+// noiseStream.reassemble uses it for bytes the sender charged that the reader's
+// debouncer will never see, because they never become a message Receive returns.
 func releaseCredit(window *flow.StreamWindow, n int64, streamID uint64, sendUpdate WindowUpdater) {
 	if n <= 0 {
 		return
@@ -116,14 +115,11 @@ func releaseCredit(window *flow.StreamWindow, n int64, streamID uint64, sendUpda
 	}
 }
 
-// recvChCapacity is the per-stream-type message count that bounds the queues
-// no credit paces. A tcpStream's delivery queue holds twice it
-// (tcpDeliveryQueueCapacity): a byte-stream session charges no credit its
-// sender waits on, so this count is what bounds its queue, and a message past
-// it ends the stream with a typed reset (tcpStream.overrun). noiseStream bounds
-// its queue by the sender's credit in bytes and uses twice this count only for
-// the control frames no credit is charged for (enqueueControl). Sized per
-// stream type to the bursts each one carries:
+// recvChCapacity is the per-stream-type message count that bounds what no credit
+// paces on a NoiseSession: noiseStream bounds its queue by the sender's credit in
+// bytes and uses twice this count only for the control frames no credit is
+// charged for (enqueueControl). Sized per stream type to the bursts each one
+// carries:
 //   - Gossip (0): 128. One full-snapshot IBLT burst arrives back to back,
 //     and a smaller count fills during it; 128 gives about four times that
 //     burst at a worst case of a few MB buffered per peer.

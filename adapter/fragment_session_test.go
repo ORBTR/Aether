@@ -324,10 +324,6 @@ func TestTCPSession_RefusesFragments(t *testing.T) {
 	if sess.IsClosed() {
 		t.Fatalf("a refused fragment closed the session")
 	}
-	// The refused fragment's bytes are granted back to the sender at once.
-	if c := st.(*tcpStream).window.Stats().Consumed; c < 5000 {
-		t.Fatalf("receiver window consumed %d bytes, want the refused fragment's 5000 granted back", c)
-	}
 }
 
 // packetPipe is one end of a buffered in-memory connection that never merges

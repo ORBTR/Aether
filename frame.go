@@ -534,7 +534,7 @@ type CongestionReason byte
 
 const (
 	CongestionUnspecified CongestionReason = 0
-	CongestionQueueFull   CongestionReason = 1 // Receiver's recvCh is backlogged
+	CongestionQueueFull   CongestionReason = 1 // Receiver's delivery queue is backlogged
 	CongestionMemoryHigh  CongestionReason = 2 // Receiver near memory pressure
 	CongestionCPUHigh     CongestionReason = 3 // Receiver can't keep up CPU-wise
 	CongestionRateLimit   CongestionReason = 4 // Receiver policy rate-limit

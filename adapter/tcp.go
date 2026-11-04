@@ -18,7 +18,6 @@ import (
 
 	"github.com/ORBTR/aether"
 	"github.com/ORBTR/aether/abuse"
-	"github.com/ORBTR/aether/congestion"
 	"github.com/ORBTR/aether/flow"
 	"github.com/ORBTR/aether/health"
 	"github.com/ORBTR/aether/reliability"
@@ -36,9 +35,14 @@ const DefaultTCPMaxConcurrentStreams = 256
 // (stream_acceptor.go), which the Noise, TCP and QUIC adapters share, so one
 // limit governs every adapter's accept backlog and none redeclares it here.
 
-// TCPSession implements Session over a TCP/TLS connection.
-// Provides Aether multiplexing (all streams share one conn), flow control,
-// and the priority scheduler. Reliability comes from TCP natively.
+// TCPSession implements Session over a byte-stream connection (TCP, TLS,
+// WebSocket, gRPC, a QUIC stream): the Lite profile. It provides Aether
+// multiplexing (all streams share one conn), the stream lifecycle and the
+// priority scheduler. Reliability, flow control and congestion control belong
+// to the transport, so a session keeps no stream or connection credit, writes
+// no WINDOW_UPDATE or CONGESTION frame and acts on none it reads
+// (dispatchFrame). What bounds a peer's unread messages is the stream's delivery
+// queue, whose overflow ends that stream with a typed reset (enqueueDelivery).
 type TCPSession struct {
 	// BaseSession owns the identity + lifecycle + accessor surface
 	// (LocalNodeID/RemoteNodeID/LocalPeerID/RemotePeerID/ConnectionID/
@@ -65,9 +69,8 @@ type TCPSession struct {
 	// it.
 	acceptor *aether.StreamAcceptor
 
-	writeMu    sync.Mutex
-	sched      *scheduler.Scheduler
-	connWindow *flow.ConnWindow
+	writeMu sync.Mutex
+	sched   *scheduler.Scheduler
 	// txCompressor and rxCompressor are separate compressor states for TX
 	// (encode: writeFrame, writeLoop's EncodeBatch) and RX (decode: readLoop's
 	// ReadNextFrame), so cross-direction traffic never pollutes
@@ -91,16 +94,10 @@ type TCPSession struct {
 	abuseTracker *aether.AbuseTracker // per-peer misbehaviour scoring + threshold-breaker
 	tickStop     chan struct{}        // shuts down the housekeeping ticker
 
-	// throttle holds the explicit-CONGESTION signal state received from the
-	// peer. Zero value is "no throttle"; handleCongestion updates it when a
-	// CONGESTION frame arrives. Send-path consumers can consult Throttle()
-	// for RateFactor/ShouldStall before committing to large sends.
-	throttle aether.CongestionThrottle
-
 	// Per-session delivery counters, session-aggregate across streams, the
 	// same type NoiseSession.deliveryStats is. enqueueDelivery counts each
 	// message it queues as delivered, and overrun counts the message that
-	// finds the queue full, the one the stream's reset refuses, both as
+	// does not fit the queue, the one the stream's reset refuses, both as
 	// backpressure and as dropped with its bytes. Surfaced through
 	// DeliveryStats() for the consumer that sums a session's stats.
 	deliveryStats DeliveryStats
@@ -162,76 +159,62 @@ type tcpStream struct {
 	config   aether.StreamConfig
 	session  *TCPSession
 	state    *aether.StreamStateMachine
-	// recvCh is the stream's delivery queue: the readLoop (deliverToStream,
+	// recvQ is the stream's delivery queue: the readLoop (deliverToStream,
 	// through enqueueDelivery) puts each whole in-order message on it without
-	// waiting, and Receive takes them. Its capacity,
-	// tcpDeliveryQueueCapacity, is the most messages the consumer can leave
-	// unread; a message that finds it full ends the stream through overrun,
+	// waiting, and Receive takes them. Its bound is the bounds profile's stream
+	// credit, in the bytes recvQueue counts (messageCredit), and not a count of
+	// messages. A message that does not fit ends the stream through overrun,
 	// because the readLoop also answers PING and serves the control plane and
-	// every other stream, so it cannot wait on this consumer, and a byte-stream
-	// session's sender holds no credit that would stop it first (Send ignores
-	// its window). recvCh is never closed: its end is recvDone, which
-	// closeRecvOnce closes exactly once (recvOnce) and Receive selects on,
-	// draining what recvCh still holds before it returns the stream's end. A
-	// close of recvCh would race the readLoop's send into it, since
-	// closeRecvOnce also runs on application goroutines (Reset) and the
-	// stream GC. recvDone is made in the struct literal with recvCh
-	// (handleOpen, handleImplicitOpen, OpenStream); a stream built outside
-	// those paths has no recvDone, and closeRecvOnce closes its recvCh
-	// instead.
-	recvCh   chan []byte
+	// every other stream, so it cannot wait on this consumer, and the peer's
+	// sender holds no aether credit that would stop it first. A queue is never
+	// closed: its end is recvDone, which closeRecvOnce closes exactly once
+	// (recvOnce) and Receive selects on, taking what recvQ still holds before
+	// it returns the stream's end. handleOpen, handleImplicitOpen and OpenStream
+	// build both.
+	recvQ    *recvQueue
 	recvDone chan struct{}
 	// endErr is the reason the stream ended, when it is not an ordinary end:
 	// aether.ErrStreamOverrun after either side's delivery queue overran
 	// (overrun here, the peer's RESET(ResetFlowCtrl) in handleReset), or
 	// aether.ErrStreamRefused after the peer's RESET(ResetRefused). Receive
-	// returns it, once recvCh is drained, where it would return io.EOF, and
+	// returns it, once recvQ is drained, where it would return io.EOF, and
 	// Send returns it for a stream that can no longer send. setEnd keeps the
 	// first reason; nil means io.EOF.
 	endErr atomic.Pointer[error]
 	// fragBuf takes a peer's fragments (DATA frames flagged
 	// aether.FlagFRAGMENT) and refuses each against the session's fragRecv,
 	// which has no realm. Touched only by the readLoop (deliverToStream).
-	fragBuf *FragmentBuffer
-	window  *flow.StreamWindow
-	// grantDebouncer coalesces stream-level WINDOW_UPDATE emissions driven
-	// by application reads. Lazily attached by attachGrantDebouncer after
-	// struct construction because the session method references must reach
-	// the initialized receiver. TCP's reliable bytestream absorbs
-	// transport-level pacing, but stream credit still gates the app-level
-	// read flow so we debounce here too for parity with the noise adapter.
-	grantDebouncer *grantDebouncer
-	observe        *reliability.ObserveEngine // ACK-observe metrics (no enforcement)
-	localSeq       uint32                     // monotonic counter (TCP doesn't set SeqNo)
-	closed         bool
-	mu             sync.Mutex
-	connOnce       sync.Once
-	connView       net.Conn // cached net.Conn wrapper
-	recvOnce       sync.Once
-	// recvEnded is set by closeRecvOnce before it closes recvDone (or
-	// recvCh); enqueueDelivery reads it so nothing is queued after the
-	// receive side's end.
-	recvEnded atomic.Bool
+	fragBuf  *FragmentBuffer
+	observe  *reliability.ObserveEngine // ACK-observe metrics (no enforcement)
+	localSeq uint32                     // monotonic counter (TCP doesn't set SeqNo)
+	// mu makes Send's state check and its Enqueue one step against Close's
+	// transition and Enqueue, so no DATA is queued behind the stream's CLOSE:
+	// the peer's receive side ends at that CLOSE (handleClose) and would refuse
+	// DATA behind it after Send had returned nil.
+	mu       sync.Mutex
+	connOnce sync.Once
+	connView net.Conn // cached net.Conn wrapper
+	recvOnce sync.Once
+	// closeFrame is the CLOSE that Close queued, and closeWritten says the
+	// writeLoop has written it (frameWritten); s.mu guards both. The stream stays
+	// in the session until closeWritten and the peer's CLOSE have both come
+	// (leaveIfEndedLocked), because the scheduler drops what a stream still has
+	// queued when it unregisters, which would lose this side's DATA and its CLOSE
+	// to a peer's CLOSE that arrives first.
+	closeFrame   *aether.Frame
+	closeWritten bool
 }
 
-// closeRecvOnce ends the stream's receive side exactly once: it sets
-// recvEnded, so enqueueDelivery queues nothing more, and closes recvDone, on
-// which Receive returns what recvCh still holds and then the stream's end
-// (endError). Every termination path calls it (handleClose, handleReset,
-// overrun, Reset, the OpenStream rollback, the stream GC through Reset), from
-// the readLoop and from application goroutines, so recvOnce keeps the close
-// idempotent. recvCh itself is never closed here because the readLoop may be
-// sending into it on another goroutine; a stream built without recvDone
-// (outside the open paths) has its recvCh closed instead, which Receive reads
-// as the same end.
+// closeRecvOnce ends the stream's receive side exactly once: it ends recvQ, so
+// enqueueDelivery queues nothing more, and closes recvDone, on which Receive
+// returns what recvQ still holds and then the stream's end (endError). Every
+// termination path calls it (handleClose, handleReset, overrun, Reset, the
+// OpenStream rollback, the stream GC through Reset), from the readLoop and from
+// application goroutines, so recvOnce keeps the close idempotent.
 func (st *tcpStream) closeRecvOnce() {
 	st.recvOnce.Do(func() {
-		st.recvEnded.Store(true)
-		if st.recvDone != nil {
-			close(st.recvDone)
-			return
-		}
-		close(st.recvCh)
+		st.recvQ.end()
+		close(st.recvDone)
 	})
 }
 
@@ -242,7 +225,7 @@ func (st *tcpStream) setEnd(err error) {
 	st.endErr.CompareAndSwap(nil, &err)
 }
 
-// endError is what Receive returns once the receive side has ended and recvCh
+// endError is what Receive returns once the receive side has ended and recvQ
 // is drained, and what Send returns for a stream that can no longer send: the
 // recorded reason (endErr) with the stream's ID, or ordinary when none was
 // recorded.
@@ -253,90 +236,47 @@ func (st *tcpStream) endError(ordinary error) error {
 	return ordinary
 }
 
-// attachGrantDebouncer initializes st.grantDebouncer bound to st.window
-// and st.session.sendWindowUpdateAgnostic. Called after the stream is
-// fully constructed + registered so the session back-reference is live.
-// Safe to call once per stream; no-op if already attached.
-func (st *tcpStream) attachGrantDebouncer() {
-	if st.window == nil || st.session == nil {
-		return
-	}
-	if st.grantDebouncer != nil {
-		return
-	}
-	initialCredit := st.config.InitialCredit
-	if initialCredit <= 0 {
-		initialCredit = flow.DefaultStreamCredit
-	}
-	st.grantDebouncer = newGrantDebouncer(
-		st.window,
-		st.session.sendWindowUpdateAgnostic,
-		st.streamID,
-		int64(float64(initialCredit)*GrantImmediateFraction),
-	)
-}
-
-// teardown releases per-stream resources that must not outlive the
-// stream itself: the grantDebouncer, which flushes what Receive recorded and
-// leaves the shared watchdog. Idempotent: every termination path calls it
-// (Close, Reset, overrun, handleClose, handleReset, the OpenStream rollback),
-// from the readLoop and from application goroutines. It leaves the receive
-// side alone, since closeRecvOnce ends that: after Close, which ends only this
-// side's sending, a message the peer sends still reaches Receive.
-func (st *tcpStream) teardown() {
-	if st.grantDebouncer != nil {
-		st.grantDebouncer.Close()
-	}
-}
-
-// tcpDeliveryQueueCapacity is the capacity of a tcpStream's delivery queue
-// (recvCh): the most whole messages its consumer can leave unread before the
-// next one ends the stream through overrun. It is twice recvChCapacity's
-// per-stream-type count, the same bound noiseStream.enqueueControl puts on the
-// control frames no credit paces: a byte-stream session's DATA is paced by no
-// credit either (Send ignores its window).
-func tcpDeliveryQueueCapacity(streamID uint64) int {
-	return 2 * recvChCapacity(streamID)
-}
-
 // enqueueDelivery puts one whole in-order message on the stream's delivery
-// queue (recvCh) without waiting: the readLoop (deliverToStream) calls it, and
+// queue (recvQ) without waiting: the readLoop (deliverToStream) calls it, and
 // the readLoop also answers PING and serves the control plane and every other
 // stream, so it never waits on one stream's consumer. It returns true when the
 // message is queued for Receive. It returns false in two cases. The receive
-// side has already ended (recvEnded: the peer's CLOSE or RESET, this side's
-// Reset or overrun), so the message is one the peer sent after its own end or
-// after this side's RESET, which tells the peer the stream is gone. Or the
-// queue is full, holding tcpDeliveryQueueCapacity messages the consumer has
-// not read: the stream ends through overrun, which refuses this message and
-// every later one with a RESET the sender reads as aether.ErrStreamOverrun,
-// while the consumer still reads every message queued ahead of it. A stream
-// that goes on loses no message: a byte-stream session's sender holds no
-// credit that would stop it short of the queue (Send ignores its window), so
-// the refusal is how the queue's bound reaches the sender.
+// side has already ended (the peer's CLOSE or RESET, this side's Reset or
+// overrun), so the message is one the peer sent after its own end or after this
+// side's RESET, which tells the peer the stream is gone. Or the message would
+// take the queue past the bounds profile's stream credit
+// (flow.BoundsProfile.StreamCredit, in messageCredit): the stream ends through
+// overrun, which refuses this message and every later one with a RESET the
+// sender reads as aether.ErrStreamOverrun, while the consumer still reads every
+// message queued ahead of it. A stream that goes on loses no message: the
+// sender holds no aether credit that would stop it short of the queue, so the
+// refusal is how the queue's bound reaches the sender.
+//
+// TODO: hold a session's delivery queues together to the profile's
+// SessionMemoryCeiling; each is bounded alone, so a session's unread messages
+// reach its stream cap times the stream credit.
 func (st *tcpStream) enqueueDelivery(payload []byte) bool {
-	if st.recvEnded.Load() {
-		return false
-	}
-	select {
-	case st.recvCh <- payload:
+	switch st.recvQ.push(payload, flow.CurrentBounds().StreamCredit, 0) {
+	case pushQueued:
 		st.session.deliveryStats.recordDelivered(st.streamID)
 		return true
-	default:
+	case pushEnded:
+		return false
 	}
 	st.overrun(len(payload))
 	return false
 }
 
-// overrun ends a stream whose delivery queue is full when the readLoop has one
-// more message for it (enqueueDelivery). It counts that message as having met
+// overrun ends a stream whose delivery queue cannot take the next message the
+// readLoop has for it (enqueueDelivery). It counts that message as having met
 // a full queue and as dropped (DeliveryStats, which the consumer summing a
 // session's stats reads), records aether.ErrStreamOverrun as the stream's end,
-// writes the peer RESET(ResetFlowCtrl), which the peer's handleReset reads as
-// aether.ErrStreamOverrun, takes the stream out of the session (sendReset),
-// and ends the receive side, so Receive returns every message recvCh holds and
-// then aether.ErrStreamOverrun. It runs on the readLoop, whose RESET write is
-// the same kind of write as its PONG and its refusal RESET (registerStream).
+// ends the receive side, so Receive returns every message recvQ holds and then
+// aether.ErrStreamOverrun, then writes the peer RESET(ResetFlowCtrl), which the
+// peer's handleReset reads as aether.ErrStreamOverrun, and takes the stream out
+// of the session (sendReset). The receive side ends first so the consumer's end
+// does not wait on that write. It runs on the readLoop, whose RESET write is the
+// same kind of write as its PONG and its refusal RESET (registerStream).
 // No abuse is charged: an honest sender reaches it by sending faster than the
 // consumer reads.
 func (st *tcpStream) overrun(n int) {
@@ -344,24 +284,31 @@ func (st *tcpStream) overrun(n int) {
 	s.deliveryStats.recordBackpressure(st.streamID)
 	s.deliveryStats.recordDropped(st.streamID, n)
 	st.setEnd(aether.ErrStreamOverrun)
-	dbgTCP.Printf("enqueueDelivery: stream %d delivery queue full (%d unread), resetting with ResetFlowCtrl",
-		st.streamID, len(st.recvCh))
-	st.teardown()
-	_ = st.sendReset(aether.ResetFlowCtrl)
+	dbgTCP.Printf("enqueueDelivery: stream %d delivery queue full (%d bytes unread, next %d), resetting with ResetFlowCtrl",
+		st.streamID, st.recvQ.queuedBytes(), n)
 	st.closeRecvOnce()
+	_ = st.sendReset(aether.ResetFlowCtrl)
 }
 
 // sendReset moves the stream to reset, writes RESET(reason) to the peer and
-// takes the stream out of the session: the scheduler and the stream GC
-// (releaseStream), s.streams when this stream object is the one there (a
-// later stream under the same ID stays), and both directional compressors'
-// per-stream state, an unbounded map (codec_short.go Compressor.streams) that
-// otherwise only the peer-driven handleClose and handleReset prune. Reset,
-// the funnel for every local teardown (a direct Reset, the stream GC's idle
-// reap, the acceptor's close), and overrun call it; it returns the RESET
-// write's error.
+// takes the stream out of the session: s.streams, the scheduler and the stream
+// GC (releaseStream), and both directional compressors' per-stream state, an
+// unbounded map (codec_short.go Compressor.streams). Reset, the funnel for every
+// local teardown (a direct Reset, the stream GC's idle reap, the acceptor's
+// close), and overrun call it; it returns the RESET write's error. A stream that
+// has already left the session writes nothing and touches nothing: the peer has
+// finished with it, and a later stream may hold the ID, on both ends, which a
+// RESET under that ID would end, and whose scheduler slot and map entry a
+// release would take away.
 func (st *tcpStream) sendReset(reason aether.ResetReason) error {
 	s := st.session
+	s.mu.Lock()
+	cur, ok := s.streams[st.streamID]
+	inSession := ok && cur == st
+	s.mu.Unlock()
+	if !inSession {
+		return nil
+	}
 	st.state.Transition(aether.EventSendReset)
 	payload := aether.EncodeReset(reason)
 	err := s.writeFrame(&aether.Frame{
@@ -372,10 +319,10 @@ func (st *tcpStream) sendReset(reason aether.ResetReason) error {
 		Length:     uint32(len(payload)),
 		Payload:    payload,
 	})
-	s.releaseStream(st.streamID)
 	s.mu.Lock()
 	if cur, ok := s.streams[st.streamID]; ok && cur == st {
 		delete(s.streams, st.streamID)
+		s.releaseStream(st.streamID)
 	}
 	s.mu.Unlock()
 	s.txCompressor.RemoveStream(st.streamID)
@@ -424,7 +371,6 @@ func NewTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 		classDefaults: aether.DefaultsForClass(tc),
 		streams:       make(map[uint64]*tcpStream),
 		sched:         scheduler.NewScheduler(),
-		connWindow:    flow.NewConnWindow(0),
 		txCompressor:  aether.NewCompressor(), // encode-side state
 		rxCompressor:  aether.NewCompressor(), // decode-side state
 		tickStop:      make(chan struct{}),
@@ -701,7 +647,7 @@ func (s *TCPSession) readLoop() {
 // dispatchFrame routes an incoming frame to the appropriate stream.
 func (s *TCPSession) dispatchFrame(frame *aether.Frame) {
 	// Record stream activity for GC — any frame type counts as
-	// activity on its stream (OPEN/DATA/CLOSE/RESET/WINDOW/etc.). This
+	// activity on its stream (OPEN/DATA/CLOSE/RESET/etc.). This
 	// keeps the idle-timeout reset even on control-only flows like
 	// keepalive.
 	if s.streamGC != nil && frame.StreamID != 0 {
@@ -716,26 +662,33 @@ func (s *TCPSession) dispatchFrame(frame *aether.Frame) {
 		s.handleClose(frame)
 	case aether.TypeRESET:
 		s.handleReset(frame)
-	case aether.TypeWINDOW:
-		s.handleWindowUpdate(frame)
 	case aether.TypePING:
 		s.handlePing(frame)
 	case aether.TypePONG:
 		s.handlePong(frame)
 	case aether.TypeGOAWAY:
 		s.handleGoAway(frame)
-	case aether.TypeACK:
-		// TCP provides native reliability — ACK not used
+	case aether.TypeACK, aether.TypeWINDOW, aether.TypeCONGESTION:
+		// The transport owns reliability, flow control and congestion on this
+		// profile, so nothing here reads what these frames carry.
 	case aether.TypePRIORITY:
 		s.handlePriority(frame)
-	case aether.TypeCONGESTION:
-		s.handleCongestion(frame)
 	}
 }
 
 func (s *TCPSession) deliverToStream(frame *aether.Frame) {
 	s.mu.Lock()
 	st, ok := s.streams[frame.StreamID]
+	// A SYN under the ID of a stream both sides have closed is the peer's next
+	// stream: it reopens the ID only after reading this side's CLOSE, and the
+	// writeLoop that wrote that CLOSE may not have run frameWritten yet, so the
+	// finished stream goes now and the SYN opens the new one. The compressors'
+	// state for the ID carries over, since this frame has just refreshed it.
+	if ok && frame.Flags.Has(aether.FlagSYN) && st.state.State() == aether.StreamClosed {
+		delete(s.streams, frame.StreamID)
+		s.releaseStream(frame.StreamID)
+		ok = false
+	}
 	s.mu.Unlock()
 	if !ok {
 		// Implicit open via SYN flag in DATA
@@ -747,14 +700,12 @@ func (s *TCPSession) deliverToStream(frame *aether.Frame) {
 		return // unknown stream, drop
 	}
 	// A fragment is never delivered as message bytes: the session has no
-	// realm, so the buffer refuses it, and the bytes the sender charged for it
-	// are granted back at once.
+	// realm, so the buffer refuses it.
 	if frame.IsFragment() {
 		if st.fragBuf == nil {
 			st.fragBuf = NewFragmentBuffer() // a stream built outside the open paths
 		}
-		_, released, err := st.fragBuf.Add(s.fragRecv, st.streamID, frame.Payload)
-		releaseCredit(st.window, released, st.streamID, s.sendWindowUpdateAgnostic)
+		_, _, err := st.fragBuf.Add(s.fragRecv, st.streamID, frame.Payload)
 		dbgTCP.Printf("deliverToStream: stream %d fragment refused: %v", frame.StreamID, err)
 		return
 	}
@@ -763,8 +714,7 @@ func (s *TCPSession) deliverToStream(frame *aether.Frame) {
 	// readLoop, which keeps serving gossip, keepalive, control and every other
 	// stream; a full queue ends this stream with a typed reset instead. A
 	// stream whose receive side ended between the lookup above and this call
-	// (a Reset on another goroutine) refuses the payload, since nothing closes
-	// recvCh under this send.
+	// (a Reset on another goroutine) refuses the payload.
 	accepted := st.enqueueDelivery(frame.Payload)
 	if accepted {
 		// ACK-observe: track metrics (no wire ACK, no retransmit). Runs only
@@ -782,19 +732,6 @@ func (s *TCPSession) deliverToStream(frame *aether.Frame) {
 		}
 	} else {
 		dbgTCP.Printf("deliverToStream: refused frame for stream %d (%d bytes, receive side ended or delivery queue full)", frame.StreamID, len(frame.Payload))
-	}
-}
-
-// sendWindowUpdateAgnostic adapts sendWindowUpdate to the WindowUpdater signature.
-func (s *TCPSession) sendWindowUpdateAgnostic(streamID uint64, credit uint64) {
-	s.sendWindowUpdate(streamID, credit)
-}
-
-// sendWindowUpdate sends a WINDOW_UPDATE frame granting additional credit to the sender.
-func (s *TCPSession) sendWindowUpdate(streamID uint64, credit uint64) {
-	dbgTCP.Printf("WINDOW_UPDATE send stream=%d credit=%d", streamID, credit)
-	if err := s.writeFrame(aether.BuildWindowUpdateFrame(s.LocalPeerID(), s.RemotePeerID(), streamID, credit)); err != nil {
-		dbgTCP.Printf("WINDOW_UPDATE send FAILED stream=%d credit=%d err=%v", streamID, credit, err)
 	}
 }
 
@@ -869,8 +806,7 @@ func (s *TCPSession) StreamRefusedCount() uint64 {
 func (s *TCPSession) handleOpen(frame *aether.Frame) {
 	dbgTCP.Printf("handleOpen: stream=%d", frame.StreamID)
 	// The payload's InitialCredit is not read: on a byte-stream session the
-	// transport owns flow control, and the window built below makes no send
-	// decision.
+	// transport owns flow control, and the stream keeps no aether credit.
 	payload := aether.DecodeOpenPayload(frame.Payload)
 	candidate := &tcpStream{
 		streamID: frame.StreamID,
@@ -882,10 +818,9 @@ func (s *TCPSession) handleOpen(frame *aether.Frame) {
 		},
 		session:  s,
 		state:    aether.NewStreamStateMachine(),
-		recvCh:   make(chan []byte, tcpDeliveryQueueCapacity(frame.StreamID)),
+		recvQ:    newRecvQueue(nil, nil),
 		recvDone: make(chan struct{}),
 		fragBuf:  NewFragmentBuffer(),
-		window:   flow.NewStreamWindowWithCap(0, 0),
 		observe:  reliability.NewObserveEngine(),
 	}
 	st := s.registerStream(candidate, true /* enforceRemoteCap */)
@@ -900,7 +835,6 @@ func (s *TCPSession) handleOpen(frame *aether.Frame) {
 	if st != candidate {
 		return
 	}
-	st.attachGrantDebouncer()
 	st.state.Transition(aether.EventRecvOpen)
 
 	s.sched.Register(frame.StreamID, payload.Priority, payload.Dependency)
@@ -938,10 +872,9 @@ func (s *TCPSession) handleImplicitOpen(frame *aether.Frame) {
 		config:   cfg,
 		session:  s,
 		state:    aether.NewStreamStateMachine(),
-		recvCh:   make(chan []byte, tcpDeliveryQueueCapacity(frame.StreamID)),
+		recvQ:    newRecvQueue(nil, nil),
 		recvDone: make(chan struct{}),
 		fragBuf:  NewFragmentBuffer(),
-		window:   flow.NewStreamWindowWithCap(cfg.InitialCredit, cfg.MaxCredit),
 		observe:  reliability.NewObserveEngine(),
 	}
 	st := s.registerStream(candidate, true /* enforceRemoteCap */)
@@ -952,7 +885,6 @@ func (s *TCPSession) handleImplicitOpen(frame *aether.Frame) {
 	if st != candidate {
 		return
 	}
-	st.attachGrantDebouncer()
 	st.state.Transition(aether.EventRecvData)
 
 	// Propagate cfg.LatencyClass — parity with the noise adapter so a
@@ -967,6 +899,13 @@ func (s *TCPSession) handleImplicitOpen(frame *aether.Frame) {
 	s.notifyStreamAccepted(st)
 }
 
+// handleClose ends the stream's receive side at the peer's CLOSE: the messages
+// queued before it stay in recvQ, and Receive returns them and then io.EOF
+// without waiting for a local Close; enqueueDelivery refuses whatever comes
+// after it. This side can still Send until its own Close. The stream leaves the
+// session here only if this side's CLOSE is already written; otherwise
+// frameWritten takes it out after writing that CLOSE. The compressors' state for
+// the stream stays until the leave, since this side may still be sending on it.
 func (s *TCPSession) handleClose(frame *aether.Frame) {
 	s.mu.Lock()
 	st, ok := s.streams[frame.StreamID]
@@ -976,25 +915,54 @@ func (s *TCPSession) handleClose(frame *aether.Frame) {
 		s.rxCompressor.RemoveStream(frame.StreamID)
 		return
 	}
-	// Transition AND remove-from-map BEFORE releasing s.mu, so every lookup
-	// after this one finds a fully closed stream gone. The messages queued
-	// before this CLOSE stay in recvCh, and Receive returns them before
-	// io.EOF; enqueueDelivery refuses whatever comes after closeRecvOnce below
-	// (recvEnded), and recvCh is never closed under its send.
 	st.state.Transition(aether.EventRecvFIN)
-	fullyClosed := !st.state.IsOpen()
-	if fullyClosed {
-		delete(s.streams, frame.StreamID)
-	}
+	left := s.leaveIfEndedLocked(st)
 	s.mu.Unlock()
 
-	if fullyClosed {
-		st.teardown()
-		st.closeRecvOnce()
-		s.releaseStream(frame.StreamID)
+	st.closeRecvOnce()
+	if left {
+		s.txCompressor.RemoveStream(frame.StreamID)
+		s.rxCompressor.RemoveStream(frame.StreamID)
 	}
-	s.txCompressor.RemoveStream(frame.StreamID) // both directional compressors hold per-stream state
-	s.rxCompressor.RemoveStream(frame.StreamID)
+}
+
+// frameWritten is what the writeLoop does after a frame has gone to the conn: a
+// stream's CLOSE, the last frame the stream has in the scheduler because Close
+// and Send are ordered by st.mu, lets the stream leave once the peer's CLOSE has
+// also come. closeFrame identifies the frame, so a CLOSE of a stream that was
+// reset while the writeLoop held it does nothing to a later stream under the ID.
+func (s *TCPSession) frameWritten(frame *aether.Frame) {
+	if frame.Type != aether.TypeCLOSE {
+		return
+	}
+	s.mu.Lock()
+	st, ok := s.streams[frame.StreamID]
+	if !ok || st.closeFrame != frame {
+		s.mu.Unlock()
+		return
+	}
+	st.closeWritten = true
+	left := s.leaveIfEndedLocked(st)
+	s.mu.Unlock()
+	if left {
+		s.txCompressor.RemoveStream(frame.StreamID)
+		s.rxCompressor.RemoveStream(frame.StreamID)
+	}
+}
+
+// leaveIfEndedLocked takes st out of s.streams, the scheduler and the stream GC
+// when both sides have closed it and this side's CLOSE is written, and reports
+// whether it did. handleClose and frameWritten call it with s.mu held, whichever
+// comes last, and hold it across the release so that an OpenStream of the same ID
+// registers after it and keeps its scheduler slot. A consumer still holding the
+// stream goes on reading what recvQ holds.
+func (s *TCPSession) leaveIfEndedLocked(st *tcpStream) bool {
+	if !st.closeWritten || st.state.State() != aether.StreamClosed {
+		return false
+	}
+	delete(s.streams, st.streamID)
+	s.releaseStream(st.streamID)
+	return true
 }
 
 func (s *TCPSession) handleReset(frame *aether.Frame) {
@@ -1002,13 +970,14 @@ func (s *TCPSession) handleReset(frame *aether.Frame) {
 	st, ok := s.streams[frame.StreamID]
 	if ok {
 		delete(s.streams, frame.StreamID)
+		s.releaseStream(frame.StreamID)
 	}
 	s.mu.Unlock()
 	s.txCompressor.RemoveStream(frame.StreamID) // both directional compressors hold per-stream state
 	s.rxCompressor.RemoveStream(frame.StreamID)
 	if ok {
 		// The peer's reason is recorded first, so Receive (after the messages
-		// recvCh holds) and Send name it: a refusal (the peer's registerStream
+		// recvQ holds) and Send name it: a refusal (the peer's registerStream
 		// cap) as aether.ErrStreamRefused, the peer's full delivery queue
 		// (overrun) as aether.ErrStreamOverrun. Every other reason ends the
 		// stream as io.EOF.
@@ -1019,15 +988,14 @@ func (s *TCPSession) handleReset(frame *aether.Frame) {
 			st.setEnd(aether.ErrStreamOverrun)
 		}
 		st.state.Transition(aether.EventRecvReset)
-		st.teardown()
 		st.closeRecvOnce()
-		s.releaseStream(frame.StreamID)
 	}
 }
 
 // releaseStream idempotently unregisters streamID from the scheduler
 // and stream GC. Parity with NoiseSession.releaseStream — gives every
-// teardown path one helper to call instead of duplicating the pair.
+// teardown path one helper to call instead of duplicating the pair. Callers
+// may hold s.mu: neither takes it, and StreamGC runs its reset outside its lock.
 func (s *TCPSession) releaseStream(streamID uint64) {
 	s.sched.Unregister(streamID)
 	if s.streamGC != nil {
@@ -1036,34 +1004,21 @@ func (s *TCPSession) releaseStream(streamID uint64) {
 }
 
 // controlHandler returns a ControlFrameHandler bound to this session's
-// scheduler, health monitor, conn-window and frame writer. The
-// stream-window lookup acquires s.mu around the streams-map read.
+// scheduler, health monitor and frame writer, for PING, PONG and PRIORITY. It
+// has no window to serve: this session's dispatchFrame never calls
+// HandleWindowUpdate, the one method that reads ConnWindow.
 // WakeScheduler is false because the TCP writeLoop runs on a 2 ms
 // ticker rather than blocking on Consume, so no writer waits for a wake.
 func (s *TCPSession) controlHandler() *aether.ControlFrameHandler {
 	return &aether.ControlFrameHandler{
 		HealthMon:         s.Health(),
 		Sched:             s.sched,
-		ConnWindow:        s.connWindow,
 		Writer:            s.writeFrame,
 		Sender:            s.LocalPeerID(),
 		Receiver:          s.RemotePeerID(),
 		KeepaliveStreamID: s.layout.Keepalive,
 		WakeScheduler:     false,
-		StreamWindowLookup: func(streamID uint64) *flow.StreamWindow {
-			s.mu.Lock()
-			st, ok := s.streams[streamID]
-			s.mu.Unlock()
-			if !ok {
-				return nil
-			}
-			return st.window
-		},
 	}
-}
-
-func (s *TCPSession) handleWindowUpdate(frame *aether.Frame) {
-	s.controlHandler().HandleWindowUpdate(frame)
 }
 
 func (s *TCPSession) handlePing(frame *aether.Frame) {
@@ -1080,32 +1035,6 @@ func (s *TCPSession) handleGoAway(frame *aether.Frame) {
 
 func (s *TCPSession) handlePriority(frame *aether.Frame) {
 	s.controlHandler().HandlePriority(frame)
-}
-
-// handleCongestion processes an explicit CONGESTION frame — the peer
-// asking us to slow down. The session stores the hint in its throttle;
-// send-path consumers can check before committing large payloads.
-func (s *TCPSession) handleCongestion(frame *aether.Frame) {
-	p := aether.HandleCongestionFrame(&s.throttle, frame)
-	dbgTCP.Printf("CONGESTION recv severity=%d reason=%d backoff=%dms",
-		p.Severity, p.Reason, p.BackoffMs)
-}
-
-// SendCongestion emits a CONGESTION frame to the peer. No code in this
-// repository calls it: the TCP receive path answers a full delivery queue
-// by ending the stream (enqueueDelivery, overrun) and signals no backoff,
-// since a byte-stream transport carries its own flow control. It stays
-// exported for a caller outside this repository that holds the session.
-func (s *TCPSession) SendCongestion(p aether.CongestionPayload) error {
-	return s.writeFrame(aether.BuildCongestionFrame(s.LocalPeerID(), s.RemotePeerID(), p))
-}
-
-// Throttle exposes the session's congestion-throttle state. No send path in
-// this repository reads it; a sender outside this repository can consult
-// RateFactor/ShouldStall before dispatching large sends, and a session
-// monitor outside it counts TotalHits.
-func (s *TCPSession) Throttle() *aether.CongestionThrottle {
-	return &s.throttle
 }
 
 // DeliveryStats exposes the session's receive-path delivery counters to
@@ -1186,6 +1115,9 @@ func (s *TCPSession) writeLoop() {
 					}
 				} else {
 					consecutiveWriteFailures = 0
+					for _, written := range batch {
+						s.frameWritten(written)
+					}
 				}
 				continue
 			}
@@ -1204,6 +1136,7 @@ func (s *TCPSession) writeLoop() {
 			}
 		} else {
 			consecutiveWriteFailures = 0
+			s.frameWritten(frame)
 		}
 	}
 }
@@ -1312,10 +1245,9 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 		config:   cfg,
 		session:  s,
 		state:    aether.NewStreamStateMachine(),
-		recvCh:   make(chan []byte, tcpDeliveryQueueCapacity(cfg.StreamID)),
+		recvQ:    newRecvQueue(nil, nil),
 		recvDone: make(chan struct{}),
 		fragBuf:  NewFragmentBuffer(),
-		window:   flow.NewStreamWindowWithCap(cfg.InitialCredit, cfg.MaxCredit),
 		observe:  reliability.NewObserveEngine(),
 	}
 	st.state.Transition(aether.EventSendOpen)
@@ -1331,7 +1263,7 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 	// with the detached, never-mapped st: the rollback defer below would
 	// delete the live map entry, RegisterWithClass would overwrite its
 	// scheduler slot, and inbound DATA would route to the original stream
-	// while the returned st.recvCh hangs forever. Compare identity and
+	// while the returned st's recvQ never fills. Compare identity and
 	// error out — matching handleOpen's `st != candidate` guard — BEFORE
 	// the rollback defer is armed so no cleanup touches the pre-existing
 	// stream.
@@ -1352,9 +1284,8 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 
 	// committed flips to true after every post-registration step succeeds.
 	// Until then, the deferred rollback unwinds every side-effect that
-	// registerStream + attachGrantDebouncer + scheduler.Register + writeFrame
-	// installed. A (nil, err) return that left the map entry, the GC and
-	// scheduler registrations and the grantDebouncer goroutine in place would
+	// registerStream + scheduler.Register + writeFrame installed. A (nil, err) return that left the map entry and the GC and
+	// scheduler registrations in place would
 	// leave a stream no caller holds in s.streams until the stream GC's idle
 	// sweep resets it, counted against MaxConcurrentStreams by registerStream
 	// the whole while.
@@ -1363,12 +1294,9 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 		if committed {
 			return
 		}
-		st.teardown()
 		s.unregisterStream(cfg.StreamID)
 		st.closeRecvOnce()
 	}()
-
-	st.attachGrantDebouncer()
 
 	// Propagate cfg.LatencyClass — parity with the noise adapter so a
 	// caller's explicit class isn't silently dropped to ClassBULK.
@@ -1383,8 +1311,7 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 	// The OPEN payload (reliability, priority, dependency) rides as the DATA frame's payload.
 	// The remote's handleImplicitOpen decodes it to configure the stream properly.
 	// Its InitialCredit is zero, the value that states no aether stream credit:
-	// on a byte-stream session the transport owns flow control, the stream's
-	// window makes no send decision (Send ignores TryConsume's result), and neither
+	// on a byte-stream session the transport owns flow control, and neither
 	// handleOpen nor handleImplicitOpen reads the field.
 	openPayload := aether.EncodeOpenPayload(aether.OpenPayload{
 		Reliability: cfg.Reliability,
@@ -1509,7 +1436,7 @@ func (s *TCPSession) CloseWithError(err error) error {
 	// Release any AcceptStreamByID waiters and unparked backlog
 	// streams so blocked callers return ErrSessionClosed instead of
 	// deadlocking. Backlog streams are reset because their config /
-	// recvCh is otherwise orphaned — nobody else will ever pick
+	// recvQ is otherwise orphaned — nobody else will ever pick
 	// them up after close. The acceptor surfaces drained backlog
 	// streams; the adapter calls Reset because the transport-
 	// specific teardown lives here.
@@ -1524,17 +1451,12 @@ func (s *TCPSession) CloseWithError(err error) error {
 
 // housekeepingTick runs the protocol-agnostic periodic maintenance
 // that NoiseSession's reliabilityTick does (minus the Noise-specific
-// reliability work). Three concerns per tick:
+// reliability work). Two concerns per tick:
 //
 //  1. **Idle session eviction** — session with no inbound activity for
 //     `opts.SessionIdleTimeout` is closed so goroutines + memory are
 //     reclaimed. Matches the Noise adapter's policy exactly.
-//  2. **Flow-control auto-tune** — feeds the session's observed RTT
-//     into each stream's window and applies a bounded window resize
-//     based on `SuggestedWindow()`. Gated by AETHER_AUTOTUNE env var
-//     (set to "off" to disable) so we can kill it in production if it
-//     misbehaves.
-//  3. **Keepalive nudge** — TCP relies on native keepalive which the
+//  2. **Keepalive nudge** — TCP relies on native keepalive which the
 //     OS usually has tuned to hours; we don't reimplement it here,
 //     but RecordActivity gets called on every incoming frame so the
 //     idle check above stays accurate under real traffic.
@@ -1560,42 +1482,6 @@ func (s *TCPSession) housekeepingTick() {
 				dbgTCP.Printf("session idle timeout (%s) — closing", idle)
 				s.CloseWithError(fmt.Errorf("session idle timeout (%s)", idle))
 				return
-			}
-			s.autoTuneWindows()
-		}
-	}
-}
-
-// autoTuneWindows feeds session RTT into each stream's window and applies
-// a bounded resize based on SuggestedWindow. Called from housekeepingTick.
-// Disabled when AETHER_AUTOTUNE=off. Safe to call concurrently with sends
-// because GrowWindow/ShrinkWindow use the semaphore's own locks.
-func (s *TCPSession) autoTuneWindows() {
-	if aether.AutoTuneDisabled() {
-		return
-	}
-	_, avgRTT := s.Health().RTT()
-	if avgRTT <= 0 {
-		return
-	}
-	s.mu.Lock()
-	streams := make([]*tcpStream, 0, len(s.streams))
-	for _, st := range s.streams {
-		streams = append(streams, st)
-	}
-	s.mu.Unlock()
-	for _, st := range streams {
-		res := aether.AutoTuneWindow(st.window, avgRTT)
-		switch res.Action {
-		case "grow":
-			if res.Applied > 0 {
-				dbgTCP.Printf("autoTune stream=%d grow=%d current=%d rtt=%s",
-					st.streamID, res.Applied, res.Current, avgRTT)
-			}
-		case "shrink":
-			if res.Applied > 0 {
-				dbgTCP.Printf("autoTune stream=%d shrink=%d current=%d rtt=%s",
-					st.streamID, res.Applied, res.Current, avgRTT)
 			}
 		}
 	}
@@ -1674,21 +1560,6 @@ func (st *tcpStream) Conn() net.Conn {
 }
 
 func (st *tcpStream) Send(ctx context.Context, data []byte) error {
-	if !st.state.CanSend() {
-		if st.streamID == 0 {
-			dbgTCP.Printf("Send: stream 0 cannot send (state=%s)", st.state.State())
-		}
-		return st.endError(fmt.Errorf("stream %d: cannot send (state=%s)", st.streamID, st.state.State()))
-	}
-
-	// Flow control: TCP provides native backpressure, so we don't enforce
-	// Aether-level credit limits on TCP/WS adapters. The non-blocking
-	// TryConsume keeps the metrics — the blocking Consume could stall this
-	// Send for the full ConsumeTimeout (~10s) on a drained window, against
-	// the "TCP native backpressure only" intent. The send proceeds
-	// regardless of the return.
-	_ = st.window.TryConsume(int64(len(data)))
-
 	totalLen := len(data)
 
 	// A message keeps its boundary, arriving as one Receive(). The
@@ -1696,15 +1567,38 @@ func (st *tcpStream) Send(ctx context.Context, data []byte) error {
 	// MaxFrameSize into interleavable frames needs the session's realm, and a
 	// TCPSession has none (fragRecv), so every message travels as one DATA
 	// frame. The byte stream carries a frame of any length up to
-	// aether.MaxPayloadSize, which the peer's ReadNextFrame also enforces; a
-	// larger message fails loudly rather than ship truncated. A
-	// message above MaxFrameSize holds the write loop for its whole length.
+	// aether.MaxPayloadSize, which the peer's ReadNextFrame also enforces, and
+	// the peer's delivery queue (enqueueDelivery) takes one of at most the
+	// bounds profile's stream credit, its entry cost included, so a larger
+	// message fails here, typed and with the stream still open, where the peer's
+	// queue would end the stream. A message above MaxFrameSize holds the write
+	// loop for its whole length.
 	// TODO: when a byte-stream session's identity binds a mesh realm, split a
 	// message above MaxFrameSize with SplitMessage as NoiseSession does, so
 	// other streams interleave with it.
 	if totalLen > aether.MaxPayloadSize {
 		return fmt.Errorf("stream %d: %w: %d bytes, one frame carries at most %d",
 			st.streamID, ErrPayloadTooLarge, totalLen, aether.MaxPayloadSize)
+	}
+	if credit := flow.CurrentBounds().StreamCredit; messageCredit(int64(totalLen)) > credit {
+		return fmt.Errorf("stream %d: %w: %d bytes and the %d B entry cost, the peer's delivery queue holds at most %d",
+			st.streamID, ErrPayloadTooLarge, totalLen, recvQueueEntryCost, credit)
+	}
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if !st.state.CanSend() {
+		if st.streamID == 0 {
+			dbgTCP.Printf("Send: stream 0 cannot send (state=%s)", st.state.State())
+		}
+		return st.endError(fmt.Errorf("stream %d: cannot send (state=%s)", st.streamID, st.state.State()))
+	}
+	// The writeLoop has stopped on a closed session, so a frame queued now would
+	// never be written.
+	select {
+	case <-st.session.CloseSignal():
+		return aether.ErrSessionClosed
+	default:
 	}
 	frame := &aether.Frame{
 		SenderID:   st.session.LocalPeerID(),
@@ -1722,72 +1616,77 @@ func (st *tcpStream) Send(ctx context.Context, data []byte) error {
 	return nil
 }
 
-// Receive returns the next whole message the readLoop queued on recvCh
-// (enqueueDelivery). After closeRecvOnce has closed recvDone it still returns
-// what recvCh holds, one message per call, and then the stream's end:
-// io.EOF, or the typed reason endErr records (aether.ErrStreamOverrun,
-// aether.ErrStreamRefused). The drain comes first because a select with both
-// recvCh and recvDone ready picks either, and a message delivered before the
-// CLOSE or RESET must not be lost behind the end. A stream built without
-// recvDone reports the same end through its closed recvCh.
+// Receive returns the next whole message the readLoop queued on recvQ
+// (enqueueDelivery). What recvQ holds comes first, one message per call, whatever
+// has ended: after closeRecvOnce has closed recvDone it returns the stream's end
+// once recvQ is empty, io.EOF or the typed reason endErr records
+// (aether.ErrStreamOverrun, aether.ErrStreamRefused), and after the session
+// closed it returns that close once recvQ is empty, so a message delivered before
+// either end is not lost behind it.
 func (st *tcpStream) Receive(ctx context.Context) ([]byte, error) {
-	consumed := func(data []byte) ([]byte, error) {
-		// Consume-driven grant: record the app-consumed bytes in the
-		// stream-level debouncer so WINDOW_UPDATE emission advances with
-		// application progress, not frame-receipt. recvCh holds whole
-		// messages only (deliverToStream keeps fragments out of it).
-		if st.grantDebouncer != nil {
-			st.grantDebouncer.Record(int64(len(data)))
-		}
-		return data, nil
-	}
 	for {
+		if data, _, ok := st.recvQ.pop(); ok {
+			return data, nil
+		}
 		select {
-		case data, ok := <-st.recvCh:
-			if !ok {
-				return nil, st.endError(io.EOF)
-			}
-			return consumed(data)
+		case <-st.recvQ.wake:
 		case <-st.recvDone:
-			select {
-			case data, ok := <-st.recvCh:
-				if !ok {
-					return nil, st.endError(io.EOF)
-				}
-				return consumed(data)
-			default:
-				return nil, st.endError(io.EOF)
+			if data, _, ok := st.recvQ.pop(); ok {
+				return data, nil
 			}
+			return nil, st.endError(io.EOF)
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-st.session.CloseSignal():
+			if data, _, ok := st.recvQ.pop(); ok {
+				return data, nil
+			}
 			return nil, fmt.Errorf("session closed")
 		}
 	}
 }
 
+// Close ends this side's sending: it queues CLOSE behind every DATA this stream
+// has queued, in the scheduler, whose per-stream order the one writeLoop writes
+// to the conn, so the peer's Receive sees all of it and then the end. It returns
+// without waiting for the write, and the stream leaves the session once CLOSE is
+// written and the peer's CLOSE has come (frameWritten, handleClose). A message
+// the peer sends after this still reaches Receive. A repeated Close, or a Close
+// after a reset, has nothing to say to the peer and returns nil. On a closed
+// session it returns aether.ErrSessionClosed: nothing will write the CLOSE.
 func (st *tcpStream) Close() error {
-	st.state.Transition(aether.EventSendFIN)
-	st.teardown()
+	s := st.session
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if err := st.state.Transition(aether.EventSendFIN); err != nil {
+		return nil
+	}
+	select {
+	case <-s.CloseSignal():
+		return aether.ErrSessionClosed
+	default:
+	}
 	frame := &aether.Frame{
-		SenderID:   st.session.LocalPeerID(),
-		ReceiverID: st.session.RemotePeerID(),
+		SenderID:   s.LocalPeerID(),
+		ReceiverID: s.RemotePeerID(),
 		StreamID:   st.streamID,
 		Type:       aether.TypeCLOSE,
 	}
-	return st.session.writeFrame(frame)
+	s.mu.Lock()
+	st.closeFrame = frame
+	s.mu.Unlock()
+	s.sched.Enqueue(st.streamID, frame)
+	return nil
 }
 
-// Reset abandons the stream from this side: it stops the grantDebouncer,
-// writes RESET(reason) and takes the stream out of the session (sendReset,
-// which also frees the compressors' per-stream state the stream would
-// otherwise hold for the session's life), then ends the receive side, after
-// which Receive returns what recvCh holds and then the stream's end (io.EOF
-// unless endErr records a typed reason). A direct Reset, the
-// stream GC's idle reap and CloseWithError's reset of unaccepted streams all
+// Reset abandons the stream from this side: it writes RESET(reason) and takes the
+// stream out of the session (sendReset, which also frees the compressors'
+// per-stream state the stream would otherwise hold for the session's life), then
+// ends the receive side, after which Receive returns what recvQ holds and then
+// the stream's end (io.EOF unless endErr records a typed reason). A direct Reset,
+// the stream GC's idle reap and CloseWithError's reset of unaccepted streams all
 // come here.
 func (st *tcpStream) Reset(reason aether.ResetReason) error {
-	st.teardown()
 	err := st.sendReset(reason)
 	st.closeRecvOnce()
 	return err
@@ -1797,20 +1696,9 @@ func (st *tcpStream) SetPriority(weight uint8, dependency uint64) {
 	st.session.sched.SetWeight(st.streamID, weight)
 }
 
-// AvailableCredit exposes the current send-side flow-control credit for
-// this stream. Used by upper layers (gossip) to self-throttle against
-// a near-empty window. TCP-family streams still track a window even though
-// Send ignores timeouts — the value is accurate for scheduling decisions.
-func (st *tcpStream) AvailableCredit() int64 {
-	return st.window.Available()
-}
-
 // Ensure interfaces are satisfied at compile time.
 var _ aether.Session = (*TCPSession)(nil)
 var _ aether.AbuseScoreCapable = (*TCPSession)(nil)
 var _ aether.IdleEvictable = (*TCPSession)(nil)
 var _ aether.WireVersionsReporter = (*TCPSession)(nil)
 var _ aether.Stream = (*tcpStream)(nil)
-
-// Suppress unused import warnings for packages used in struct fields.
-var _ = (*congestion.Controller)(nil)

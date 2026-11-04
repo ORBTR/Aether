@@ -38,7 +38,9 @@ type AutoTuneResult struct {
 // next pass starts from a fresh peak measurement.
 //
 // It is AutoTuneWindowWithin with flow.MaxGrowableWindow as the ceiling, which
-// GrowWindow never passes anyway. The TCP adapter's autoTuneWindows calls it.
+// GrowWindow never passes anyway. Only tests call it in this repository:
+// noiseStream.autoTune goes through AutoTuneWindowWithin and a byte-stream session
+// keeps no window.
 //
 // Returns the zero AutoTuneResult{Action:"noop"} when rtt <= 0 or when
 // suggested == current — i.e. no work needed.

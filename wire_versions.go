@@ -53,13 +53,17 @@ type WireVersions []WireVersion
 // grammar 2 alone before either side creates a session or a stream.
 // frame.short is the short-frame table; it is optional because a session that
 // does not choose it writes full frames only. reliability is the profile a
-// session's streams run: version 1 is the Full profile (adapter.NoiseSession's
+// session's streams run: version 2 is the Full profile (adapter.NoiseSession's
 // reliability.Engine per stream, with its composite ACK, retransmit, flow and
 // congestion frames) and the Lite profile (adapter.TCPSession on a natively
-// reliable byte stream, observation only) as this build runs them. It is
-// required because a peer running another profile version reads the ACK,
-// retransmit and flow frames of this one differently, so no stream could be
-// published between the two.
+// reliable byte stream, observation only, writing no flow or congestion frame,
+// with each stream's CLOSE behind its DATA and ending the peer's receive side) as
+// this build runs them. It is required because a peer running another profile
+// version reads the ACK, retransmit and flow frames of this one differently, so
+// no stream could be published between the two: a peer that expects WINDOW_UPDATE
+// on a Lite session would watch its credit run down with no grant coming, and one
+// that sends CLOSE ahead of its DATA would lose its replies to this build's
+// readers.
 const (
 	WireVersionBounds      = "bounds"
 	WireVersionFragment    = "fragment"
@@ -75,7 +79,7 @@ const (
 	// of it); tests outside this package build peer offers from it.
 	WireVersionFrameCurrent       uint16 = 3
 	wireVersionFrameShortCurrent  uint16 = 1
-	wireVersionReliabilityCurrent uint16 = 1
+	wireVersionReliabilityCurrent uint16 = 2
 )
 
 // MaxWireVersionsEncodedSize bounds one encoded set. The preface reader and

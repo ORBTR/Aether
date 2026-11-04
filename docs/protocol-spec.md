@@ -110,7 +110,7 @@ All multi-byte fields are **big-endian** (network byte order).
 | Code | Name | Payload | Description |
 |------|------|---------|-------------|
 | 0x02 | OPEN | `[Reliability:1][Priority:1][Dependency:8][InitialCredit:4]` | Opens a new stream with specified QoS parameters. `InitialCredit` (big-endian) is the credit the opener reserved for the stream; a Noise (Full profile) receiver builds its window and reservation for the stream from it and refuses (RESET Refused) a value below 1024 or above its stream ceiling. Zero states no aether stream credit: TCP-family and QUIC openers write it and their receivers do not read it. Frame grammar 3 (§15). |
-| 0x03 | CLOSE | (empty) | Graceful stream close (FIN). Sender will send no more data. Receiver continues until its own CLOSE. |
+| 0x03 | CLOSE | (empty) | Graceful stream close (FIN). Sender will send no more data; it follows all the stream's DATA, and the receiver's `Receive` returns what it holds and then the end without a local close. The receiver may go on sending until its own CLOSE. |
 | 0x04 | RESET | `[ReasonCode:4]` | Immediate stream abort. Both sides receive error on next Send/Receive. Reason codes: Cancel(0), Refused(1), Internal(2), FlowCtrl(3), Timeout(4). |
 
 ### 2.3 Reliability
@@ -399,7 +399,7 @@ AE-P-25: The standalone `reliability/packet_replay.go:PacketReplayWindow` was re
 - **MinGuaranteedWindow:** 1 KB — frames at or below this size bypass the semaphore entirely. Not metered, don't consume credit. Keeps in-band control traffic (WINDOW_UPDATE, headers, pings) flowing through a drained data window.
 - **Sender-side tracking:** `dataOutstanding` = credit acquired by Consume but not yet granted back. `ApplyUpdate` caps grants at `dataOutstanding` so we never release past real in-flight, preventing the semaphore from panicking on release-past-capacity.
 - **Receiver-side tracking:** `recvCredit` = credit granted but not yet consumed on receive. Decremented on each `ReceiverConsume(n)` so the auto-grant cap (`currentWindow - recvCredit`) reflects the actual outstanding window. Historical bug: never decrementing `recvCredit` pinned it at maxSize in the production `initialCredit == maxSize` config, so every grant computed to zero and no WINDOW_UPDATE was ever sent.
-- **Byte-stream delivery queue (TCP, WebSocket, gRPC):** the read loop puts each whole message on the stream's delivery queue without waiting (it also answers PING and serves every other stream). The queue holds `2 × recvChCapacity(streamID)` unread messages (gossip 256, RPC 256, keepalive and control 8, dynamic 16). A message that finds it full is never dropped from a stream that goes on: the receiver resets the stream with `RESET(ResetFlowCtrl)`, the sender's `Send` and `Receive` return `aether.ErrStreamOverrun`, and the receiver's consumer reads every queued message and then `aether.ErrStreamOverrun`. No credit is granted back and no CONGESTION is sent for it. Implementation: `adapter/tcp.go` `enqueueDelivery`, `overrun`.
+- **Byte-stream delivery queue (TCP, WebSocket, gRPC):** the read loop puts each whole message on the stream's delivery queue without waiting (it also answers PING and serves every other stream). The queue is bounded in bytes by the bounds profile's stream credit (1 MiB, counted as payload plus 64 B per message), not by a count of messages; a `Send` of a message that could never fit fails with `ErrPayloadTooLarge`. A message that does not fit is never dropped from a stream that goes on: the receiver resets the stream with `RESET(ResetFlowCtrl)`, the sender's `Send` and `Receive` return `aether.ErrStreamOverrun`, and the receiver's consumer reads every queued message and then `aether.ErrStreamOverrun`. These sessions run no credit and send no CONGESTION. Implementation: `adapter/tcp.go` `enqueueDelivery`, `overrun`.
 
 Implementation: `flow/stream_window.go`
 
@@ -425,7 +425,7 @@ Beyond the implicit backpressure from withholding grants, receivers can emit an 
 - **Sender behaviour:** `CongestionThrottle.Apply(payload)` updates internal state; `RateFactor()` returns the current rate multiplier; `ShouldStall()` returns true while severity == 100 within the backoff window. Overlapping hints NEVER shorten an active window (`Apply` only extends).
 - **Scope:** connection-level (StreamID = `0xFFFFFFFFFFFFFFFF`). The throttle applies to all streams on the session.
 
-Implementation: `congestion_signal.go`, `adapter/{tcp,noise_dispatch}.go` (`handleCongestion`, `SendCongestion`).
+Implementation: `congestion_signal.go`, `adapter/noise_dispatch.go` (`handleCongestion`, `SendCongestion`). Noise sessions only: a byte-stream session sends none and acts on none it reads, and exposes no `Throttle()`.
 
 ### 8.4 Auto-Tuning Hooks
 
@@ -814,7 +814,7 @@ Dial-path integration points: `peer_connections.go:833` in HSTLES, `wire/peers.g
 
 There is no negotiation header before the handshake; identity is established by the underlying transport crypto layer (Noise XX/XK static keys, QUIC TLS handshake, WebSocket Ed25519 header, gRPC metadata). The `NegotiateMode` / `ModeAether` / `ModeString` APIs are gone, and a peer that sends a 4-byte negotiation header fails at the first read.
 
-Wire grammars are negotiated per session generation as a named set (`wire_versions.go`). Each side offers entries in name order, each a list of versions and a required flag; aether registers `bounds` (credit and queue profile version 1, required: section 8.5), `fragment` (envelope version 2, required), `frame` (full-frame grammar 3, required), `frame.short` (version 1, optional) and `reliability` (version 1, required), and an application adds its own names through its options. For each name both sides list, the choice is the highest version in both lists; a required name with no common version, or one a side omits, refuses the session with `ErrWireVersionMismatch` (a `*WireVersionMismatchError` naming the entry and both lists) before any session or stream state exists; an optional one is left out. Under Noise the offer rides the NodeInfo inside the encrypted handshake; a TCP, WebSocket or gRPC session, and QUIC built through `NewSessionForProtocol` (all `TCPSession`), writes it as a bounded `AEWV` preface before its first frame and reads the peer's before decoding any; `adapter.QUICSession` exchanges none. Sessions report the choice through `aether.SessionWireVersions`.
+Wire grammars are negotiated per session generation as a named set (`wire_versions.go`). Each side offers entries in name order, each a list of versions and a required flag; aether registers `bounds` (credit and queue profile version 1, required: section 8.5), `fragment` (envelope version 2, required), `frame` (full-frame grammar 3, required), `frame.short` (version 1, optional) and `reliability` (version 2, required), and an application adds its own names through its options. For each name both sides list, the choice is the highest version in both lists; a required name with no common version, or one a side omits, refuses the session with `ErrWireVersionMismatch` (a `*WireVersionMismatchError` naming the entry and both lists) before any session or stream state exists; an optional one is left out. Under Noise the offer rides the NodeInfo inside the encrypted handshake; a TCP, WebSocket or gRPC session, and QUIC built through `NewSessionForProtocol` (all `TCPSession`), writes it as a bounded `AEWV` preface before its first frame and reads the peer's before decoding any; `adapter.QUICSession` exchanges none. Sessions report the choice through `aether.SessionWireVersions`.
 
 Frame grammar 3 is the grammar whose OPEN payload carries the opener's initial credit (§2.2). A build lists only the grammar it writes, so a peer offering only grammar 2 is refused before any state.
 
@@ -854,7 +854,7 @@ The protocol adapts to each transport's native capabilities. Aether layers are o
 | Frame codec (encode/decode) | **Active** | **Active** | **Active** | Skip | Skip |
 | Stream multiplexing | **Active** | **Active** | **Active** | Native streams | Native streams |
 | Reliability (Composite ACK/retransmit) | **Active** | Skip (TCP) | Skip (TCP) | Skip (QUIC) | Skip (HTTP/2) |
-| Flow control (WINDOW) | **Active** | **Active** | **Active** | Skip (QUIC) | Skip (HTTP/2) |
+| Flow control (WINDOW) | **Active** | Skip (TCP) | Skip (TCP) | Skip (QUIC) | Skip (HTTP/2) |
 | Congestion (CUBIC/BBR) | **Active** | Skip (TCP) | Skip (TCP) | Skip (QUIC) | Skip (HTTP/2) |
 | FEC (XOR repair) | **Active** | Skip | Skip | Skip | Skip |
 | Anti-replay window | **Active** (DATA only) | Skip | Skip | Skip | Skip |
@@ -864,7 +864,7 @@ The protocol adapts to each transport's native capabilities. Aether layers are o
 
 **Bold = Aether provides. Skip = transport provides natively.**
 
-**Flow control on TCP/WS:** TCP and WebSocket enforce flow control at the Aether level (WINDOW frames are active), but `Consume()` errors are ignored on these transports — TCP provides native backpressure as a safety net. On Noise-UDP, flow control is enforced fully and `Consume()` failures will block sends.
+**Flow control on TCP/WS:** A byte-stream session runs no Aether credit: it writes no WINDOW frame and acts on none it reads, and a stream's `AvailableCredit` through `StreamConn` answers -1, as on QUIC. Its delivery queue is bounded in bytes by the bounds profile's stream credit and a full queue is a typed reset (section 8). On Noise-UDP, flow control is enforced fully and `Consume()` failures will block sends.
 
 **Anti-replay on Noise-UDP:** Anti-replay is only active on Noise-UDP, and only for DATA frames. Control frames (SeqNo=0) bypass the replay window on all transports. See section 7 for details.
 
@@ -1196,7 +1196,7 @@ The Noise adapter sends entire payloads as single UDP datagrams regardless of si
 `Send()` transparently fragments payloads exceeding the transport MSS into multiple Aether frames. Each fragment is independently tracked by the reliability engine (ACK, retransmit, FEC). `Receive()` reassembles fragments transparently. Callers never see fragmentation.
 
 - **Noise-UDP:** Fragments at PMTU prober MSS (default 1400 bytes). Each fragment is one UDP packet — no IP fragmentation.
-- **TCP/WS:** Fragments at MaxFrameSize (65536 for STREAM class, 32768 for PROXY class) to avoid head-of-line blocking. Interleaves with other streams' frames in the scheduler.
+- **TCP/WS:** Does not fragment: a byte-stream session has no realm to bind a fragment to, so every message travels as one DATA frame, and a flagged fragment it receives is refused.
 
 ### 24.3 Fragment Header (4 bytes)
 
@@ -1342,7 +1342,7 @@ Consumers derive their own quality models from these capabilities.
 | Profile | Name in `profile.go` | Transports | Active Layers |
 |---------|----------------------|-----------|---------------|
 | Aether-FULL | `ProfileFull` (`"A-FULL"`) | Noise-UDP | All: codec, mux, reliability, flow, congestion, FEC, anti-replay, scheduler, pacing, PMTU, FEC, resume, migration, abuse scoring |
-| Aether-LITE | `ProfileLite` (`"A-LITE"`) | QUIC, TCP, WS, gRPC | Stream lifecycle, scheduler, flow control, abuse scoring, idle eviction, stream GC, control plane, observability |
+| Aether-LITE | `ProfileLite` (`"A-LITE"`) | QUIC, TCP, WS, gRPC | Stream lifecycle, scheduler, abuse scoring, idle eviction, stream GC, control plane, observability |
 
 Same session-API semantics across profiles — `Stream.Send()` / `Stream.Receive()` / `Session.OpenStream()` behave identically regardless of which profile the underlying adapter is running. The agnostic interfaces (`AbuseScoreCapable`, `IdleEvictable`, `CompressionCapable`) work uniformly on either profile.
 

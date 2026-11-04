@@ -41,15 +41,13 @@ const (
 // while the rest of the burst is still arriving.
 const teardownRaceUnreadBeforeReset = 3
 
-// unreadMessages reports how many payloads st's receive queue holds. For a TCP
-// stream that is a channel's length, read without synchronising with its
-// senders, so the hand-offs that filled it stay unordered with what the test
-// does next; a noise stream's queue length is read under the queue's lock.
+// unreadMessages reports how many payloads st's receive queue holds, read under
+// the queue's lock.
 func unreadMessages(t *testing.T, st aether.Stream) int {
 	t.Helper()
 	switch s := st.(type) {
 	case *tcpStream:
-		return len(s.recvCh)
+		return s.recvQ.len()
 	case *noiseStream:
 		return s.recvQ.len()
 	}
@@ -143,7 +141,7 @@ func resetUnderBurst(t *testing.T, client, server aether.Session, streamID uint6
 
 // TestTCPStream_ResetUnderABurstFromThePeer resets a TCP stream from the
 // application's goroutine while the peer is still sending into it. The
-// readLoop is then putting payloads on the stream's recvCh while the reset
+// readLoop is then putting payloads on the stream's recvQ while the reset
 // tears the stream down; that hand-off may not race the teardown, and
 // Receive after the reset ends with io.EOF.
 func TestTCPStream_ResetUnderABurstFromThePeer(t *testing.T) {

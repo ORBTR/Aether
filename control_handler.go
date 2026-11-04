@@ -35,9 +35,10 @@ type StreamWindowLookup func(streamID uint64) *flow.StreamWindow
 // supplies a frame writer + health monitor + scheduler.
 //
 // The Noise and TCP adapters build one of these per call (their
-// controlHandler methods) and dispatch the four frame types through it, so
-// PING-echo, PONG-record, SetWeight and ApplyUpdate behave the same on both
-// transports from one definition.
+// controlHandler methods), so PING-echo, PONG-record and SetWeight behave the
+// same on both transports from one definition. Only the Noise adapter dispatches
+// WINDOW_UPDATE through it: TCPSession's dispatchFrame acts on none, and sets
+// neither ConnWindow nor StreamWindowLookup, which HandleWindowUpdate reads.
 //
 // QUIC's WindowUpdate handling is part of its native QUIC machinery,
 // so QUICSession deliberately does NOT use this helper.
@@ -52,8 +53,7 @@ type ControlFrameHandler struct {
 	// WakeScheduler controls whether HandleWindowUpdate calls
 	// Sched.Wake() after applying credit. Noise sets true so a stalled
 	// writeLoop blocked on Consume unblocks the moment credit arrives.
-	// TCP sets false because its writeLoop runs on a 2ms ticker and never
-	// waits for a wake.
+	// TCPSession leaves it false: it never calls HandleWindowUpdate.
 	WakeScheduler bool
 }
 

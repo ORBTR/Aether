@@ -139,7 +139,7 @@ func TestTCPSession_ObserveMetrics(t *testing.T) {
 	// Wait for delivery
 	time.Sleep(100 * time.Millisecond)
 
-	// Drain the server recvCh
+	// Drain the server recvQ
 	for i := 0; i < 3; i++ {
 		if _, err := serverStream.Receive(ctx); err != nil {
 			t.Fatalf("recv %d: %v", i, err)

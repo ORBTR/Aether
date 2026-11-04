@@ -25,8 +25,8 @@ func TestAetherWireVersionsRegistersReliability(t *testing.T) {
 	if found == nil {
 		t.Fatalf("AetherWireVersions() = %+v has no reliability entry", own)
 	}
-	if !found.Required || !reflect.DeepEqual(found.Versions, []uint16{1}) {
-		t.Fatalf("reliability entry = %+v, want versions [1], required", *found)
+	if !found.Required || !reflect.DeepEqual(found.Versions, []uint16{2}) {
+		t.Fatalf("reliability entry = %+v, want versions [2], required", *found)
 	}
 	if err := own.Validate(); err != nil {
 		t.Fatalf("AetherWireVersions() is not canonical: %v", err)
@@ -36,8 +36,8 @@ func TestAetherWireVersionsRegistersReliability(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ChooseWireVersions(own, own): %v", err)
 	}
-	if v, ok := both.Version(WireVersionReliability); !ok || v != 1 {
-		t.Fatalf("chosen reliability = %d, %v; want 1, true", v, ok)
+	if v, ok := both.Version(WireVersionReliability); !ok || v != 2 {
+		t.Fatalf("chosen reliability = %d, %v; want 2, true", v, ok)
 	}
 
 	// Peers that agree on every other entry and omit reliability, or offer
@@ -50,8 +50,8 @@ func TestAetherWireVersionsRegistersReliability(t *testing.T) {
 	}
 	for _, peer := range []WireVersions{
 		agreeing,
-		append(append(WireVersions(nil), agreeing...), wv(WireVersionReliability, true, 2)),
-		append(append(WireVersions(nil), agreeing...), wv(WireVersionReliability, false, 2, 3)),
+		append(append(WireVersions(nil), agreeing...), wv(WireVersionReliability, true, 1)),
+		append(append(WireVersions(nil), agreeing...), wv(WireVersionReliability, false, 1, 3)),
 	} {
 		for _, swap := range []bool{false, true} {
 			a, b := own, peer
