@@ -523,9 +523,9 @@ func TestNoiseSession_AnAbandonedQueueIsDiscardedAfterTheIdleTimeout(t *testing.
 	if _, err := ss.Receive(ctx); !errors.Is(err, aether.ErrStreamOverrun) {
 		t.Errorf("Receive after the discard: %v, want ErrStreamOverrun", err)
 	}
-	server.mu.Lock()
+	server.endedMu.Lock()
 	tracked := len(server.endedQueues)
-	server.mu.Unlock()
+	server.endedMu.Unlock()
 	if tracked != 0 {
 		t.Errorf("%d queues still tracked after the sweep", tracked)
 	}

@@ -275,14 +275,6 @@ type NoiseSession struct {
 	// inspect counter % period.
 	cwndUtilCounter uint64
 
-	// recvQueued is the cost of every stream's recvQ on this session: the
-	// memory makeQueueRoom keeps inside the session ceiling and
-	// signalReceiveOverload reads. recvCharged is the part of it the peer still
-	// has charged to its connection credit, which receiveCeilings' session
-	// limit holds the peer to. Written under each stream's queue lock, read
-	// without one.
-	recvQueued  atomic.Int64
-	recvCharged atomic.Int64
 	// lastOverloadSignal is the UnixNano of signalReceiveOverload's last
 	// CONGESTION, so a sustained overload emits one per receiveOverloadInterval.
 	lastOverloadSignal atomic.Int64
@@ -488,26 +480,23 @@ type NoiseSession struct {
 	// the per-peer ceiling (peerCreditCeiling) across every session to the same
 	// peer. createStream reserves a stream's credit here before publishing it;
 	// a stream's departure from s.streams releases it; CloseWithError closes
-	// the ledger, returning the rest to the peer's. peerShared says the
+	// the ledger, returning the rest to the peer's. creditPeerShared says the
 	// parent is the remote node ID's entry in sessionPeerLedgers, which
 	// CloseWithError leaves; false for a session whose parent is its own
 	// (newNoiseSession).
-	admitted   *creditLedger
-	peerShared bool
+	admitted         *creditLedger
+	creditPeerShared bool
 
 	// recentlyLeft holds, per stream ID, when a stream that left on both CLOSEs
 	// stops being a reason to refuse a local OpenStream of its ID (noteLeft,
 	// reopenQuietLocked). Guarded by s.mu, pruned by sweepRecentlyLeft.
 	recentlyLeft map[uint64]time.Time
 
-	// endedQueues are the receive queues of streams that have left s.streams
-	// with messages still unread. Their cost stays in recvQueued until the
-	// consumer takes them; sweepEndedQueues, on the reliability tick, discards
-	// a queue nobody has taken from for aether.DefaultStreamIdleTimeout, so a
-	// consumer that abandons a stream does not hold the session's budget for
-	// the session's life, and makeQueueRoom discards one a RESET ended when a
-	// credited message needs its room. Guarded by mu.
-	endedQueues map[*recvQueue]struct{}
+	// recvMemory is what this session's receive queues hold: recvQueued, which
+	// signalReceiveOverload reads, recvCharged, which receiveCeilings'
+	// session limit holds the peer to, and the queues of ended streams, which
+	// sweepEndedQueues on the reliability tick and makeQueueRoom discard.
+	recvMemory
 }
 
 // NewNoiseSession creates an Aether session over a Noise-encrypted
@@ -552,18 +541,18 @@ func newNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 		// the grantable + sendUpdate bindings reference s itself.
 		txCompressor: aether.NewCompressor(),
 		rxCompressor: aether.NewCompressor(),
-		endedQueues:  make(map[*recvQueue]struct{}),
 		recentlyLeft: make(map[uint64]time.Time),
 	}
 	sessionCeiling := flow.CurrentBounds().AdmittedCreditCeiling(opts.MaxConcurrentStreams)
 	var peerLedger *creditLedger
 	if sharedPeer {
 		peerLedger = sessionPeerLedgers.join(remoteNodeID, peerCreditCeiling(sessionCeiling))
-		s.peerShared = true
+		s.creditPeerShared = true
 	} else {
 		peerLedger = newCreditLedger("peer", peerCreditCeiling(sessionCeiling), nil)
 	}
 	s.admitted = newCreditLedger("session", sessionCeiling, peerLedger)
+	s.joinPeerMemory(remoteNodeID, sharedPeer)
 	// Lift the peer's advertised max_ack_delay off the underlying
 	// noiseConn (when the substrate supports the handshake-capability
 	// surface). createStream uses this to seed each stream's TLP PTO
@@ -908,6 +897,12 @@ func (s *NoiseSession) releaseStream(streamID uint64) {
 	}
 }
 
+// sweepEndedQueues is recvMemory.sweepEnded on the reliability tick every ten seconds.
+// A discard grants the peer the credit it still had charged for those messages.
+func (s *NoiseSession) sweepEndedQueues(now time.Time) {
+	s.sweepEnded(now, s.grantConnCredit)
+}
+
 // reopenQuietRTOs is how many of the leaving stream's RTOs a stream ID stays closed
 // to a local OpenStream after the stream left on both CLOSEs. The peer retransmits
 // its CLOSE until this side's ACK of it arrives, and a frame says nothing of which
@@ -953,92 +948,6 @@ func (s *NoiseSession) sweepRecentlyLeft(now time.Time) {
 			delete(s.recentlyLeft, id)
 		}
 	}
-}
-
-// trackEnded puts the queue of a stream leaving s.streams on endedQueues when
-// it still holds messages. Its callers are the stream's exits (handleReset,
-// Reset, noiseStream.leaveSession): from then on the stream GC
-// does not see the stream, and the queue's cost stays in recvQueued until
-// the consumer takes its messages or sweepEndedQueues discards them.
-func (s *NoiseSession) trackEnded(q *recvQueue) {
-	if q == nil || q.len() == 0 {
-		return
-	}
-	s.mu.Lock()
-	s.endedQueues[q] = struct{}{}
-	s.mu.Unlock()
-}
-
-// sweepEndedQueues runs on the reliability tick every ten seconds. It drops
-// endedQueues entries the consumer has emptied, and discards the messages of
-// a queue nobody has taken from for aether.DefaultStreamIdleTimeout, the same
-// idle bound the stream GC gives a stream still in s.streams; the discard
-// takes their cost off recvQueued and grants the peer the credit it still had
-// charged for them, which no later Receive will record.
-func (s *NoiseSession) sweepEndedQueues(now time.Time) {
-	for _, q := range s.endedQueueList() {
-		empty, idle := q.idleSince(now)
-		if !empty && idle < aether.DefaultStreamIdleTimeout {
-			continue
-		}
-		if !empty {
-			s.grantConnCredit(q.discard())
-		}
-		s.forgetEnded(q)
-	}
-}
-
-// makeQueueRoom keeps the session's queues inside ceiling for a message of
-// cost need that enqueueDelivery is about to queue. What push holds a sender to
-// counts only recvCharged, so the memory past it is queues a RESET ended, which
-// no credit pays for, and control frames (enqueueControl). The readLoop discards
-// the longest-idle such queue until the message fits: that stream has already
-// ended, and its consumer, if it returns, reads aether.ErrStreamOverrun. Control
-// frames are never discarded; they are bounded by their own count on the one
-// control stream, and that count is what the session's queues can stand past the
-// ceiling once no RESET's queue is left.
-func (s *NoiseSession) makeQueueRoom(need, ceiling int64) {
-	for s.recvQueued.Load()+need > ceiling {
-		q := s.longestIdleResetQueue()
-		if q == nil {
-			return
-		}
-		q.discard()
-		s.forgetEnded(q)
-	}
-}
-
-// longestIdleResetQueue returns the endedQueues entry a RESET ended that has
-// gone longest with nothing taken from it, or nil when there is none.
-func (s *NoiseSession) longestIdleResetQueue() *recvQueue {
-	var (
-		oldest   *recvQueue
-		earliest int64
-	)
-	for _, q := range s.endedQueueList() {
-		if last, ok := q.idleResetQueue(); ok && (oldest == nil || last < earliest) {
-			oldest, earliest = q, last
-		}
-	}
-	return oldest
-}
-
-// endedQueueList copies endedQueues, so its readers can take each queue's lock
-// without holding s.mu.
-func (s *NoiseSession) endedQueueList() []*recvQueue {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	queues := make([]*recvQueue, 0, len(s.endedQueues))
-	for q := range s.endedQueues {
-		queues = append(queues, q)
-	}
-	return queues
-}
-
-func (s *NoiseSession) forgetEnded(q *recvQueue) {
-	s.mu.Lock()
-	delete(s.endedQueues, q)
-	s.mu.Unlock()
 }
 
 // resetGrant is what a stream this side reset had granted when it did
@@ -1136,7 +1045,8 @@ func (s *NoiseSession) CloseWithError(err error) error {
 	// back to the peer's ledger here in one step, and a createStream racing
 	// this close is refused by the closed ledger.
 	s.admitted.close()
-	if s.peerShared {
+	s.leavePeerMemory(s.RemoteNodeID())
+	if s.creditPeerShared {
 		sessionPeerLedgers.leave(s.RemoteNodeID(), s.admitted.parent)
 	}
 	// Flush any pending conn-level grant so the peer gets credit for

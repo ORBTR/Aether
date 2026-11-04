@@ -16,7 +16,7 @@ import (
 // and the default constants the windows build from.
 func TestCurrentBounds_TheNumbersFitTogether(t *testing.T) {
 	p := CurrentBounds()
-	if p.Version != BoundsProfileVersion || p.StreamCredit != 1<<20 || p.SessionMemoryCeiling != 16<<20 || p.StreamCap != 1024 {
+	if p.Version != BoundsProfileVersion || p.StreamCredit != 1<<20 || p.SessionMemoryCeiling != 16<<20 || p.PeerMemoryCeiling != 24<<20 || p.StreamCap != 1024 {
 		t.Fatalf("profile %+v", p)
 	}
 	if p.ConnCredit() != p.SessionMemoryCeiling {
@@ -62,7 +62,7 @@ func TestNewBoundsProfile_RefusesNumbersThatDoNotFit(t *testing.T) {
 		{"a stream cap whose credit overflows", BoundsProfileVersion, credit, ceiling, math.MaxInt},
 		{"streams that cannot reach the ceiling", BoundsProfileVersion, credit, ceiling, 15},
 	} {
-		p, err := NewBoundsProfile(c.version, c.credit, c.ceiling, c.cap)
+		p, err := NewBoundsProfile(c.version, c.credit, c.ceiling, DefaultPeerMemoryCeiling+c.ceiling, c.cap)
 		if !errors.Is(err, ErrBoundsProfileInvalid) || p != (BoundsProfile{}) {
 			t.Errorf("%s: profile %+v, err %v; want ErrBoundsProfileInvalid", c.name, p, err)
 		}
@@ -77,9 +77,12 @@ func TestNewBoundsProfile_RefusesNumbersThatDoNotFit(t *testing.T) {
 		{"credit at the window capacity", MaxGrowableWindow, MaxGrowableWindow, 1},
 		{"streams exactly reaching the ceiling", credit, ceiling, 16},
 	} {
-		if _, err := NewBoundsProfile(BoundsProfileVersion, c.credit, c.ceiling, c.cap); err != nil {
+		if _, err := NewBoundsProfile(BoundsProfileVersion, c.credit, c.ceiling, c.ceiling, c.cap); err != nil {
 			t.Errorf("%s: %v", c.name, err)
 		}
+	}
+	if _, err := NewBoundsProfile(BoundsProfileVersion, credit, ceiling, ceiling-1, streams); !errors.Is(err, ErrBoundsProfileInvalid) {
+		t.Errorf("a peer ceiling below the session's: %v", err)
 	}
 }
 

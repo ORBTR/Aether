@@ -41,9 +41,9 @@ func TestAetherWireVersionsRegistersFragment(t *testing.T) {
 	}
 
 	for _, peer := range []WireVersions{
-		{wv(WireVersionBounds, true, 1), wv(WireVersionFrame, true, WireVersionFrameCurrent), wv(WireVersionFrameShort, false, 1)},
-		{wv(WireVersionBounds, true, 1), wv("fragment", true, 1), wv(WireVersionFrame, true, WireVersionFrameCurrent)},
-		{wv(WireVersionBounds, true, 1), wv("fragment", false, 3), wv(WireVersionFrame, true, WireVersionFrameCurrent)},
+		{wv(WireVersionBounds, true, 2), wv(WireVersionFrame, true, WireVersionFrameCurrent), wv(WireVersionFrameShort, false, 1)},
+		{wv(WireVersionBounds, true, 2), wv("fragment", true, 1), wv(WireVersionFrame, true, WireVersionFrameCurrent)},
+		{wv(WireVersionBounds, true, 2), wv("fragment", false, 3), wv(WireVersionFrame, true, WireVersionFrameCurrent)},
 	} {
 		for _, swap := range []bool{false, true} {
 			a, b := own, peer

@@ -16,11 +16,17 @@ import (
 // ceiling of a receiver running the same numbers: a change to any value in the
 // profile is a new version, and peers on different versions refuse each other
 // before a session exists.
-const BoundsProfileVersion uint16 = 1
+const BoundsProfileVersion uint16 = 2
 
 // DefaultSessionMemoryCeiling is the most a session's receive queues hold of
 // what its peer's credit paid for (16 MiB), the profile's session ceiling.
 const DefaultSessionMemoryCeiling int64 = 16 * 1024 * 1024
+
+// DefaultPeerMemoryCeiling is the most the receive queues of every session to one
+// peer hold together (24 MiB), the profile's per-peer ceiling: one session's ceiling
+// and half of another's, so a second session to the peer has room beside one at its
+// own ceiling, and no number of sessions brings a peer a fresh ceiling each.
+const DefaultPeerMemoryCeiling int64 = 24 * 1024 * 1024
 
 // DefaultStreamCap is the profile's cap on a session's concurrent streams;
 // aether.DefaultMaxConcurrentStreams is this value.
@@ -35,12 +41,17 @@ var ErrBoundsProfileInvalid = errors.New("aether flow: bounds profile invalid")
 // session, a receiver's queues hold at most SessionMemoryCeiling, and the two
 // are one number, so credit a sender holds always fits what the receiver can
 // queue, and a session stalls on its connection credit once
-// SessionMemoryCeiling/StreamCredit streams have their credit unread. Values
-// come from NewBoundsProfile, which refuses numbers that do not fit.
+// SessionMemoryCeiling/StreamCredit streams have their credit unread. A peer's
+// sessions together queue at most PeerMemoryCeiling, which a sender's credit does
+// not cover: connection credit is per session, so a sender with several sessions can
+// be inside its credit on each and past this, and the refusal is a stream's typed
+// reset and no charge against the sender. Values come from NewBoundsProfile, which
+// refuses numbers that do not fit.
 type BoundsProfile struct {
 	Version              uint16
 	StreamCredit         int64
 	SessionMemoryCeiling int64
+	PeerMemoryCeiling    int64
 	StreamCap            int
 }
 
@@ -52,14 +63,17 @@ type BoundsProfile struct {
 //     builds it with;
 //   - the ceiling, and so the connection credit, is below one stream's credit,
 //     so that one stream's credit could never be spent;
+//   - the per-peer ceiling is below the session's, so that one session to a peer
+//     could never reach its own ceiling;
 //   - the stream cap is not positive, or its admitted credit overflows or
 //     stays below the ceiling, so that the streams a session may admit could
 //     never reach the connection credit it declares.
-func NewBoundsProfile(version uint16, streamCredit, sessionMemoryCeiling int64, streamCap int) (BoundsProfile, error) {
+func NewBoundsProfile(version uint16, streamCredit, sessionMemoryCeiling, peerMemoryCeiling int64, streamCap int) (BoundsProfile, error) {
 	p := BoundsProfile{
 		Version:              version,
 		StreamCredit:         streamCredit,
 		SessionMemoryCeiling: sessionMemoryCeiling,
+		PeerMemoryCeiling:    peerMemoryCeiling,
 		StreamCap:            streamCap,
 	}
 	refuse := func(format string, args ...any) (BoundsProfile, error) {
@@ -74,6 +88,8 @@ func NewBoundsProfile(version uint16, streamCredit, sessionMemoryCeiling int64, 
 		return refuse("stream credit %d above the window capacity %d", streamCredit, MaxGrowableWindow)
 	case sessionMemoryCeiling < streamCredit:
 		return refuse("session ceiling %d below one stream's credit %d", sessionMemoryCeiling, streamCredit)
+	case peerMemoryCeiling < sessionMemoryCeiling:
+		return refuse("peer ceiling %d below the session ceiling %d", peerMemoryCeiling, sessionMemoryCeiling)
 	case streamCap <= 0:
 		return refuse("stream cap %d", streamCap)
 	case int64(streamCap) > math.MaxInt64/streamCredit:
@@ -112,10 +128,10 @@ func (p BoundsProfile) AdmittedCreditCeiling(streamCap int) int64 {
 
 // currentBounds is the profile this build runs. Its numbers are checked here
 // so a build whose constants do not fit cannot start a session.
-var currentBounds = mustBoundsProfile(BoundsProfileVersion, DefaultStreamCredit, DefaultSessionMemoryCeiling, DefaultStreamCap)
+var currentBounds = mustBoundsProfile(BoundsProfileVersion, DefaultStreamCredit, DefaultSessionMemoryCeiling, DefaultPeerMemoryCeiling, DefaultStreamCap)
 
-func mustBoundsProfile(version uint16, streamCredit, sessionMemoryCeiling int64, streamCap int) BoundsProfile {
-	p, err := NewBoundsProfile(version, streamCredit, sessionMemoryCeiling, streamCap)
+func mustBoundsProfile(version uint16, streamCredit, sessionMemoryCeiling, peerMemoryCeiling int64, streamCap int) BoundsProfile {
+	p, err := NewBoundsProfile(version, streamCredit, sessionMemoryCeiling, peerMemoryCeiling, streamCap)
 	if err != nil {
 		panic(err)
 	}
@@ -123,7 +139,8 @@ func mustBoundsProfile(version uint16, streamCredit, sessionMemoryCeiling int64,
 }
 
 // CurrentBounds returns the profile this build runs: 1 MiB of stream credit, a
-// 16 MiB session ceiling and connection credit, and 1024 streams. NoiseSession
-// builds its connection window and credit ledgers from it, and a TCPSession's
-// streams bound their delivery queues at its stream credit.
+// 16 MiB session ceiling and connection credit, a 24 MiB per-peer ceiling, and 1024
+// streams. NoiseSession builds its connection window and credit ledgers from it, a
+// TCPSession bounds its delivery queues at its stream credit and session ceiling,
+// and both hold what they queue for one peer at its per-peer ceiling.
 func CurrentBounds() BoundsProfile { return currentBounds }

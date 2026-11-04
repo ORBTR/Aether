@@ -33,7 +33,7 @@ func shortFormCompressor(t testing.TB) *Compressor {
 func fullOnlyVersions(t testing.TB) NegotiatedWireVersions {
 	t.Helper()
 	peer := WireVersions{
-		{Name: WireVersionBounds, Versions: []uint16{1}, Required: true},
+		{Name: WireVersionBounds, Versions: []uint16{2}, Required: true},
 		{Name: WireVersionFragment, Versions: []uint16{WireVersionFragmentCurrent}, Required: true},
 		{Name: WireVersionFrame, Versions: []uint16{WireVersionFrameCurrent}, Required: true},
 		{Name: WireVersionReliability, Versions: []uint16{wireVersionReliabilityCurrent}, Required: true},

@@ -119,6 +119,22 @@ func (l *creditLedger) close() {
 	}
 }
 
+// fits reports whether reserve(n) would succeed now, checking this ledger and its
+// parent; a nil ledger, a session built without one, always fits. recvMemory.makeQueueRoom
+// reads it to decide whether to discard an ended queue before a push that would meet
+// the ceiling; the push's own reserve is what decides.
+func (l *creditLedger) fits(n int64) bool {
+	if l == nil {
+		return true
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed || n > l.ceiling-l.reserved {
+		return false
+	}
+	return l.parent == nil || l.parent.fits(n)
+}
+
 // held returns the credit this ledger's streams hold admitted.
 func (l *creditLedger) held() int64 {
 	l.mu.Lock()
@@ -144,6 +160,11 @@ type peerLedgerEntry struct {
 // sessionPeerLedgers is the process's registry: the per-peer ceiling holds
 // across every session this package builds for a peer, whoever builds it.
 var sessionPeerLedgers = &peerLedgers{m: make(map[aether.NodeID]*peerLedgerEntry)}
+
+// peerMemoryLedgers is the registry of what every session to one peer holds in its
+// receive queues, against flow.BoundsProfile.PeerMemoryCeiling: where
+// sessionPeerLedgers counts what streams are promised, this counts what they hold.
+var peerMemoryLedgers = &peerLedgers{m: make(map[aether.NodeID]*peerLedgerEntry)}
 
 // join returns the peer's ledger and counts one more session using it; a new
 // entry takes ceiling.

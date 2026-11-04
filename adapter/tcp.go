@@ -87,6 +87,13 @@ type TCPSession struct {
 	// MaxConcurrentStreams was reached (registerStream).
 	streamRefused uint64
 
+	// recvMemory is what this session's delivery queues hold, against the bounds
+	// profile's session and per-peer ceilings (tcpStream.enqueueDelivery), and the
+	// queues of ended streams, which housekeepingTick's sweep and makeQueueRoom
+	// discard. The caller of NewTCPSession has established the remote node ID, so
+	// its session shares the peer's entry.
+	recvMemory
+
 	// Protocol-agnostic capabilities (cross-adapter parity with Noise —
 	// these aren't Noise-specific concerns, they're session-level).
 	streamGC     *aether.StreamGC     // idle stream auto-RESET
@@ -216,19 +223,19 @@ func (st *tcpStream) endError(ordinary error) error {
 // side has already ended (the peer's CLOSE or RESET, this side's Reset or
 // overrun), so the message is one the peer sent after its own end or after this
 // side's RESET, which tells the peer the stream is gone. Or the message would
-// take the queue past the bounds profile's stream credit
-// (flow.BoundsProfile.StreamCredit, in messageCredit): the stream ends through
-// overrun, which refuses this message and every later one with a RESET the
-// sender reads as aether.ErrStreamOverrun, while the consumer still reads every
-// message queued ahead of it. A stream that goes on loses no message: the
-// sender holds no aether credit that would stop it short of the queue, so the
-// refusal is how the queue's bound reaches the sender.
-//
-// TODO: hold a session's delivery queues together to the profile's
-// SessionMemoryCeiling; each is bounded alone, so a session's unread messages
-// reach its stream cap times the stream credit.
+// take the queue past the bounds profile's stream credit, the session's queues past
+// its session ceiling or the peer's past its per-peer ceiling, all in messageCredit
+// (makeQueueRoom first discards a queue a RESET ended to make that room): the stream
+// ends through overrun, which refuses this message and every later one with a RESET
+// the sender reads as aether.ErrStreamOverrun, while the consumer still reads every
+// message queued ahead of it. A stream that goes on loses no message: the sender holds
+// no aether credit that would stop it short of the queue, so the refusal is how the
+// queue's bound reaches the sender.
 func (st *tcpStream) enqueueDelivery(payload []byte) bool {
-	switch st.recvQ.push(payload, flow.CurrentBounds().StreamCredit, 0) {
+	s := st.session
+	bounds := flow.CurrentBounds()
+	s.makeQueueRoom(recvItemCost(payload), bounds.SessionMemoryCeiling)
+	switch st.recvQ.push(payload, bounds.StreamCredit, bounds.SessionMemoryCeiling) {
 	case pushQueued:
 		st.session.deliveryStats.recordDelivered(st.streamID)
 		return true
@@ -297,6 +304,8 @@ func (st *tcpStream) sendReset(reason aether.ResetReason) error {
 		s.releaseStream(st.streamID)
 	}
 	s.mu.Unlock()
+	st.recvQ.peerEnded()
+	s.trackEnded(st.recvQ)
 	s.txCompressor.RemoveStream(st.streamID)
 	s.rxCompressor.RemoveStream(st.streamID)
 	return err
@@ -351,6 +360,7 @@ func NewTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 		prefaceWritten: make(chan struct{}),
 		prefaceTimeout: wireVersionsPrefaceTimeout,
 	}
+	s.joinPeerMemory(remoteNodeID, true)
 	s.wireOffer, s.wireOfferErr = aether.LocalWireVersions(opts.WireVersions)
 	// Per-peer abuse tracker — per-session registry by default,
 	// overridable via SetAbuseScoreRegistry for cross-session scoring.
@@ -411,11 +421,11 @@ func NewTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 	// preface write returns, orders the preface ahead of any frame whichever
 	// goroutine writes first.
 	s.writeMu.Lock()
-	s.wireTimer = time.AfterFunc(s.prefaceTimeout, func() {
+	s.wireTimer.Store(time.AfterFunc(s.prefaceTimeout, func() {
 		if s.finishWireVersions(aether.NegotiatedWireVersions{}, errWireVersionsPrefaceTimeout) {
 			s.CloseWithError(errWireVersionsPrefaceTimeout)
 		}
-	})
+	}))
 	go s.writePreface()
 	go s.readLoop()
 	go s.writeLoop()
@@ -764,7 +774,7 @@ func (s *TCPSession) handleOpen(frame *aether.Frame) {
 		},
 		session:  s,
 		state:    aether.NewStreamStateMachine(),
-		recvQ:    newRecvQueue(nil, nil),
+		recvQ:    s.newQueue(),
 		recvDone: make(chan struct{}),
 		fragBuf:  NewFragmentBuffer(),
 		observe:  reliability.NewObserveEngine(),
@@ -859,6 +869,8 @@ func (s *TCPSession) leaveIfEndedLocked(st *tcpStream) bool {
 	}
 	delete(s.streams, st.streamID)
 	s.releaseStream(st.streamID)
+	st.recvQ.leftSession()
+	s.trackEnded(st.recvQ)
 	return true
 }
 
@@ -886,6 +898,8 @@ func (s *TCPSession) handleReset(frame *aether.Frame) {
 		}
 		st.state.Transition(aether.EventRecvReset)
 		st.closeRecvOnce()
+		st.recvQ.peerEnded()
+		s.trackEnded(st.recvQ)
 	}
 }
 
@@ -1142,7 +1156,7 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 		config:   cfg,
 		session:  s,
 		state:    aether.NewStreamStateMachine(),
-		recvQ:    newRecvQueue(nil, nil),
+		recvQ:    s.newQueue(),
 		recvDone: make(chan struct{}),
 		fragBuf:  NewFragmentBuffer(),
 		observe:  reliability.NewObserveEngine(),
@@ -1300,6 +1314,7 @@ func (s *TCPSession) CloseWithError(err error) error {
 	// A close before the preface exchange ended ends it, releasing every
 	// waiter and stopping the deadline timer.
 	s.finishWireVersions(aether.NegotiatedWireVersions{}, aether.ErrSessionClosed)
+	s.leavePeerMemory(s.RemoteNodeID())
 	// Capture the caller chain so the FIRST closer in a close
 	// cascade is identifiable. Frame 0 is this closure, 1 is
 	// CloseWithError; frames 2-5 are the actual callers — readLoop
@@ -1379,6 +1394,7 @@ func (s *TCPSession) housekeepingTick() {
 				s.CloseWithError(fmt.Errorf("session idle timeout (%s)", idle))
 				return
 			}
+			s.sweepEnded(time.Now(), nil)
 		}
 	}
 }
@@ -1516,7 +1532,8 @@ func (st *tcpStream) Send(ctx context.Context, data []byte) error {
 // (enqueueDelivery). What recvQ holds comes first, one message per call, whatever
 // has ended: after closeRecvOnce has closed recvDone it returns the stream's end
 // once recvQ is empty, io.EOF or the typed reason endErr records
-// (aether.ErrStreamOverrun, aether.ErrStreamRefused), and after the session
+// (aether.ErrStreamOverrun, aether.ErrStreamRefused; aether.ErrStreamOverrun too for
+// a consumer returning to messages recvMemory discarded), and after the session
 // closed it returns that close once recvQ is empty, so a message delivered before
 // either end is not lost behind it.
 func (st *tcpStream) Receive(ctx context.Context) ([]byte, error) {
@@ -1529,6 +1546,9 @@ func (st *tcpStream) Receive(ctx context.Context) ([]byte, error) {
 		case <-st.recvDone:
 			if data, _, ok := st.recvQ.pop(); ok {
 				return data, nil
+			}
+			if st.recvQ.discardedMessages() {
+				st.setEnd(aether.ErrStreamOverrun)
 			}
 			return nil, st.endError(io.EOF)
 		case <-ctx.Done():

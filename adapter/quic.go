@@ -104,11 +104,11 @@ func NewQuicSession(conn quic.Connection, localNodeID, remoteNodeID aether.NodeI
 		Closed:    base.CloseSignal(),
 		ErrClosed: aether.ErrSessionClosed,
 	})
-	s.wireTimer = time.AfterFunc(s.prefaceTimeout, func() {
+	s.wireTimer.Store(time.AfterFunc(s.prefaceTimeout, func() {
 		if s.finishWireVersions(aether.NegotiatedWireVersions{}, errWireVersionsPrefaceTimeout) {
 			s.closeRefused(errWireVersionsPrefaceTimeout)
 		}
-	})
+	}))
 	go s.exchangeWireVersions()
 	go s.acceptLoop()
 	return s

@@ -24,7 +24,7 @@ import (
 // a session that negotiates with it chooses no frame.short.
 func frameOnlyOffer() aether.WireVersions {
 	return aether.WireVersions{
-		{Name: aether.WireVersionBounds, Versions: []uint16{1}, Required: true},
+		{Name: aether.WireVersionBounds, Versions: []uint16{2}, Required: true},
 		{Name: aether.WireVersionFragment, Versions: []uint16{aether.WireVersionFragmentCurrent}, Required: true},
 		{Name: aether.WireVersionFrame, Versions: []uint16{aether.WireVersionFrameCurrent}, Required: true},
 		{Name: aether.WireVersionReliability, Versions: []uint16{2}, Required: true},
