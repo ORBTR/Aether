@@ -78,6 +78,8 @@ type aep06Conn struct {
 	idx      int
 	done     chan struct{}
 	doneOnce sync.Once
+	// peerOffer is the set the peer's preface states; nil states aether's own.
+	peerOffer aether.WireVersions
 }
 
 func (c *aep06Conn) AcceptStream(context.Context) (quic.Stream, error) {
@@ -96,7 +98,11 @@ func (c *aep06Conn) AcceptStream(context.Context) (quic.Stream, error) {
 // QUICSession reads, so acceptLoop goes on to the fake streams.
 func (c *aep06Conn) AcceptUniStream(context.Context) (quic.ReceiveStream, error) {
 	var preface bytes.Buffer
-	if err := aether.WriteWireVersionsPreface(&preface, aether.AetherWireVersions()); err != nil {
+	offer := c.peerOffer
+	if offer == nil {
+		offer = aether.AetherWireVersions()
+	}
+	if err := aether.WriteWireVersionsPreface(&preface, offer); err != nil {
 		return nil, err
 	}
 	return &aep06Stream{readBuf: bytes.NewReader(preface.Bytes())}, nil

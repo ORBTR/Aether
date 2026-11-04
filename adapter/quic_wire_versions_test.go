@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ORBTR/aether"
+	"github.com/quic-go/quic-go"
 )
 
 // TestQUICSession_ExchangesTheWireVersionPreface: two QUICSessions choose one set
@@ -75,6 +76,26 @@ func TestQUICSession_RefusesAPeerWithNoCommonVersion(t *testing.T) {
 	}
 	if got := client.WireVersions(); len(got.Entries()) != 0 {
 		t.Fatalf("a refused session reports %v", got)
+	}
+}
+
+// TestQUICSession_ARefusedSessionReadsNoStreamHeader: a session whose exchange refused
+// its peer accepts no stream, even on a connection that goes on offering them.
+func TestQUICSession_ARefusedSessionReadsNoStreamHeader(t *testing.T) {
+	conn := &aep06Conn{queue: []quic.Stream{newAEP06Stream(10)}, done: make(chan struct{}),
+		peerOffer: aether.WireVersions{{Name: aether.WireVersionFrame, Versions: []uint16{aether.WireVersionFrameCurrent - 1}, Required: true}}}
+	sess := NewQuicSession(conn, aether.NodeID("aep06-local"), aether.NodeID("aep06-remote"))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, err := sess.OpenStream(ctx, aether.StreamConfig{StreamID: 11}); !errors.Is(err, aether.ErrWireVersionMismatch) {
+		t.Fatalf("OpenStream: %v, want the mismatch", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	conn.mu.Lock()
+	taken := conn.idx
+	conn.mu.Unlock()
+	if taken != 0 {
+		t.Fatalf("a refused session took %d streams off the connection", taken)
 	}
 }
 

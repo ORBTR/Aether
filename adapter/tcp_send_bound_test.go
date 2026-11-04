@@ -32,11 +32,15 @@ func filledSender(t *testing.T, p *liteRawPeer, ctx context.Context, id uint64) 
 	var taken int64
 	for i := 0; ; i++ {
 		short, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+		start := time.Now()
 		err := st.Send(short, msg)
 		cancel()
 		if err != nil {
 			if !errors.Is(err, flow.ErrCreditExhausted) || !errors.Is(err, context.DeadlineExceeded) {
 				t.Fatalf("Send %d under a passed context: %v, want the backpressure and the context's error", i, err)
+			}
+			if took := time.Since(start); took >= flow.ConsumeTimeout {
+				t.Fatalf("Send ran %s under a 300 ms context", took)
 			}
 			return st, taken
 		}
@@ -61,15 +65,18 @@ func TestTCPStream_SendWaitsAtTheStreamCredit(t *testing.T) {
 	if taken > credit || taken < credit/2 {
 		t.Fatalf("Send took %d bytes against a conn that takes none, stream credit %d", taken, credit)
 	}
+	// As large as what was refused, so it needs the room the written frames give back.
+	after := make([]byte, 128*1024)
+	copy(after, "after")
 	done := make(chan error, 1)
-	go func() { done <- st.Send(ctx, []byte("after")) }()
+	go func() { done <- st.Send(ctx, after) }()
 	var payloads int64
 	for got := int64(0); ; {
 		f := p.next()
 		if f.Type != aether.TypeDATA {
 			t.Fatalf("frame on the wire: %+v", f)
 		}
-		if string(f.Payload) == "after" {
+		if bytes.HasPrefix(f.Payload, []byte("after")) {
 			break
 		}
 		got += messageCredit(int64(len(f.Payload)))
@@ -117,6 +124,32 @@ func TestTCPStream_AWaitingSendEndsWithItsStreamOrSession(t *testing.T) {
 		go func() { done <- st.Send(ctx, big) }()
 		time.Sleep(50 * time.Millisecond)
 		writeFrames(t, p.conn, &aether.Frame{StreamID: 64, Type: aether.TypeRESET, Payload: aether.EncodeReset(aether.ResetFlowCtrl)})
+		select {
+		case err := <-done:
+			if !errors.Is(err, aether.ErrStreamOverrun) {
+				t.Fatalf("Send on the peer's RESET: %v, want ErrStreamOverrun", err)
+			}
+		case <-time.After(flow.ConsumeTimeout / 2):
+			t.Fatal("a waiting Send did not see the peer's RESET")
+		}
+	})
+	t.Run("the peer's RESET with no queued frame to drop", func(t *testing.T) {
+		p := newLiteRawPeer(t)
+		drainAtEnd(t, p)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		st := p.open(ctx, 68)
+		// One message that fills the room, which the writeLoop holds in its write; the
+		// RESET drops nothing, so only the stream's end can wake the next Send.
+		whole := make([]byte, flow.CurrentBounds().StreamCredit-recvQueueEntryCost)
+		if err := st.Send(ctx, whole); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+		waitLong(t, "the writeLoop taking the frame", func() bool { return p.sess.sched.QueueLen(68) == 0 })
+		done := make(chan error, 1)
+		go func() { done <- st.Send(ctx, big) }()
+		time.Sleep(50 * time.Millisecond)
+		writeFrames(t, p.conn, &aether.Frame{StreamID: 68, Type: aether.TypeRESET, Payload: aether.EncodeReset(aether.ResetFlowCtrl)})
 		select {
 		case err := <-done:
 			if !errors.Is(err, aether.ErrStreamOverrun) {
