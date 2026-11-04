@@ -93,8 +93,9 @@ var (
 
 	// ErrStreamOverrun signals that a stream ended with messages it could not
 	// deliver. On a byte-stream session (TCP, WebSocket, gRPC) the receiver's
-	// delivery queue was full: the sender sent more messages than the receiving
-	// consumer had read and the queue holds. On a Noise session the sender went
+	// delivery queue was full: the sender sent more bytes than the receiving
+	// consumer had read and the queue holds, the bounds profile's stream credit
+	// (flow.BoundsProfile.StreamCredit). On a Noise session the sender went
 	// past the credit it holds. Either way the receiver reset the stream with
 	// RESET(ResetFlowCtrl) rather than drop a message unannounced: on the
 	// receiver, Receive returns every message the queue held and then this

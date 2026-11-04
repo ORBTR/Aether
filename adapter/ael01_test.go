@@ -21,14 +21,13 @@ import (
 // the typed sentinel aether.ErrDuplicateStreamID and a nil stream, and must
 // leave the pre-existing stream entry untouched.
 //
-// Before the fix, registerStream's tri-state return (nil on cap-hit, the
-// PRE-EXISTING stream on a duplicate, or the fresh st) was tested only with
-// `== nil`, so a duplicate fell through: OpenStream armed the rollback defer,
-// let RegisterWithClass clobber the live scheduler slot, sent a second
-// SYN+DATA, and returned a detached, never-mapped stream whose recvCh hangs
-// forever. Assertion A fails pre-fix (non-nil dead stream, nil error) and
-// passes after; Assertion B guards the scheduler-overwrite / rollback-delete
-// collateral damage against the live stream.
+// registerStream's return is tri-state (nil on cap-hit, the PRE-EXISTING stream
+// on a duplicate, or the fresh st). A duplicate that OpenStream did not tell
+// apart would arm the rollback defer, let RegisterWithClass clobber the live
+// scheduler slot, send a second SYN+DATA, and return a detached, never-mapped
+// stream whose recvQ never fills. Assertion A requires the error and no dead
+// stream; Assertion B guards the live stream against the scheduler overwrite and
+// the rollback's delete.
 func TestAEL01_DuplicateStreamIDReturnsError(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()

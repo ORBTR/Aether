@@ -328,10 +328,10 @@ func (w *StreamWindow) SetGrantStarveHist(h *metrics.DurationHist) {
 
 // TryConsume attempts a non-blocking credit acquire (the fast path only) and
 // returns true if credit was available and consumed, false otherwise — it
-// NEVER blocks. Transports with native backpressure (TCP/WS) track
-// outstanding bytes for metrics but must never stall a send on Aether-level
-// credit; the blocking Consume could park a TCP Send for the full
-// ConsumeTimeout (~10s) on a drained window.
+// NEVER blocks, where the blocking Consume could stall a send for the full
+// ConsumeTimeout (~10s) on a drained window. Only tests call it in this
+// repository: noiseStream.Send uses Consume and a byte-stream session keeps no
+// window.
 func (w *StreamWindow) TryConsume(n int64) bool {
 	if n <= 0 {
 		return true
@@ -628,8 +628,7 @@ func (w *StreamWindow) Available() int64 {
 // returned yet: on the wire, or held by the peer's receive queue until its
 // consumer takes them, in what Consume charges: the count its Send passes
 // (the adapter's noiseStream.Send passes the plaintext length plus a fixed
-// per-message cost, tcpStream.Send's TryConsume the plaintext length), not the
-// frame wire bytes a CEBytes claim counts.
+// per-message cost), not the frame wire bytes a CEBytes claim counts.
 func (w *StreamWindow) Outstanding() int64 {
 	w.mu.Lock()
 	defer w.mu.Unlock()

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ORBTR/aether"
+	"github.com/ORBTR/aether/flow"
 )
 
 // tcpPairWithOptions builds a client and server TCPSession over net.Pipe, the
@@ -43,20 +44,20 @@ func indexedMessage(i int) []byte {
 }
 
 // TestTCPStream_ABurstPastTheQueueEndsInTheTypedResetAfterEveryQueuedMessage
-// sends more messages than a dynamic stream's delivery queue holds to a
-// consumer that has read none of them. The receiver's readLoop never waits
-// on that consumer: it resets the stream with RESET(ResetFlowCtrl) when the
-// queue is full and goes on answering PING. The sender's Send and Receive
-// then return aether.ErrStreamOverrun, and the receiver's consumer reads
-// every queued message, in order and without a gap, and then the same
-// typed end, never io.EOF. No CONGESTION frame reaches the sender.
+// sends more bytes than a stream's delivery queue holds to a consumer that has
+// read none of them. The receiver's readLoop never waits on that consumer: it
+// resets the stream with RESET(ResetFlowCtrl) when the next message does not fit
+// and goes on answering PING. The sender's Send and Receive then return
+// aether.ErrStreamOverrun, and the receiver's consumer reads every queued
+// message, in order and without a gap, and then the same typed end, never io.EOF.
 func TestTCPStream_ABurstPastTheQueueEndsInTheTypedResetAfterEveryQueuedMessage(t *testing.T) {
 	client, server := tcpPairWithOptions(t, aether.DefaultSessionOptions())
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
 	const streamID = 30
-	queue := tcpDeliveryQueueCapacity(streamID)
+	const size = 8 * 1024
+	queue := int(flow.CurrentBounds().StreamCredit / messageCredit(size))
 	burst := queue + 20
 
 	cs, err := client.OpenStream(ctx, aether.StreamConfig{StreamID: streamID, Reliability: aether.ReliableOrdered, Priority: 128})
@@ -67,10 +68,9 @@ func TestTCPStream_ABurstPastTheQueueEndsInTheTypedResetAfterEveryQueuedMessage(
 	if err != nil {
 		t.Fatalf("accept: %v", err)
 	}
-	hitsBefore := client.Throttle().TotalHits()
 
 	for i := 0; i < burst; i++ {
-		if err := cs.Send(ctx, indexedMessage(i)); err != nil {
+		if err := cs.Send(ctx, burstMessage(i, size)); err != nil {
 			if errors.Is(err, aether.ErrStreamOverrun) {
 				break
 			}
@@ -108,7 +108,7 @@ func TestTCPStream_ABurstPastTheQueueEndsInTheTypedResetAfterEveryQueuedMessage(
 			time.Sleep(5 * time.Millisecond)
 		}
 	}
-	if got := len(ss.(*tcpStream).recvCh); got != queue {
+	if got := ss.(*tcpStream).recvQ.len(); got != queue {
 		t.Fatalf("premise: the receiver's queue holds %d unread messages, want the full %d", got, queue)
 	}
 
@@ -140,9 +140,6 @@ func TestTCPStream_ABurstPastTheQueueEndsInTheTypedResetAfterEveryQueuedMessage(
 	}
 	if got := server.DeliveryStats().Delivered.Load(); got != int64(queue) {
 		t.Errorf("receiver Delivered = %d, want %d", got, queue)
-	}
-	if hits := client.Throttle().TotalHits() - hitsBefore; hits != 0 {
-		t.Errorf("the sender applied %d CONGESTION frames; the overrun sends none", hits)
 	}
 	server.mu.Lock()
 	_, still := server.streams[streamID]

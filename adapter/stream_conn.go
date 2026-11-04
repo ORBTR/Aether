@@ -202,8 +202,8 @@ func (c *StreamConn) StreamID() uint64 { return c.stream.StreamID() }
 
 // AvailableCredit returns the send-side flow-control credit currently
 // available on the underlying stream, or -1 if the stream doesn't expose
-// flow control (e.g. QUIC, which has its own native flow control and
-// bypasses the Aether credit layer).
+// flow control: every Lite-profile stream (tcpStream, quicStream), whose
+// transport has its own flow control and which runs no Aether credit.
 //
 // Callers (notably gossip) use this to self-throttle: when credit is low,
 // prefer a delta sync over a full sync to avoid guaranteed ConsumeTimeout

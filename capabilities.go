@@ -20,11 +20,11 @@ const (
 	// When set, the Aether reliability engine (retransmit, SACK) is skipped.
 	CapNativeReliability Capabilities = 1 << 0
 
-	// CapNativeFlowControl means the transport provides flow control (QUIC, gRPC).
+	// CapNativeFlowControl means the transport provides flow control (TCP, WebSocket, QUIC, gRPC).
 	// When set, Aether WINDOW_UPDATE frames are not used.
 	CapNativeFlowControl Capabilities = 1 << 1
 
-	// CapNativeCongestion means the transport provides congestion control (TCP, QUIC).
+	// CapNativeCongestion means the transport provides congestion control (TCP, WebSocket, QUIC, gRPC).
 	// When set, Aether CUBIC/BBR is not used.
 	CapNativeCongestion Capabilities = 1 << 2
 
@@ -128,10 +128,10 @@ func CapabilitiesForProtocol(proto Protocol) Capabilities {
 			CapNativeIdentity | CapCompression | CapMigration
 
 	case ProtoWebSocket, ProtoTCP:
-		// WebSocket / TCP+TLS: reliability + ordering from TCP. Encryption from TLS.
-		// No native mux, flow control, or congestion control.
-		return CapNativeReliability | CapNativeOrdering | CapNativeEncryption |
-			CapNativeIdentity | CapCompression
+		// WebSocket / TCP+TLS: reliability, ordering, flow control and congestion
+		// control from TCP. Encryption from TLS. No native mux.
+		return CapNativeReliability | CapNativeFlowControl | CapNativeCongestion |
+			CapNativeOrdering | CapNativeEncryption | CapNativeIdentity | CapCompression
 
 	case ProtoGRPC:
 		// gRPC: full native stack via HTTP/2.

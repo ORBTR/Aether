@@ -403,9 +403,7 @@ func (d *grantDebouncer) Close() {
 // reaching this window's threshold, and then sends nothing that would make
 // another Record happen, so the window's TIMED trigger is reached only from
 // here. A NoiseSession's two ends of a stream start at the one credit its OPEN
-// states (handleOpen); a TCPSession's accepting side builds this window from
-// its own default credit, since its OPEN states none, so there the sender's
-// credit and this window can differ.
+// states (handleOpen).
 func (d *grantDebouncer) checkAndFlushStuck(gapThreshold time.Duration) {
 	d.mu.Lock()
 	defer d.mu.Unlock()

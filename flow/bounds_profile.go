@@ -124,5 +124,6 @@ func mustBoundsProfile(version uint16, streamCredit, sessionMemoryCeiling int64,
 
 // CurrentBounds returns the profile this build runs: 1 MiB of stream credit, a
 // 16 MiB session ceiling and connection credit, and 1024 streams. NoiseSession
-// builds its connection window and credit ledgers from it.
+// builds its connection window and credit ledgers from it, and a TCPSession's
+// streams bound their delivery queues at its stream credit.
 func CurrentBounds() BoundsProfile { return currentBounds }

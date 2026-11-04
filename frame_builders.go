@@ -8,11 +8,9 @@ package aether
 // `credit` additional bytes on the stream identified by streamID. Use
 // StreamConnectionLevel for the conn-level window.
 //
-// The Noise and TCP adapters' sendWindowUpdate build their frame here, so
-// both carry the same payload encoding — the only adapter-specific
-// concern is the writeFrame path, which stays in the adapter (TCP wraps
-// writeMu, Noise wraps writeMu + encryption pipeline). Adapter callers
-// pass the result to their own writeFrame.
+// The Noise adapter's sendWindowUpdate builds its frame here; the adapter-specific
+// concern is the writeFrame path, which stays in the adapter (writeMu +
+// encryption pipeline). A byte-stream session runs no credit and writes none.
 func BuildWindowUpdateFrame(sender, receiver PeerID, streamID uint64, credit uint64) *Frame {
 	payload := EncodeWindowUpdate(credit)
 	return &Frame{

@@ -95,7 +95,7 @@ func TestOverConn_CompatibleWireVersionsChosenOnBothEnds(t *testing.T) {
 	if !a.Equal(b) {
 		t.Fatalf("ends disagree: dialer %v accepter %v", a, b)
 	}
-	for name, want := range map[string]uint16{"frame": aether.WireVersionFrameCurrent, "frame.short": 1, "gossip.codec": 2, "reliability": 1} {
+	for name, want := range map[string]uint16{"frame": aether.WireVersionFrameCurrent, "frame.short": 1, "gossip.codec": 2, "reliability": 2} {
 		if v, ok := a.Version(name); !ok || v != want {
 			t.Fatalf("%s = %d, %v; want %d", name, v, ok, want)
 		}

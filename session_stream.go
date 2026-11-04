@@ -424,7 +424,8 @@ type Stream interface {
 	// For sequenced streams, only the latest payload is returned (older ones dropped).
 	Receive(ctx context.Context) ([]byte, error)
 
-	// Close sends a FIN (graceful close) and waits for the peer's FIN.
+	// Close ends this side's sending (graceful close): its FIN follows what Send
+	// has already taken, and Close does not wait for the peer's FIN.
 	// After Close, no more Send calls are allowed. Receive continues until peer's FIN.
 	Close() error
 

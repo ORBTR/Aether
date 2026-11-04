@@ -45,13 +45,15 @@ const (
 	pushOverCredit
 )
 
-// recvQueue holds a noiseStream's whole in-order messages between the
-// session's readLoop and the stream's one consumer. The readLoop pushes without
-// waiting, so a slow consumer on one stream holds up neither the noiseConn
-// inbox nor the inbound ACKs of any other stream; and it is bounded in credit
-// (messageCredit) and not in a count of messages, because credit is what the
-// sender has been admitted by and a count would turn a sender within its
-// credit into a loss.
+// recvQueue holds a stream's whole in-order messages between the session's
+// readLoop and the stream's one consumer. The readLoop pushes without waiting,
+// so a slow consumer on one stream holds up neither the noiseConn inbox nor the
+// inbound ACKs of any other stream; and it is bounded in credit (messageCredit)
+// and not in a count of messages, because credit is what the sender has been
+// admitted by and a count would turn a sender within its credit into a loss. A
+// tcpStream's sender holds no credit: the same count bounds its queue at the
+// bounds profile's stream credit (enqueueDelivery), and it uses neither session
+// total nor the credit a pop reports.
 //
 // Receive takes messages off under mu, and a stream's end does not lose what
 // the queue holds: pop keeps returning it after end, which only stops further
@@ -100,7 +102,8 @@ type recvQueue struct {
 }
 
 // newRecvQueue builds a queue counting into the session's two totals
-// (NoiseSession.recvQueued and recvCharged); a nil total counts to itself.
+// (NoiseSession.recvQueued and recvCharged); a nil total counts to itself, which
+// is what a tcpStream's queue passes.
 func newRecvQueue(budget, charged *atomic.Int64) *recvQueue {
 	if budget == nil {
 		budget = new(atomic.Int64)
