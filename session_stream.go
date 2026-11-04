@@ -474,10 +474,12 @@ type StreamConfig struct {
 	// Default: determined by DefaultLatencyClass(StreamID).
 	LatencyClass LatencyClass
 
-	// MaxAge is the maximum frame age before delivery is skipped (deadline-based reliability).
-	// 0 = no deadline (deliver regardless of age).
-	// Non-zero: sender skips retransmit if expired, receiver drops if expired.
-	// Use for: screen deltas (100ms), input events (50ms), telemetry (10s).
+	// MaxAge is the frame age a stream of a class that may lose frames tolerates.
+	// A NoiseSession hands it to its reliability.Engine, which stores it and reads
+	// it nowhere, so every stream's frames are delivered and retransmitted whatever
+	// their age, on every adapter.
+	// TODO: run it through RecvWindow.SetMaxAge and RetransmitQueue.SetMaxAge on the
+	// classes that may lose frames, and state it in OPEN so the accepting side runs it.
 	MaxAge time.Duration
 
 	// InitialCredit sets the flow control credit window for this stream.

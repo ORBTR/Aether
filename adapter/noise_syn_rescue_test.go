@@ -6,30 +6,26 @@ package adapter
 
 import (
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/ORBTR/aether"
 )
 
-// Coverage for the lost-OPEN rescue on noise-UDP.
+// A stream reached by DATA and no OPEN. OpenStream writes one TypeOPEN frame with
+// no sequence number and no send-window entry, and nothing retransmits it, so a lost
+// OPEN leaves the receiver with no stream: handleData drops the stream's DATA without
+// an ACK until the sender's stream GC resets the stream. Only a frame flagged
+// aether.FlagSYN would create the stream from then on, and the two tests below
+// characterise that receiver.
 //
-// THE DEFECT THESE PIN: OpenStream installs a stream locally and then writes ONE
-// `TypeOPEN` frame with no SeqNo and no send-window entry. There is no OPEN
-// retransmit, ack, or timeout anywhere in the codebase. On noise-UDP a single
-// lost datagram therefore left the receiver without the stream forever — and
-// every later DATA frame hit handleData's `return // unknown stream`, dropped
-// WITHOUT an ACK, so the sender's bytes never retired: unbounded progressAge,
-// TLP probing a stream the peer would never create.
-//
-// The receiver already carried the rescue (handleImplicitOpen) but it is
-// reachable ONLY from FlagSYN, and nothing on the noise path ever set that flag —
-// so on this transport the rescue was dead code while being live on TCP.
-//
-// ⚠ THE NEGATIVE CONTROL IN TestUnknownStream_NoSYNIsDroppedSilently IS THE
-// DEFECT ITSELF, EXECUTABLE. It is expected to keep passing: it documents that a
-// non-SYN frame for an unknown stream is still dropped. If it ever fails, the
-// unknown-stream branch changed and the rationale above needs re-measuring.
+// TODO: a Noise sender that writes the OPEN payload again in a frame flagged
+// aether.FlagSYN once its DATA goes unacknowledged. That stream reaches the acceptor's
+// per-ID backlog, and past a responder's AcceptStreamByID deadline it goes on to the
+// FIFO, so the application's dynamic-stream handler, which filters no stream ID, would
+// read and discard its messages as unparseable; the sender needs a responder that
+// re-arms its wait, or a stream ID filter on that handler, both outside this repository.
 
 // discardConn is a net.Conn whose writes always succeed and whose reads block
 // until close. A real session's writeLoop/ACK path must not fail or block for
@@ -59,28 +55,9 @@ func (c *discardConn) SetDeadline(time.Time) error      { return nil }
 func (c *discardConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *discardConn) SetWriteDeadline(time.Time) error { return nil }
 
-// 📌 STATUS: THE SENDER-SIDE HALF IS **NOT IN THE TREE**. A change setting FlagSYN
-// on outbound noise DATA frames was written, tested, mutation-proven, and then
-// REVERTED — because the rescue it triggers routes through the acceptor's 100 ms
-// per-ID backlog, and on a wedge older than the responder's 30 s AcceptStreamByID
-// deadline no waiter is left to claim the rescued stream. It would then flush to
-// the FIFO, be picked up by loom's dynamic-RPC handler (which filters no StreamID),
-// fail to unmarshal, and be discarded frame after frame — converting a LOUD,
-// detectable wedge into SILENT data loss on exactly the population the fix targets.
-//
-// So the sender flag must not ship alone. It needs a companion that guarantees the
-// rescued stream reaches the right consumer (a responder re-arm, and/or a StreamID
-// filter on that dynamic handler). Both companions are loom-side.
-//
-// The two tests below characterise the RECEIVER, which is unchanged and already
-// deployed. They are what make the sender-side fix meaningful when it does land,
-// and they hold today regardless.
-
-// TestUnknownStream_SYNCreatesTheStream proves the rescue path a sender-side
-// FlagSYN would reach is actually wired and does create the stream.
-//
-// This is what would make such a sender change worth anything — without it,
-// setting the flag would be a no-op against a receiver that ignored it.
+// TestUnknownStream_SYNCreatesTheStream: a frame flagged aether.FlagSYN for an unknown
+// stream admits the stream from the OPEN payload it carries, at the credit it states,
+// and delivers nothing, since the payload is no message.
 func TestUnknownStream_SYNCreatesTheStream(t *testing.T) {
 	conn := newDiscardConn()
 	defer conn.Close()
@@ -102,32 +79,73 @@ func TestUnknownStream_SYNCreatesTheStream(t *testing.T) {
 		t.Fatal("precondition failed: stream 100 already exists on a fresh session")
 	}
 
+	const credit = 256 << 10
+	open := aether.EncodeOpenPayload(aether.OpenPayload{Reliability: aether.ReliableOrdered, InitialCredit: credit})
 	s.handleData(&aether.Frame{
 		StreamID: probeStream,
 		Type:     aether.TypeDATA,
 		Flags:    aether.FlagANTIREPLAY | aether.FlagSYN,
-		SeqNo:    1,
-		Length:   4,
-		Payload:  []byte("ping"),
+		Length:   uint32(len(open)),
+		Payload:  open,
 	})
 
 	s.mu.Lock()
-	_, existsAfter := s.streams[probeStream]
+	st, existsAfter := s.streams[probeStream]
 	s.mu.Unlock()
 	if !existsAfter {
-		t.Error("a SYN-bearing DATA frame for an unknown stream did NOT create it. " +
-			"handleImplicitOpen is the rescue path the sender-side FlagSYN exists to " +
-			"reach; if it is no longer wired, the sender change is inert and the " +
-			"lost-OPEN wedge is back")
+		t.Fatal("a SYN frame carrying an OPEN payload did not create its stream")
+	}
+	if got := st.window.CurrentWindow(); got != credit {
+		t.Errorf("window = %d, want the %d the OPEN payload states", got, credit)
+	}
+	if n := st.recvQ.len(); n != 0 {
+		t.Errorf("%d messages queued, want none: the OPEN payload is no message", n)
 	}
 }
 
-// TestUnknownStream_NoSYNIsDroppedSilently is the NEGATIVE CONTROL, and it is the
-// wedge mechanism itself expressed as a test.
-//
-// Without it the test above proves only "streams can be created", not that the
-// FLAG is what decides it. The pair together is the whole finding: identical
-// frame, one bit different, opposite outcomes.
+// TestNoiseSession_ASYNPayloadIsNeverAMessage: a frame flagged aether.FlagSYN whose
+// payload is not an OPEN payload is refused and keeps no state, and on a live stream
+// such a frame changes nothing and delivers nothing.
+func TestNoiseSession_ASYNPayloadIsNeverAMessage(t *testing.T) {
+	s := NewNoiseSession(newDiscardConn(), aether.NodeID("vl1_local_syn_meaning_aaaaaaaaaa"),
+		aether.NodeID("vl1_remote_syn_meaning_bbbbbbbbb"), aether.DefaultSessionOptions())
+	defer s.Close()
+
+	syn := func(id uint64, payload []byte) *aether.Frame {
+		return &aether.Frame{StreamID: id, Type: aether.TypeDATA, Flags: aether.FlagSYN, Length: uint32(len(payload)), Payload: payload}
+	}
+	s.handleData(syn(100, []byte("ping")))
+	s.mu.Lock()
+	_, exists := s.streams[100]
+	s.mu.Unlock()
+	if exists {
+		t.Fatal("a SYN frame carrying message bytes created a stream")
+	}
+	if got := atomic.LoadUint64(&s.streamRefused); got != 1 {
+		t.Errorf("streamRefused = %d, want 1", got)
+	}
+
+	open := aether.EncodeOpenPayload(aether.OpenPayload{Reliability: aether.ReliableOrdered, InitialCredit: 256 << 10})
+	s.handleData(syn(101, open))
+	s.mu.Lock()
+	st := s.streams[101]
+	s.mu.Unlock()
+	if st == nil {
+		t.Fatal("no stream from the OPEN payload")
+	}
+	s.handleData(syn(101, []byte("ping")))
+	s.handleData(syn(101, open))
+	s.mu.Lock()
+	same := s.streams[101] == st
+	s.mu.Unlock()
+	if !same || st.recvQ.len() != 0 {
+		t.Fatalf("a SYN frame on the live stream: same stream %v, %d messages queued", same, st.recvQ.len())
+	}
+}
+
+// TestUnknownStream_NoSYNIsDroppedSilently: the flag is what decides it. A DATA frame
+// for an unknown stream that lacks aether.FlagSYN creates nothing, which is what leaves
+// a stream whose OPEN was lost without a receiver.
 func TestUnknownStream_NoSYNIsDroppedSilently(t *testing.T) {
 	conn := newDiscardConn()
 	defer conn.Close()
@@ -142,7 +160,7 @@ func TestUnknownStream_NoSYNIsDroppedSilently(t *testing.T) {
 
 	const probeStream = 100
 
-	// Byte-for-byte the frame from the test above, minus FlagSYN.
+	// A frame of DATA, as a stream whose OPEN was lost would send.
 	s.handleData(&aether.Frame{
 		StreamID: probeStream,
 		Type:     aether.TypeDATA,
@@ -156,8 +174,6 @@ func TestUnknownStream_NoSYNIsDroppedSilently(t *testing.T) {
 	_, exists := s.streams[probeStream]
 	s.mu.Unlock()
 	if exists {
-		t.Error("a DATA frame WITHOUT FlagSYN created an unknown stream. That is a " +
-			"fine change — but it means the unknown-stream drop no longer exists, so " +
-			"the sender-side FlagSYN is redundant and this file's rationale is stale")
+		t.Error("a DATA frame without FlagSYN created an unknown stream")
 	}
 }

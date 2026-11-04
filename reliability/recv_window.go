@@ -36,6 +36,7 @@ type RecvWindow struct {
 	maxAge        time.Duration        // max time a frame can sit in reorder buffer (0 = unlimited)
 	lastRecvTime  time.Time            // when the last data frame was received (for ACK delay)
 	dropCount     uint64               // atomic: frames dropped due to reorder buffer full
+	expiredCount  uint64               // atomic: frames returned Expired (SetMaxAge)
 
 	// holHist is the head-of-line-block histogram. When non-nil, every buffered frame that
 	// is flushed in order records (deliveryTime − bufferArrivalTime) into
@@ -74,9 +75,13 @@ func NewRecvWindowWithCap(maxGap int, maxBytes int64) *RecvWindow {
 	}
 }
 
-// SetMaxAge sets the maximum time a frame can remain in the reorder buffer.
-// Frames older than this are silently dropped during delivery flushes.
-// Used for partial reliability (e.g., real-time streams where stale data is useless).
+// SetMaxAge sets how long a frame may wait in the reorder buffer for a stream
+// that may lose stale data. A frame older than d when its turn comes returns as
+// Expired (RecvDelivery) and not as a message: it was acknowledged when it was
+// buffered, so no retransmit replaces it, and the caller has its charge to settle.
+// A CLOSE never expires (InsertEnd), since the receive side would never end.
+// Zero, the value every session's windows run at, delivers every buffered frame
+// whatever its age: aether.StreamConfig.MaxAge does not reach this call.
 func (w *RecvWindow) SetMaxAge(d time.Duration) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -100,11 +105,15 @@ func (w *RecvWindow) SetHOLHist(h *metrics.DurationHist) {
 // the flag the frame header carried reaches reassembly after reordering, which
 // sees payloads only. End says the frame carries no message and is the peer's
 // CLOSE (InsertEnd), which reaches its reader behind every frame sequenced before
-// it.
+// it. Expired says the frame outwaited SetMaxAge: its payload is no message, and it
+// comes back so the caller can settle what the frame was charged (the adapter's
+// noiseStream.settleExpired), since an acknowledged frame the window dropped without
+// a word would hold its sender's credit for good.
 type RecvDelivery struct {
 	Payload []byte
 	Marked  bool
 	End     bool
+	Expired bool
 }
 
 // Insert records a received frame. Returns the list of in-order payloads
@@ -128,7 +137,7 @@ func (w *RecvWindow) InsertChecked(seqNo uint32, payload []byte) (delivered [][]
 // InsertMarked is InsertChecked for a caller that carries one bit per frame
 // through the reorder buffer: each delivered payload comes back with the mark
 // its own frame was inserted under. A re-insert of a still-buffered frame takes
-// the latest mark; a frame dropped for age drops its mark with it.
+// the latest mark, and an Expired delivery (SetMaxAge) keeps its own.
 func (w *RecvWindow) InsertMarked(seqNo uint32, payload []byte, mark bool) (delivered []RecvDelivery, accepted bool) {
 	return w.insert(seqNo, payload, mark, false)
 }
@@ -158,8 +167,8 @@ func (w *RecvWindow) insert(seqNo uint32, payload []byte, mark, end bool) (deliv
 		delivered := []RecvDelivery{{Payload: copyPayload(payload), Marked: mark, End: end}}
 		w.expected++
 
-		// Flush buffered successors, skipping expired frames.
-		// For each flushed buffered frame, record the time it spent
+		// Flush buffered successors, an expired frame among them returning as
+		// Expired. For each one delivered as a message, record the time it spent
 		// head-of-line blocked (bufferArrivalTime → now) into holHist.
 		// Frames that arrive in order and are delivered immediately have
 		// zero HOL-block time and are not recorded — the histogram represents
@@ -170,16 +179,19 @@ func (w *RecvWindow) insert(seqNo uint32, payload []byte, mark, end bool) (deliv
 			if !ok {
 				break
 			}
-			// MaxAge check: drop frames that sat in the buffer too long
-			if w.maxAge > 0 {
+			// A frame past SetMaxAge goes back to the caller Expired. The stream's
+			// CLOSE stays: acknowledged like any frame, it would never come again,
+			// and the receive side would stay open until the stream GC.
+			if w.maxAge > 0 && !w.ends[w.expected] {
 				if arrived, hasTime := w.bufTime[w.expected]; hasTime && now.Sub(arrived) > w.maxAge {
+					delivered = append(delivered, RecvDelivery{Payload: p, Marked: w.marked[w.expected], Expired: true})
+					atomic.AddUint64(&w.expiredCount, 1)
 					w.bufferedBytes -= int64(len(p))
 					delete(w.buffer, w.expected)
 					delete(w.bufTime, w.expected)
 					delete(w.marked, w.expected)
-					delete(w.ends, w.expected)
 					w.expected++
-					continue // skip expired frame
+					continue
 				}
 			}
 			// HOL-block measurement: time from buffer arrival to delivery.
@@ -243,14 +255,17 @@ func (w *RecvWindow) insert(seqNo uint32, payload []byte, mark, end bool) (deliv
 	return nil, true
 }
 
-// payloadsOf strips the marks off deliveries for the unmarked entry points.
+// payloadsOf strips the marks off deliveries for the unmarked entry points, which
+// read only payloads: an Expired delivery is no message, and ExpiredCount counts it.
 func payloadsOf(d []RecvDelivery) [][]byte {
 	if d == nil {
 		return nil
 	}
-	out := make([][]byte, len(d))
+	out := make([][]byte, 0, len(d))
 	for i := range d {
-		out[i] = d[i].Payload
+		if !d[i].Expired {
+			out = append(out, d[i].Payload)
+		}
 	}
 	return out
 }
@@ -260,6 +275,12 @@ func payloadsOf(d []RecvDelivery) [][]byte {
 // monotonic; safe to call from any goroutine.
 func (w *RecvWindow) DropsCount() uint64 {
 	return atomic.LoadUint64(&w.dropCount)
+}
+
+// ExpiredCount returns the number of frames this window has returned Expired
+// (SetMaxAge). Always monotonic; safe to call from any goroutine.
+func (w *RecvWindow) ExpiredCount() uint64 {
+	return atomic.LoadUint64(&w.expiredCount)
 }
 
 // ExpectedSeqNo returns the next expected sequence number (cumulative ACK point).
@@ -459,6 +480,7 @@ func (w *RecvWindow) DrainMarked() []RecvDelivery {
 	w.buffer = make(map[uint32][]byte)
 	w.bufTime = make(map[uint32]time.Time)
 	w.marked = make(map[uint32]bool)
+	w.ends = make(map[uint32]bool)
 	w.bufferedBytes = 0
 
 	return delivered

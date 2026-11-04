@@ -47,7 +47,23 @@ type QUICSession struct {
 	// AcceptStream and AcceptStreamByID delegate to it.
 	acceptor *aether.StreamAcceptor
 	mu       sync.Mutex
+
+	// wireExchange is the preface exchange (exchangeWireVersions): OpenStream waits
+	// on it, and acceptLoop reads no stream header before it, since a peer of another
+	// frame grammar lays the OPEN payload in a header out differently. wireOffer is
+	// what this side offers, and wireOfferErr that offer's refusal. Both are set in
+	// NewQuicSession before any goroutine starts and never change.
+	wireExchange
+	wireOffer      aether.WireVersions
+	wireOfferErr   error
+	prefaceTimeout time.Duration
 }
+
+// quicWireRefusalCode is the QUIC application error a session closes with when its
+// preface exchange refuses the peer. Closing the connection can overtake this side's
+// preface, so a peer whose own exchange then fails reads this code as the refusal
+// (exchangeWireVersions).
+const quicWireRefusalCode quic.ApplicationErrorCode = 0x57
 
 // quicStream wraps a native QUIC bidirectional stream as an Aether Stream.
 type quicStream struct {
@@ -62,15 +78,21 @@ type quicStream struct {
 	rx         quicFrameRead // the frame Receive is partway through; see Receive
 }
 
-// NewQuicSession creates an Aether session over a QUIC connection.
-func NewQuicSession(conn quic.Connection, localNodeID, remoteNodeID aether.NodeID) *QUICSession {
+// NewQuicSession creates an Aether session over a QUIC connection and starts the
+// wire version exchange. app is what an application adds to aether's own entries in
+// the set it offers (aether.LocalWireVersions).
+func NewQuicSession(conn quic.Connection, localNodeID, remoteNodeID aether.NodeID, app ...aether.WireVersion) *QUICSession {
 	base := aether.NewBaseSession(localNodeID, remoteNodeID, aether.ProtoQUIC)
 	base.SetHealthMonitor(health.NewMonitor(0.2))
 	s := &QUICSession{
 		BaseSession: base,
 		conn:        conn,
 		streams:     make(map[uint64]*quicStream),
+
+		wireExchange:   newWireExchange(),
+		prefaceTimeout: wireVersionsPrefaceTimeout,
 	}
+	s.wireOffer, s.wireOfferErr = aether.LocalWireVersions(app)
 	// Per-StreamID accept dispatch + AcceptStream FIFO — shared
 	// implementation in the root aether package. BlockUntilClose: when the
 	// FIFO fills up the accept loop (acceptLoop) blocks until a consumer
@@ -82,12 +104,111 @@ func NewQuicSession(conn quic.Connection, localNodeID, remoteNodeID aether.NodeI
 		Closed:    base.CloseSignal(),
 		ErrClosed: aether.ErrSessionClosed,
 	})
+	s.wireTimer = time.AfterFunc(s.prefaceTimeout, func() {
+		if s.finishWireVersions(aether.NegotiatedWireVersions{}, errWireVersionsPrefaceTimeout) {
+			s.closeRefused(errWireVersionsPrefaceTimeout)
+		}
+	})
+	go s.exchangeWireVersions()
 	go s.acceptLoop()
 	return s
 }
 
-// acceptLoop accepts incoming QUIC streams and wraps them as Aether streams.
+// exchangeWireVersions runs the preface exchange: each side opens one unidirectional
+// QUIC stream, writes its preface on it and closes it, and reads the peer's from the
+// one it accepts. Aether's streams are bidirectional, so the unidirectional stream
+// cannot be mistaken for one, and neither side waits for the other to write first.
+// The peer's read needs the write to have finished, so a refusal waits for it before
+// the close, as far as the connection lets it: a peer whose read loses to that close
+// reads quicWireRefusalCode as the same refusal.
+func (s *QUICSession) exchangeWireVersions() {
+	if s.wireOfferErr != nil {
+		s.refuseWire(s.wireOfferErr)
+		return
+	}
+	written := make(chan error, 1)
+	go func() { written <- s.writePreface() }()
+	chosen, err := s.readPreface()
+	if err != nil {
+		select {
+		case <-written:
+		case <-s.CloseSignal():
+		case <-time.After(s.prefaceTimeout):
+		}
+		s.refuseWire(err)
+		return
+	}
+	s.finishWireVersions(chosen, nil)
+}
+
+func (s *QUICSession) writePreface() error {
+	st, err := s.conn.OpenUniStreamSync(s.conn.Context())
+	if err != nil {
+		return err
+	}
+	if err := aether.WriteWireVersionsPreface(st, s.wireOffer); err != nil {
+		return err
+	}
+	return st.Close()
+}
+
+// readPreface reads the peer's preface and makes the choice from the two offers. A
+// connection the peer closed with quicWireRefusalCode is the peer's refusal, which
+// names the same mismatch this side would have found.
+func (s *QUICSession) readPreface() (aether.NegotiatedWireVersions, error) {
+	rs, err := s.conn.AcceptUniStream(s.conn.Context())
+	var peer aether.WireVersions
+	if err == nil {
+		peer, err = aether.ReadWireVersionsPreface(rs)
+	}
+	if err != nil {
+		var refused *quic.ApplicationError
+		if errors.As(err, &refused) && refused.Remote && refused.ErrorCode == quicWireRefusalCode {
+			return aether.NegotiatedWireVersions{}, fmt.Errorf("%w: refused by the peer: %s", aether.ErrWireVersionMismatch, refused.ErrorMessage)
+		}
+		return aether.NegotiatedWireVersions{}, fmt.Errorf("wire versions preface: %w", err)
+	}
+	return aether.ChooseWireVersions(s.wireOffer, peer)
+}
+
+// refuseWire ends the exchange with err and closes the session, if nothing has ended
+// the exchange first.
+func (s *QUICSession) refuseWire(err error) {
+	if s.finishWireVersions(aether.NegotiatedWireVersions{}, err) {
+		s.closeRefused(err)
+	}
+}
+
+// closeRefused closes a session whose preface exchange refused its peer, recording
+// err as the close reason and sending it as the connection's error.
+func (s *QUICSession) closeRefused(err error) {
+	if !s.SignalClose() {
+		return
+	}
+	s.SetCloseErr(err)
+	if s.acceptor != nil {
+		_ = s.acceptor.Close()
+	}
+	_ = s.conn.CloseWithError(quicWireRefusalCode, err.Error())
+}
+
+// WireVersions returns the set the preface exchange chose (wireExchange.chosenWire).
+func (s *QUICSession) WireVersions() aether.NegotiatedWireVersions {
+	return s.chosenWire(s.CloseSignal())
+}
+
+// acceptLoop accepts incoming QUIC streams and wraps them as Aether streams, once
+// the preface exchange has chosen a set: a session that refused its peer holds no
+// stream state.
 func (s *QUICSession) acceptLoop() {
+	select {
+	case <-s.wireDone:
+	case <-s.CloseSignal():
+		return
+	}
+	if r := s.wireResult.Load(); r.err != nil {
+		return
+	}
 	for {
 		qs, err := s.conn.AcceptStream(context.Background())
 		if err != nil {
@@ -96,10 +217,7 @@ func (s *QUICSession) acceptLoop() {
 
 		// Read stream header: [StreamID:8][OpenPayload:OpenPayloadSize].
 		// The payload's InitialCredit is not read: QUIC owns the stream's
-		// flow control.
-		// TODO: QUICSession exchanges no wire version preface, so a peer
-		// whose frame grammar lays out OpenPayload differently misreads this
-		// header; it needs the preface TCPSession writes and reads.
+		// flow control. The preface exchange has fixed the grammar this layout is.
 		var hdr [8 + aether.OpenPayloadSize]byte
 		if _, err := io.ReadFull(qs, hdr[:]); err != nil {
 			qs.CancelRead(0)
@@ -155,15 +273,44 @@ func (s *QUICSession) acceptLoop() {
 // Session interface
 // ────────────────────────────────────────────────────────────────────────────
 
+// OpenStream opens a stream under cfg.StreamID, or refuses with
+// aether.ErrDuplicateStreamID, before anything reaches the wire, when a stream
+// holds that ID: the peer's acceptLoop would refuse the second one, and the stream
+// in place keeps its map entry.
 func (s *QUICSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (aether.Stream, error) {
 	select {
 	case <-s.CloseSignal():
+		if err := s.wireRefusal(); err != nil {
+			return nil, err
+		}
 		return nil, fmt.Errorf("session closed")
 	default:
 	}
+	// No stream exists before the wire versions are chosen: a refused peer returns
+	// the refusal here and the session holds nothing to tear down.
+	if err := s.awaitWire(ctx, s.CloseSignal()); err != nil {
+		return nil, err
+	}
+
+	st := &quicStream{
+		streamID: cfg.StreamID,
+		config:   cfg,
+		state:    aether.NewStreamStateMachine(),
+		session:  s,
+	}
+	// The map entry holds the ID across the two blocking calls below; only the
+	// duplicate check and Metrics read an entry, so it needs no QUIC stream yet.
+	s.mu.Lock()
+	if _, dup := s.streams[cfg.StreamID]; dup {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("OpenStream stream=%d: %w", cfg.StreamID, aether.ErrDuplicateStreamID)
+	}
+	s.streams[cfg.StreamID] = st
+	s.mu.Unlock()
 
 	qs, err := s.conn.OpenStreamSync(ctx)
 	if err != nil {
+		st.dropStream()
 		return nil, fmt.Errorf("quic open stream: %w", err)
 	}
 
@@ -178,34 +325,14 @@ func (s *QUICSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (
 		Dependency:  cfg.Dependency,
 	}))
 	if _, err := qs.Write(hdr[:]); err != nil {
+		qs.CancelRead(0)
+		qs.CancelWrite(0)
+		st.dropStream()
 		return nil, fmt.Errorf("write stream header: %w", err)
 	}
 
-	st := &quicStream{
-		streamID:   cfg.StreamID,
-		quicStream: qs,
-		config:     cfg,
-		state:      aether.NewStreamStateMachine(),
-		session:    s,
-	}
+	st.quicStream = qs
 	st.state.Transition(aether.EventSendOpen)
-
-	s.mu.Lock()
-	if existing, dup := s.streams[cfg.StreamID]; dup {
-		s.mu.Unlock()
-		// Reject a duplicate local StreamID instead of overwriting, as
-		// acceptLoop does: recycling an ID before the prior stream closed
-		// would orphan the old quic.Stream (never CancelRead/Write'd) and let
-		// a later dropStream on the stale entry evict the survivor. Cancel the
-		// just-created QUIC stream we won't be tracking.
-		_ = existing
-		qs.CancelRead(0)
-		qs.CancelWrite(0)
-		return nil, fmt.Errorf("quic: stream %d already open", cfg.StreamID)
-	}
-	s.streams[cfg.StreamID] = st
-	s.mu.Unlock()
-
 	return st, nil
 }
 
@@ -214,7 +341,13 @@ func (s *QUICSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (
 // stream_acceptor.go for the underlying drain order (waiter → backlog
 // → FIFO).
 func (s *QUICSession) AcceptStream(ctx context.Context) (aether.Stream, error) {
-	return s.acceptor.Accept(ctx)
+	st, err := s.acceptor.Accept(ctx)
+	if err != nil {
+		if werr := s.wireRefusal(); werr != nil {
+			return nil, werr
+		}
+	}
+	return st, err
 }
 
 // AcceptStreamByID delegates to the shared aether.StreamAcceptor. See
@@ -223,7 +356,13 @@ func (s *QUICSession) AcceptStream(ctx context.Context) (aether.Stream, error) {
 // root aether package so all three transport adapters share one
 // implementation.
 func (s *QUICSession) AcceptStreamByID(ctx context.Context, streamID uint64) (aether.Stream, error) {
-	return s.acceptor.AcceptByID(ctx, streamID)
+	st, err := s.acceptor.AcceptByID(ctx, streamID)
+	if err != nil {
+		if werr := s.wireRefusal(); werr != nil {
+			return nil, werr
+		}
+	}
+	return st, err
 }
 
 // Ping reports session liveness for keepalive. QUIC has its own
@@ -254,6 +393,9 @@ func (s *QUICSession) Close() error {
 	if !s.SignalClose() {
 		return nil
 	}
+	// A close before the preface exchange ended ends it, releasing every waiter
+	// and stopping the deadline timer.
+	s.finishWireVersions(aether.NegotiatedWireVersions{}, aether.ErrSessionClosed)
 	// Release ByID waiters and drain the backlog; blocked
 	// AcceptStreamByID callers return ErrSessionClosed. Drained
 	// backlog streams are not Reset here because QUIC stream
@@ -447,9 +589,10 @@ func (f *quicFrameRead) fill(r io.Reader, buf []byte) error {
 	return nil
 }
 
-// dropStream evicts st from the session's stream map. Idempotent — a
-// delete of an absent key is a no-op, so every quicStream termination
-// path (Close, Reset, Receive EOF/error) can call it safely. The QUIC
+// dropStream evicts st from the session's stream map. Idempotent — only an
+// entry that is st itself goes, so every quicStream termination path (Close,
+// Reset, Receive EOF/error) can call it safely, however late, without touching a
+// later stream that holds the ID. The QUIC
 // streams map is otherwise write-only (its sole reader is Metrics for
 // the ActiveStreams count), so without this eviction it grows by one
 // pinned *quicStream — and the quic.Stream handle each retains — for
@@ -457,7 +600,9 @@ func (f *quicFrameRead) fill(r io.Reader, buf []byte) error {
 // leak. Mirrors the tcp/noise adapters' teardown discipline.
 func (st *quicStream) dropStream() {
 	st.session.mu.Lock()
-	delete(st.session.streams, st.streamID)
+	if cur, ok := st.session.streams[st.streamID]; ok && cur == st {
+		delete(st.session.streams, st.streamID)
+	}
 	st.session.mu.Unlock()
 }
 

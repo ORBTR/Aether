@@ -92,18 +92,28 @@ func (c *aep06Conn) AcceptStream(context.Context) (quic.Stream, error) {
 	return nil, io.EOF
 }
 
-func (c *aep06Conn) AcceptUniStream(context.Context) (quic.ReceiveStream, error) { return nil, io.EOF }
-func (c *aep06Conn) OpenStream() (quic.Stream, error)                            { return nil, io.EOF }
-func (c *aep06Conn) OpenStreamSync(context.Context) (quic.Stream, error)         { return nil, io.EOF }
-func (c *aep06Conn) OpenUniStream() (quic.SendStream, error)                     { return nil, io.EOF }
-func (c *aep06Conn) OpenUniStreamSync(context.Context) (quic.SendStream, error)  { return nil, io.EOF }
-func (c *aep06Conn) LocalAddr() net.Addr                                         { return nil }
-func (c *aep06Conn) RemoteAddr() net.Addr                                        { return nil }
-func (c *aep06Conn) CloseWithError(quic.ApplicationErrorCode, string) error      { return nil }
-func (c *aep06Conn) Context() context.Context                                    { return context.Background() }
-func (c *aep06Conn) ConnectionState() quic.ConnectionState                       { return quic.ConnectionState{} }
-func (c *aep06Conn) SendDatagram([]byte) error                                   { return nil }
-func (c *aep06Conn) ReceiveDatagram(context.Context) ([]byte, error)             { return nil, io.EOF }
+// AcceptUniStream hands the session the peer's wire version preface, the first thing
+// QUICSession reads, so acceptLoop goes on to the fake streams.
+func (c *aep06Conn) AcceptUniStream(context.Context) (quic.ReceiveStream, error) {
+	var preface bytes.Buffer
+	if err := aether.WriteWireVersionsPreface(&preface, aether.AetherWireVersions()); err != nil {
+		return nil, err
+	}
+	return &aep06Stream{readBuf: bytes.NewReader(preface.Bytes())}, nil
+}
+func (c *aep06Conn) OpenStream() (quic.Stream, error)                    { return nil, io.EOF }
+func (c *aep06Conn) OpenStreamSync(context.Context) (quic.Stream, error) { return nil, io.EOF }
+func (c *aep06Conn) OpenUniStream() (quic.SendStream, error)             { return nil, io.EOF }
+func (c *aep06Conn) OpenUniStreamSync(context.Context) (quic.SendStream, error) {
+	return &aep06Stream{readBuf: bytes.NewReader(nil)}, nil
+}
+func (c *aep06Conn) LocalAddr() net.Addr                                    { return nil }
+func (c *aep06Conn) RemoteAddr() net.Addr                                   { return nil }
+func (c *aep06Conn) CloseWithError(quic.ApplicationErrorCode, string) error { return nil }
+func (c *aep06Conn) Context() context.Context                               { return context.Background() }
+func (c *aep06Conn) ConnectionState() quic.ConnectionState                  { return quic.ConnectionState{} }
+func (c *aep06Conn) SendDatagram([]byte) error                              { return nil }
+func (c *aep06Conn) ReceiveDatagram(context.Context) ([]byte, error)        { return nil, io.EOF }
 
 var _ quic.Connection = (*aep06Conn)(nil)
 

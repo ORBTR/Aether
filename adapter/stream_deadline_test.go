@@ -55,6 +55,16 @@ const quicLoopbackDials = 4
 // server reads.
 func quicLoopback(t *testing.T) (client, server *QUICSession) {
 	t.Helper()
+	cc, sc := quicLoopbackConns(t)
+	client = NewQuicSession(cc, aether.NodeID("quic-client"), aether.NodeID("quic-server"))
+	server = NewQuicSession(sc, aether.NodeID("quic-server"), aether.NodeID("quic-client"))
+	return client, server
+}
+
+// quicLoopbackConns returns both ends of one real loopback QUIC connection, for a
+// test that builds its own QUICSession on either end.
+func quicLoopbackConns(t *testing.T) (cc, sc quic.Connection) {
+	t.Helper()
 	_, key, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("key: %v", err)
@@ -73,7 +83,6 @@ func quicLoopback(t *testing.T) (client, server *QUICSession) {
 		NextProtos:         []string{"aether-deadline-test"},
 		InsecureSkipVerify: true,
 	}
-	var cc, sc quic.Connection
 	for try := 1; ; try++ {
 		if cc, sc, err = quicLoopbackPair(t, tlsConf); err == nil {
 			break
@@ -83,13 +92,11 @@ func quicLoopback(t *testing.T) (client, server *QUICSession) {
 		}
 		t.Logf("loopback QUIC try %d: %v", try, err)
 	}
-	client = NewQuicSession(cc, aether.NodeID("quic-client"), aether.NodeID("quic-server"))
-	server = NewQuicSession(sc, aether.NodeID("quic-server"), aether.NodeID("quic-client"))
 	t.Cleanup(func() {
 		_ = cc.CloseWithError(0, "")
 		_ = sc.CloseWithError(0, "")
 	})
-	return client, server
+	return cc, sc
 }
 
 // quicLoopbackPair listens on a fresh loopback port, dials it once and

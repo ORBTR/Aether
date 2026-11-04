@@ -838,6 +838,7 @@ func (s *NoiseSession) reliabilityTick() {
 				s.lastAutoTune = now
 				s.autoTuneWindows()
 				s.sweepEndedQueues(now)
+				s.sweepRecentlyLeft(now)
 				s.sweepResetGrants(now)
 			}
 

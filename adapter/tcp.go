@@ -64,9 +64,8 @@ type TCPSession struct {
 	// per-ID backlog, and the FIFO that AcceptStream drains. Shared
 	// transport-agnostic implementation in the root aether package, so
 	// the Noise, TCP, and QUIC adapters do not each carry their own
-	// channel + push-mode shim. handleOpen / handleImplicitOpen call
-	// acceptor.Notify; AcceptStream and AcceptStreamByID delegate to
-	// it.
+	// channel + push-mode shim. handleOpen calls acceptor.Notify;
+	// AcceptStream and AcceptStreamByID delegate to it.
 	acceptor *aether.StreamAcceptor
 
 	writeMu sync.Mutex
@@ -110,20 +109,12 @@ type TCPSession struct {
 	wireOffer    aether.WireVersions
 	wireOfferErr error
 
-	// wireDone closes when the preface exchange ends: the peer's preface was
-	// read and the choice made, or the exchange failed or the session closed
-	// first. wireResult then holds the chosen set or the reason. OpenStream
-	// waits on it and readLoop decodes no frame before it, which is what puts
-	// the refusal of a mismatched peer ahead of every stream.
-	// prefaceWritten closes once this side's preface write has returned, so
-	// a refusing readLoop can let its preface reach the peer before the conn
-	// closes and the peer reaches the same refusal. wireTimer ends an
-	// exchange the peer leaves unanswered.
-	wireDone       chan struct{}
-	wireOnce       sync.Once
-	wireResult     atomic.Pointer[tcpWireResult]
+	// wireExchange is the preface exchange: OpenStream waits on it, and readLoop
+	// decodes no frame before it. prefaceWritten closes once this side's preface
+	// write has returned, so a refusing readLoop can let its preface reach the peer
+	// before the conn closes and the peer reaches the same refusal.
+	wireExchange
 	prefaceWritten chan struct{}
-	wireTimer      *time.Timer
 	prefaceTimeout time.Duration
 
 	// fragRecv is what a fragment this session receives must match. A
@@ -134,24 +125,6 @@ type TCPSession struct {
 	// frame; only readLoop reads it.
 	fragRecv *FragmentReceiver
 }
-
-// tcpWireResult is the outcome of a TCPSession's preface exchange: the set
-// both offers chose, or the reason there is none.
-type tcpWireResult struct {
-	chosen aether.NegotiatedWireVersions
-	err    error
-}
-
-// wireVersionsPrefaceTimeout bounds a TCPSession's preface exchange: a peer
-// whose preface has not arrived by then has the session closed with
-// errWireVersionsPrefaceTimeout. NewTCPSession copies it into the session
-// (prefaceTimeout), so a test can shorten it for the sessions it builds
-// without racing sessions already running.
-var wireVersionsPrefaceTimeout = 10 * time.Second
-
-// errWireVersionsPrefaceTimeout is the close reason of a session whose peer
-// sent no complete preface within wireVersionsPrefaceTimeout.
-var errWireVersionsPrefaceTimeout = fmt.Errorf("%w: peer sent no preface within the deadline", aether.ErrHandshakeFailed)
 
 // tcpStream is a single Aether stream multiplexed over a TCP connection.
 type tcpStream struct {
@@ -169,8 +142,7 @@ type tcpStream struct {
 	// sender holds no aether credit that would stop it first. A queue is never
 	// closed: its end is recvDone, which closeRecvOnce closes exactly once
 	// (recvOnce) and Receive selects on, taking what recvQ still holds before
-	// it returns the stream's end. handleOpen, handleImplicitOpen and OpenStream
-	// build both.
+	// it returns the stream's end. handleOpen and OpenStream build both.
 	recvQ    *recvQueue
 	recvDone chan struct{}
 	// endErr is the reason the stream ended, when it is not an ordinary end:
@@ -375,7 +347,7 @@ func NewTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 		rxCompressor:  aether.NewCompressor(), // decode-side state
 		tickStop:      make(chan struct{}),
 
-		wireDone:       make(chan struct{}),
+		wireExchange:   newWireExchange(),
 		prefaceWritten: make(chan struct{}),
 		prefaceTimeout: wireVersionsPrefaceTimeout,
 	}
@@ -396,7 +368,7 @@ func NewTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 	// Per-StreamID accept dispatch + AcceptStream FIFO — shared
 	// implementation in the root aether package. NonBlockingDrop: when the
 	// FIFO is full the OPEN-frame handler drops the stream rather than hold
-	// the readLoop, which runs handleOpen and handleImplicitOpen.
+	// the readLoop, which runs handleOpen.
 	s.acceptor = aether.NewStreamAcceptor(aether.StreamAcceptorConfig{
 		Mode:      aether.NonBlockingDrop,
 		Closed:    base.CloseSignal(),
@@ -508,65 +480,15 @@ func (s *TCPSession) readPreface() error {
 	return nil
 }
 
-// finishWireVersions records the outcome of the preface exchange once and
-// releases everything waiting on wireDone. It reports whether this call was
-// the one that ended the exchange.
-func (s *TCPSession) finishWireVersions(chosen aether.NegotiatedWireVersions, err error) bool {
-	first := false
-	s.wireOnce.Do(func() {
-		first = true
-		s.wireResult.Store(&tcpWireResult{chosen: chosen, err: err})
-		if s.wireTimer != nil {
-			s.wireTimer.Stop()
-		}
-		close(s.wireDone)
-	})
-	return first
-}
-
-// awaitWireVersions blocks until the preface exchange has ended, returning
-// its refusal, the caller's context error, or ErrSessionClosed. OpenStream
-// calls it before creating any stream state.
+// awaitWireVersions blocks until the preface exchange has ended (wireExchange).
+// OpenStream calls it before creating any stream state.
 func (s *TCPSession) awaitWireVersions(ctx context.Context) error {
-	select {
-	case <-s.wireDone:
-	case <-s.CloseSignal():
-		if err := s.wireRefusal(); err != nil {
-			return err
-		}
-		return aether.ErrSessionClosed
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-	if r := s.wireResult.Load(); r.err != nil {
-		return r.err
-	}
-	return nil
+	return s.awaitWire(ctx, s.CloseSignal())
 }
 
-// wireRefusal returns why the preface exchange produced no set, or nil when
-// it chose one or the session was simply closed. AcceptStream and
-// AcceptStreamByID return it in place of the acceptor's ErrSessionClosed so
-// a caller sees the mismatch that closed the session.
-func (s *TCPSession) wireRefusal() error {
-	if r := s.wireResult.Load(); r != nil && r.err != nil && r.err != aether.ErrSessionClosed {
-		return r.err
-	}
-	return nil
-}
-
-// WireVersions returns the set the preface exchange chose. It waits for the
-// exchange to end, which wireVersionsPrefaceTimeout bounds, and returns the
-// empty set for a session that refused its peer or closed first.
+// WireVersions returns the set the preface exchange chose (wireExchange.chosenWire).
 func (s *TCPSession) WireVersions() aether.NegotiatedWireVersions {
-	select {
-	case <-s.wireDone:
-	case <-s.CloseSignal():
-	}
-	if r := s.wireResult.Load(); r != nil {
-		return r.chosen
-	}
-	return aether.NegotiatedWireVersions{}
+	return s.chosenWire(s.CloseSignal())
 }
 
 // readLoop reads Aether frames from the TCP connection and dispatches to streams.
@@ -690,12 +612,14 @@ func (s *TCPSession) deliverToStream(frame *aether.Frame) {
 		ok = false
 	}
 	s.mu.Unlock()
+	// A SYN frame opens its stream and carries no message (aether.FlagSYN): its
+	// payload is the OPEN payload, which handleOpen reads, and a live stream stays
+	// as it is, so those bytes never reach its consumer as a message.
+	if frame.Flags.Has(aether.FlagSYN) {
+		s.handleOpen(frame)
+		return
+	}
 	if !ok {
-		// Implicit open via SYN flag in DATA
-		if frame.Flags.Has(aether.FlagSYN) {
-			s.handleImplicitOpen(frame)
-			return
-		}
 		dbgTCP.Printf("deliverToStream: no stream for ID=%d, dropping %d bytes", frame.StreamID, frame.Length)
 		return // unknown stream, drop
 	}
@@ -762,16 +686,7 @@ func (s *TCPSession) registerStream(st *tcpStream, enforceRemoteCap bool) *tcpSt
 			atomic.AddUint64(&s.streamRefused, 1)
 			s.reportAbuse(abuse.ReasonStreamRefused)
 			if enforceRemoteCap {
-				payload := aether.EncodeReset(aether.ResetRefused)
-				reset := &aether.Frame{
-					SenderID:   s.LocalPeerID(),
-					ReceiverID: s.RemotePeerID(),
-					StreamID:   st.streamID,
-					Type:       aether.TypeRESET,
-					Length:     uint32(len(payload)),
-					Payload:    payload,
-				}
-				s.writeFrame(reset)
+				s.sendRefused(st.streamID)
 			}
 			return nil
 		}
@@ -784,6 +699,20 @@ func (s *TCPSession) registerStream(st *tcpStream, enforceRemoteCap bool) *tcpSt
 		s.streamGC.Register(st.streamID)
 	}
 	return st
+}
+
+// sendRefused answers a stream the peer opened and this side will not admit, with
+// RESET(ResetRefused), which the peer's handleReset reads as aether.ErrStreamRefused.
+func (s *TCPSession) sendRefused(streamID uint64) {
+	payload := aether.EncodeReset(aether.ResetRefused)
+	s.writeFrame(&aether.Frame{
+		SenderID:   s.LocalPeerID(),
+		ReceiverID: s.RemotePeerID(),
+		StreamID:   streamID,
+		Type:       aether.TypeRESET,
+		Length:     uint32(len(payload)),
+		Payload:    payload,
+	})
 }
 
 // unregisterStream undoes registerStream — removes the stream from the
@@ -803,8 +732,25 @@ func (s *TCPSession) StreamRefusedCount() uint64 {
 	return atomic.LoadUint64(&s.streamRefused)
 }
 
+// handleOpen admits a stream the peer opened, by an OPEN frame or a DATA frame
+// flagged aether.FlagSYN (deliverToStream), which is how OpenStream writes it. A
+// payload that is not an OPEN payload is refused with RESET(ResetRefused) and an
+// abuse charge and keeps no state: the peer has written bytes this side cannot read
+// as what the frame says they are. A duplicate leaves the stream in place as it is.
 func (s *TCPSession) handleOpen(frame *aether.Frame) {
 	dbgTCP.Printf("handleOpen: stream=%d", frame.StreamID)
+	s.mu.Lock()
+	_, live := s.streams[frame.StreamID]
+	s.mu.Unlock()
+	if live {
+		return
+	}
+	if len(frame.Payload) != aether.OpenPayloadSize {
+		atomic.AddUint64(&s.streamRefused, 1)
+		s.reportAbuse(abuse.ReasonStreamRefused)
+		s.sendRefused(frame.StreamID)
+		return
+	}
 	// The payload's InitialCredit is not read: on a byte-stream session the
 	// transport owns flow control, and the stream keeps no aether credit.
 	payload := aether.DecodeOpenPayload(frame.Payload)
@@ -828,10 +774,10 @@ func (s *TCPSession) handleOpen(frame *aether.Frame) {
 		dbgTCP.Printf("handleOpen: refused stream=%d (cap reached)", frame.StreamID)
 		return
 	}
-	// registerStream returns the pre-existing stream on duplicate OPEN;
-	// only advance state + notify acceptor when we actually inserted.
-	// Duplicate OPENs short-circuit here so the same stream is never
-	// delivered twice to a waiter / acceptCh.
+	// registerStream returns the pre-existing stream when a local OpenStream of the
+	// ID took it after the check above; only advance state + notify acceptor when
+	// we actually inserted, so the same stream is never delivered twice to a waiter
+	// / acceptCh.
 	if st != candidate {
 		return
 	}
@@ -845,58 +791,9 @@ func (s *TCPSession) handleOpen(frame *aether.Frame) {
 // notifyStreamAccepted hands a freshly-accepted stream to the shared
 // StreamAcceptor. The acceptor picks between a pinned ByID waiter, a
 // per-ID backlog slot, or the internal FIFO that AcceptStream drains.
-// Called by handleOpen and handleImplicitOpen — the two paths that
-// produce a remotely-initiated stream.
+// Called by handleOpen, the path that produces a remotely-initiated stream.
 func (s *TCPSession) notifyStreamAccepted(st *tcpStream) {
 	s.acceptor.Notify(st)
-}
-
-func (s *TCPSession) handleImplicitOpen(frame *aether.Frame) {
-	// Decode the OPEN payload from the SYN-flagged DATA frame for proper stream config.
-	// Falls back to defaults if the payload is missing or malformed.
-	var cfg aether.StreamConfig
-	if len(frame.Payload) > 0 {
-		payload := aether.DecodeOpenPayload(frame.Payload)
-		cfg = aether.StreamConfig{
-			StreamID:    frame.StreamID,
-			Reliability: payload.Reliability,
-			Priority:    payload.Priority,
-			Dependency:  payload.Dependency,
-		}
-	} else {
-		cfg = aether.DefaultStreamConfig(frame.StreamID)
-	}
-
-	candidate := &tcpStream{
-		streamID: frame.StreamID,
-		config:   cfg,
-		session:  s,
-		state:    aether.NewStreamStateMachine(),
-		recvQ:    newRecvQueue(nil, nil),
-		recvDone: make(chan struct{}),
-		fragBuf:  NewFragmentBuffer(),
-		observe:  reliability.NewObserveEngine(),
-	}
-	st := s.registerStream(candidate, true /* enforceRemoteCap */)
-	if st == nil {
-		dbgTCP.Printf("handleImplicitOpen: refused stream=%d (cap reached)", frame.StreamID)
-		return
-	}
-	if st != candidate {
-		return
-	}
-	st.state.Transition(aether.EventRecvData)
-
-	// Propagate cfg.LatencyClass — parity with the noise adapter so a
-	// caller's explicit class isn't silently dropped to ClassBULK.
-	// ClassUnset (zero value) → DefaultLatencyClass(streamID).
-	classAccepted := cfg.LatencyClass
-	if classAccepted == aether.ClassUnset {
-		classAccepted = aether.DefaultLatencyClass(frame.StreamID)
-	}
-	s.sched.RegisterWithClass(frame.StreamID, cfg.Priority, cfg.Dependency, classAccepted)
-
-	s.notifyStreamAccepted(st)
 }
 
 // handleClose ends the stream's receive side at the peer's CLOSE: the messages
@@ -1307,12 +1204,11 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 	}
 	s.sched.RegisterWithClass(cfg.StreamID, cfg.Priority, cfg.Dependency, classOpen)
 
-	// Implicit OPEN via SYN flag — saves 50 bytes by combining OPEN with first DATA frame.
-	// The OPEN payload (reliability, priority, dependency) rides as the DATA frame's payload.
-	// The remote's handleImplicitOpen decodes it to configure the stream properly.
-	// Its InitialCredit is zero, the value that states no aether stream credit:
-	// on a byte-stream session the transport owns flow control, and neither
-	// handleOpen nor handleImplicitOpen reads the field.
+	// The stream opens with a DATA frame flagged aether.FlagSYN, whose payload is
+	// the OPEN payload (reliability, priority, dependency); the peer's handleOpen
+	// decodes it to configure the stream. Its InitialCredit is zero, the value that
+	// states no aether stream credit: on a byte-stream session the transport owns
+	// flow control, and handleOpen does not read the field.
 	openPayload := aether.EncodeOpenPayload(aether.OpenPayload{
 		Reliability: cfg.Reliability,
 		Priority:    cfg.Priority,

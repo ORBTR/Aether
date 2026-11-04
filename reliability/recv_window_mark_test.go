@@ -56,20 +56,51 @@ func TestRecvWindowMarkTravelsWithItsFrame(t *testing.T) {
 	}
 }
 
-// TestRecvWindowMarkExpiresWithItsFrame: a frame the reorder buffer drops for
-// age takes its mark with it, so the next frame delivered under that sequence
-// number is not reported marked.
+// TestRecvWindowMarkExpiresWithItsFrame: a frame that outwaits SetMaxAge comes
+// back Expired with its mark and its payload, so the caller can settle its charge,
+// and the next frame is not reported marked. The unmarked entry point reads no
+// Expired frame as a message and counts it.
 func TestRecvWindowMarkExpiresWithItsFrame(t *testing.T) {
 	w := NewRecvWindow(16)
 	w.SetMaxAge(time.Millisecond)
 	w.InsertMarked(1, []byte("old"), true)
 	time.Sleep(5 * time.Millisecond)
 	got, _ := w.InsertMarked(0, []byte("a"), false)
-	deliveriesEqual(t, "expired skip", got, []RecvDelivery{{Payload: []byte("a"), Marked: false}})
+	deliveriesEqual(t, "expired frame", got, []RecvDelivery{{Payload: []byte("a")}, {Payload: []byte("old"), Marked: true}})
+	if got[0].Expired || !got[1].Expired {
+		t.Fatalf("expired flags = %v, %v; want the buffered frame's alone", got[0].Expired, got[1].Expired)
+	}
 	got, _ = w.InsertMarked(2, []byte("c"), false)
-	deliveriesEqual(t, "after skip", got, []RecvDelivery{{Payload: []byte("c"), Marked: false}})
+	deliveriesEqual(t, "after the expired frame", got, []RecvDelivery{{Payload: []byte("c"), Marked: false}})
 	if len(w.marked) != 0 {
 		t.Fatalf("marks left behind: %v", w.marked)
+	}
+
+	w2 := NewRecvWindow(16)
+	w2.SetMaxAge(time.Millisecond)
+	w2.Insert(1, []byte("old"))
+	time.Sleep(5 * time.Millisecond)
+	if plain := w2.Insert(0, []byte("a")); len(plain) != 1 || string(plain[0]) != "a" {
+		t.Fatalf("Insert returned %q, want only the message", plain)
+	}
+	if n := w2.ExpiredCount(); n != 1 {
+		t.Fatalf("ExpiredCount = %d, want 1", n)
+	}
+}
+
+// TestRecvWindow_AnEndFrameNeverExpires: a buffered CLOSE, older than SetMaxAge
+// when its turn comes, still comes back End: it was acknowledged when it was
+// buffered, so nothing would end the receive side after it.
+func TestRecvWindow_AnEndFrameNeverExpires(t *testing.T) {
+	w := NewRecvWindow(16)
+	w.SetMaxAge(time.Millisecond)
+	if got, ok := w.InsertEnd(1); !ok || got != nil {
+		t.Fatalf("InsertEnd out of order = %v, %v", got, ok)
+	}
+	time.Sleep(5 * time.Millisecond)
+	got, _ := w.InsertMarked(0, []byte("a"), false)
+	if len(got) != 2 || got[1].Expired || !got[1].End {
+		t.Fatalf("deliveries = %+v, want the message and then End", got)
 	}
 }
 

@@ -24,12 +24,12 @@ const (
 
 	// SafeFloorMSS is the conservative MSS used as the starting point before
 	// PMTU discovery completes, and the low end of the probe sweep. Sized to
-	// fit constrained private-network paths — notably Fly.io 6PN / WireGuard
-	// IPv6 at a 1280-byte MTU (minus IPv6+UDP+Noise overhead). Data flows at
+	// fit a tunnelled IPv6 path at the 1280-byte minimum MTU (minus IPv6, UDP
+	// and Noise overhead), the smallest a private network can run. Data flows at
 	// this floor from session start; the prober then probes UPWARD to the real
 	// path maximum, so no capacity is lost on paths that support more.
 	// Starting at DefaultMSS (1400) instead would strand a sub-1400 path such
-	// as the 6PN: the first 1400-byte probe is dropped, OnProbeTimeout keeps
+	// as that one: the first 1400-byte probe is dropped, OnProbeTimeout keeps
 	// the last successful size and there is none, so mss stays 1400 and every
 	// data frame is dropped.
 	SafeFloorMSS = 1200

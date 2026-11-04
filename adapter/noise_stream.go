@@ -45,7 +45,7 @@ type noiseStream struct {
 	session  *NoiseSession
 	state    *aether.StreamStateMachine
 	// recvQ holds the whole in-order messages between the readLoop
-	// (handleData, handleImplicitOpen and deliverToControl, through
+	// (handleData and deliverToControl, through
 	// enqueueDelivery and enqueueControl) and Receive. recvDone is the
 	// end Receive selects on, draining what recvQ still holds before it
 	// returns io.EOF; closeRecvOnce closes it exactly once (recvOnce), from the
@@ -163,8 +163,8 @@ type noiseStream struct {
 	lastStuckResetUnixNano atomic.Int64
 
 	// fragBuf reassembles the fragments of this stream's messages. Touched by
-	// the session's readLoop only (handleData, handleImplicitOpen,
-	// handleFECRepair), which hands each completed message to recvQ.
+	// the session's readLoop only (handleData, handleFECRepair), which hands
+	// each completed message to recvQ.
 	fragBuf *FragmentBuffer
 
 	// generation is this stream object's number among the session's streams
@@ -204,7 +204,8 @@ type noiseStream struct {
 // aether.ErrStreamCapExhausted or aether.ErrStreamCreditRefused; when
 // enforceRemoteCap is true (the peer opened it) the peer is also sent
 // RESET(ResetRefused) and no state is kept, and locally-initiated OpenStream
-// passes false and returns the error to its caller.
+// passes false and returns the error to its caller. An ID in use is refused with
+// aether.ErrDuplicateStreamID and sends nothing.
 func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, enforceRemoteCap bool) (*noiseStream, error) {
 	// FEC is off by default and a caller opts in through cfg.FECLevel, which an
 	// accepted stream takes from the peer's OPEN. Both callers have checked the
@@ -348,13 +349,16 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 	// pass a separate admission check and then both insert, exceeding
 	// the cap by one per racing goroutine.
 	s.mu.Lock()
-	if _, exists := s.streams[streamID]; exists {
-		// Duplicate peer OPEN for an already-open stream — no new slot
-		// needed; return the existing stream, which holds its reservation.
-		existing := s.streams[streamID]
+	// One stream per ID: the stream in place keeps its window and reservation.
+	// The peer's handleOpen ignores the refusal, and OpenStream hands it to its
+	// caller, who would otherwise be given another caller's stream and put a second
+	// OPEN on the wire, which the peer ignores in turn. A stream that has just left
+	// on both CLOSEs holds its ID against a local open for a short while
+	// (reopenQuietLocked).
+	if _, exists := s.streams[streamID]; exists || (!enforceRemoteCap && s.reopenQuietLocked(streamID)) {
 		s.mu.Unlock()
 		st.discardUnpublished()
-		return existing, nil
+		return nil, aether.ErrDuplicateStreamID
 	}
 	// MaxConcurrentStreams cap applies to BOTH locally-initiated and
 	// peer-initiated stream opens — otherwise a caller leaking streams
@@ -771,6 +775,31 @@ func (st *noiseStream) reassemble(d reliability.RecvDelivery) (payload []byte, o
 	return msg, msg != nil
 }
 
+// settleExpired takes a frame the receive window has given up on (RecvWindow.SetMaxAge)
+// and that was acknowledged while it waited: no retransmit will replace it and no
+// Receive will record it, so a grant here is the only way its sender's credit comes
+// back. A whole message returns what Send charged for it (messageCredit); a fragment
+// returns its chunk, and its group's FragmentBuffer returns the rest when it discards
+// the group. It counts as dropped, for the consumer summing DeliveryStats. Called by
+// the session's readLoop only.
+func (st *noiseStream) settleExpired(d reliability.RecvDelivery) {
+	s := st.session
+	n := messageCredit(int64(len(d.Payload)))
+	if d.Marked {
+		_, chunk, err := ParseFragment(d.Payload)
+		if err != nil {
+			return // a fragment that cannot be read charged nothing Add would have returned
+		}
+		n = int64(len(chunk))
+	}
+	s.deliveryStats.recordDropped(st.streamID, int(n))
+	st.recvQ.addGranted(n)
+	releaseCredit(st.window, n, st.streamID, s.sendWindowUpdateAgnostic)
+	if grant := s.connWindow.ReceiverConsume(n); grant > 0 {
+		s.sendWindowUpdate(aether.StreamConnectionLevel, uint64(grant))
+	}
+}
+
 // recordReceive advances flow-control credit accounting for bytes the
 // application has actually received on this stream. Both the per-stream
 // debouncer AND the session-wide conn-level debouncer get the same byte
@@ -886,12 +915,31 @@ func (st *noiseStream) leaveIfEnded() {
 	}
 	st.teardown()
 	st.recvQ.leftSession()
+	st.session.noteLeft(st.streamID, st.rtt.RTO())
 	st.leaveSession()
 }
 
+// peerReopened takes a peer's OPEN for this stream's ID (handleOpen) as the news that
+// the peer's stream under it has left, and reports whether this stream has gone too.
+// That can only be true once both CLOSEs are out: the peer leaves on this side's CLOSE
+// and the ACK of its own, so an OPEN from it says this side's CLOSE arrived, whose ACK
+// must be lost or crossing. The window's entry for the CLOSE goes with the stream,
+// giving the session's in-flight count back. Any earlier, the OPEN is a duplicate of
+// the one that opened this stream, and false leaves the stream as it is. Called by the
+// session's readLoop only.
+func (st *noiseStream) peerReopened() bool {
+	if !st.closeQueued.Load() || !st.peerClosed.Load() {
+		return false
+	}
+	if st.closeDone.CompareAndSwap(false, true) {
+		st.sendWindow.ReleaseInFlight()
+	}
+	st.leaveIfEnded()
+	return true
+}
+
 // enqueueDelivery hands one in-order message the sender charged credit for to
-// the stream's consumer without blocking: the readLoop (handleData,
-// handleImplicitOpen) calls it and
+// the stream's consumer without blocking: the readLoop (handleData) calls it and
 // must never wait on a stream's consumer. The message is admitted because its
 // sender holds credit for it: the ceilings count messageCredit, the unit Send
 // charges, against what that sender still has charged, so a sender honouring
