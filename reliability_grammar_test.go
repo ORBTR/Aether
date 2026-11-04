@@ -43,6 +43,7 @@ func TestAetherWireVersionsRegistersReliability(t *testing.T) {
 	// Peers that agree on every other entry and omit reliability, or offer
 	// only another version of it.
 	agreeing := WireVersions{
+		wv(WireVersionBounds, true, 1),
 		wv(WireVersionFragment, true, WireVersionFragmentCurrent),
 		wv(WireVersionFrame, true, WireVersionFrameCurrent),
 		wv(WireVersionFrameShort, false, wireVersionFrameShortCurrent),

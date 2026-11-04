@@ -38,8 +38,8 @@ func streamPresent(s *NoiseSession, id uint64) bool {
 // local side half-closes each stream first, as the reply side of an RPC does, and
 // does not read yet; a peer that ignores credit fills each stream to three
 // quarters of its ceiling and CLOSEs it, over eight streams, each opened with
-// the connection window's initial credit, the stream ceiling the OPEN gives
-// the server. The messages stay charged to the session's budget after the
+// the most credit one stream can hold, the stream ceiling the OPEN gives the
+// server. The messages stay charged to the session's budget after the
 // peer's CLOSE, so the ceiling refuses the stream that would pass it: what the
 // queues hold never exceeds the session ceiling, the budget equals what the
 // queues hold, and a late reader still drains a closed stream to io.EOF, which
@@ -51,10 +51,9 @@ func TestNoiseStream_APeerClosingFilledStreamsStaysInsideTheSessionCeiling(t *te
 	const size = 64 * 1024
 	var held []*noiseStream
 	var streamLimit, sessionLimit int64
-	connInitial, _ := server.connWindow.ReceiveCeilings()
 	for k := 0; k < 8; k++ {
 		id := uint64(300 + k)
-		cs, ss := openWithCredit(t, ctx, client, server, id, connInitial)
+		cs, ss := openWithCredit(t, ctx, client, server, id, flow.MaxGrowableWindow)
 		waitSendWindowEmpty(t, cs, "the opening message")
 		streamLimit, sessionLimit = ss.receiveCeilings()
 		if err := ss.Close(); err != nil {
@@ -119,8 +118,7 @@ func TestNoiseStream_SmallMessagesInsideCreditAreNotRefused(t *testing.T) {
 			client, server := noisePairWithRealms(t, nil, nil)
 			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 			defer cancel()
-			initial, _ := server.connWindow.ReceiveCeilings()
-			_, ss := openWithCredit(t, ctx, client, server, 311, initial)
+			_, ss := openWithCredit(t, ctx, client, server, 311, flow.MaxGrowableWindow)
 			streamLimit, _ := ss.receiveCeilings()
 			n := int(streamLimit / messageCredit(size))
 			for i := 0; i < n; i++ {
@@ -145,9 +143,9 @@ func TestNoiseStream_SmallMessagesInsideCreditAreNotRefused(t *testing.T) {
 // replies 256 KiB, the reply is acknowledged, and the server closes; the client
 // reads the reply either before the server's CLOSE reaches it or after. The
 // server's Close, the second close, takes the stream out of the session and
-// gives back the connection credit the reply still holds, which the client's
-// grants stop returning once its handleClose has ended the stream; so twenty
-// replies through a 4 MiB connection window all go, and the window ends whole.
+// returns no credit; the client's reads return it by grant, also when the read
+// comes after the client's stream has left. So seventy replies, past the 16 MiB
+// connection window in total, all go, and the window ends whole.
 func TestNoiseStream_GracefulCloseReturnsConnectionCredit(t *testing.T) {
 	for _, late := range []bool{true, false} {
 		t.Run(fmt.Sprintf("lateReader=%v", late), func(t *testing.T) {
@@ -160,7 +158,7 @@ func TestNoiseStream_GracefulCloseReturnsConnectionCredit(t *testing.T) {
 				reply[i] = byte(i * 7)
 			}
 			initial, _ := server.connWindow.ReceiveCeilings()
-			for k := 0; k < 20; k++ {
+			for k := 0; k < 70; k++ {
 				id := uint64(400 + k)
 				cs, err := client.OpenStream(ctx, aether.StreamConfig{StreamID: id, Reliability: aether.ReliableOrdered, Priority: 128})
 				if err != nil {
@@ -218,7 +216,7 @@ func TestNoiseStream_GracefulCloseReturnsConnectionCredit(t *testing.T) {
 				}
 				waitFor(t, "the closed stream out of the server's session", func() bool { return !streamPresent(server, id) })
 			}
-			waitFor(t, "the server's connection window whole again", func() bool { return server.connWindow.Available() == initial })
+			waitLong(t, "the server's connection window whole again", func() bool { return server.connWindow.Available() == initial })
 		})
 	}
 }
@@ -228,7 +226,7 @@ func TestNoiseStream_GracefulCloseReturnsConnectionCredit(t *testing.T) {
 // frame is unacknowledged the server's CLOSE is not written and the stream stays
 // in the session, where handleACK and the reliability tick reach it; the ACK
 // that empties its send window writes the CLOSE (finishSend), the stream leaves,
-// and its connection credit comes back.
+// and its connection credit comes back when the client's consumer reads the frame.
 func TestNoiseStream_AClosedStreamWritesItsCloseAndLeavesOnTheACKThatEmptiesItsWindow(t *testing.T) {
 	key := uint32(0x5eed5eed)
 	client, server := noisePairWithRealms(t, &key, &key)
@@ -252,12 +250,19 @@ func TestNoiseStream_AClosedStreamWritesItsCloseAndLeavesOnTheACKThatEmptiesItsW
 	}
 	waitFor(t, "the CLOSE written after the last ACK", func() bool { return ss.closeDone.Load() })
 	waitFor(t, "the stream out of the session after its last ACK", func() bool { return !streamPresent(server, 450) })
-	waitFor(t, "the connection credit back", func() bool { return server.connWindow.Available() == initial })
+	waitFor(t, "the client's CLOSE leaving its stream", func() bool { return !streamPresent(client, 450) })
+	if got, want := server.connWindow.Available(), initial-messageCredit(8*1024); got != want {
+		t.Fatalf("connection credit %d after the leave; want %d, what the client's queue still holds", got, want)
+	}
+	if got, err := cs.Receive(ctx); err != nil || len(got) != 8*1024 {
+		t.Fatalf("the client's late read: %d bytes, %v", len(got), err)
+	}
+	waitLong(t, "the connection credit back by the client's grant", func() bool { return server.connWindow.Available() == initial })
 }
 
 // creditPairWithStreamCap is noisePairWithRealms with no realm and the given
 // MaxConcurrentStreams on both sides, so the session's credit ceiling
-// (sessionCreditCeiling) is that many default stream credits, and node IDs no
+// (flow.BoundsProfile.AdmittedCreditCeiling) is that many default stream credits, and node IDs no
 // other test uses, so the two sessions' peer ledgers are this pair's alone.
 func creditPairWithStreamCap(t *testing.T, streams int, tag string) (client, server *NoiseSession) {
 	t.Helper()
@@ -515,8 +520,8 @@ func TestNoiseSession_AnAbandonedQueueIsDiscardedAfterTheIdleTimeout(t *testing.
 	if got := server.recvQueued.Load(); got != 0 {
 		t.Errorf("after the idle sweep the budget reads %d, want 0", got)
 	}
-	if _, err := ss.Receive(ctx); !errors.Is(err, io.EOF) {
-		t.Errorf("Receive after the discard: %v, want io.EOF", err)
+	if _, err := ss.Receive(ctx); !errors.Is(err, aether.ErrStreamOverrun) {
+		t.Errorf("Receive after the discard: %v, want ErrStreamOverrun", err)
 	}
 	server.mu.Lock()
 	tracked := len(server.endedQueues)

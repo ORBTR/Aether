@@ -479,7 +479,7 @@ type StreamConfig struct {
 	MaxAge time.Duration
 
 	// InitialCredit sets the flow control credit window for this stream.
-	// 0 = use DefaultStreamCredit (256KB). Non-zero overrides the default.
+	// 0 = use flow.DefaultStreamCredit. Non-zero overrides the default.
 	// File transfer streams should use 2MB+ for throughput (40MB/s at 50ms RTT).
 	InitialCredit int64
 

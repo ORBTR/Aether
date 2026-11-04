@@ -405,11 +405,12 @@ Implementation: `flow/stream_window.go`
 
 ### 8.2 Connection-Level
 
-- **Initial credit:** 1,048,576 bytes (1 MB)
-- **Maximum credit:** 16,777,216 bytes (16 MB)
+- **Credit:** 16,777,216 bytes (16 MB), initial and maximum: the bounds profile's connection credit (section 8.5).
 - **Auto-grant threshold:** 25% consumed
 - **Signal:** WINDOW frame with StreamID = `0xFFFFFFFFFFFFFFFF`
 - **Purpose:** Prevents any single stream from starving the connection. All stream sends also consume connection credit.
+- **Replenishment (Noise):** credit returns by the receiver's grant when its consumer takes a message, or when it discards one on the sweep of an abandoned queue, whether the stream is live or has ended on both CLOSEs: a sender's CLOSE is written only once every DATA frame is acknowledged, so its stream's leave returns no credit, and a late reader holds its sender to the credit it has not yet read. A RESET, sent by either side, settles otherwise: the RESET's sender cannot tell what reached the peer's queue, so the stream's sender takes back all the stream still has charged and the receiver grants nothing further for that stream.
+- **Receiver's ceiling (Noise):** a message past the stream's credit, or past the session ceiling counted over what its sender still has charged, is a sender ignoring credit: the receiver resets the stream with RESET(ResetFlowCtrl) and charges abuse; its consumer reads what the queue holds and then `ErrStreamOverrun`, and the sender's Send and Receive return `ErrStreamOverrun`. A queue a RESET ended is memory no sender's credit pays for: when a credited message needs its room, the longest-idle such queue is discarded and its consumer reads `ErrStreamOverrun`.
 
 Implementation: `flow/conn_window.go`
 
@@ -437,6 +438,19 @@ Implementation: `congestion_signal.go`, `adapter/{tcp,noise_dispatch}.go` (`hand
 - **`GrowWindow(n)` / `ShrinkWindow(n)`** — callers apply the delta.
 
 A typical auto-tuner samples `Stats` at ~10 Hz, compares against `SuggestedWindow`, and calls `GrowWindow` / `ShrinkWindow` with bounded step sizes (e.g. ±25 %) to avoid oscillation.
+
+### 8.5 Bounds Profile
+
+One versioned profile holds the credit and queue numbers, derived and validated together (`flow/bounds_profile.go`; `NewBoundsProfile` refuses numbers that do not fit):
+
+| Bound | Value | Relation |
+|---|---|---|
+| Version | 1 | The `bounds` entry of the negotiated set; a change to any number is a new version, and peers on different versions refuse each other before a session exists. |
+| Stream credit | 1,048,576 bytes | At least the guaranteed window, at most the window capacity (8 MB). |
+| Session memory ceiling | 16,777,216 bytes | At least one stream's credit. |
+| Connection credit | 16,777,216 bytes | Equal to the session memory ceiling, never set apart from it, so a sender inside its credit fits what its receiver can queue. Sixteen streams' unread credit stalls a session. |
+| Stream cap | 1,024 | Its admitted credit must reach the ceiling. |
+| Admitted credit | 1,024 × 1,048,576 bytes | What a session's streams may hold promised: the stream cap at the stream credit, so streams at the default credit meet the stream cap first and the ceiling binds on streams that declare more. |
 
 ---
 
@@ -800,7 +814,7 @@ Dial-path integration points: `peer_connections.go:833` in HSTLES, `wire/peers.g
 
 There is no negotiation header before the handshake; identity is established by the underlying transport crypto layer (Noise XX/XK static keys, QUIC TLS handshake, WebSocket Ed25519 header, gRPC metadata). The `NegotiateMode` / `ModeAether` / `ModeString` APIs are gone, and a peer that sends a 4-byte negotiation header fails at the first read.
 
-Wire grammars are negotiated per session generation as a named set (`wire_versions.go`). Each side offers entries in name order, each a list of versions and a required flag; aether registers `fragment` (envelope version 2, required), `frame` (full-frame grammar 3, required), `frame.short` (version 1, optional) and `reliability` (version 1, required), and an application adds its own names through its options. For each name both sides list, the choice is the highest version in both lists; a required name with no common version, or one a side omits, refuses the session with `ErrWireVersionMismatch` (a `*WireVersionMismatchError` naming the entry and both lists) before any session or stream state exists; an optional one is left out. Under Noise the offer rides the NodeInfo inside the encrypted handshake; a TCP, WebSocket or gRPC session, and QUIC built through `NewSessionForProtocol` (all `TCPSession`), writes it as a bounded `AEWV` preface before its first frame and reads the peer's before decoding any; `adapter.QUICSession` exchanges none. Sessions report the choice through `aether.SessionWireVersions`.
+Wire grammars are negotiated per session generation as a named set (`wire_versions.go`). Each side offers entries in name order, each a list of versions and a required flag; aether registers `bounds` (credit and queue profile version 1, required: section 8.5), `fragment` (envelope version 2, required), `frame` (full-frame grammar 3, required), `frame.short` (version 1, optional) and `reliability` (version 1, required), and an application adds its own names through its options. For each name both sides list, the choice is the highest version in both lists; a required name with no common version, or one a side omits, refuses the session with `ErrWireVersionMismatch` (a `*WireVersionMismatchError` naming the entry and both lists) before any session or stream state exists; an optional one is left out. Under Noise the offer rides the NodeInfo inside the encrypted handshake; a TCP, WebSocket or gRPC session, and QUIC built through `NewSessionForProtocol` (all `TCPSession`), writes it as a bounded `AEWV` preface before its first frame and reads the peer's before decoding any; `adapter.QUICSession` exchanges none. Sessions report the choice through `aether.SessionWireVersions`.
 
 Frame grammar 3 is the grammar whose OPEN payload carries the opener's initial credit (§2.2). A build lists only the grammar it writes, so a peer offering only grammar 2 is refused before any state.
 

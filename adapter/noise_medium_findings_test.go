@@ -94,7 +94,7 @@ func TestHandleData_DoesNotInflateCWND(t *testing.T) {
 		window:     flow.NewStreamWindow(0),
 		// recvQ takes the payloads with no consumer reading: none is needed
 		// to exercise handleData end-to-end for the cwnd invariant.
-		recvQ: newRecvQueue(&s.recvQueued),
+		recvQ: newRecvQueue(&s.recvQueued, &s.recvCharged),
 	}
 	s.streams[5] = st
 
@@ -135,7 +135,7 @@ func noiseStreamForDelivery(streamID uint64) *noiseStream {
 		streamID: streamID,
 		session:  s,
 		window:   flow.NewStreamWindow(0),
-		recvQ:    newRecvQueue(&s.recvQueued),
+		recvQ:    newRecvQueue(&s.recvQueued, &s.recvCharged),
 		recvDone: make(chan struct{}),
 	}
 }

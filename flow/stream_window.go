@@ -20,7 +20,8 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
-// DefaultStreamCredit is the initial flow control credit per stream (1 MB).
+// DefaultStreamCredit is the initial flow control credit per stream (1 MB), the
+// bounds profile's stream credit (CurrentBounds).
 //
 // Sized to absorb a full startup gossip burst without stalling: when a
 // node's peers all reconnect to it at once, each needs a full-state gossip
@@ -448,9 +449,9 @@ func (w *StreamWindow) ReleaseUnsent(n int64) {
 }
 
 // ReleaseAll returns every outstanding byte to the window and reports how many,
-// for a stream that is leaving its session: no grant for these bytes will
-// reach this window, and noiseStream.releaseInFlight gives the count back to
-// the connection window, which outlives the stream and charged the same bytes.
+// for a stream a RESET has ended: no grant for these bytes will reach this
+// window, and noiseStream.releaseInFlight gives the count back to the
+// connection window, which outlives the stream and charged the same bytes.
 // A Send blocked in Consume wakes and finds the stream's state closed. Idempotent:
 // a second call reports what was charged since, so 0 on a stream that has left.
 func (w *StreamWindow) ReleaseAll() int64 {

@@ -359,7 +359,7 @@ func TestStreamWindow_TimedTrigger_NoConsumeNoGrant(t *testing.T) {
 func TestConnWindow_TimedTrigger_Fires(t *testing.T) {
 	w := NewConnWindow(DefaultConnCredit)
 
-	// Feed small payloads — DefaultConnCredit is 4 MB, threshold = 1 MB,
+	// Feed small payloads — a quarter of DefaultConnCredit is the threshold,
 	// so 3 × 70 KB (210 KB total) stays well under all size-based triggers.
 	for i := 0; i < 3; i++ {
 		if grant := w.ReceiverConsume(70 * 1024); grant != 0 {

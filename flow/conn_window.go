@@ -14,25 +14,23 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
-// DefaultConnCredit is the initial connection-level credit (4 MB).
+// DefaultConnCredit is the initial connection-level credit: the bounds
+// profile's session memory ceiling (BoundsProfile.ConnCredit), so credit a
+// sender holds always fits what the receiver's queues may hold.
 //
-// Sized for a gossip burst: full-state exchanges run ~70-100 KB per
+// It also has to carry a gossip burst. A full-state exchange runs ~70-100 KB per
 // round-trip and the receiver emits a WINDOW_UPDATE only once the
-// AutoGrantThreshold fraction (25%) of the initial credit has been
-// consumed, so a 1 MB window runs about four round-trips before any grant
-// flows back. Under high-rate gossip (every peer converging at once) that
-// leaves Consume waiting out ConsumeTimeout (10 s) and failing with
-// "insufficient connection credit" while the available credit (tens of KB)
-// trails the next 72 KB exchange: credit flows back, just not fast enough
-// to keep up with the leading edge of a burst.
-//
-// 4 MB covers ~16 back-to-back 72 KB exchanges before any stall,
-// comfortably more than the grant-emission cycle. Auto-tuning + the
-// 16 MB cap can still grow per-peer as BDP dictates.
-const DefaultConnCredit int64 = 4 * 1024 * 1024
+// AutoGrantThreshold fraction (25%) of this credit has been consumed or
+// GrantMaxInterval has passed, so the credit covers the exchanges sent before a
+// grant flows back; a sender short of it waits out ConsumeTimeout (10 s) in
+// Consume and fails with ErrCreditExhausted. 16 MiB covers over 200 back-to-back
+// 72 KB exchanges.
+const DefaultConnCredit int64 = DefaultSessionMemoryCeiling
 
-// DefaultMaxConnCredit is the maximum connection-level credit (16 MB).
-const DefaultMaxConnCredit int64 = 16 * 1024 * 1024
+// DefaultMaxConnCredit is the least capacity NewConnWindow builds a window
+// with, the same 16 MiB: a window built with less credit than this holds the
+// difference back as its deficit.
+const DefaultMaxConnCredit int64 = DefaultSessionMemoryCeiling
 
 // ConnWindow implements connection-level aggregate flow control.
 // Prevents any single stream from starving the connection.
@@ -137,8 +135,8 @@ func (w *ConnWindow) Consume(ctx context.Context, n int64) error {
 // return: the connection-level mirror of StreamWindow.ReleaseUnsent. Its
 // callers are noiseStream.Send, when a step after this window's Consume fails
 // before the bytes reach the transport (the peer never sees them, so never
-// grants them), and noiseStream.releaseInFlight, with the bytes a leaving
-// stream still had charged (the peer's grants for them stop with the stream).
+// grants them), and noiseStream.releaseInFlight, with the bytes a RESET left
+// charged on a stream (the peer's queue stops granting for that stream).
 // Without it each such Send or stream would shrink the window, which every
 // stream of the session shares, for the session's life, until Consume fails
 // with ErrCreditExhausted on every stream.
@@ -258,12 +256,11 @@ func (w *ConnWindow) grantLocked(sinceLastGrant int64, trigger string) int64 {
 }
 
 // ReceiveCeilings returns the two bounds a session's receive side holds this
-// window's peer to: initial, the credit the peer's sender starts with and the
-// most its consumer-driven grants let it keep unconsumed on any one stream;
-// and maximum, the semaphore capacity, kept above initial for the skew a
-// stream's departure leaves (the sender's ReleaseUnsent there and a grant
-// already on its way for the same byte). NoiseSession's receive queues refuse
-// a peer past them.
+// window's peer to: initial, the credit the peer's sender starts with, and
+// maximum, the semaphore capacity. A session's window is built at the bounds
+// profile's connection credit, where the two are the one number the profile's
+// memory ceiling derives; NoiseSession's receive queues refuse a peer past it,
+// and signalReceiveOverload reads the fraction of it they hold.
 func (w *ConnWindow) ReceiveCeilings() (initial, maximum int64) {
 	return w.initialSize, w.maxSize
 }

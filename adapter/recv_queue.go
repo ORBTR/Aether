@@ -57,13 +57,23 @@ const (
 // the queue holds: pop keeps returning it after end, which only stops further
 // pushes.
 //
-// budget is the session-wide count of queued cost (messageCredit of every
-// message). A message's cost stays in it until the message is taken (pop) or
-// thrown away (discard): a stream's end, by either side, leaves what the queue
-// holds charged, since a late consumer may still read it and the memory is
-// held until then. Once the stream has ended the sender has its credit back
-// from its own side (noiseStream.releaseInFlight), so nothing taken after that
-// is credited.
+// Two session-wide counts follow the queue. budget is the cost (messageCredit)
+// of every queued message, which is what the session's memory holds: it falls
+// only when a message is taken (pop) or thrown away (discard), since a late
+// consumer may still read a message after the stream's end. charged is the part
+// of budget the sender still has charged to its connection window, the count
+// push holds a sender to: a sender inside its credit cannot take it past the
+// ceiling however far behind the consumers are.
+//
+// A message stays charged to the sender until the receiver's grant returns it,
+// so taking it or sweeping it replenishes the sender even after the stream has
+// left the session (a late reader of a closed stream, noiseStream.leaveIfEnded).
+// A RESET is the one exit that settles the credit otherwise: the sender takes
+// back all the stream had charged (noiseStream.releaseInFlight), since it cannot
+// tell what reached this queue, so peerEnded takes the queue out of charged and
+// nothing taken after it is credited. Such a queue's cost is memory no sender
+// is paying for, and NoiseSession.makeQueueRoom discards it when a credited
+// message needs the room.
 type recvQueue struct {
 	mu        sync.Mutex
 	items     []recvItem
@@ -75,11 +85,13 @@ type recvQueue struct {
 	ended     bool
 	noCredit  bool
 	discarded bool
-	// lastTake is the UnixNano of the last pop or of peerEnded, whichever is
-	// later: sweepEndedQueues reads it to tell an abandoned queue from one a
-	// late consumer is still draining.
+	// lastTake is the UnixNano of the last pop or of the stream's leaving the
+	// session (leftSession, peerEnded), whichever is later: sweepEndedQueues
+	// reads it to tell an abandoned queue from one a late consumer is still
+	// draining, and makeQueueRoom to pick the longest-idle queue.
 	lastTake int64
 	budget   *atomic.Int64
+	charged  *atomic.Int64
 
 	// wake holds one token while a Receive may find a message. push and pop
 	// (for the next of several consumers) leave it non-blocking; a stale token
@@ -87,11 +99,16 @@ type recvQueue struct {
 	wake chan struct{}
 }
 
-func newRecvQueue(budget *atomic.Int64) *recvQueue {
+// newRecvQueue builds a queue counting into the session's two totals
+// (NoiseSession.recvQueued and recvCharged); a nil total counts to itself.
+func newRecvQueue(budget, charged *atomic.Int64) *recvQueue {
 	if budget == nil {
 		budget = new(atomic.Int64)
 	}
-	return &recvQueue{budget: budget, wake: make(chan struct{}, 1)}
+	if charged == nil {
+		charged = new(atomic.Int64)
+	}
+	return &recvQueue{budget: budget, charged: charged, wake: make(chan struct{}, 1)}
 }
 
 func (q *recvQueue) signal() {
@@ -114,9 +131,12 @@ func retained(payload []byte) []byte {
 }
 
 // push queues one metered message unless the stream has ended or it would
-// take the queue past streamLimit (metered credit) or the session past
-// sessionLimit (cost). Both count messageCredit, the unit the sender's credit
-// is charged in. A limit of 0 or less is no limit.
+// take the queue past streamLimit or the session's charged credit past
+// sessionLimit, both counted in messageCredit, the unit the sender's credit is
+// charged in. Unmetered cost and the queues a RESET ended are not part of what
+// sessionLimit compares: no sender's credit pays for them, so they cannot be
+// why a sender inside its credit is refused (makeQueueRoom makes their room).
+// A limit of 0 or less is no limit.
 func (q *recvQueue) push(payload []byte, streamLimit, sessionLimit int64) pushResult {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -127,7 +147,7 @@ func (q *recvQueue) push(payload []byte, streamLimit, sessionLimit int64) pushRe
 	if streamLimit > 0 && q.credit+c > streamLimit {
 		return pushOverCredit
 	}
-	if sessionLimit > 0 && q.budget.Load()+c > sessionLimit {
+	if sessionLimit > 0 && q.charged.Load()+c > sessionLimit {
 		return pushOverCredit
 	}
 	q.appendLocked(recvItem{payload: retained(payload), metered: true}, c)
@@ -150,16 +170,6 @@ func (q *recvQueue) pushUnmetered(payload []byte, limit int) pushResult {
 	return pushQueued
 }
 
-// pushFinal queues what handleClose drains from the receive window at the
-// peer's CLOSE, the last messages the reader sees before the end. It checks
-// neither the end nor the ceilings: the sender's credit covered these messages,
-// and handleClose ends the queue's admission right after.
-func (q *recvQueue) pushFinal(payload []byte) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.appendLocked(recvItem{payload: retained(payload), metered: true}, recvItemCost(payload))
-}
-
 // appendLocked adds a message and charges its cost to budget. A discarded
 // queue takes nothing: no consumer is left to read it.
 func (q *recvQueue) appendLocked(it recvItem, c int64) {
@@ -170,6 +180,7 @@ func (q *recvQueue) appendLocked(it recvItem, c int64) {
 	if it.metered {
 		q.bytes += int64(len(it.payload))
 		q.credit += c
+		q.charged.Add(c)
 	} else {
 		q.unmetered++
 	}
@@ -179,7 +190,8 @@ func (q *recvQueue) appendLocked(it recvItem, c int64) {
 }
 
 // pop returns the oldest message. credited says the caller must record its
-// bytes as consumed: the message was metered and its sender still counts it.
+// bytes as consumed: the message was metered and its sender still has it
+// charged, which holds until a RESET ended the stream (peerEnded).
 func (q *recvQueue) pop() (payload []byte, credited, ok bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -202,6 +214,9 @@ func (q *recvQueue) pop() (payload []byte, credited, ok bool) {
 	if it.metered {
 		q.bytes -= int64(len(it.payload))
 		q.credit -= c
+		if !q.noCredit {
+			q.charged.Add(-c)
+		}
 	} else {
 		q.unmetered--
 	}
@@ -221,46 +236,104 @@ func (q *recvQueue) end() {
 	q.mu.Unlock()
 }
 
-// peerEnded records that the stream has ended for the sender: its credit comes
-// back from its own side (noiseStream.releaseInFlight, on its RESET or its last
-// CLOSE), so a later Receive replenishes nothing. The messages stay charged to
-// the session budget until they are read or discarded, so a peer that fills
-// streams and then closes or resets them cannot grow memory past the ceiling
-// behind a consumer that is not reading. Its callers are every exit of a stream
-// that has queued what it may still hold (noiseStream.leaveIfEnded,
-// handleReset, Reset), and each then hands the queue to trackEnded. A nil
-// queue is a stream built outside createStream, which Reset and Close may
-// still reach.
+// leftSession records that the stream left the session with what the queue
+// holds still charged to the sender (noiseStream.leaveIfEnded, once both CLOSEs
+// are done): a later pop credits it, and the sweep measures idleness from here.
+// A nil queue is a stream built outside createStream.
+func (q *recvQueue) leftSession() {
+	if q == nil {
+		return
+	}
+	q.mu.Lock()
+	q.lastTake = time.Now().UnixNano()
+	q.mu.Unlock()
+}
+
+// peerEnded records that a RESET has ended the stream, sent by either side: the
+// sender takes back all the stream had charged (noiseStream.releaseInFlight), so
+// a later pop replenishes nothing and the queue leaves the session's charged
+// count. The messages stay in its budget until they are read or discarded, so a
+// peer that fills streams and resets them cannot grow memory past the ceiling
+// behind a consumer that is not reading. Its callers are the RESET exits
+// (handleReset, Reset), and each then hands the queue to trackEnded. A nil
+// queue is a stream built outside createStream, which Reset may still reach.
 func (q *recvQueue) peerEnded() {
 	if q == nil {
 		return
 	}
 	q.mu.Lock()
-	q.noCredit = true
+	if !q.noCredit {
+		q.noCredit = true
+		q.charged.Add(-q.credit)
+	}
 	q.lastTake = time.Now().UnixNano()
 	q.mu.Unlock()
 }
 
-// discard throws away what the queue holds, returns its cost to the session
-// budget and ends it for good. Its callers are enqueueDelivery, for a sender
-// past every ceiling, and sweepEndedQueues, for a queue its consumer abandoned.
-// Idempotent; nil-safe like peerEnded.
-func (q *recvQueue) discard() {
+// releaseCharge takes the queue out of the session's charged count and returns
+// the credit its sender still has charged for it, which the caller grants back,
+// for a local Reset of a stream that left on both CLOSEs: the consumer has said
+// it will not read, and the peer's stream is gone, so only a grant can return
+// that credit. The messages stay readable and in budget, like a RESET's queue
+// (makeQueueRoom may discard them). Nil-safe like peerEnded.
+func (q *recvQueue) releaseCharge() (grant int64) {
 	if q == nil {
-		return
+		return 0
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if q.noCredit {
+		return 0
+	}
+	q.noCredit = true
+	q.charged.Add(-q.credit)
+	return q.credit
+}
+
+// discard throws away what the queue holds, returns its cost to the session
+// budget and ends it for good, and returns the credit its sender still has
+// charged for those messages, which the caller grants back. Its callers are
+// sweepEndedQueues, for a queue its consumer abandoned, and makeQueueRoom. A
+// consumer that comes back reads aether.ErrStreamOverrun (discardedMessages).
+// Idempotent; nil-safe like peerEnded.
+func (q *recvQueue) discard() (grant int64) {
+	if q == nil {
+		return 0
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if !q.noCredit {
+		grant = q.credit
+		q.charged.Add(-q.credit)
+	}
 	q.ended = true
 	q.noCredit = true
 	q.discarded = true
 	q.budget.Add(-q.cost)
 	q.cost = 0
 	q.items, q.head, q.bytes, q.credit, q.unmetered = nil, 0, 0, 0, 0
+	return grant
+}
+
+// discardedMessages reports whether the queue threw messages away, so Receive
+// can say so once it has returned the rest.
+func (q *recvQueue) discardedMessages() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.discarded
+}
+
+// idleResetQueue reports whether a RESET ended this queue's stream with messages
+// unread, and when it was last taken from: makeQueueRoom picks among such queues.
+func (q *recvQueue) idleResetQueue() (lastTake int64, ok bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.lastTake, q.noCredit && q.head < len(q.items)
 }
 
 // idleSince reports whether the queue is empty and how long since its consumer
-// last took a message or the stream ended (peerEnded), for sweepEndedQueues.
+// last took a message or the stream left the session (leftSession, peerEnded),
+// for sweepEndedQueues.
 func (q *recvQueue) idleSince(now time.Time) (empty bool, idle time.Duration) {
 	q.mu.Lock()
 	defer q.mu.Unlock()

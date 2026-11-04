@@ -53,13 +53,13 @@ func TestAEP14_GrantEmittedAboveConstant(t *testing.T) {
 func TestAEP14_CommonPathUnchanged(t *testing.T) {
 	w := NewConnWindow(DefaultConnCredit)
 	if got := w.Available(); got != DefaultConnCredit {
-		t.Fatalf("Available() = %d, want %d for the default 4 MB window", got, DefaultConnCredit)
+		t.Fatalf("Available() = %d, want %d for the default window", got, DefaultConnCredit)
 	}
 	// Repeated threshold-crossing consumes keep emitting positive grants and
 	// never drive recvCredit past the 16 MB cap.
-	oneMB := int64(1024 * 1024)
+	threshold := int64(float64(DefaultConnCredit) * AutoGrantThreshold)
 	for i := 0; i < 8; i++ {
-		if g := w.ReceiverConsume(oneMB); g <= 0 {
+		if g := w.ReceiverConsume(threshold); g <= 0 {
 			t.Fatalf("iter %d: grant %d, want > 0", i, g)
 		}
 		if rc := w.Stats().RecvCredit; rc > DefaultMaxConnCredit {

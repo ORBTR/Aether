@@ -91,16 +91,19 @@ var (
 	// Use errors.Is(err, aether.ErrStreamRefused) to detect.
 	ErrStreamRefused = errors.New("transport: stream refused by peer")
 
-	// ErrStreamOverrun signals that a stream on a byte-stream session (TCP,
-	// WebSocket, gRPC) ended because its receiver's delivery queue was full:
-	// the sender sent more messages than the receiving consumer had read and
-	// the queue holds, so the receiver reset the stream with
-	// RESET(ResetFlowCtrl) rather than drop a message. On the receiver,
-	// Receive returns every message the queue held and then this error; on
-	// the sender, Send and Receive return it once that RESET arrives. The
-	// messages the sender sent after the last one the queue took are not
-	// delivered. It is a refusal of the stream, not a transport failure: the
-	// session stays up.
+	// ErrStreamOverrun signals that a stream ended with messages it could not
+	// deliver. On a byte-stream session (TCP, WebSocket, gRPC) the receiver's
+	// delivery queue was full: the sender sent more messages than the receiving
+	// consumer had read and the queue holds. On a Noise session the sender went
+	// past the credit it holds. Either way the receiver reset the stream with
+	// RESET(ResetFlowCtrl) rather than drop a message unannounced: on the
+	// receiver, Receive returns every message the queue held and then this
+	// error; on the sender, Send and Receive return it once that RESET arrives.
+	// The messages the sender sent after the last one the queue took are not
+	// delivered. A Noise receiver also returns it when messages it had queued
+	// on a stream already ended were thrown away because their consumer did not
+	// read them in time or a credited message needed their room. It is a refusal
+	// of the stream, not a transport failure: the session stays up.
 	// Use errors.Is(err, aether.ErrStreamOverrun) to detect.
 	ErrStreamOverrun = errors.New("transport: stream reset, receiver's delivery queue full")
 

@@ -13,24 +13,6 @@ import (
 	"github.com/ORBTR/aether/flow"
 )
 
-// sessionCreditCeiling is the most receive credit a session's streams may hold
-// admitted at once: its stream cap (MaxConcurrentStreams) at the default
-// stream credit, the two derived together, so streams opened at the default
-// credit meet the stream cap first and the credit ceiling binds when streams
-// declare more than the default. It bounds what streams are promised; what the
-// receive queues may hold in memory is bounded apart from it, by the
-// connection window's ceilings (receiveCeilings).
-func sessionCreditCeiling(opts aether.SessionOptions) int64 {
-	streams := int64(opts.MaxConcurrentStreams)
-	if streams <= 0 {
-		streams = aether.DefaultMaxConcurrentStreams
-	}
-	if streams > math.MaxInt64/flow.DefaultStreamCredit {
-		return math.MaxInt64
-	}
-	return streams * flow.DefaultStreamCredit
-}
-
 // streamCreditCeiling is the most credit one stream's window may hold: the
 // growth ceiling cfg.MaxCredit sets, or flow.MaxGrowableWindow when it sets
 // none, the same capacity flow.NewStreamWindowWithCap builds the window with.
