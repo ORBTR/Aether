@@ -399,7 +399,7 @@ AE-P-25: The standalone `reliability/packet_replay.go:PacketReplayWindow` was re
 - **MinGuaranteedWindow:** 1 KB — frames at or below this size bypass the semaphore entirely. Not metered, don't consume credit. Keeps in-band control traffic (WINDOW_UPDATE, headers, pings) flowing through a drained data window.
 - **Sender-side tracking:** `dataOutstanding` = credit acquired by Consume but not yet granted back. `ApplyUpdate` caps grants at `dataOutstanding` so we never release past real in-flight, preventing the semaphore from panicking on release-past-capacity.
 - **Receiver-side tracking:** `recvCredit` = credit granted but not yet consumed on receive. Decremented on each `ReceiverConsume(n)` so the auto-grant cap (`currentWindow - recvCredit`) reflects the actual outstanding window. Historical bug: never decrementing `recvCredit` pinned it at maxSize in the production `initialCredit == maxSize` config, so every grant computed to zero and no WINDOW_UPDATE was ever sent.
-- **Byte-stream delivery queue (TCP, WebSocket, gRPC):** the read loop puts each whole message on the stream's delivery queue without waiting (it also answers PING and serves every other stream). The queue is bounded in bytes by the bounds profile's stream credit (1 MiB, counted as payload plus 64 B per message), not by a count of messages, and a session's queues together by its 16 MiB session ceiling, and every session to one peer by the 24 MiB per-peer ceiling, with queues that a RESET ended giving way first and abandoned ones swept after the stream idle timeout; a `Send` of a message that could never fit fails with `ErrPayloadTooLarge`. A message that does not fit is never dropped from a stream that goes on: the receiver resets the stream with `RESET(ResetFlowCtrl)`, the sender's `Send` and `Receive` return `aether.ErrStreamOverrun`, and the receiver's consumer reads every queued message and then `aether.ErrStreamOverrun`. These sessions run no credit and send no CONGESTION. Implementation: `adapter/tcp.go` `enqueueDelivery`, `overrun`.
+- **Byte-stream delivery queue (TCP, WebSocket, gRPC):** the read loop puts each whole message on the stream's delivery queue without waiting (it also answers PING and serves every other stream). The queue is bounded in bytes by the bounds profile's stream credit (1 MiB, counted as payload plus 64 B per message), not by a count of messages, and a session's queues together by its 16 MiB session ceiling, and every session to one peer by the 24 MiB per-peer ceiling (sessions built under a node ID the transport proved share it; one built under an ID the remote only stated, through `adapter.NewSessionForStatedPeer`, holds that ceiling alone), with queues that a RESET ended giving way first and abandoned ones swept after the stream idle timeout; a `Send` of a message that could never fit fails with `ErrPayloadTooLarge`. A message that does not fit is never dropped from a stream that goes on: the receiver resets the stream with `RESET(ResetFlowCtrl)`, the sender's `Send` and `Receive` return `aether.ErrStreamOverrun`, and the receiver's consumer reads every queued message and then `aether.ErrStreamOverrun`. These sessions run no credit and send no CONGESTION. Implementation: `adapter/tcp.go` `enqueueDelivery`, `overrun`.
 
 Implementation: `flow/stream_window.go`
 
@@ -1746,10 +1746,11 @@ type SessionOptions struct {
 Unified constructor signature across every adapter:
 
 ```go
-adapter.NewSessionForProtocol(conn, proto, local, remote, opts) (aether.Session, aether.Protocol, error)
+adapter.NewSessionForProtocol(conn, proto, local, remote, opts) (aether.Session, error)
+adapter.NewSessionForStatedPeer(conn, proto, local, stated, opts) (aether.Session, error)
 ```
 
-Returns the primary protocol that won (useful for multipath `TopUpPaths` skip-list construction) plus the session.
+`NewSessionForProtocol` takes the remote node ID the transport's authentication proved, and its session shares that node's per-peer ledgers (memory on every adapter, credit on Noise) with every other session to it. `NewSessionForStatedPeer` takes an ID the remote only stated, with no proof of its key: the session reports it as its remote ID and keeps per-peer ceilings of its own, so a remote stating another node's ID cannot fill that node's room.
 
 ---
 

@@ -534,7 +534,9 @@ func NewNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 // sharedPeer joins the remote node ID's entry in sessionPeerLedgers; false
 // gives the session a peer ledger of its own at the same ceiling, for
 // wrapPostHandshakeAsSession, whose remote node ID the over-conn handshake
-// reports unchecked, so sharing it would let one peer spend another's credit.
+// reports unchecked, and for NewSessionForStatedPeer, whose caller holds only
+// the ID the remote stated, since sharing either would let one peer spend
+// another's credit.
 func newNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opts aether.SessionOptions, sharedPeer bool) *NoiseSession {
 	opts = aether.NormalizeSessionOptions(opts)
 	base := aether.NewBaseSession(localNodeID, remoteNodeID, aether.ProtoNoise)

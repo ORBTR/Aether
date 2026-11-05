@@ -105,8 +105,10 @@ type TCPSession struct {
 	// recvMemory is what this session's delivery queues hold, against the bounds
 	// profile's session and per-peer ceilings (tcpStream.enqueueDelivery), and the
 	// queues of ended streams, which housekeepingTick's sweep and makeQueueRoom
-	// discard. The caller of NewTCPSession has established the remote node ID, so
-	// its session shares the peer's entry.
+	// discard. A session built under a remote node ID its transport proved
+	// (NewTCPSession) shares that peer's entry in peerMemoryLedgers; one built
+	// under an ID the remote only stated (NewSessionForStatedPeer) holds a
+	// per-peer ceiling of its own, so its queues never take another node's room.
 	recvMemory
 
 	// Protocol-agnostic capabilities (cross-adapter parity with Noise —
@@ -126,7 +128,7 @@ type TCPSession struct {
 	// wireOffer is the wire version offer this session's preface sends:
 	// aether's entries plus opts.WireVersions (aether.LocalWireVersions).
 	// wireOfferErr is that merge's refusal, which closes the session before
-	// any preface is written. Both are set in NewTCPSession before any
+	// any preface is written. Both are set in newTCPSession before any
 	// goroutine starts and never change.
 	wireOffer    aether.WireVersions
 	wireOfferErr error
@@ -435,7 +437,23 @@ func (st *tcpStream) sendReset(reason aether.ResetReason) error {
 // The ticker goroutine (`housekeepingTick`) handles idle eviction +
 // stream GC — a single ticker covers both so we don't accumulate one
 // goroutine per concern.
+//
+// remoteNodeID keys the per-peer memory ledger (peerMemoryLedgers), so it must
+// be the identity conn's transport proved; a session whose remote ID is a label
+// the remote stated is built through NewSessionForStatedPeer, which gives it a
+// ledger of its own.
 func NewTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto aether.Protocol, opts aether.SessionOptions) *TCPSession {
+	return newTCPSession(conn, localNodeID, remoteNodeID, proto, opts, true)
+}
+
+// newTCPSession is NewTCPSession with the choice of per-peer memory ledger:
+// sharedPeer joins the remote node ID's entry in peerMemoryLedgers, which every
+// session to that node built under a proved ID shares, Noise sessions included;
+// false gives the session a ledger of its own at the same ceiling
+// (recvMemory.joinPeerMemory), for NewSessionForStatedPeer, whose caller holds
+// only the ID the remote stated, so sharing it would let one peer fill another's
+// room and send that node's streams a typed reset.
+func newTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto aether.Protocol, opts aether.SessionOptions, sharedPeer bool) *TCPSession {
 	opts = aether.NormalizeSessionOptions(opts)
 	tc := aether.TransportClassForProtocol(proto)
 	base := aether.NewBaseSession(localNodeID, remoteNodeID, proto)
@@ -458,7 +476,7 @@ func NewTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 		prefaceWritten: make(chan struct{}),
 		prefaceTimeout: wireVersionsPrefaceTimeout,
 	}
-	s.joinPeerMemory(remoteNodeID, true)
+	s.joinPeerMemory(remoteNodeID, sharedPeer)
 	s.wireOffer, s.wireOfferErr = aether.LocalWireVersions(opts.WireVersions)
 	// Per-peer abuse tracker — per-session registry by default,
 	// overridable via SetAbuseScoreRegistry for cross-session scoring.
@@ -532,7 +550,7 @@ func NewTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 }
 
 // writePreface writes this session's wire version preface, then releases
-// the writeMu NewTCPSession took. A malformed local offer writes nothing.
+// the writeMu newTCPSession took. A malformed local offer writes nothing.
 // A failed write ends the exchange, if it is still open, and closes the
 // session. writeMu is released before any close so the close path's own
 // frame writes cannot wait on it.
