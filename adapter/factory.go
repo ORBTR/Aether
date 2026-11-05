@@ -31,24 +31,50 @@ import (
 // Numeric zero-values in opts are normalised to package defaults —
 // start from aether.DefaultSessionOptions() when you want feature-
 // flag bools enabled.
+//
+// remoteNodeID is the identity that authentication proved: the session it
+// builds shares that node's per-peer ledgers (peerMemoryLedgers, and on Noise
+// sessionPeerLedgers) with every other session to it. A caller that holds only
+// a node ID the remote stated, with no proof of its key, builds the session
+// through NewSessionForStatedPeer.
 func NewSessionForProtocol(conn net.Conn, proto aether.Protocol,
 	localNodeID, remoteNodeID aether.NodeID, opts aether.SessionOptions) (aether.Session, error) {
+	return newSessionForProtocol(conn, proto, localNodeID, remoteNodeID, opts, true)
+}
+
+// NewSessionForStatedPeer is NewSessionForProtocol for a conn whose remote node
+// ID is a label the remote stated (a header or a plaintext line) and no
+// handshake proved. The session reports statedNodeID as its RemoteNodeID, and
+// its per-peer ceilings are its own: it joins no other session's per-peer
+// ledger, so a remote stating another node's ID cannot fill that node's room or
+// send that node's streams a typed reset. Every other bound is
+// NewSessionForProtocol's.
+func NewSessionForStatedPeer(conn net.Conn, proto aether.Protocol,
+	localNodeID, statedNodeID aether.NodeID, opts aether.SessionOptions) (aether.Session, error) {
+	return newSessionForProtocol(conn, proto, localNodeID, statedNodeID, opts, false)
+}
+
+// newSessionForProtocol builds the adapter proto names. sharedPeer is the
+// choice newNoiseSession and newTCPSession take: true joins remoteNodeID's
+// per-peer ledgers, false gives the session ledgers of its own.
+func newSessionForProtocol(conn net.Conn, proto aether.Protocol,
+	localNodeID, remoteNodeID aether.NodeID, opts aether.SessionOptions, sharedPeer bool) (aether.Session, error) {
 
 	switch proto {
 	case aether.ProtoNoise:
-		return NewNoiseSession(conn, localNodeID, remoteNodeID, opts), nil
+		return newNoiseSession(conn, localNodeID, remoteNodeID, opts, sharedPeer), nil
 	case aether.ProtoWebSocket:
-		return NewWebSocketSession(conn, localNodeID, remoteNodeID, opts), nil
+		return newWebSocketSession(conn, localNodeID, remoteNodeID, opts, sharedPeer), nil
 	case aether.ProtoQUIC:
 		// QUIC via this factory is the byte-stream adapter path
 		// (net.Conn-wrapped QUIC stream). For native QUIC
 		// multiplexing, callers invoke NewQuicSession directly.
-		return NewTCPSession(conn, localNodeID, remoteNodeID, aether.ProtoQUIC, opts), nil
+		return newTCPSession(conn, localNodeID, remoteNodeID, aether.ProtoQUIC, opts, sharedPeer), nil
 	case aether.ProtoGRPC:
-		return NewGrpcSession(conn, localNodeID, remoteNodeID, opts), nil
+		return newGrpcSession(conn, localNodeID, remoteNodeID, opts, sharedPeer), nil
 	default:
 		// TCP/TLS and any unknown protocol use the TCP adapter.
-		return NewTCPSession(conn, localNodeID, remoteNodeID, aether.ProtoTCP, opts), nil
+		return newTCPSession(conn, localNodeID, remoteNodeID, aether.ProtoTCP, opts, sharedPeer), nil
 	}
 }
 

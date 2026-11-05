@@ -16,7 +16,7 @@ import (
 
 // wireVersionsPrefaceTimeout bounds a preface exchange: a peer whose preface has
 // not arrived by then has the session closed with errWireVersionsPrefaceTimeout.
-// NewTCPSession and NewQuicSession copy it into the session (prefaceTimeout), so a
+// newTCPSession and NewQuicSession copy it into the session (prefaceTimeout), so a
 // test can shorten it for the sessions it builds without racing sessions already
 // running.
 var wireVersionsPrefaceTimeout = 10 * time.Second

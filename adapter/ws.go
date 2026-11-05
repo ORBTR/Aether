@@ -27,9 +27,16 @@ type WebSocketSession struct {
 // NewWebSocketSession creates an Aether session over a WebSocket
 // connection. The conn parameter should be a websocket.WSConn which
 // implements net.Conn. See NewTCPSession for the opts semantics —
-// WebSocket uses the TCP-family adapter under the hood.
+// WebSocket uses the TCP-family adapter under the hood. remoteNodeID must
+// be the identity the WebSocket transport proved, as NewTCPSession states.
 func NewWebSocketSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opts aether.SessionOptions) *WebSocketSession {
-	tcp := NewTCPSession(conn, localNodeID, remoteNodeID, aether.ProtoWebSocket, opts)
+	return newWebSocketSession(conn, localNodeID, remoteNodeID, opts, true)
+}
+
+// newWebSocketSession is NewWebSocketSession with newTCPSession's choice of
+// per-peer memory ledger, which NewSessionForStatedPeer passes as false.
+func newWebSocketSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opts aether.SessionOptions, sharedPeer bool) *WebSocketSession {
+	tcp := newTCPSession(conn, localNodeID, remoteNodeID, aether.ProtoWebSocket, opts, sharedPeer)
 	return &WebSocketSession{TCPSession: tcp, proto: aether.ProtoWebSocket}
 }
 

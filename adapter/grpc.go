@@ -45,15 +45,26 @@ type GrpcSession struct {
 // NewGrpcSession creates an Aether gRPC session with the caller-
 // supplied SessionOptions. gRPC sessions use TCPSession internally
 // since gRPC's HTTP/2 provides the same reliable stream semantics as
-// TCP. See NewTCPSession for the opts semantics.
+// TCP. See NewTCPSession for the opts semantics, and for remoteNodeID, which
+// must be the identity the gRPC transport proved.
 func NewGrpcSession(conn interface {
 	Read([]byte) (int, error)
 	Write([]byte) (int, error)
 	Close() error
 }, localNodeID, remoteNodeID aether.NodeID, opts aether.SessionOptions) *GrpcSession {
+	return newGrpcSession(conn, localNodeID, remoteNodeID, opts, true)
+}
+
+// newGrpcSession is NewGrpcSession with newTCPSession's choice of per-peer
+// memory ledger, which NewSessionForStatedPeer passes as false.
+func newGrpcSession(conn interface {
+	Read([]byte) (int, error)
+	Write([]byte) (int, error)
+	Close() error
+}, localNodeID, remoteNodeID aether.NodeID, opts aether.SessionOptions, sharedPeer bool) *GrpcSession {
 	wrapped := &grpcConnWrapper{conn: conn}
 	return &GrpcSession{
-		TCPSession: NewTCPSession(wrapped, localNodeID, remoteNodeID, aether.ProtoGRPC, opts),
+		TCPSession: newTCPSession(wrapped, localNodeID, remoteNodeID, aether.ProtoGRPC, opts, sharedPeer),
 		proto:      aether.ProtoGRPC,
 	}
 }
