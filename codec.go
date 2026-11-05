@@ -564,7 +564,8 @@ func DecodePriority(data []byte) PriorityPayload {
 }
 
 // EncodeOpenPayload encodes an OPEN frame payload:
-// [1 reliability][1 priority][8 dependency, big-endian][4 initial credit, big-endian][1 FEC level].
+// [1 reliability][1 priority][8 dependency, big-endian][4 initial credit, big-endian][1 FEC level]
+// [8 generation, big-endian].
 func EncodeOpenPayload(o OpenPayload) []byte {
 	data := make([]byte, OpenPayloadSize)
 	data[0] = byte(o.Reliability)
@@ -572,12 +573,13 @@ func EncodeOpenPayload(o OpenPayload) []byte {
 	binary.BigEndian.PutUint64(data[2:10], o.Dependency)
 	binary.BigEndian.PutUint32(data[10:14], o.InitialCredit)
 	data[14] = o.FECLevel
+	binary.BigEndian.PutUint64(data[15:23], o.Generation)
 	return data
 }
 
 // DecodeOpenPayload decodes an OPEN frame payload. Input shorter than
-// OpenPayloadSize decodes to the zero value, whose InitialCredit of zero a
-// NoiseSession refuses.
+// OpenPayloadSize decodes to the zero value, whose InitialCredit and Generation
+// of zero a NoiseSession refuses.
 func DecodeOpenPayload(data []byte) OpenPayload {
 	if len(data) < OpenPayloadSize {
 		return OpenPayload{}
@@ -588,7 +590,47 @@ func DecodeOpenPayload(data []byte) OpenPayload {
 		Dependency:    binary.BigEndian.Uint64(data[2:10]),
 		InitialCredit: binary.BigEndian.Uint32(data[10:14]),
 		FECLevel:      data[14],
+		Generation:    binary.BigEndian.Uint64(data[15:23]),
 	}
+}
+
+// ValidStreamGeneration reports whether g is a generation an OPEN may state: from
+// 1 to MaxStreamGeneration. The NoiseSession and TCP-family session's handleOpen
+// refuse any other.
+func ValidStreamGeneration(g uint64) bool {
+	return g != 0 && g <= MaxStreamGeneration
+}
+
+// putIncarnation writes inc into the StreamIncarnationSize bytes of b.
+func putIncarnation(b []byte, inc StreamIncarnation) {
+	v := inc.Generation & MaxStreamGeneration
+	if inc.WriterOpened {
+		v |= 1 << 63
+	}
+	binary.BigEndian.PutUint64(b[:StreamIncarnationSize], v)
+}
+
+// incarnationAt reads the StreamIncarnation putIncarnation wrote into b.
+func incarnationAt(b []byte) StreamIncarnation {
+	v := binary.BigEndian.Uint64(b[:StreamIncarnationSize])
+	return StreamIncarnation{Generation: v & MaxStreamGeneration, WriterOpened: v>>63 == 1}
+}
+
+// EncodeClosePayload encodes a CLOSE frame payload: the stream's incarnation.
+func EncodeClosePayload(inc StreamIncarnation) []byte {
+	data := make([]byte, ClosePayloadSize)
+	putIncarnation(data, inc)
+	return data
+}
+
+// DecodeClosePayload decodes a CLOSE frame payload. Input shorter than
+// ClosePayloadSize decodes to the zero value, generation 0, which names no
+// stream: Validate has refused such a frame on every session path that reads one.
+func DecodeClosePayload(data []byte) StreamIncarnation {
+	if len(data) < ClosePayloadSize {
+		return StreamIncarnation{}
+	}
+	return incarnationAt(data)
 }
 
 // EncodeGoAway encodes a GOAWAY frame payload.
@@ -673,9 +715,9 @@ func DecodeFECHeader(data []byte) (FECHeader, []byte, error) {
 	return h, data[end:], nil
 }
 
-// EncodeReset encodes the RESET payload of a writer that states no credit counts:
-// a refusal, which holds no stream, and the TCP-family and QUIC sessions, which
-// run no aether credit.
+// EncodeReset encodes the RESET payload of a writer that states no credit counts
+// and no incarnation. No session writes it: every RESET a session writes names its
+// stream (ResetPayload.Incarnation), through EncodeResetPayload.
 func EncodeReset(reason ResetReason) []byte {
 	return EncodeResetPayload(ResetPayload{Reason: reason})
 }
@@ -687,6 +729,7 @@ func EncodeResetPayload(p ResetPayload) []byte {
 	binary.BigEndian.PutUint64(data[4:12], p.Charged)
 	binary.BigEndian.PutUint64(data[12:20], p.Released)
 	binary.BigEndian.PutUint64(data[20:28], p.Consumed)
+	putIncarnation(data[28:36], p.Incarnation)
 	return data
 }
 
@@ -704,10 +747,11 @@ func DecodeResetPayload(data []byte) ResetPayload {
 		return ResetPayload{}
 	}
 	return ResetPayload{
-		Reason:   ResetReason(binary.BigEndian.Uint32(data[0:4])),
-		Charged:  binary.BigEndian.Uint64(data[4:12]),
-		Released: binary.BigEndian.Uint64(data[12:20]),
-		Consumed: binary.BigEndian.Uint64(data[20:28]),
+		Reason:      ResetReason(binary.BigEndian.Uint32(data[0:4])),
+		Charged:     binary.BigEndian.Uint64(data[4:12]),
+		Released:    binary.BigEndian.Uint64(data[12:20]),
+		Consumed:    binary.BigEndian.Uint64(data[20:28]),
+		Incarnation: incarnationAt(data[28:36]),
 	}
 }
 

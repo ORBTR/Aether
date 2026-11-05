@@ -99,6 +99,14 @@ type NoiseSession struct {
 	// peer's RESET crossing it (noteResetGrants, handleReset). Guarded by mu.
 	resetGrants map[uint64]resetGrant
 
+	// pendingResets holds, per stream ID, the RESET this side wrote last under the
+	// ID and has had no acknowledgment of (writeReset, resetAcknowledged), which
+	// retransmitResets writes again on the reliability tick. pendingResetCount is
+	// its size, read lock-free so a tick with nothing pending takes no lock. Both
+	// guarded by mu (the count is written under it).
+	pendingResets     map[uint64]*pendingReset
+	pendingResetCount atomic.Int64
+
 	// PMTU discovery (UDP only)
 	pmtuProber *pmtu.Prober
 
@@ -472,7 +480,9 @@ type NoiseSession struct {
 
 	// streamGenerations numbers every stream object this session creates, so a
 	// stream ID opened again carries a higher generation on its fragments than
-	// the stream that used the ID before (FragmentBinding.Generation).
+	// the stream that used the ID before (FragmentBinding.Generation), and a
+	// stream this side opens states its number in its OPEN, CLOSE and RESET
+	// (noiseStream.incarnation).
 	streamGenerations atomic.Uint64
 
 	// admitted is the receive credit this session's streams hold, against the
@@ -487,9 +497,11 @@ type NoiseSession struct {
 	admitted         *creditLedger
 	creditPeerShared bool
 
-	// recentlyLeft holds, per stream ID, when a stream that left on both CLOSEs
-	// stops being a reason to refuse a local OpenStream of its ID (noteLeft,
-	// reopenQuietLocked). Guarded by s.mu, pruned by sweepRecentlyLeft.
+	// recentlyLeft holds, per stream ID, when a stream that left on both CLOSEs,
+	// or whose RESET was acknowledged or not kept to wait for it, stops being a
+	// reason to refuse a local OpenStream of its ID (noteLeft, resetAcknowledged,
+	// writeReset, reopenQuietLocked). Guarded by s.mu, pruned by
+	// sweepRecentlyLeft.
 	recentlyLeft map[uint64]time.Time
 
 	// recvMemory is what this session's receive queues hold: recvQueued, which
@@ -754,9 +766,10 @@ func (s *NoiseSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) 
 	// send a RESET back (no peer to RESET — the caller gets the error
 	// directly). Both apply universally so a leaking local caller can't
 	// exhaust the session's stream-slot table or its admitted credit. An ID
-	// still in use, or just left on both CLOSEs (reopenQuietLocked), is refused
-	// too, and no second OPEN goes to the peer.
-	st, err := s.createStream(cfg.StreamID, cfg, false)
+	// still in use, just left on both CLOSEs or by an acknowledged RESET
+	// (reopenQuietLocked), or whose RESET waits for its acknowledgment
+	// (resetPendingLocked), is refused too, and no second OPEN goes to the peer.
+	st, err := s.createStream(cfg.StreamID, cfg, false, 0)
 	if err != nil {
 		// Refused. streamRefused counter already incremented inside
 		// createStream for a cap or credit refusal. Surface the typed sentinel
@@ -781,7 +794,9 @@ func (s *NoiseSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) 
 	// its reservation for the stream from it, so each side's sends on the
 	// stream are bounded by the credit the other side holds for them. It states
 	// the FEC level the stream runs here, none on a session with FEC disabled,
-	// which the peer builds its own state from.
+	// which the peer builds its own state from, and the stream's generation, by
+	// which the peer tells this stream's CLOSE and RESET from those of another
+	// stream under the ID.
 	var fecLevel reliability.FECLevel
 	if st.fec != nil {
 		fecLevel = st.fec.Level()
@@ -792,6 +807,7 @@ func (s *NoiseSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) 
 		Dependency:    cfg.Dependency,
 		InitialCredit: uint32(st.window.CurrentWindow()),
 		FECLevel:      uint8(fecLevel),
+		Generation:    st.incarnation.Generation,
 	})
 	frame := &aether.Frame{
 		SenderID:   s.LocalPeerID(),
@@ -904,27 +920,31 @@ func (s *NoiseSession) sweepEndedQueues(now time.Time) {
 }
 
 // reopenQuietRTOs is how many of the leaving stream's RTOs a stream ID stays closed
-// to a local OpenStream after the stream left on both CLOSEs. The peer retransmits
-// its CLOSE until this side's ACK of it arrives, and a frame says nothing of which
-// stream under an ID it belongs to: a copy reaching a new stream under the ID would
-// end that stream's receive side at the old stream's sequence number. An ACK and the
-// copy after it take one RTO each way to settle, which three RTOs cover unless every
-// ACK of a run of them is lost.
-// TODO: state the stream's generation on OPEN and CLOSE under a frame grammar
-// version, so a stale CLOSE is refused however late it comes and no ID waits.
+// to a local OpenStream after the stream left on both CLOSEs, or after the
+// acknowledgment of its RESET came (resetAcknowledged), or after a RESET writeReset
+// could not keep was written. A CLOSE and a RESET name the stream they end
+// (aether.StreamIncarnation), so a late copy of either meets a new stream under the
+// ID and ends nothing of it (handleClose, handleReset). A DATA or ACK frame names no
+// stream under its ID: a copy of one still on the path would reach a new stream
+// under the ID at the old stream's sequence numbers. A frame and the ACK after it
+// take one RTO each way to settle, which three RTOs cover unless every ACK of a run
+// of them is lost.
+// TODO: name the stream's incarnation on DATA and ACK under a frame grammar
+// version, so a late copy of either is refused however late it comes and no ID waits.
 const reopenQuietRTOs = 3
 
 // noteLeft records that the stream under id has just left on both CLOSEs
 // (noiseStream.leaveIfEnded), starting its ID's quiet time.
 func (s *NoiseSession) noteLeft(id uint64, rto time.Duration) {
 	s.mu.Lock()
-	s.recentlyLeft[id] = time.Now().Add(reopenQuietRTOs * rto)
+	s.startQuietLocked(id, time.Now(), rto)
 	s.mu.Unlock()
 }
 
 // reopenQuietLocked reports whether id is in its quiet time (reopenQuietRTOs).
 // createStream, under s.mu, refuses a local OpenStream of such an ID; a peer's OPEN
-// is not refused, since the peer has seen this side's CLOSE and its own acknowledged.
+// is not refused, since the peer has seen this side's CLOSE or RESET, and its own
+// CLOSE acknowledged.
 func (s *NoiseSession) reopenQuietLocked(id uint64) bool {
 	until, ok := s.recentlyLeft[id]
 	if !ok {
@@ -950,17 +970,145 @@ func (s *NoiseSession) sweepRecentlyLeft(now time.Time) {
 	}
 }
 
-// resetGrant is what a stream this side reset had granted when it did
-// (noteResetGrants).
+// resetGrant is what a stream this side reset had granted when it did, and the
+// stream as this side's RESET named it (noteResetGrants).
 type resetGrant struct {
 	granted int64
 	at      time.Time
+	inc     aether.StreamIncarnation
 }
 
 // resetGrantLifetime is how long a note waits for a crossing RESET. Two RESETs cross
-// within a path's delay, and a RESET is written once, so a note past this has no
-// RESET coming.
+// within a path's delay of each other, and the peer writes its RESET again at most
+// resetRetransmitMaxWait apart until this side acknowledges it (retransmitResets), so
+// a crossing RESET reaches its note unless every copy of it is lost for this long; one
+// that comes later finds no note, and its writer keeps the overlap's credit twice, as
+// past the map's bound.
 const resetGrantLifetime = 30 * time.Second
+
+// resetRetransmitMaxWait is the longest wait between two copies of a RESET no
+// acknowledgment has answered: the wait starts at the RTO of the stream it ended and
+// doubles up to this. A RESET is written again until its acknowledgment comes or the
+// session ends, since while it waits createStream holds the ID against a local open,
+// and a session whose peer answers nothing ends on its idle timeout.
+const resetRetransmitMaxWait = 2 * time.Second
+
+// pendingReset is a RESET writeReset wrote that has had no acknowledgment: the
+// frame, written again as it is (writeFrame resends its encrypted bytes), the stream
+// as it names it, which the acknowledgment must name too, the RTO of the stream it
+// ended, from which the quiet time after it is measured, the wait before its next
+// copy and when that copy is due.
+type pendingReset struct {
+	frame *aether.Frame
+	inc   aether.StreamIncarnation
+	rto   time.Duration
+	wait  time.Duration
+	next  time.Time
+}
+
+// writeReset writes the RESET p states for streamID and keeps it until the peer
+// acknowledges it (resetAcknowledged), writing it again on the reliability tick
+// (retransmitResets): a RESET lost on the datagram path would leave the peer's stream
+// live under an ID this side opens again, whose frames would then reach the old
+// stream's consumer. createStream refuses a local OpenStream of the ID while the
+// RESET waits. rto is the RTO of the stream the RESET ends, or of a fresh estimator
+// for a refusal, which holds no stream. Past the session's stream cap of waiting
+// RESETs, which only a peer that acknowledges none of them reaches, a RESET is written
+// once with the ID's quiet time started, so such a peer cannot grow the map; an OPEN
+// of the ID reaching that peer's copy of a stream it opened replaces the stream there
+// by its higher generation (handleOpen). Reset and sendRefused call it.
+func (s *NoiseSession) writeReset(streamID uint64, p aether.ResetPayload, rto time.Duration) error {
+	payload := aether.EncodeResetPayload(p)
+	frame := &aether.Frame{
+		SenderID:   s.LocalPeerID(),
+		ReceiverID: s.RemotePeerID(),
+		StreamID:   streamID,
+		Type:       aether.TypeRESET,
+		Length:     uint32(len(payload)),
+		Payload:    payload,
+	}
+	now := time.Now()
+	limit := s.opts.MaxConcurrentStreams
+	if limit <= 0 {
+		limit = aether.DefaultMaxConcurrentStreams
+	}
+	s.mu.Lock()
+	if s.pendingResets == nil {
+		s.pendingResets = make(map[uint64]*pendingReset)
+	}
+	if _, replaced := s.pendingResets[streamID]; replaced || len(s.pendingResets) < limit {
+		if !replaced {
+			s.pendingResetCount.Add(1)
+		}
+		s.pendingResets[streamID] = &pendingReset{
+			frame: frame,
+			inc:   p.Incarnation,
+			rto:   rto,
+			wait:  rto,
+			next:  now.Add(rto),
+		}
+	} else {
+		s.startQuietLocked(streamID, now, rto)
+	}
+	s.mu.Unlock()
+	return s.writeFrame(frame)
+}
+
+// resetPendingLocked reports whether a RESET this side wrote under id waits for its
+// acknowledgment (writeReset). createStream, under s.mu, refuses a local OpenStream
+// of such an ID: the peer may still hold the stream that RESET ends.
+func (s *NoiseSession) resetPendingLocked(id uint64) bool {
+	_, ok := s.pendingResets[id]
+	return ok
+}
+
+// resetAcknowledged takes the peer's acknowledgment of a RESET under streamID: when
+// it names the stream the waiting RESET names, the RESET stops and the ID's quiet
+// time starts. An acknowledgment of an earlier RESET under the ID, which a later one
+// replaced, stops nothing. handleReset calls it for a RESET flagged FlagACK.
+func (s *NoiseSession) resetAcknowledged(streamID uint64, inc aether.StreamIncarnation) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p, ok := s.pendingResets[streamID]
+	if !ok || p.inc != inc {
+		return
+	}
+	delete(s.pendingResets, streamID)
+	s.pendingResetCount.Add(-1)
+	s.startQuietLocked(streamID, time.Now(), p.rto)
+}
+
+// startQuietLocked starts id's quiet time (reopenQuietRTOs of rto from now). Caller
+// holds s.mu.
+func (s *NoiseSession) startQuietLocked(id uint64, now time.Time, rto time.Duration) {
+	if s.recentlyLeft == nil {
+		s.recentlyLeft = make(map[uint64]time.Time)
+	}
+	s.recentlyLeft[id] = now.Add(reopenQuietRTOs * rto)
+}
+
+// retransmitResets writes again every waiting RESET whose wait is over, doubling
+// its wait up to resetRetransmitMaxWait. reliabilityTick calls it on every tick; with
+// nothing waiting it reads one atomic.
+func (s *NoiseSession) retransmitResets(now time.Time) {
+	if s.pendingResetCount.Load() == 0 {
+		return
+	}
+	var due []*aether.Frame
+	s.mu.Lock()
+	for _, p := range s.pendingResets {
+		if now.Before(p.next) {
+			continue
+		}
+		p.wait = min(2*p.wait, resetRetransmitMaxWait)
+		p.next = now.Add(p.wait)
+		due = append(due, p.frame)
+	}
+	s.mu.Unlock()
+	for _, f := range due {
+		_ = s.writeFrame(f)
+	}
+}
 
 // grantConnCredit returns n bytes of the peer's connection credit that no
 // Receive will record, through the debouncer Receive's records go through.

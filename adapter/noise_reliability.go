@@ -405,6 +405,11 @@ func (s *NoiseSession) reliabilityTick() {
 				_ = s.writeFrame(statsFrame)
 			}
 
+			// A RESET no acknowledgment has answered is written again here,
+			// outside the congestion window like STATS: it ends a stream the
+			// peer still holds, and the ID it frees waits for it.
+			s.retransmitResets(time.Now())
+
 			// Snapshot the stream list under a brief lock so we can
 			// process per-stream work without contending with handleACK
 			// / handleData / OpenStream which all acquire s.mu.

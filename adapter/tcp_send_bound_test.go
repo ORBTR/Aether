@@ -123,7 +123,7 @@ func TestTCPStream_AWaitingSendEndsWithItsStreamOrSession(t *testing.T) {
 		done := make(chan error, 1)
 		go func() { done <- st.Send(ctx, big) }()
 		time.Sleep(50 * time.Millisecond)
-		writeFrames(t, p.conn, &aether.Frame{StreamID: 64, Type: aether.TypeRESET, Payload: aether.EncodeReset(aether.ResetFlowCtrl)})
+		writeFrames(t, p.conn, resetTo(st, aether.ResetFlowCtrl))
 		select {
 		case err := <-done:
 			if !errors.Is(err, aether.ErrStreamOverrun) {
@@ -149,7 +149,7 @@ func TestTCPStream_AWaitingSendEndsWithItsStreamOrSession(t *testing.T) {
 		done := make(chan error, 1)
 		go func() { done <- st.Send(ctx, big) }()
 		time.Sleep(50 * time.Millisecond)
-		writeFrames(t, p.conn, &aether.Frame{StreamID: 68, Type: aether.TypeRESET, Payload: aether.EncodeReset(aether.ResetFlowCtrl)})
+		writeFrames(t, p.conn, resetTo(st, aether.ResetFlowCtrl))
 		select {
 		case err := <-done:
 			if !errors.Is(err, aether.ErrStreamOverrun) {

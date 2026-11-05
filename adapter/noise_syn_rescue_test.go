@@ -80,7 +80,7 @@ func TestUnknownStream_SYNCreatesTheStream(t *testing.T) {
 	}
 
 	const credit = 256 << 10
-	open := aether.EncodeOpenPayload(aether.OpenPayload{Reliability: aether.ReliableOrdered, InitialCredit: credit})
+	open := aether.EncodeOpenPayload(aether.OpenPayload{Reliability: aether.ReliableOrdered, InitialCredit: credit, Generation: 1})
 	s.handleData(&aether.Frame{
 		StreamID: probeStream,
 		Type:     aether.TypeDATA,
@@ -125,7 +125,7 @@ func TestNoiseSession_ASYNPayloadIsNeverAMessage(t *testing.T) {
 		t.Errorf("streamRefused = %d, want 1", got)
 	}
 
-	open := aether.EncodeOpenPayload(aether.OpenPayload{Reliability: aether.ReliableOrdered, InitialCredit: 256 << 10})
+	open := aether.EncodeOpenPayload(aether.OpenPayload{Reliability: aether.ReliableOrdered, InitialCredit: 256 << 10, Generation: 1})
 	s.handleData(syn(101, open))
 	s.mu.Lock()
 	st := s.streams[101]

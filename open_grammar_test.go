@@ -12,13 +12,15 @@ import (
 )
 
 // TestOpenPayloadGolden: the OPEN payload of the current frame grammar is
-// fifteen bytes, the opener's initial credit big-endian in bytes 10-13 and the
-// stream's FEC level in the last, and it decodes back to what was encoded. A
-// payload of an earlier layout decodes to the zero value, and Validate refuses an
-// OPEN frame carrying one before any handler reads it.
+// twenty-three bytes, the opener's initial credit big-endian in bytes 10-13, the
+// stream's FEC level in byte 14 and the opener's generation big-endian in the last
+// eight, and it decodes back to what was encoded. A payload of an earlier layout
+// decodes to the zero value, and Validate refuses an OPEN frame carrying one before
+// any handler reads it.
 func TestOpenPayloadGolden(t *testing.T) {
-	o := OpenPayload{Reliability: ReliableUnordered, Priority: 128, Dependency: 0x0102030405060708, InitialCredit: 0x00100400, FECLevel: 2}
-	want := []byte{byte(ReliableUnordered), 0x80, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x00, 0x10, 0x04, 0x00, 0x02}
+	o := OpenPayload{Reliability: ReliableUnordered, Priority: 128, Dependency: 0x0102030405060708, InitialCredit: 0x00100400, FECLevel: 2, Generation: 0x3132333435363738}
+	want := []byte{byte(ReliableUnordered), 0x80, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x00, 0x10, 0x04, 0x00, 0x02,
+		0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38}
 	got := EncodeOpenPayload(o)
 	if !bytes.Equal(got, want) {
 		t.Fatalf("EncodeOpenPayload = % x, want % x", got, want)
@@ -33,7 +35,7 @@ func TestOpenPayloadGolden(t *testing.T) {
 		t.Fatalf("MaxOpenCredit = %d, the four-byte field holds %d", MaxOpenCredit, int64(1<<32-1))
 	}
 
-	for _, n := range []int{10, 14} {
+	for _, n := range []int{10, 14, 15} {
 		earlier := got[:n]
 		if back := DecodeOpenPayload(earlier); back != (OpenPayload{}) {
 			t.Fatalf("a %d-byte OPEN payload decoded to %+v, want the zero value", n, back)
@@ -50,8 +52,8 @@ func TestOpenPayloadGolden(t *testing.T) {
 }
 
 // earlierFrameOffer is this build's own offer with the frame grammar entry
-// listing only the version before the current one: a peer whose CLOSE takes no
-// sequence number and whose OPEN, RESET and FEC_REPAIR have other layouts.
+// listing only the version before the current one: a peer whose OPEN, CLOSE and
+// RESET name no stream generation and whose RESET is never acknowledged.
 func earlierFrameOffer(t *testing.T) WireVersions {
 	t.Helper()
 	own, err := LocalWireVersions(nil)
@@ -75,8 +77,8 @@ func earlierFrameOffer(t *testing.T) WireVersions {
 // *WireVersionMismatchError naming the frame entry and both lists, whichever
 // side is local, so neither side reaches session state.
 func TestFrameGrammarNegotiation(t *testing.T) {
-	if WireVersionFrameCurrent != 4 {
-		t.Fatalf("WireVersionFrameCurrent = %d; the sequence-numbered CLOSE and the RESET and FEC_REPAIR with their counts and tables are grammar 4", WireVersionFrameCurrent)
+	if WireVersionFrameCurrent != 5 {
+		t.Fatalf("WireVersionFrameCurrent = %d; the OPEN, CLOSE and RESET naming their stream's generation and the acknowledged RESET are grammar 5", WireVersionFrameCurrent)
 	}
 	own, err := LocalWireVersions(nil)
 	if err != nil {

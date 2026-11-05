@@ -97,6 +97,11 @@ type TCPSession struct {
 	// MaxConcurrentStreams was reached (registerStream).
 	streamRefused uint64
 
+	// streamGenerations numbers the streams this session opens; OpenStream states
+	// each one's number in its SYN, and its CLOSE and RESET name it by that number
+	// (tcpStream.incarnation).
+	streamGenerations atomic.Uint64
+
 	// recvMemory is what this session's delivery queues hold, against the bounds
 	// profile's session and per-peer ceilings (tcpStream.enqueueDelivery), and the
 	// queues of ended streams, which housekeepingTick's sweep and makeQueueRoom
@@ -208,6 +213,24 @@ type tcpStream struct {
 	// to a peer's CLOSE that arrives first.
 	closeFrame   *aether.Frame
 	closeWritten bool
+
+	// incarnation names this stream among those that have used its ID on the
+	// session, as this side states it: the opener's generation, from this session's
+	// streamGenerations when this side opened it (OpenStream) and from the peer's
+	// SYN when the peer did (handleOpen), with WriterOpened set when this side
+	// opened it. Its CLOSE and RESET state it, and handleClose and handleReset end
+	// the stream only for a frame that names it (namedBy): the peer writes its CLOSE
+	// or RESET of a stream before it reads this side's RESET of it, so on the
+	// ordered byte stream such a frame can follow this side's reopening of the ID,
+	// and would otherwise end the new stream. Set before the stream is registered,
+	// read-only after.
+	incarnation aether.StreamIncarnation
+}
+
+// namedBy reports whether inc, read from a frame of the peer's, names this stream:
+// the same generation, and the peer's WriterOpened the opposite of this side's.
+func (st *tcpStream) namedBy(inc aether.StreamIncarnation) bool {
+	return inc.Generation == st.incarnation.Generation && inc.WriterOpened != st.incarnation.WriterOpened
 }
 
 // closeRecvOnce ends the stream's receive side exactly once: it ends recvQ, so
@@ -363,7 +386,7 @@ func (st *tcpStream) sendReset(reason aether.ResetReason) error {
 	}
 	st.state.Transition(aether.EventSendReset)
 	st.endSend()
-	payload := aether.EncodeReset(reason)
+	payload := aether.EncodeResetPayload(aether.ResetPayload{Reason: reason, Incarnation: st.incarnation})
 	err := s.writeFrame(&aether.Frame{
 		SenderID:   s.LocalPeerID(),
 		ReceiverID: s.RemotePeerID(),
@@ -773,7 +796,7 @@ func (s *TCPSession) registerStream(st *tcpStream, enforceRemoteCap bool) *tcpSt
 			atomic.AddUint64(&s.streamRefused, 1)
 			s.reportAbuse(abuse.ReasonStreamRefused)
 			if enforceRemoteCap {
-				s.sendRefused(st.streamID)
+				s.sendRefused(st.streamID, st.incarnation.Generation)
 			}
 			return nil
 		}
@@ -790,8 +813,13 @@ func (s *TCPSession) registerStream(st *tcpStream, enforceRemoteCap bool) *tcpSt
 
 // sendRefused answers a stream the peer opened and this side will not admit, with
 // RESET(ResetRefused), which the peer's handleReset reads as aether.ErrStreamRefused.
-func (s *TCPSession) sendRefused(streamID uint64) {
-	payload := aether.EncodeReset(aether.ResetRefused)
+// It names the stream by the generation the peer's SYN stated, so it ends that
+// stream and no later one under the ID.
+func (s *TCPSession) sendRefused(streamID, generation uint64) {
+	payload := aether.EncodeResetPayload(aether.ResetPayload{
+		Reason:      aether.ResetRefused,
+		Incarnation: aether.StreamIncarnation{Generation: generation},
+	})
 	s.writeFrame(&aether.Frame{
 		SenderID:   s.LocalPeerID(),
 		ReceiverID: s.RemotePeerID(),
@@ -821,9 +849,11 @@ func (s *TCPSession) StreamRefusedCount() uint64 {
 
 // handleOpen admits a stream the peer opened, by an OPEN frame or a DATA frame
 // flagged aether.FlagSYN (deliverToStream), which is how OpenStream writes it. A
-// payload that is not an OPEN payload is refused with RESET(ResetRefused) and an
-// abuse charge and keeps no state: the peer has written bytes this side cannot read
-// as what the frame says they are. A duplicate leaves the stream in place as it is.
+// payload that is not an OPEN payload, or one stating a generation of zero or above
+// aether.MaxStreamGeneration, which names no stream, is refused with
+// RESET(ResetRefused) and an abuse charge and keeps no state: the peer has written
+// bytes this side cannot read as what the frame says they are. A duplicate leaves
+// the stream in place as it is.
 func (s *TCPSession) handleOpen(frame *aether.Frame) {
 	dbgTCP.Printf("handleOpen: stream=%d", frame.StreamID)
 	s.mu.Lock()
@@ -832,15 +862,15 @@ func (s *TCPSession) handleOpen(frame *aether.Frame) {
 	if live {
 		return
 	}
-	if len(frame.Payload) != aether.OpenPayloadSize {
-		atomic.AddUint64(&s.streamRefused, 1)
-		s.reportAbuse(abuse.ReasonStreamRefused)
-		s.sendRefused(frame.StreamID)
-		return
-	}
 	// The payload's InitialCredit is not read: on a byte-stream session the
 	// transport owns flow control, and the stream keeps no aether credit.
 	payload := aether.DecodeOpenPayload(frame.Payload)
+	if len(frame.Payload) != aether.OpenPayloadSize || !aether.ValidStreamGeneration(payload.Generation) {
+		atomic.AddUint64(&s.streamRefused, 1)
+		s.reportAbuse(abuse.ReasonStreamRefused)
+		s.sendRefused(frame.StreamID, payload.Generation)
+		return
+	}
 	candidate := &tcpStream{
 		streamID: frame.StreamID,
 		config: aether.StreamConfig{
@@ -858,6 +888,7 @@ func (s *TCPSession) handleOpen(frame *aether.Frame) {
 		sendRoom:  semaphore.NewWeighted(flow.CurrentBounds().StreamCredit),
 		sendEnded: make(chan struct{}),
 	}
+	candidate.incarnation = aether.StreamIncarnation{Generation: payload.Generation}
 	st := s.registerStream(candidate, true /* enforceRemoteCap */)
 	if st == nil {
 		dbgTCP.Printf("handleOpen: refused stream=%d (cap reached)", frame.StreamID)
@@ -892,6 +923,9 @@ func (s *TCPSession) notifyStreamAccepted(st *tcpStream) {
 // session here only if this side's CLOSE is already written; otherwise
 // frameWritten takes it out after writing that CLOSE. The compressors' state for
 // the stream stays until the leave, since this side may still be sending on it.
+// A CLOSE naming another stream than the one under the ID (tcpStream.incarnation)
+// ends nothing and leaves the compressors' state alone: it is the CLOSE of a stream
+// this side has reset, written before the peer read that RESET.
 func (s *TCPSession) handleClose(frame *aether.Frame) {
 	s.mu.Lock()
 	st, ok := s.streams[frame.StreamID]
@@ -899,6 +933,10 @@ func (s *TCPSession) handleClose(frame *aether.Frame) {
 		s.mu.Unlock()
 		s.txCompressor.RemoveStream(frame.StreamID) // both directional compressors hold per-stream state
 		s.rxCompressor.RemoveStream(frame.StreamID)
+		return
+	}
+	if !st.namedBy(aether.DecodeClosePayload(frame.Payload)) {
+		s.mu.Unlock()
 		return
 	}
 	st.state.Transition(aether.EventRecvFIN)
@@ -956,9 +994,23 @@ func (s *TCPSession) leaveIfEndedLocked(st *tcpStream) bool {
 	return true
 }
 
+// handleReset ends the stream the peer's RESET names (tcpStream.incarnation). A
+// RESET naming another stream than the one under the ID, written by the peer before
+// it read this side's own RESET of that stream, ends nothing and leaves the
+// compressors' state alone. A RESET flagged aether.FlagACK is a Full-profile
+// session's acknowledgment, which no TCP-family peer writes, since the transport
+// delivers every RESET once in order; it is not a RESET and changes nothing.
 func (s *TCPSession) handleReset(frame *aether.Frame) {
+	if frame.Flags.Has(aether.FlagACK) {
+		return
+	}
+	payload := aether.DecodeResetPayload(frame.Payload)
 	s.mu.Lock()
 	st, ok := s.streams[frame.StreamID]
+	if ok && !st.namedBy(payload.Incarnation) {
+		s.mu.Unlock()
+		return
+	}
 	if ok {
 		// The peer's reason and the stream's state come first, ahead of the release:
 		// the scheduler's dropped frames give their room back to a Send waiting for
@@ -966,7 +1018,7 @@ func (s *TCPSession) handleReset(frame *aether.Frame) {
 		// holds, and Send, name it). A refusal (the peer's registerStream cap) is
 		// aether.ErrStreamRefused, the peer's full delivery queue (overrun)
 		// aether.ErrStreamOverrun. Every other reason ends the stream as io.EOF.
-		switch aether.DecodeReset(frame.Payload) {
+		switch payload.Reason {
 		case aether.ResetRefused:
 			st.setEnd(aether.ErrStreamRefused)
 		case aether.ResetFlowCtrl:
@@ -1235,6 +1287,10 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 		observe:   reliability.NewObserveEngine(),
 		sendRoom:  semaphore.NewWeighted(flow.CurrentBounds().StreamCredit),
 		sendEnded: make(chan struct{}),
+		incarnation: aether.StreamIncarnation{
+			Generation:   s.streamGenerations.Add(1),
+			WriterOpened: true,
+		},
 	}
 	st.state.Transition(aether.EventSendOpen)
 
@@ -1294,14 +1350,15 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 	s.sched.RegisterWithClass(cfg.StreamID, cfg.Priority, cfg.Dependency, classOpen)
 
 	// The stream opens with a DATA frame flagged aether.FlagSYN, whose payload is
-	// the OPEN payload (reliability, priority, dependency); the peer's handleOpen
-	// decodes it to configure the stream. Its InitialCredit is zero, the value that
-	// states no aether stream credit: on a byte-stream session the transport owns
-	// flow control, and handleOpen does not read the field.
+	// the OPEN payload (reliability, priority, dependency, generation); the peer's
+	// handleOpen decodes it to configure the stream and name it. Its InitialCredit is
+	// zero, the value that states no aether stream credit: on a byte-stream session
+	// the transport owns flow control, and handleOpen does not read the field.
 	openPayload := aether.EncodeOpenPayload(aether.OpenPayload{
 		Reliability: cfg.Reliability,
 		Priority:    cfg.Priority,
 		Dependency:  cfg.Dependency,
+		Generation:  st.incarnation.Generation,
 	})
 	frame := &aether.Frame{
 		SenderID:   s.LocalPeerID(),
@@ -1672,11 +1729,14 @@ func (st *tcpStream) Close() error {
 		return s.closedError()
 	default:
 	}
+	payload := aether.EncodeClosePayload(st.incarnation)
 	frame := &aether.Frame{
 		SenderID:   s.LocalPeerID(),
 		ReceiverID: s.RemotePeerID(),
 		StreamID:   st.streamID,
 		Type:       aether.TypeCLOSE,
+		Length:     uint32(len(payload)),
+		Payload:    payload,
 	}
 	s.mu.Lock()
 	st.closeFrame = frame

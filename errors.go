@@ -67,10 +67,11 @@ var (
 	// pre-existing stream is left intact; there is no new stream to
 	// return, so the caller must pick a fresh StreamID or close the prior
 	// stream first. A NoiseSession also answers it for an ID whose stream
-	// left on both CLOSEs a moment ago, whose ID opens again a few RTOs later
-	// (reopenQuietRTOs in adapter), because the peer may still be writing its
-	// CLOSE again. A transient caller-side signal, not a transport
-	// failure — do NOT close the session in response.
+	// left on both CLOSEs or by a RESET a moment ago: the ID opens again a few
+	// RTOs after the leave on both CLOSEs, or after the peer acknowledges the
+	// RESET (reopenQuietRTOs in adapter), because until then the peer may still
+	// hold the stream or be writing its CLOSE again. A transient caller-side signal,
+	// not a transport failure — do NOT close the session in response.
 	// Use errors.Is(err, aether.ErrDuplicateStreamID) to detect.
 	ErrDuplicateStreamID = errors.New("transport: duplicate stream id")
 

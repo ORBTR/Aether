@@ -81,7 +81,7 @@ func (p *liteRawPeer) open(ctx context.Context, id uint64) *tcpStream {
 
 func synFrame(id uint64) *aether.Frame {
 	return &aether.Frame{StreamID: id, Type: aether.TypeDATA, Flags: aether.FlagSYN,
-		Payload: aether.EncodeOpenPayload(aether.OpenPayload{Reliability: aether.ReliableOrdered})}
+		Payload: aether.EncodeOpenPayload(aether.OpenPayload{Reliability: aether.ReliableOrdered, Generation: rawGeneration(id)})}
 }
 
 func inSession(s *TCPSession, id uint64) bool {
@@ -155,7 +155,7 @@ func TestTCPStream_ThePeersCloseEndsTheReceiveSide(t *testing.T) {
 	writeFrames(t, p.conn,
 		synFrame(40),
 		&aether.Frame{StreamID: 40, Type: aether.TypeDATA, Payload: []byte("one")},
-		&aether.Frame{StreamID: 40, Type: aether.TypeCLOSE},
+		rawClose(40),
 		&aether.Frame{StreamID: 40, Type: aether.TypeDATA, Payload: []byte("behind")})
 	st, err := p.sess.AcceptStream(ctx)
 	if err != nil {
@@ -237,7 +237,7 @@ func TestTCPStream_ThePeersCloseDoesNotOvertakeQueuedFrames(t *testing.T) {
 	if err := st.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	writeFrames(t, p.conn, &aether.Frame{StreamID: 46, Type: aether.TypeCLOSE})
+	writeFrames(t, p.conn, closeTo(st))
 	if _, err := st.Receive(ctx); !errors.Is(err, io.EOF) {
 		t.Fatalf("after the peer's CLOSE: %v, want io.EOF", err)
 	}
@@ -272,7 +272,7 @@ func TestTCPStream_ASynOnAClosedStreamOpensTheNextStream(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 	writeFrames(t, p.conn,
-		&aether.Frame{StreamID: 48, Type: aether.TypeCLOSE},
+		closeTo(first),
 		synFrame(48),
 		&aether.Frame{StreamID: 48, Type: aether.TypeDATA, Payload: []byte("next")})
 	next, err := p.sess.AcceptStream(ctx)
@@ -663,7 +663,7 @@ func TestTCPStream_DataBehindAResetIsRefused(t *testing.T) {
 	writeFrames(t, p.conn,
 		synFrame(54),
 		&aether.Frame{StreamID: 54, Type: aether.TypeDATA, Payload: []byte("one")},
-		&aether.Frame{StreamID: 54, Type: aether.TypeRESET, Payload: aether.EncodeReset(aether.ResetCancel)},
+		rawReset(54, aether.ResetCancel),
 		&aether.Frame{StreamID: 54, Type: aether.TypeDATA, Payload: []byte("behind")},
 		&aether.Frame{StreamID: 2, Type: aether.TypePING})
 	if f := p.next(); f.Type != aether.TypePONG {

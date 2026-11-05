@@ -11,60 +11,65 @@ import (
 	"testing"
 )
 
-// TestFrameGrammar4_CloseCarriesItsSequenceNumberInBothForms: a CLOSE's sequence
-// number survives the full header and the eight-byte control short form, which is
-// what lets its peer put it in the receive window and acknowledge it.
-func TestFrameGrammar4_CloseCarriesItsSequenceNumberInBothForms(t *testing.T) {
-	close := &Frame{SenderID: goldenSender, ReceiverID: goldenReceiver, StreamID: 5, Type: TypeCLOSE, SeqNo: 0x01020304}
+// TestFrameGrammar5_CloseCarriesItsSequenceNumberAndIncarnation: a CLOSE's sequence
+// number and the stream incarnation its payload states survive the full header,
+// which is what lets its peer put it in the receive window, acknowledge it and tell
+// it from the CLOSE of another stream under the ID. A CLOSE has a payload, so it
+// never takes the eight-byte control short form, and a payload-less CLOSE, which is
+// all that form can carry, is refused by Validate before any handler reads it.
+func TestFrameGrammar5_CloseCarriesItsSequenceNumberAndIncarnation(t *testing.T) {
+	inc := StreamIncarnation{Generation: 0x0102030405060708, WriterOpened: true}
+	payload := EncodeClosePayload(inc)
+	if want := []byte{0x81, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}; !bytes.Equal(payload, want) || ClosePayloadSize != len(want) {
+		t.Fatalf("EncodeClosePayload = % x (size %d), want % x", payload, ClosePayloadSize, want)
+	}
+	close := &Frame{SenderID: goldenSender, ReceiverID: goldenReceiver, StreamID: 5, Type: TypeCLOSE, SeqNo: 0x01020304,
+		Length: uint32(len(payload)), Payload: payload}
 
 	wire := EncodeFrameToBytes(close)
 	full, err := DecodeFrameFromBytes(wire)
 	if err != nil {
 		t.Fatalf("full form: %v", err)
 	}
-	if full.Type != TypeCLOSE || full.SeqNo != close.SeqNo {
+	if full.Type != TypeCLOSE || full.SeqNo != close.SeqNo || DecodeClosePayload(full.Payload) != inc {
 		t.Fatalf("full form decoded %+v", full)
+	}
+	if err := full.Validate(); err != nil {
+		t.Fatalf("Validate refused a current CLOSE: %v", err)
 	}
 
 	chosen, err := ChooseWireVersions(AetherWireVersions(), AetherWireVersions())
 	if err != nil {
 		t.Fatalf("ChooseWireVersions: %v", err)
 	}
-	tx, rx := NewCompressor(), NewCompressor()
+	tx := NewCompressor()
 	tx.UseWireVersions(chosen)
-	rx.UseWireVersions(chosen)
 	tx.RecordFullHeader(close)
-	rx.RecordFullHeader(close)
-	if !tx.ShouldCompressControl(close) {
-		t.Fatal("a CLOSE, which has no payload, does not take the short form")
+	if tx.ShouldCompressControl(close) {
+		t.Fatal("a CLOSE with its incarnation took the payload-less short form")
 	}
-	var buf bytes.Buffer
-	if _, err := tx.EncodeControlShort(&buf, close); err != nil {
-		t.Fatalf("encode short: %v", err)
+	bare := &Frame{StreamID: 5, Type: TypeCLOSE, SeqNo: 0x01020304}
+	if err := bare.Validate(); err == nil {
+		t.Fatal("Validate admitted a CLOSE that names no stream")
 	}
-	want := []byte{ShortControlIndicator, byte(TypeCLOSE), 0x00, 0x05, 0x01, 0x02, 0x03, 0x04}
-	if !bytes.Equal(buf.Bytes(), want) {
-		t.Fatalf("short form % x, want % x", buf.Bytes(), want)
-	}
-	short, err := rx.DecodeControlShort(bytes.NewReader(buf.Bytes()[1:]))
-	if err != nil {
-		t.Fatalf("decode short: %v", err)
-	}
-	if short.Type != TypeCLOSE || short.SeqNo != close.SeqNo || short.StreamID != 5 {
-		t.Fatalf("short form decoded %+v", short)
+	if got := DecodeClosePayload(nil); got != (StreamIncarnation{}) {
+		t.Fatalf("an empty CLOSE payload decoded to %+v", got)
 	}
 }
 
-// TestFrameGrammar4_ResetGolden: a RESET payload is twenty-eight bytes, the reason
-// and its three credit counts big-endian. A payload of the four-byte layout decodes
+// TestFrameGrammar5_ResetGolden: a RESET payload is thirty-six bytes, the reason,
+// its three credit counts and the stream incarnation big-endian, the incarnation's
+// top bit saying the writer opened the stream. A payload of an earlier layout decodes
 // to the zero value, and Validate refuses a frame carrying one.
-func TestFrameGrammar4_ResetGolden(t *testing.T) {
-	p := ResetPayload{Reason: ResetFlowCtrl, Charged: 0x0102030405060708, Released: 0x1112131415161718, Consumed: 0x2122232425262728}
+func TestFrameGrammar5_ResetGolden(t *testing.T) {
+	p := ResetPayload{Reason: ResetFlowCtrl, Charged: 0x0102030405060708, Released: 0x1112131415161718, Consumed: 0x2122232425262728,
+		Incarnation: StreamIncarnation{Generation: 0x3132333435363738}}
 	want := []byte{
 		0x00, 0x00, 0x00, 0x03,
 		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
 		0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
 		0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+		0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
 	}
 	got := EncodeResetPayload(p)
 	if !bytes.Equal(got, want) || ResetPayloadSize != len(want) {
@@ -76,20 +81,42 @@ func TestFrameGrammar4_ResetGolden(t *testing.T) {
 	if DecodeReset(got) != ResetFlowCtrl {
 		t.Fatalf("DecodeReset = %d", DecodeReset(got))
 	}
+	opened := p
+	opened.Incarnation.WriterOpened = true
+	if b := EncodeResetPayload(opened); b[28] != 0xB1 || DecodeResetPayload(b) != opened {
+		t.Fatalf("the writer-opened bit: byte 28 = %#x, decoded %+v", b[28], DecodeResetPayload(b))
+	}
 	if !bytes.Equal(EncodeReset(ResetRefused), EncodeResetPayload(ResetPayload{Reason: ResetRefused})) {
-		t.Fatal("EncodeReset states counts")
+		t.Fatal("EncodeReset states counts or an incarnation")
 	}
-	earlier := got[:4]
-	if back := DecodeResetPayload(earlier); back != (ResetPayload{}) {
-		t.Fatalf("a four-byte RESET decoded to %+v", back)
+	for _, n := range []int{4, 28} {
+		earlier := got[:n]
+		if back := DecodeResetPayload(earlier); back != (ResetPayload{}) {
+			t.Fatalf("a %d-byte RESET decoded to %+v", n, back)
+		}
+		f := &Frame{StreamID: 9, Type: TypeRESET, Length: uint32(len(earlier)), Payload: earlier}
+		if err := f.Validate(); err == nil {
+			t.Fatalf("Validate admitted a %d-byte RESET frame", n)
+		}
 	}
-	f := &Frame{StreamID: 9, Type: TypeRESET, Length: uint32(len(earlier)), Payload: earlier}
-	if err := f.Validate(); err == nil {
-		t.Fatal("Validate admitted a RESET frame without the counts")
-	}
-	f = &Frame{StreamID: 9, Type: TypeRESET, Length: uint32(len(got)), Payload: got}
+	f := &Frame{StreamID: 9, Type: TypeRESET, Length: uint32(len(got)), Payload: got}
 	if err := f.Validate(); err != nil {
 		t.Fatalf("Validate refused a current RESET: %v", err)
+	}
+}
+
+// TestFrameGrammar5_GenerationBounds: an OPEN may state a generation from 1 to
+// MaxStreamGeneration, which leaves an incarnation's top bit to WriterOpened, and an
+// incarnation's generation never reaches that bit however large it is stated.
+func TestFrameGrammar5_GenerationBounds(t *testing.T) {
+	for g, want := range map[uint64]bool{0: false, 1: true, MaxStreamGeneration: true, MaxStreamGeneration + 1: false, ^uint64(0): false} {
+		if ValidStreamGeneration(g) != want {
+			t.Fatalf("ValidStreamGeneration(%#x) = %v, want %v", g, !want, want)
+		}
+	}
+	inc := DecodeClosePayload(EncodeClosePayload(StreamIncarnation{Generation: ^uint64(0)}))
+	if inc.Generation != MaxStreamGeneration || inc.WriterOpened {
+		t.Fatalf("an over-wide generation decoded to %+v", inc)
 	}
 }
 

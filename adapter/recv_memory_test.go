@@ -250,12 +250,11 @@ func TestTCPSession_ResetQueuesMakeRoomAndTheSweepDiscardsAbandonedOnes(t *testi
 	defer cancel()
 	const size, perStream = 64 * 1024, 15
 	ceiling := flow.CurrentBounds().SessionMemoryCeiling
-	reset := aether.EncodeReset(aether.ResetCancel)
 	var frames []*aether.Frame
 	for k := 0; k < 17; k++ {
 		id := uint64(400 + k)
 		frames = append(frames, liteFill(id, perStream, size)...)
-		frames = append(frames, &aether.Frame{StreamID: id, Type: aether.TypeRESET, Payload: reset})
+		frames = append(frames, rawReset(id, aether.ResetCancel))
 	}
 	liteSettled(p, frames...)
 	if p.sess.recvCharged.Load() != 0 {
@@ -284,7 +283,7 @@ func TestTCPSession_ResetQueuesMakeRoomAndTheSweepDiscardsAbandonedOnes(t *testi
 		t.Fatalf("a reader of the discarded queue: %v, want ErrStreamOverrun", err)
 	}
 
-	writeFrames(t, p.conn, &aether.Frame{StreamID: 500, Type: aether.TypeCLOSE})
+	writeFrames(t, p.conn, rawClose(500))
 	liteSettled(p)
 	live := acceptEach(t, ctx, p.sess, 1)[500]
 	go func() { _, _ = io.Copy(io.Discard, p.conn) }()

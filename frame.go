@@ -129,7 +129,7 @@ type FrameFlags byte
 const (
 	FlagFIN        FrameFlags = 0x01 // Last frame in stream
 	FlagSYN        FrameFlags = 0x02 // This DATA frame opens its stream: its payload is the stream's OpenPayload, never a message, on every profile
-	FlagACK        FrameFlags = 0x04 // Acknowledgment piggyback
+	FlagACK        FrameFlags = 0x04 // This frame answers one of its type: a PATH_PROBE response, a RESET's acknowledgment (ResetPayload)
 	FlagPRIORITY   FrameFlags = 0x08 // Priority field present in payload
 	FlagENCRYPTED  FrameFlags = 0x10 // Payload is AEAD encrypted
 	FlagCOMPRESSED FrameFlags = 0x20 // Payload is DEFLATE compressed
@@ -397,6 +397,7 @@ func (f *Frame) Validate() error {
 // caller, whether or not it ran Validate on the frame first.
 var minPayloadSizes = map[FrameType]uint32{
 	TypeOPEN:       OpenPayloadSize,
+	TypeCLOSE:      ClosePayloadSize,
 	TypeRESET:      ResetPayloadSize,
 	TypeWINDOW:     WindowUpdateSize,
 	TypeCONGESTION: CongestionPayloadSize,
@@ -637,7 +638,7 @@ const GoAwayPayloadMinSize = 4 // reason code only
 // OpenPayloadSize is the wire size of an OPEN frame payload in frame grammar
 // WireVersionFrameCurrent. Validate refuses an uncompressed OPEN frame shorter
 // than this (minPayloadSizes) before either session's handleOpen runs.
-const OpenPayloadSize = 15
+const OpenPayloadSize = 23
 
 // MaxOpenCredit is the largest initial credit an OPEN payload can state: the
 // field is four bytes. adapter.NoiseSession's OpenStream refuses a stream
@@ -666,21 +667,66 @@ const MaxOpenCredit int64 = 1<<32 - 1
 // the OPEN states one. Zero is no FEC. A level outside the registry is refused
 // with RESET(ResetRefused) and no state. The TCP-family session and the QUIC
 // stream adapter state zero: FEC belongs to their transport.
+//
+// Generation is the opener's number for this stream, from 1 to
+// MaxStreamGeneration, rising with every stream the opener's session creates: the
+// stream's incarnation is this generation together with which side opened it
+// (StreamIncarnation), and every CLOSE and RESET of the stream states it. The
+// NoiseSession and TCP-family session refuse with RESET(ResetRefused) and no
+// state an OPEN stating zero or a number above MaxStreamGeneration. The QUIC
+// stream adapter states zero and does not read it: each of its streams is a QUIC
+// stream of its own, which QUIC never hands out twice.
 type OpenPayload struct {
 	Reliability   Reliability // 1 byte: delivery guarantee
 	Priority      uint8       // 1 byte: initial weight (1-255)
 	Dependency    uint64      // 8 bytes: parent stream ID
 	InitialCredit uint32      // 4 bytes: the opener's initial stream credit
 	FECLevel      uint8       // 1 byte: the stream's FEC level
+	Generation    uint64      // 8 bytes: the opener's generation of the stream
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Stream incarnation
+// ────────────────────────────────────────────────────────────────────────────
+
+// MaxStreamGeneration is the largest stream generation a frame states: the
+// eight bytes of an incarnation keep their top bit for WriterOpened.
+const MaxStreamGeneration uint64 = 1<<63 - 1
+
+// StreamIncarnationSize is the wire size of a StreamIncarnation: eight bytes,
+// big-endian, the top bit WriterOpened and the rest Generation.
+const StreamIncarnationSize = 8
+
+// ClosePayloadSize is the wire size of a CLOSE frame payload: the stream's
+// incarnation. Validate refuses an uncompressed CLOSE frame shorter than this
+// (minPayloadSizes), so a CLOSE stating no incarnation ends nothing.
+const ClosePayloadSize = StreamIncarnationSize
+
+// StreamIncarnation names one stream among those that have used its stream ID
+// on a session: the generation its opener's OPEN stated (OpenPayload.Generation),
+// and whether the side writing the frame is that opener. Two sides number their
+// streams each from their own count, so the generation alone can name a stream
+// of each side; the opener bit tells them apart.
+//
+// CLOSE carries one as its payload and RESET in its payload (ResetPayload). A
+// session's handleClose and handleReset end a stream only when the frame's
+// incarnation is the stream's own, the receiver reading WriterOpened as "the peer
+// opened it": a CLOSE or RESET of an earlier stream under the ID, a copy delayed
+// on the path or written before its writer read this side's reopening, finds the
+// stream it names gone and ends nothing of the stream that now has the ID.
+type StreamIncarnation struct {
+	Generation   uint64
+	WriterOpened bool
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // ────────────────────────────────────────────────────────────────────────────
 // RESET payload
 // ────────────────────────────────────────────────────────────────────────────
 
 // ResetPayloadSize is the wire size of a RESET frame payload:
-// [4 reason][8 charged][8 released][8 consumed], all big-endian.
-const ResetPayloadSize = 28
+// [4 reason][8 charged][8 released][8 consumed][8 incarnation], all big-endian.
+const ResetPayloadSize = 36
 
 // ResetPayload is the decoded payload of a RESET frame. The three counts say what
 // the stream's connection credit stood at when its sender wrote the RESET, in the
@@ -697,13 +743,26 @@ const ResetPayloadSize = 28
 // what Consumed does not cover, since those grants still arrive, and takes off its
 // later connection grants what it has granted past Charged-Released, since the
 // writer has taken that back already. A refusal, which holds no stream, and a
-// TCP-family or QUIC session, whose transport owns flow control, state zeros (and
-// those sessions do not read them).
+// TCP-family or QUIC session, whose transport owns flow control, state zero counts
+// (and those sessions do not read them).
+//
+// Incarnation is the stream the RESET ends (StreamIncarnation); a refusal states
+// the generation of the OPEN it refuses, opened by the peer. A RESET flagged
+// FlagACK is a NoiseSession's acknowledgment of a RESET it read, whatever that
+// RESET found: it states the acknowledged RESET's incarnation exactly as that
+// RESET stated it, zero counts and the same reason, and its reader neither settles
+// anything nor answers it. A NoiseSession writes each RESET again until its
+// acknowledgment comes (adapter.NoiseSession's pending RESETs), because a RESET
+// lost on a datagram path would leave the peer's stream live under an ID this
+// side may open again. A TCP-family session writes neither the acknowledgment nor
+// a second copy, its transport delivering every frame once in order, and ignores
+// a RESET flagged FlagACK.
 type ResetPayload struct {
-	Reason   ResetReason
-	Charged  uint64
-	Released uint64
-	Consumed uint64
+	Reason      ResetReason
+	Charged     uint64
+	Released    uint64
+	Consumed    uint64
+	Incarnation StreamIncarnation
 }
 
 // ResetReason codes for RESET frames.
