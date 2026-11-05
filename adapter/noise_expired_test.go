@@ -36,7 +36,7 @@ func TestNoiseStream_AnExpiredFrameReturnsItsCreditAndTheCloseStillEnds(t *testi
 		return &aether.Frame{Type: aether.TypeDATA, StreamID: 900, SeqNo: seq, Length: size, Payload: make([]byte, size)}
 	}
 	sess.handleData(data(1))
-	sess.handleClose(&aether.Frame{Type: aether.TypeCLOSE, StreamID: 900, SeqNo: 2})
+	sess.handleClose(peerClose(st, 2))
 	time.Sleep(5 * time.Millisecond)
 	sess.handleData(data(0))
 

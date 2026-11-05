@@ -174,6 +174,15 @@ type noiseStream struct {
 	// fragments.
 	generation uint64
 
+	// incarnation names this stream among those that have used its ID on the
+	// session, as this side states it: the opener's generation, this stream's own
+	// generation when this side opened it (OpenStream) and the generation the peer's
+	// OPEN stated when the peer did (handleOpen), with WriterOpened set when this side
+	// opened it. Its CLOSE (finishSend) and RESET (Reset) state it; handleClose and
+	// handleReset end the stream only for a frame that names it (namedBy). Set in
+	// createStream before the stream is published, read-only after.
+	incarnation aether.StreamIncarnation
+
 	// messageIDs numbers the messages Send splits into fragments; the next ID
 	// is messageIDs.Add(1), so the first is 1 and none is 0.
 	messageIDs atomic.Uint64
@@ -205,8 +214,10 @@ type noiseStream struct {
 // enforceRemoteCap is true (the peer opened it) the peer is also sent
 // RESET(ResetRefused) and no state is kept, and locally-initiated OpenStream
 // passes false and returns the error to its caller. An ID in use is refused with
-// aether.ErrDuplicateStreamID and sends nothing.
-func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, enforceRemoteCap bool) (*noiseStream, error) {
+// aether.ErrDuplicateStreamID and sends nothing. peerGeneration is the generation
+// the peer's OPEN stated, the stream's incarnation for a stream the peer opened;
+// OpenStream passes 0, and the stream's own generation names it.
+func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, enforceRemoteCap bool, peerGeneration uint64) (*noiseStream, error) {
 	// FEC is off by default and a caller opts in through cfg.FECLevel, which an
 	// accepted stream takes from the peer's OPEN. Both callers have checked the
 	// level (reliability.ValidFECLevel), so the only error left is the Reed-Solomon
@@ -247,6 +258,10 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 		replay:      eng.Replay,
 		rack:        congestion.NewRACK(eng.RTT.SRTT()),
 		tlp:         congestion.NewTLP(eng.RTT.SRTT()),
+	}
+	st.incarnation = aether.StreamIncarnation{Generation: st.generation, WriterOpened: true}
+	if enforceRemoteCap {
+		st.incarnation = aether.StreamIncarnation{Generation: peerGeneration}
 	}
 	// Surface retransmit-queue evictions (the queue's onEvict hook) instead
 	// of dropping them silently. An eviction (byte-cap pressure, deadline, or
@@ -353,9 +368,11 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 	// The peer's handleOpen ignores the refusal, and OpenStream hands it to its
 	// caller, who would otherwise be given another caller's stream and put a second
 	// OPEN on the wire, which the peer ignores in turn. A stream that has just left
-	// on both CLOSEs holds its ID against a local open for a short while
-	// (reopenQuietLocked).
-	if _, exists := s.streams[streamID]; exists || (!enforceRemoteCap && s.reopenQuietLocked(streamID)) {
+	// on both CLOSEs or by an acknowledged RESET holds its ID against a local open
+	// for a short while (reopenQuietLocked), and one whose RESET waits for its
+	// acknowledgment holds it until then (resetPendingLocked): the peer may still
+	// hold that stream, and would take the new stream's frames for its own.
+	if _, exists := s.streams[streamID]; exists || (!enforceRemoteCap && (s.reopenQuietLocked(streamID) || s.resetPendingLocked(streamID))) {
 		s.mu.Unlock()
 		st.discardUnpublished()
 		return nil, aether.ErrDuplicateStreamID
@@ -428,23 +445,40 @@ func (s *NoiseSession) refuseStream(st *noiseStream, toPeer bool) {
 	if !toPeer {
 		return
 	}
-	s.sendRefused(st.streamID)
+	s.sendRefused(st.streamID, st.incarnation.Generation)
 }
 
 // sendRefused answers a peer's open of streamID with RESET(ResetRefused), which
-// the peer's handleReset turns into aether.ErrStreamRefused on that stream.
+// the peer's handleReset turns into aether.ErrStreamRefused on that stream. It names
+// the stream by the generation the peer's OPEN stated, so the refusal ends that
+// stream and no later one under the ID, and it is written again until acknowledged
+// (writeReset): a lost refusal would leave the peer's stream holding its credit. No
+// stream here has an RTT, so the wait starts at a fresh estimator's RTO.
 // refuseStream sends it for a stream createStream did not admit, and handleOpen
-// for an OPEN whose credit it refuses before any stream is built.
-func (s *NoiseSession) sendRefused(streamID uint64) {
-	payload := aether.EncodeReset(aether.ResetRefused)
-	s.writeFrame(&aether.Frame{
-		SenderID:   s.LocalPeerID(),
-		ReceiverID: s.RemotePeerID(),
-		StreamID:   streamID,
-		Type:       aether.TypeRESET,
-		Length:     uint32(len(payload)),
-		Payload:    payload,
-	})
+// for an OPEN whose credit, FEC level or generation it refuses before any stream is
+// built.
+func (s *NoiseSession) sendRefused(streamID, generation uint64) {
+	_ = s.writeReset(streamID, aether.ResetPayload{
+		Reason:      aether.ResetRefused,
+		Incarnation: aether.StreamIncarnation{Generation: generation},
+	}, reliability.NewRTTEstimator().RTO())
+}
+
+// resetRTO is the wait before this stream's RESET is written again: the stream's
+// RTO, or a fresh estimator's for a stream built outside createStream, which has no
+// estimator of its own.
+func (st *noiseStream) resetRTO() time.Duration {
+	if st.rtt == nil {
+		return reliability.NewRTTEstimator().RTO()
+	}
+	return st.rtt.RTO()
+}
+
+// namedBy reports whether inc, read from a frame of the peer's, names this stream:
+// the same generation, and the peer's WriterOpened the opposite of this side's,
+// since each side states whether it is the opener itself.
+func (st *noiseStream) namedBy(inc aether.StreamIncarnation) bool {
+	return inc.Generation == st.incarnation.Generation && inc.WriterOpened != st.incarnation.WriterOpened
 }
 
 // discardUnpublished stops the timers createStream starts before admission
@@ -883,11 +917,14 @@ func (st *noiseStream) finishSend() error {
 		return fmt.Errorf("stream %d: session closed", st.streamID)
 	default:
 	}
+	payload := aether.EncodeClosePayload(st.incarnation)
 	frame := &aether.Frame{
 		SenderID:   s.LocalPeerID(),
 		ReceiverID: s.RemotePeerID(),
 		StreamID:   st.streamID,
 		Type:       aether.TypeCLOSE,
+		Length:     uint32(len(payload)),
+		Payload:    payload,
 	}
 	st.sendWindow.Add(frame)
 	st.closeQueued.Store(true)
@@ -925,8 +962,9 @@ func (st *noiseStream) leaveIfEnded() {
 // and the ACK of its own, so an OPEN from it says this side's CLOSE arrived, whose ACK
 // must be lost or crossing. The window's entry for the CLOSE goes with the stream,
 // giving the session's in-flight count back. Any earlier, the OPEN is a duplicate of
-// the one that opened this stream, and false leaves the stream as it is. Called by the
-// session's readLoop only.
+// the one that opened this stream, or one handleOpen weighs by its generation
+// (supersededBy), and false leaves the stream as it is. Called by the session's
+// readLoop only.
 func (st *noiseStream) peerReopened() bool {
 	if !st.closeQueued.Load() || !st.peerClosed.Load() {
 		return false
@@ -1059,15 +1097,8 @@ func (st *noiseStream) Reset(reason aether.ResetReason) error {
 	// The RESET ends the send side: no CLOSE follows it (finishSend).
 	st.closeSent.Store(true)
 	st.closeDone.Store(true)
-	payload := aether.EncodeResetPayload(st.settleLocalReset(reason))
-	frame := &aether.Frame{
-		SenderID:   st.session.LocalPeerID(),
-		ReceiverID: st.session.RemotePeerID(),
-		StreamID:   st.streamID,
-		Type:       aether.TypeRESET,
-		Length:     uint32(len(payload)),
-		Payload:    payload,
-	}
+	p := st.settleLocalReset(reason)
+	p.Incarnation = st.incarnation
 	// Send the wire RESET first, then release the local state: teardown, the
 	// s.streams entry (when it is this stream, not a later one on the same
 	// ID), the credit reservation, the scheduler and stream GC registrations
@@ -1079,8 +1110,10 @@ func (st *noiseStream) Reset(reason aether.ResetReason) error {
 	// registration behind would hold a slot and be reset again by the sweep.
 	// The receive queue keeps its messages, readable and in the session's
 	// budget, until they are read, makeQueueRoom needs the room or
-	// sweepEndedQueues finds the queue abandoned (trackEnded).
-	err := st.session.writeFrame(frame)
+	// sweepEndedQueues finds the queue abandoned (trackEnded). The RESET is
+	// written again until the peer acknowledges it (writeReset), and the ID opens
+	// locally only after that.
+	err := st.session.writeReset(st.streamID, p, st.resetRTO())
 	st.teardown()
 	st.session.mu.Lock()
 	if cur, ok := st.session.streams[st.streamID]; ok && cur == st {
@@ -1113,7 +1146,7 @@ func (st *noiseStream) settleLocalReset(reason aether.ResetReason) aether.ResetP
 			st.session.connWindow.ReleaseUnsent(released)
 		}
 	}
-	st.session.noteResetGrants(st.streamID, granted)
+	st.session.noteResetGrants(st.streamID, granted, st.incarnation)
 	return p
 }
 

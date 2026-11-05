@@ -272,7 +272,7 @@ func TestTCPSession_ReadsChosenShortForms(t *testing.T) {
 	go func() { _, _ = io.Copy(io.Discard, peer) }()
 
 	tx := wireDecoder(chosen)
-	openPayload := aether.EncodeOpenPayload(aether.OpenPayload{Reliability: aether.ReliableOrdered})
+	openPayload := aether.EncodeOpenPayload(aether.OpenPayload{Reliability: aether.ReliableOrdered, Generation: 1})
 	open := &aether.Frame{StreamID: 10, Type: aether.TypeDATA, Flags: aether.FlagSYN, Length: uint32(len(openPayload)), Payload: openPayload}
 	var wire bytes.Buffer
 	if _, err := aether.EncodeFrame(&wire, open); err != nil {

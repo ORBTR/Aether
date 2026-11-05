@@ -638,6 +638,11 @@ func (c *Compressor) EncodeControlShort(w io.Writer, f *Frame) (int, error) {
 // isShortControlType reports whether t is one of the four types the 0x83
 // form carries. Every other type has a payload the form cannot hold, or is
 // a DATA frame, which the form would give a second encoding beside 0x82.
+// CLOSE and RESET carry a payload too, the stream incarnation
+// (ClosePayloadSize, ResetPayloadSize): ShouldCompressControl, which refuses
+// any payload, never picks the form for them, and a payload-less one decoded
+// from it is refused by Validate (minPayloadSizes), which the Noise and
+// TCP-family read paths run on every frame before dispatch.
 func isShortControlType(t FrameType) bool {
 	switch t {
 	case TypePING, TypePONG, TypeCLOSE, TypeRESET:

@@ -167,7 +167,7 @@ func TestNoiseStream_AnOvertakingCloseWaitsItsTurn(t *testing.T) {
 	cs, ss := openWithCredit(t, ctx, client, server, 808, 0)
 	waitSendWindowEmpty(t, cs, "the opening message acknowledged")
 
-	closeFrame := &aether.Frame{Type: aether.TypeCLOSE, StreamID: 808, SeqNo: 2}
+	closeFrame := peerClose(ss, 2)
 	server.handleClose(closeFrame)
 	if ss.peerClosed.Load() {
 		t.Fatal("a CLOSE ahead of its frame ended the receive side")

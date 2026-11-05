@@ -117,7 +117,7 @@ func TestNoiseStream_TheCreditReadFromOpenBoundsTheQueue(t *testing.T) {
 func TestNoiseSession_RefusesAnOpenWhoseCreditItCannotHold(t *testing.T) {
 	_, server := noisePairWithRealms(t, nil, nil)
 	open := func(id uint64, credit uint32) *aether.Frame {
-		p := aether.EncodeOpenPayload(aether.OpenPayload{Reliability: aether.ReliableOrdered, Priority: 128, InitialCredit: credit})
+		p := aether.EncodeOpenPayload(aether.OpenPayload{Reliability: aether.ReliableOrdered, Priority: 128, InitialCredit: credit, Generation: 1})
 		return &aether.Frame{StreamID: id, Type: aether.TypeOPEN, Length: uint32(len(p)), Payload: p}
 	}
 	for i, credit := range []uint32{0, uint32(flow.MinGuaranteedWindow - 1), uint32(flow.MaxGrowableWindow + 1)} {

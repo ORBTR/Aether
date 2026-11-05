@@ -44,15 +44,19 @@ type WireVersions []WireVersion
 // because a session that cannot read its peer's fragments cannot carry the
 // messages they make up. frame is the full-frame grammar a session's frames are
 // read and written in; it is required because no frame can be read without it.
-// Its version 4 is the grammar in which a Full-profile CLOSE takes the next
+// Its version 5 is the grammar in which a Full-profile CLOSE takes the next
 // sequence number of its stream and is acknowledged and retransmitted like DATA
 // (adapter.noiseStream.finishSend), an FEC_REPAIR names the frames it covers
-// (FECHeader.Covered), OPEN states the stream's initial credit and FEC level
-// (OpenPayload), and RESET states the stream's connection credit (ResetPayload).
-// A peer that writes any of them otherwise cannot share a session with this build:
-// its CLOSE would never be acknowledged, its repairs and RESETs would not parse.
-// This build lists only version 4, so ChooseWireVersions refuses a peer that offers
-// an earlier frame grammar alone before either side creates a session or a stream.
+// (FECHeader.Covered), OPEN states the stream's initial credit, FEC level and
+// generation (OpenPayload), CLOSE states the stream's incarnation (ClosePayloadSize,
+// StreamIncarnation), and RESET states the stream's connection credit and
+// incarnation and, on a Full-profile session, is acknowledged by a RESET flagged
+// FlagACK and written again until that comes (ResetPayload). A peer that writes
+// any of them otherwise cannot share a session with this build: its CLOSE would
+// never be acknowledged, its OPENs, CLOSEs, repairs and RESETs would not parse, and
+// its RESETs would be written again without end. This build lists only version 5,
+// so ChooseWireVersions refuses a peer that offers an earlier frame grammar alone
+// before either side creates a session or a stream.
 // frame.short is the short-frame table; it is optional because a session that
 // does not choose it writes full frames only. reliability is the profile a
 // session's streams run: version 2 is the Full profile (adapter.NoiseSession's
@@ -77,10 +81,10 @@ const (
 	// writes and reads; adapter.FragmentEnvelope's version byte carries it.
 	WireVersionFragmentCurrent uint16 = 2
 	// WireVersionFrameCurrent is the full-frame grammar version this build
-	// writes and reads (the OPEN, RESET and FEC_REPAIR payload layouts and
-	// CLOSE's sequence number are part of it); tests outside this package build
-	// peer offers from it.
-	WireVersionFrameCurrent       uint16 = 4
+	// writes and reads (the OPEN, CLOSE, RESET and FEC_REPAIR payload layouts,
+	// CLOSE's sequence number and RESET's acknowledgment are part of it); tests
+	// outside this package build peer offers from it.
+	WireVersionFrameCurrent       uint16 = 5
 	wireVersionFrameShortCurrent  uint16 = 1
 	wireVersionReliabilityCurrent uint16 = 2
 )

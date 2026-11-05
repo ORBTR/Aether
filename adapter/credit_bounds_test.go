@@ -346,7 +346,7 @@ func TestNoiseSession_FramesHeldBehindAGapMeetTheCeilingWhenItFills(t *testing.T
 		cs, ss := openWithCredit(t, ctx, client, server, id, 0)
 		waitSendWindowEmpty(t, cs, "the opening message")
 		injectData(server, id, 2, 30, size)
-		server.handleClose(&aether.Frame{Type: aether.TypeCLOSE, StreamID: id, SeqNo: 32})
+		server.handleClose(peerClose(ss, 32))
 		if ss.peerClosed.Load() {
 			t.Fatalf("stream %d: a CLOSE behind a gap ended the receive side", id)
 		}

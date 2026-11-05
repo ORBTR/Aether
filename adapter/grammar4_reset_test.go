@@ -283,8 +283,8 @@ func TestNoiseSession_ResetNotesAreBounded(t *testing.T) {
 	client, server := noisePairWithRealms(t, nil, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	server.noteResetGrants(1000, 0)
-	server.noteResetGrants(1001, 5)
+	server.noteResetGrants(1000, 0, aether.StreamIncarnation{Generation: 1})
+	server.noteResetGrants(1001, 5, aether.StreamIncarnation{Generation: 1})
 	server.mu.Lock()
 	if _, ok := server.resetGrants[1000]; ok {
 		server.mu.Unlock()
@@ -308,7 +308,7 @@ func TestNoiseSession_ResetNotesAreBounded(t *testing.T) {
 		t.Fatal("the sweep kept an old note")
 	}
 
-	server.noteResetGrants(906, 5)
+	server.noteResetGrants(906, 5, aether.StreamIncarnation{Generation: 1})
 	_, _ = openWithCredit(t, ctx, client, server, 906, 0)
 	server.mu.Lock()
 	_, kept = server.resetGrants[906]
@@ -322,7 +322,7 @@ func TestNoiseSession_ResetNotesAreBounded(t *testing.T) {
 		limit = aether.DefaultMaxConcurrentStreams
 	}
 	for i := 0; i < limit+10; i++ {
-		server.noteResetGrants(uint64(5000+i), 1)
+		server.noteResetGrants(uint64(5000+i), 1, aether.StreamIncarnation{Generation: 1})
 	}
 	server.mu.Lock()
 	n := len(server.resetGrants)

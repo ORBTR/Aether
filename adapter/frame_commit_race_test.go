@@ -145,7 +145,7 @@ func TestNoiseSession_APeerResetReadsNothingTheWriteLoopCommits(t *testing.T) {
 			t.Fatalf("round %d: no entry for seq %d", i, seq)
 		}
 		client.sched.EnqueueProbe(st.streamID, e.Frame)
-		reset := &aether.Frame{Type: aether.TypeRESET, StreamID: st.streamID}
+		reset := peerReset(st, aether.ResetCancel)
 		hold.hold.Store(nil)
 		close(g)
 		overlapDelay(i)

@@ -219,7 +219,7 @@ func TestNoiseSession_FrameMarksFragments(t *testing.T) {
 	sess, peer := noiseRawWriter(t, 0x1234)
 	raw := aether.PeerID{9, 9, 9, 9, 9, 9, 9, 9}
 	frBytes := append([]byte{'F', 'R', 0, 1}, "hello"...)
-	openPayload := aether.EncodeOpenPayload(aether.OpenPayload{Reliability: aether.ReliableOrdered, InitialCredit: 1 << 20})
+	openPayload := aether.EncodeOpenPayload(aether.OpenPayload{Reliability: aether.ReliableOrdered, InitialCredit: 1 << 20, Generation: 1})
 	writeFrames(t, peer,
 		&aether.Frame{SenderID: raw, StreamID: 10, Type: aether.TypeOPEN, Payload: openPayload},
 		&aether.Frame{SenderID: raw, StreamID: 10, Type: aether.TypeDATA, SeqNo: 0, Payload: frBytes})
@@ -305,7 +305,7 @@ func TestTCPSession_RefusesFragments(t *testing.T) {
 	env := fxEnvelope()
 	env.StreamID, env.Index, env.Total, env.OriginalLength = 10, 0, 1, 5000
 	envelope := fxFragment(env, bytes.Repeat([]byte{'b'}, 5000))
-	openPayload := aether.EncodeOpenPayload(aether.OpenPayload{Reliability: aether.ReliableOrdered})
+	openPayload := aether.EncodeOpenPayload(aether.OpenPayload{Reliability: aether.ReliableOrdered, Generation: 1})
 	writeFrames(t, peer,
 		&aether.Frame{StreamID: 10, Type: aether.TypeDATA, Flags: aether.FlagSYN, Payload: openPayload},
 		&aether.Frame{StreamID: 10, Type: aether.TypeDATA, Payload: frBytes},
