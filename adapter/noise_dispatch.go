@@ -605,8 +605,11 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 		for _, nackSeqNo := range nacks {
 			if written := st.sendWindow.WrittenFrame(nackSeqNo); written != nil {
 				s.sched.MarkRetransmit(frame.StreamID)
-				s.sched.Enqueue(frame.StreamID, written)
-				st.sendWindow.BumpXmitTime(nackSeqNo, ackTime)
+				// A stream a RESET has taken out of the scheduler is owed no
+				// retransmit, and its clock is left alone.
+				if s.sched.Enqueue(frame.StreamID, written) {
+					st.sendWindow.BumpXmitTime(nackSeqNo, ackTime)
+				}
 			}
 		}
 		s.congestion().OnLossWithPipe(pipe)

@@ -444,19 +444,23 @@ func (s *NoiseSession) reliabilityTick() {
 				// ACK-starved sessions where RACK has nothing to work
 				// with (no fack established yet). BackoffRTO still runs
 				// so the RTO interval grows on persistent loss.
+				// A stream a RESET has taken out of the scheduler (its snapshot
+				// entry outlives the removal) is owed no retransmit, and its clocks
+				// are left alone.
 				if frame := st.retransmitQ.Dequeue(); frame != nil {
 					s.sched.MarkRetransmit(streamID)
-					s.sched.Enqueue(streamID, frame)
-					st.sendWindow.BumpXmitTime(frame.SeqNo, tickNow)
-					// Back off at most once per RTO interval, not once per
-					// retransmitted frame: a burst loss of N frames drained
-					// one-per-tick would otherwise double RTO N times, pinning
-					// it at the 60s cap and stalling RTO-only recovery for up
-					// to a minute (RFC 6298 §5.5 doubles once per timeout
-					// event).
-					if st.lastRTOBackoffAt.IsZero() || tickNow.Sub(st.lastRTOBackoffAt) >= st.rtt.RTO() {
-						st.rtt.BackoffRTO()
-						st.lastRTOBackoffAt = tickNow
+					if s.sched.Enqueue(streamID, frame) {
+						st.sendWindow.BumpXmitTime(frame.SeqNo, tickNow)
+						// Back off at most once per RTO interval, not once per
+						// retransmitted frame: a burst loss of N frames drained
+						// one-per-tick would otherwise double RTO N times, pinning
+						// it at the 60s cap and stalling RTO-only recovery for up
+						// to a minute (RFC 6298 §5.5 doubles once per timeout
+						// event).
+						if st.lastRTOBackoffAt.IsZero() || tickNow.Sub(st.lastRTOBackoffAt) >= st.rtt.RTO() {
+							st.rtt.BackoffRTO()
+							st.lastRTOBackoffAt = tickNow
+						}
 					}
 				}
 
@@ -502,9 +506,10 @@ func (s *NoiseSession) reliabilityTick() {
 						for _, seq := range lost {
 							if written := st.sendWindow.WrittenFrame(seq); written != nil {
 								s.sched.MarkRetransmit(streamID)
-								s.sched.Enqueue(streamID, written)
-								st.sendWindow.BumpXmitTime(seq, tickNow)
-								actuallyRetx++
+								if s.sched.Enqueue(streamID, written) {
+									st.sendWindow.BumpXmitTime(seq, tickNow)
+									actuallyRetx++
+								}
 							}
 						}
 						atomic.AddUint64(&s.rackMarksTotal, actuallyRetx)

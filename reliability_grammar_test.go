@@ -11,9 +11,10 @@ import (
 )
 
 // TestAetherWireVersionsRegistersReliability: every offer carries the
-// reliability profile as a required entry at version 1, so a peer that omits
-// it, or offers only another version, is refused before a session exists, and
-// an application cannot register the name for itself.
+// reliability profile as a required entry at version 3, so a peer that omits
+// it, or offers only another version (2, whose Lite profile does not acknowledge
+// a RESET, among them), is refused before a session exists, and an application
+// cannot register the name for itself.
 func TestAetherWireVersionsRegistersReliability(t *testing.T) {
 	own := AetherWireVersions()
 	var found *WireVersion
@@ -25,8 +26,8 @@ func TestAetherWireVersionsRegistersReliability(t *testing.T) {
 	if found == nil {
 		t.Fatalf("AetherWireVersions() = %+v has no reliability entry", own)
 	}
-	if !found.Required || !reflect.DeepEqual(found.Versions, []uint16{2}) {
-		t.Fatalf("reliability entry = %+v, want versions [2], required", *found)
+	if !found.Required || !reflect.DeepEqual(found.Versions, []uint16{3}) {
+		t.Fatalf("reliability entry = %+v, want versions [3], required", *found)
 	}
 	if err := own.Validate(); err != nil {
 		t.Fatalf("AetherWireVersions() is not canonical: %v", err)
@@ -36,8 +37,8 @@ func TestAetherWireVersionsRegistersReliability(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ChooseWireVersions(own, own): %v", err)
 	}
-	if v, ok := both.Version(WireVersionReliability); !ok || v != 2 {
-		t.Fatalf("chosen reliability = %d, %v; want 2, true", v, ok)
+	if v, ok := both.Version(WireVersionReliability); !ok || v != 3 {
+		t.Fatalf("chosen reliability = %d, %v; want 3, true", v, ok)
 	}
 
 	// Peers that agree on every other entry and omit reliability, or offer
@@ -51,7 +52,8 @@ func TestAetherWireVersionsRegistersReliability(t *testing.T) {
 	for _, peer := range []WireVersions{
 		agreeing,
 		append(append(WireVersions(nil), agreeing...), wv(WireVersionReliability, true, 1)),
-		append(append(WireVersions(nil), agreeing...), wv(WireVersionReliability, false, 1, 3)),
+		append(append(WireVersions(nil), agreeing...), wv(WireVersionReliability, true, 2)),
+		append(append(WireVersions(nil), agreeing...), wv(WireVersionReliability, false, 1, 2, 4)),
 	} {
 		for _, swap := range []bool{false, true} {
 			a, b := own, peer
