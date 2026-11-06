@@ -85,6 +85,16 @@ func NewEngine(cfg EngineConfig) *Engine {
 		maxAge:      cfg.MaxAge,
 	}
 
+	// A positive MaxAge bounds a frame's age on both of the engine's queues: the
+	// receive window hands a buffered frame older than it back Expired, which the
+	// adapter's noiseStream.settleExpired settles, and the retransmit queue's RTO
+	// path stops resending a frame older than it (RACK and TLP in the adapter's
+	// reliabilityTick still resend it from the send window).
+	if cfg.MaxAge > 0 {
+		e.RetransmitQ.SetMaxAge(cfg.MaxAge)
+		e.RecvWin.SetMaxAge(cfg.MaxAge)
+	}
+
 	return e
 }
 

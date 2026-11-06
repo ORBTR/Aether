@@ -33,88 +33,27 @@ import (
 	aether "github.com/ORBTR/aether"
 )
 
-// MappingBehaviour describes how the NAT assigns a reflexive address.
-type MappingBehaviour int
-
-const (
-	MappingUnknown              MappingBehaviour = iota
-	MappingEndpointIndependent                   // EIM — same reflexive for all targets
-	MappingAddressDependent                      // ADM — changes with target IP
-	MappingAddressPortDependent                  // APDM — changes with target IP+port (symmetric)
+// The RFC 5780 classification is defined in the aether package beside the
+// aether.STUNClient seam whose DetectNATBehaviour returns it, so a package that
+// takes the seam needs no import of this one; these names keep the strategy
+// engine and its callers reading it as nat.NATBehaviour.
+type (
+	MappingBehaviour   = aether.MappingBehaviour
+	FilteringBehaviour = aether.FilteringBehaviour
+	NATBehaviour       = aether.NATBehaviour
 )
 
-func (m MappingBehaviour) String() string {
-	switch m {
-	case MappingEndpointIndependent:
-		return "endpoint-independent"
-	case MappingAddressDependent:
-		return "address-dependent"
-	case MappingAddressPortDependent:
-		return "address-port-dependent"
-	default:
-		return "unknown"
-	}
-}
-
-// FilteringBehaviour describes who can reach the reflexive address.
-type FilteringBehaviour int
-
 const (
-	FilteringUnknown              FilteringBehaviour = iota
-	FilteringEndpointIndependent                     // EIF — anyone can reach
-	FilteringAddressDependent                        // ADF — only hosts we've sent to
-	FilteringAddressPortDependent                    // APDF — only IP+port we've sent to
+	MappingUnknown              = aether.MappingUnknown
+	MappingEndpointIndependent  = aether.MappingEndpointIndependent
+	MappingAddressDependent     = aether.MappingAddressDependent
+	MappingAddressPortDependent = aether.MappingAddressPortDependent
+
+	FilteringUnknown              = aether.FilteringUnknown
+	FilteringEndpointIndependent  = aether.FilteringEndpointIndependent
+	FilteringAddressDependent     = aether.FilteringAddressDependent
+	FilteringAddressPortDependent = aether.FilteringAddressPortDependent
 )
-
-func (f FilteringBehaviour) String() string {
-	switch f {
-	case FilteringEndpointIndependent:
-		return "endpoint-independent"
-	case FilteringAddressDependent:
-		return "address-dependent"
-	case FilteringAddressPortDependent:
-		return "address-port-dependent"
-	default:
-		return "unknown"
-	}
-}
-
-// NATBehaviour is the full RFC 5780 classification.
-type NATBehaviour struct {
-	Mapping   MappingBehaviour
-	Filtering FilteringBehaviour
-}
-
-// LegacyType maps the RFC 5780 classification to the single-valued
-// aether.NATType enum (Open/FullCone/Restricted/PortRestricted/Symmetric)
-// that ReflexiveAddress.NATType carries and the STUN detector reports, for
-// consumers that key on that one value rather than the mapping/filtering
-// pair. Uses the matrix:
-//
-//	               | EIF              | ADF              | APDF
-//	---------------|------------------|------------------|--------------------
-//	EIM            | NATFullCone      | NATRestricted    | NATPortRestricted
-//	ADM            | NATSymmetric     | NATSymmetric     | NATSymmetric
-//	APDM           | NATSymmetric     | NATSymmetric     | NATSymmetric
-func (b NATBehaviour) LegacyType() aether.NATType {
-	if b.Mapping != MappingEndpointIndependent {
-		return aether.NATSymmetric
-	}
-	switch b.Filtering {
-	case FilteringEndpointIndependent:
-		return aether.NATFullCone
-	case FilteringAddressDependent:
-		return aether.NATRestricted
-	case FilteringAddressPortDependent:
-		return aether.NATPortRestricted
-	}
-	return aether.NATUnknown
-}
-
-// String returns a compact human-readable description.
-func (b NATBehaviour) String() string {
-	return fmt.Sprintf("mapping=%s filtering=%s", b.Mapping, b.Filtering)
-}
 
 // DetectNATBehaviour runs the RFC 5780 test suite against the configured
 // STUN servers. Requires at least 2 distinct STUN servers (or one server

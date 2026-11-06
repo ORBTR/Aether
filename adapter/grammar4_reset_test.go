@@ -120,8 +120,16 @@ func TestNoiseStream_TheResetsReaderTakesBackOnlyWhatItsGrantsDoNotCover(t *test
 	if err := cs.Reset(aether.ResetCancel); err != nil {
 		t.Fatalf("reset: %v", err)
 	}
+	// handleReset takes the stream out of s.streams before settlePeerReset runs on the
+	// same readLoop pass, so the count is polled: with the grants held on the path it
+	// can only fall to the read message's charge, and never below it.
 	waitFor(t, "the RESET at the server", func() bool { return !streamPresent(server, 902) })
-	if got := connOutstanding(server); got != c {
+	var got int64
+	deadline := time.Now().Add(5 * time.Second)
+	for got = connOutstanding(server); got != c && time.Now().Before(deadline); got = connOutstanding(server) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got != c {
 		t.Fatalf("after the RESET the server has %d outstanding, want the read message's %d, whose grant is on its way", got, c)
 	}
 	blocked.Store(false)

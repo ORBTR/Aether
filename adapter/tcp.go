@@ -1285,7 +1285,7 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 		if err := s.wireRefusal(); err != nil {
 			return nil, err
 		}
-		return nil, fmt.Errorf("session closed")
+		return nil, s.closedError()
 	default:
 	}
 	// No stream exists before the wire versions are chosen: a refused peer
@@ -1719,10 +1719,7 @@ func (st *tcpStream) Receive(ctx context.Context) ([]byte, error) {
 			if data, _, ok := st.recvQ.pop(); ok {
 				return data, nil
 			}
-			if err := st.session.closedError(); !errors.Is(err, aether.ErrSessionClosed) {
-				return nil, err
-			}
-			return nil, fmt.Errorf("session closed")
+			return nil, st.session.closedError()
 		}
 	}
 }

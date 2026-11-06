@@ -34,7 +34,7 @@ func TestAEP03_RequestSignVerifyWithAddrs(t *testing.T) {
 		TargetNodeID:    "vl1_bob",
 		ReflexiveAddrs:  aep03Addrs(),
 		LocalAddrs:      aep03Addrs(),
-		Behaviour:       NATBehaviour{MappingEndpointIndependent, FilteringAddressDependent},
+		Behaviour:       NATBehaviour{Mapping: MappingEndpointIndependent, Filtering: FilteringAddressDependent},
 		Timestamp:       time.Now().Unix(),
 	}
 	r.Sign(priv)
@@ -50,7 +50,7 @@ func TestAEP03_OfferSignVerifyWithAddrs(t *testing.T) {
 		RequesterNodeID: "vl1_alice",
 		ReflexiveAddrs:  aep03Addrs(),
 		LocalAddrs:      aep03Addrs(),
-		Behaviour:       NATBehaviour{MappingAddressPortDependent, FilteringAddressPortDependent},
+		Behaviour:       NATBehaviour{Mapping: MappingAddressPortDependent, Filtering: FilteringAddressPortDependent},
 		Method:          PunchPortPrediction,
 		Timestamp:       time.Now().Unix(),
 	}
@@ -67,7 +67,7 @@ func TestAEP03_RequestPortTamperDetected(t *testing.T) {
 		RequesterNodeID: "vl1_alice",
 		TargetNodeID:    "vl1_bob",
 		LocalAddrs:      aep03Addrs(),
-		Behaviour:       NATBehaviour{MappingEndpointIndependent, FilteringAddressDependent},
+		Behaviour:       NATBehaviour{Mapping: MappingEndpointIndependent, Filtering: FilteringAddressDependent},
 		Timestamp:       time.Now().Unix(),
 	}
 	r.Sign(priv)
@@ -84,7 +84,7 @@ func TestAEP03_RequestIPTamperDetected(t *testing.T) {
 		RequesterNodeID: "vl1_alice",
 		TargetNodeID:    "vl1_bob",
 		LocalAddrs:      aep03Addrs(),
-		Behaviour:       NATBehaviour{MappingEndpointIndependent, FilteringAddressDependent},
+		Behaviour:       NATBehaviour{Mapping: MappingEndpointIndependent, Filtering: FilteringAddressDependent},
 		Timestamp:       time.Now().Unix(),
 	}
 	r.Sign(priv)
@@ -101,7 +101,7 @@ func TestAEP03_OfferReflexiveTamperDetected(t *testing.T) {
 		ResponderNodeID: "vl1_bob",
 		RequesterNodeID: "vl1_alice",
 		ReflexiveAddrs:  aep03Addrs(),
-		Behaviour:       NATBehaviour{MappingAddressPortDependent, FilteringAddressPortDependent},
+		Behaviour:       NATBehaviour{Mapping: MappingAddressPortDependent, Filtering: FilteringAddressPortDependent},
 		Method:          PunchPortPrediction,
 		Timestamp:       time.Now().Unix(),
 	}
@@ -150,7 +150,7 @@ func TestAEP03_EmptyAddrsRoundTrip(t *testing.T) {
 	r := &PunchRequest{
 		RequesterNodeID: "vl1_alice",
 		TargetNodeID:    "vl1_bob",
-		Behaviour:       NATBehaviour{MappingEndpointIndependent, FilteringAddressDependent},
+		Behaviour:       NATBehaviour{Mapping: MappingEndpointIndependent, Filtering: FilteringAddressDependent},
 		Timestamp:       time.Now().Unix(),
 	}
 	r.Sign(priv)

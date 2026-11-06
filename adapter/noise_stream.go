@@ -772,7 +772,7 @@ func (st *noiseStream) Receive(ctx context.Context) ([]byte, error) {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-st.session.CloseSignal():
-			return nil, fmt.Errorf("session closed")
+			return nil, aether.ErrSessionClosed
 		}
 	}
 }
@@ -914,7 +914,7 @@ func (st *noiseStream) finishSend() error {
 	s := st.session
 	select {
 	case <-s.CloseSignal():
-		return fmt.Errorf("stream %d: session closed", st.streamID)
+		return fmt.Errorf("stream %d: %w", st.streamID, aether.ErrSessionClosed)
 	default:
 	}
 	payload := aether.EncodeClosePayload(st.incarnation)

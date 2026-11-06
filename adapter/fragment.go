@@ -679,10 +679,19 @@ func (fb *FragmentBuffer) BufferedBytes() int64 {
 	return fb.bufferedBytes
 }
 
-// MSSToMaxPayload computes the maximum application payload per fragment
-// given the MSS and the Aether + encryption overhead.
+// frameAEADTagSize is the authentication tag aethercrypto.FrameEncryptor adds to
+// every payload it seals (ChaCha20-Poly1305); its nonce travels in the header.
+const frameAEADTagSize = 16
+
+// MSSToMaxPayload computes the maximum application payload per frame given the
+// MSS: the MSS less a full frame's wire header (aether.FullFrameHeaderWireSize,
+// the discriminator and the header that ReadNextFrame reads) and the AEAD tag.
+// A full DATA frame carrying this payload, sealed, is exactly the MSS long; the
+// 100-byte floor is never reached from a prober MSS, which is one of its probe
+// sizes (pmtu.SafeFloorMSS, 1200, the least). noiseStream.Send splits a message into frames of it, and MaxAppMessageBudget
+// reads it as the per-class budget.
 func MSSToMaxPayload(mss int) int {
-	overhead := 50 + 16 // Aether header + Noise AEAD tag
+	overhead := aether.FullFrameHeaderWireSize + frameAEADTagSize
 	maxPayload := mss - overhead
 	if maxPayload < 100 {
 		maxPayload = 100

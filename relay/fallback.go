@@ -16,7 +16,6 @@ import (
 	"time"
 
 	aether "github.com/ORBTR/aether"
-	"github.com/ORBTR/aether/nat"
 )
 
 var (
@@ -46,7 +45,7 @@ const (
 // It attempts direct connection, then hole-punching, then relay.
 type FallbackDialer struct {
 	mu          sync.RWMutex
-	stunClient  *nat.STUNClient
+	stunClient  aether.STUNClient // nil when none is composed: detectNATType reports aether.ErrSTUNNotComposed
 	localNodeID [32]byte
 	privateKey  ed25519.PrivateKey
 
@@ -85,6 +84,12 @@ type FallbackConfig struct {
 	DialTimeout    time.Duration
 	DiscoverRelays func(ctx context.Context, preferRegion string) ([]RelayInfo, error)
 	DirectDial     func(ctx context.Context, addr string, nodeID [32]byte) (aether.Connection, error)
+
+	// STUN is the STUN client the host composes (nat.NewSTUNClient is one). When
+	// it is nil the dialer builds one from STUNConfig through aether.NewSTUNClient,
+	// which the linked nat package provides; with none linked it detects no NAT
+	// type and Dial takes the path it takes when detection fails.
+	STUN aether.STUNClient
 }
 
 // NewFallbackDialer creates a dialer with automatic relay fallback.
@@ -96,8 +101,12 @@ func NewFallbackDialer(cfg FallbackConfig) *FallbackDialer {
 		cfg.DialTimeout = 10 * time.Second
 	}
 
+	stunClient := cfg.STUN
+	if stunClient == nil {
+		stunClient, _ = aether.NewSTUNClient(cfg.STUNConfig)
+	}
 	return &FallbackDialer{
-		stunClient:     nat.NewSTUNClient(cfg.STUNConfig),
+		stunClient:     stunClient,
 		localNodeID:    cfg.LocalNodeID,
 		privateKey:     cfg.PrivateKey,
 		cachedNATType:  aether.NATUnknown,
@@ -165,6 +174,9 @@ func (d *FallbackDialer) detectNATType(ctx context.Context) (aether.NATType, err
 		return aether.NATUnknown, nil
 	}
 	d.mu.RUnlock()
+	if d.stunClient == nil {
+		return aether.NATUnknown, aether.ErrSTUNNotComposed
+	}
 
 	// Create a temporary UDP connection for NAT detection
 	localAddr, err := net.ResolveUDPAddr("udp", ":0")

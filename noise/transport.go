@@ -17,12 +17,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pion/stun"
-
 	aether "github.com/ORBTR/aether"
 	vl1 "github.com/ORBTR/aether"
 	transportCrypto "github.com/ORBTR/aether/crypto/identity"
-	"github.com/ORBTR/aether/nat"
 	"github.com/ORBTR/aether/relay"
 )
 
@@ -74,6 +71,15 @@ type NoiseTransportConfig struct {
 	ListenAddr       string            // Address to listen on (e.g., ":0", ":41641")
 	RateLimitBurst   int               // Rate limit burst size (0 = default 100)
 	RateLimitRate    int               // Rate limit rate per second (0 = default 1000)
+
+	// STUN is the STUN client a NAT-traversing host composes (nat.NewSTUNClient
+	// is one). When it is nil and STUNConfig.Enabled is set, NewNoiseTransport
+	// builds one through aether.NewSTUNClient, which the linked nat package
+	// provides, and refuses with aether.ErrSTUNNotComposed when no STUN
+	// implementation is linked. With neither, the transport runs no STUN, and
+	// this package links none: it imports no STUN or NAT traversal code, so a
+	// host that only dials carries none.
+	STUN aether.STUNClient
 
 	// UDP socket buffer sizes. Zero = OS default.
 	UDPReadBuffer  int // Read buffer size in bytes (default 4 MB)
@@ -188,9 +194,10 @@ type NoiseTransport struct {
 	maxPacket            int
 	listenAddr           string
 
-	// NAT/STUN
-	stun     *nat.STUNClient
-	stunTx   map[string]chan *stun.Message
+	// NAT/STUN: stun is nil when the transport runs none (NoiseTransportConfig.STUN);
+	// stunTx holds a waiter per binding transaction sent on the listener socket.
+	stun     aether.STUNClient
+	stunTx   map[[12]byte]chan stunResult
 	stunMu   sync.Mutex
 	stunConn *net.UDPConn
 
@@ -325,9 +332,11 @@ func NewNoiseTransport(cfg NoiseTransportConfig) (*NoiseTransport, error) {
 	if maxPacket <= 0 {
 		maxPacket = noiseDefaultMaxPacket
 	}
-	var stunClient *nat.STUNClient
-	if cfg.STUNConfig.Enabled {
-		stunClient = nat.NewSTUNClient(cfg.STUNConfig)
+	stunClient := cfg.STUN
+	if stunClient == nil && cfg.STUNConfig.Enabled {
+		if stunClient, err = aether.NewSTUNClient(cfg.STUNConfig); err != nil {
+			return nil, fmt.Errorf("vl1: %w", err)
+		}
 	}
 	rateLimitBurst := cfg.RateLimitBurst
 	if rateLimitBurst <= 0 {
@@ -379,7 +388,7 @@ func NewNoiseTransport(cfg NoiseTransportConfig) (*NoiseTransport, error) {
 
 		// NAT/STUN
 		stun:   stunClient,
-		stunTx: make(map[string]chan *stun.Message),
+		stunTx: make(map[[12]byte]chan stunResult),
 
 		// Relay
 		relayConfig:  cfg.RelayConfig,
@@ -830,13 +839,19 @@ func (t *NoiseTransport) DiscoverReflexiveAddr(ctx context.Context, localAddr *n
 	return t.stun.DiscoverReflexiveAddr(ctx, localAddr)
 }
 
+// stunResult is what handleSTUNPacket hands the waiter of a binding transaction:
+// the reflexive address the response carries, or why it carries none.
+type stunResult struct {
+	addr *aether.ReflexiveAddress
+	err  error
+}
+
 func (t *NoiseTransport) discoverReflexiveAddrMultiplexed(ctx context.Context) (*aether.ReflexiveAddress, error) {
 	// Create STUN message
-	msg := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
-	txID := string(msg.TransactionID[:])
+	txID, raw := t.stun.BindingRequest()
 
 	// Register transaction
-	ch := make(chan *stun.Message, 1)
+	ch := make(chan stunResult, 1)
 	t.stunMu.Lock()
 	t.stunTx[txID] = ch
 	t.stunMu.Unlock()
@@ -861,7 +876,7 @@ func (t *NoiseTransport) discoverReflexiveAddrMultiplexed(ctx context.Context) (
 			continue
 		}
 		// Best-effort send; ignore errors for individual servers
-		_, _ = t.stunConn.WriteToUDP(msg.Raw, serverAddr)
+		_, _ = t.stunConn.WriteToUDP(raw, serverAddr)
 	}
 
 	// Wait for response
@@ -869,36 +884,31 @@ func (t *NoiseTransport) discoverReflexiveAddrMultiplexed(ctx context.Context) (
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case resp := <-ch:
-		var xorAddr stun.XORMappedAddress
-		if err := xorAddr.GetFrom(resp); err != nil {
-			return nil, err
-		}
-		return &aether.ReflexiveAddress{
-			IP:         xorAddr.IP,
-			Port:       xorAddr.Port,
-			Discovered: time.Now(),
-		}, nil
+		return resp.addr, resp.err
 	case <-time.After(5 * time.Second):
 		return nil, errors.New("vl1: STUN timeout")
 	}
 }
 
-// handleSTUNPacket processes an incoming STUN packet
+// handleSTUNPacket processes an incoming STUN packet: the response to a binding
+// transaction discoverReflexiveAddrMultiplexed waits on goes to its waiter. A
+// transport with no STUN client sent no request, and reads none.
 func (t *NoiseTransport) handleSTUNPacket(data []byte) {
-	msg := new(stun.Message)
-	msg.Raw = append([]byte(nil), data...)
-	if err := msg.Decode(); err != nil {
+	if t.stun == nil {
+		return
+	}
+	txID, addr, err := t.stun.BindingResponse(data)
+	if err != nil && txID == ([12]byte{}) {
 		return
 	}
 
-	txID := string(msg.TransactionID[:])
 	t.stunMu.Lock()
 	ch, ok := t.stunTx[txID]
 	t.stunMu.Unlock()
 
 	if ok {
 		select {
-		case ch <- msg:
+		case ch <- stunResult{addr: addr, err: err}:
 		default:
 		}
 	}
@@ -912,8 +922,10 @@ func (t *NoiseTransport) DetectNATType(ctx context.Context, localAddr *net.UDPAd
 	return t.stun.DetectNATType(ctx, localAddr)
 }
 
-// GetSTUNClient returns the underlying STUN client (may be nil if STUN disabled)
-func (t *NoiseTransport) GetSTUNClient() *nat.STUNClient {
+// GetSTUNClient returns the transport's STUN client, nil when it runs no STUN. A
+// traversing host hands it to nat.StrategyConfig.STUN and reads DetectNATBehaviour
+// and DiscoverReflexiveAddr from it.
+func (t *NoiseTransport) GetSTUNClient() aether.STUNClient {
 	return t.stun
 }
 

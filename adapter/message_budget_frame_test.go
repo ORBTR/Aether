@@ -19,7 +19,7 @@ import (
 // would silently invoke SplitMessage, which is meant to be anomaly defence, not
 // the routine path.
 func TestPayloadAtBudgetDoesNotFragment(t *testing.T) {
-	budget := MaxAppMessageBudget(aether.ClassRAW) // 1400 frame - 66 overhead = 1334
+	budget := MaxAppMessageBudget(aether.ClassRAW) // 1400 frame - 67 overhead = 1333
 	for _, n := range []int{1, budget - 1, budget} {
 		data := bytes.Repeat([]byte{'a'}, n)
 		frags, err := SplitMessage(fxBinding(), 1, data, budget)

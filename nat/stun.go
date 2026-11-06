@@ -49,6 +49,49 @@ func (c *STUNClient) Config() aether.STUNConfig {
 	return c.config
 }
 
+// STUNClient is the implementation a traversing host composes into the
+// aether.STUNClient seam. Linking this package registers it, so a Noise transport
+// or relay fallback dialer whose config enables STUN and passes no client builds
+// one through aether.NewSTUNClient.
+var _ aether.STUNClient = (*STUNClient)(nil)
+
+func init() {
+	aether.RegisterSTUNClient(func(cfg aether.STUNConfig) aether.STUNClient { return NewSTUNClient(cfg) })
+}
+
+// BindingRequest builds a binding request with a fresh transaction ID and returns
+// the ID and the message's raw bytes, for a caller that writes it on a socket of
+// its own (the Noise transport's listener) and reads the answer through
+// BindingResponse.
+func (c *STUNClient) BindingRequest() ([12]byte, []byte) {
+	msg := stun.MustBuild(stun.TransactionID, stun.BindingRequest)
+	return msg.TransactionID, msg.Raw
+}
+
+// BindingResponse decodes a STUN message and returns the transaction ID it
+// carries and, for a binding success, its XOR-MAPPED-ADDRESS. A message that does
+// not decode returns a zero ID and an error; any other failure returns the ID, so
+// the caller can end the transaction that ID names.
+func (c *STUNClient) BindingResponse(raw []byte) ([12]byte, *aether.ReflexiveAddress, error) {
+	msg := new(stun.Message)
+	msg.Raw = append([]byte(nil), raw...)
+	if err := msg.Decode(); err != nil {
+		return [12]byte{}, nil, fmt.Errorf("decode STUN response: %w", err)
+	}
+	if msg.Type != stun.BindingSuccess {
+		return msg.TransactionID, nil, fmt.Errorf("stun: unexpected response type %s (want binding success)", msg.Type)
+	}
+	var xorAddr stun.XORMappedAddress
+	if err := xorAddr.GetFrom(msg); err != nil {
+		return msg.TransactionID, nil, fmt.Errorf("extract XOR-MAPPED-ADDRESS: %w", err)
+	}
+	return msg.TransactionID, &aether.ReflexiveAddress{
+		IP:         xorAddr.IP,
+		Port:       xorAddr.Port,
+		Discovered: time.Now(),
+	}, nil
+}
+
 // DiscoverReflexiveAddr discovers the public IP:port mapping for a local address
 func (c *STUNClient) DiscoverReflexiveAddr(ctx context.Context, localAddr *net.UDPAddr) (*aether.ReflexiveAddress, error) {
 	if !c.config.Enabled {

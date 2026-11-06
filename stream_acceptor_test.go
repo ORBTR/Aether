@@ -11,22 +11,18 @@ import (
 	"time"
 )
 
-// First tests for StreamAcceptor's per-ID backlog and grace-expiry dispatch.
+// Tests for StreamAcceptor's per-ID backlog, its grace expiry and the FIFO.
 //
-// WHY THIS FILE DID NOT EXIST AND WHY IT MATTERS: the 100 ms hand-off below
-// decides whether a well-known stream reaches the consumer that asked for it by
-// ID, or is diverted to the legacy FIFO where some *other* consumer picks it up.
-// loom's swarm transport binds stream 100 through AcceptStreamByID from a
-// goroutine spawned at session-establishment time, so it is racing this timer on
-// every single mesh session — and nothing here was covered.
+// The 100 ms hand-off below decides which consumer a stream reaches. Inside the
+// grace only an AcceptStreamByID claim takes it; past it the stream is in the
+// FIFO, where Accept and a later AcceptStreamByID of its ID both take it, first
+// come first served. The mesh host outside this repository claims its setup
+// streams 0-4 by ID one after another before its Accept loop starts, so a setup
+// stream whose OPEN came early is still its claimant's; it claims its swarm stream
+// (100) by ID from a goroutine while that loop runs, and a stream the loop takes
+// first reaches its dynamic-RPC handler, which cannot read swarm frames.
 //
-// The mesh consequence of losing that race is NOT a stalled stream: the stream
-// exists on the responder (handleOpen created it), so its frames are ACKed and
-// drain. It is diverted into loom's dynamic-RPC handler, which accepts any
-// StreamID, fails to unmarshal swarm frames as RPC requests, and discards them
-// forever. Silent total loss on that peer, with a healthy-looking session.
-//
-// ⚠ READ A FAILURE HERE AS "THE DISPATCH CONTRACT CHANGED", not as a flake. Each
+// READ A FAILURE HERE AS "THE DISPATCH CONTRACT CHANGED", not as a flake. Each
 // test names what its own failure means.
 
 // graceProbeStream is a minimal Stream for driving the acceptor. Only StreamID
@@ -105,57 +101,139 @@ func TestStreamAcceptor_PreArmedWaiterBypassesBacklog(t *testing.T) {
 			"reliably by ANY consumer and the grace timer is no longer a mitigation")
 	}
 
-	// And it must never have reached the FIFO: a legacy AcceptStream consumer
+	// And it must never have reached the FIFO: an AcceptStream consumer
 	// picking this up is the misroute the whole mechanism exists to prevent.
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
 	if s, err := a.Accept(ctx); err == nil {
 		t.Errorf("stream %d reached the FIFO despite a pre-armed ByID waiter — a "+
-			"legacy AcceptStream consumer can now steal well-known streams", s.StreamID())
+			"FIFO AcceptStream consumer can now steal well-known streams", s.StreamID())
 	}
 }
 
-// TestStreamAcceptor_GraceExpiryDivertsToFIFO is the POSITIVE CONTROL: it proves
-// this file can SEE the defect, not merely that the healthy path works.
-//
-// No waiter is armed at Notify time — precisely loom's situation, where the
-// AcceptStreamByID call lives in a goroutine spawned from the session hook. Once
-// ByIDBacklogGrace elapses, flushBacklogEntry moves the stream to the FIFO and
-// the ByID consumer can NEVER claim it, no matter how long it waits.
-func TestStreamAcceptor_GraceExpiryDivertsToFIFO(t *testing.T) {
+// TestStreamAcceptor_AStreamPastItsGraceIsStillItsClaimants: no waiter is armed
+// at Notify time and the grace lapses before the claim, the delay a consumer loses
+// to goroutine scheduling at session establishment. With no Accept running the
+// stream is in the FIFO, and the AcceptByID of its ID takes it from there, so it
+// reaches the consumer that asked for it and no other.
+func TestStreamAcceptor_AStreamPastItsGraceIsStillItsClaimants(t *testing.T) {
 	a := newProbeAcceptor()
 	st := &graceProbeStream{id: 100}
 
 	if !a.Notify(st) {
 		t.Fatal("Notify reported the stream undelivered onto an empty backlog")
 	}
-
-	// Let the grace lapse — the delay a real consumer loses to goroutine
-	// scheduling at session establishment.
 	time.Sleep(ByIDBacklogGrace + 150*time.Millisecond)
 
-	// THE DEFECT: the consumer that asked for this exact StreamID cannot get it.
 	byIDCtx, cancelByID := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancelByID()
-	if s, err := a.AcceptByID(byIDCtx, 100); err == nil {
-		t.Fatalf("AcceptByID(100) still claimed the stream (%v) after the grace "+
-			"expired. If a retry or a re-park was added this is an IMPROVEMENT — "+
-			"update this test to bound the new behaviour rather than deleting it",
-			s.StreamID())
+	s, err := a.AcceptByID(byIDCtx, 100)
+	if err != nil || s != st {
+		t.Fatalf("AcceptByID(100) after the grace: %v, %v; the stream it asked for is in "+
+			"the FIFO and setup would hang waiting for it", s, err)
 	}
-
-	// ...and the legacy FIFO consumer has it instead. This is the hand-off that
-	// puts a swarm stream into loom's dynamic-RPC handler.
-	fifoCtx, cancelFIFO := context.WithTimeout(context.Background(), 2*time.Second)
+	fifoCtx, cancelFIFO := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancelFIFO()
-	s, err := a.Accept(fifoCtx)
-	if err != nil {
-		t.Fatalf("after grace expiry the stream reached NEITHER the ByID consumer "+
-			"nor the FIFO — it was lost outright, which is worse than the diversion "+
-			"this test was written to pin: %v", err)
+	if dup, err := a.Accept(fifoCtx); err == nil {
+		t.Fatalf("Accept also delivered stream %d, which AcceptByID already took: one "+
+			"stream reached two consumers", dup.StreamID())
 	}
-	if s != st {
-		t.Fatalf("FIFO delivered a different stream than the one notified: %v", s)
+}
+
+// TestStreamAcceptor_AStreamPastItsGraceReachesAccept: a stream nobody claims by ID
+// reaches the FIFO consumer once its grace lapses, the path dynamic streams take.
+func TestStreamAcceptor_AStreamPastItsGraceReachesAccept(t *testing.T) {
+	a := newProbeAcceptor()
+	st := &graceProbeStream{id: 10}
+	if !a.Notify(st) {
+		t.Fatal("Notify reported the stream undelivered onto an empty backlog")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	s, err := a.Accept(ctx)
+	if err != nil || s != st {
+		t.Fatalf("Accept after the grace: %v, %v; the stream reached no consumer", s, err)
+	}
+}
+
+// TestStreamAcceptor_AcceptByIDTakesFromTheFIFOAndKeepsItsOrder: AcceptByID takes
+// the stream of its ID out of the middle of the FIFO, and Accept still reads the
+// others in arrival order. Five streams: a take that filled the gap with the last
+// stream would hand Accept 13 before 12 (with fewer, two such takes in a row can
+// put the order back).
+func TestStreamAcceptor_AcceptByIDTakesFromTheFIFOAndKeepsItsOrder(t *testing.T) {
+	a := newProbeAcceptor()
+	first, middle := &graceProbeStream{id: 10}, &graceProbeStream{id: 11}
+	third, fourth, last := &graceProbeStream{id: 12}, &graceProbeStream{id: 13}, &graceProbeStream{id: 14}
+	for _, st := range []*graceProbeStream{first, middle, third, fourth, last} {
+		if !a.pushFIFO(st) {
+			t.Fatalf("premise: the FIFO refused stream %d", st.id)
+		}
+	}
+	if s, err := a.AcceptByID(context.Background(), 11); err != nil || s != middle {
+		t.Fatalf("AcceptByID(11): %v, %v", s, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	for _, want := range []*graceProbeStream{first, third, fourth, last} {
+		if s, err := a.Accept(ctx); err != nil || s != want {
+			t.Fatalf("Accept: %v, %v; want stream %d next", s, err, want.id)
+		}
+	}
+}
+
+// TestStreamAcceptor_ABlockedPushTakesTheRoomAcceptByIDMakes: under BlockUntilClose
+// a push onto a full FIFO waits, and the room AcceptByID makes by taking a stream
+// lets it in.
+func TestStreamAcceptor_ABlockedPushTakesTheRoomAcceptByIDMakes(t *testing.T) {
+	a := NewStreamAcceptor(StreamAcceptorConfig{Mode: BlockUntilClose, BufferSize: 1, Closed: make(chan struct{})})
+	held, waiting := &graceProbeStream{id: 5}, &graceProbeStream{id: 6}
+	if !a.pushFIFO(held) {
+		t.Fatal("premise: the FIFO refused its first stream")
+	}
+	pushed := make(chan bool, 1)
+	go func() { pushed <- a.pushFIFO(waiting) }()
+	select {
+	case <-pushed:
+		t.Fatal("a push onto a full FIFO returned without waiting")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if s, err := a.AcceptByID(context.Background(), 5); err != nil || s != held {
+		t.Fatalf("AcceptByID(5): %v, %v", s, err)
+	}
+	select {
+	case ok := <-pushed:
+		if !ok {
+			t.Fatal("the waiting push was refused after AcceptByID made room")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the waiting push did not take the room AcceptByID made")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if s, err := a.Accept(ctx); err != nil || s != waiting {
+		t.Fatalf("Accept: %v, %v; want the stream whose push waited", s, err)
+	}
+}
+
+// TestStreamAcceptor_CloseHandsBackWhatTheFIFOHolds: Close returns the streams
+// still in the FIFO with the backlog's, so the session's teardown resets them, and
+// Accept then answers the close.
+func TestStreamAcceptor_CloseHandsBackWhatTheFIFOHolds(t *testing.T) {
+	a := newProbeAcceptor()
+	queued := &graceProbeStream{id: 10}
+	if !a.pushFIFO(queued) {
+		t.Fatal("premise: the FIFO refused the stream")
+	}
+	drained := a.Close()
+	if len(drained) != 1 || drained[0] != queued {
+		t.Fatalf("Close returned %v, want the stream the FIFO held", drained)
+	}
+	if s, err := a.Accept(context.Background()); err != ErrSessionClosed || s != nil {
+		t.Fatalf("Accept after Close: %v, %v; want ErrSessionClosed", s, err)
+	}
+	if a.pushFIFO(&graceProbeStream{id: 11}) {
+		t.Fatal("a closed acceptor took a stream onto its FIFO")
 	}
 }
 
@@ -199,19 +277,20 @@ func TestStreamAcceptor_ClaimWithinGraceKeepsItOffTheFIFO(t *testing.T) {
 // TestStreamAcceptor_GraceConstantIsLoadBearing pins the value itself, because a
 // consumer outside this package depends on it and cannot see it change.
 //
-// This is not a tautological assertion on a constant: it is a tripwire. loom
-// arms AcceptStreamByID(100) from a freshly-spawned goroutine, so shrinking this
-// value narrows the window that goroutine has to win. Anyone retuning it should
-// be told what else depends on it, here, at build time.
+// This is not a tautological assertion on a constant: it is a tripwire. The mesh
+// host outside this repository arms AcceptStreamByID(100) from a freshly-spawned
+// goroutine while its Accept loop runs, so shrinking this value narrows the window
+// that goroutine has to win. Anyone retuning it should be told what else depends
+// on it, here, at build time.
 func TestStreamAcceptor_GraceConstantIsLoadBearing(t *testing.T) {
 	if ByIDBacklogGrace != 100*time.Millisecond {
 		t.Errorf("ByIDBacklogGrace changed to %v. That is allowed, but it moves the "+
 			"window in which a consumer spawned as a goroutine must call "+
-			"AcceptStreamByID — loom's swarm transport (stream 100) does exactly "+
-			"that from its session hook. SHRINKING it makes the diversion in "+
-			"TestStreamAcceptor_GraceExpiryDivertsToFIFO more likely in production; "+
-			"the durable fix is for consumers to pre-arm, as this file's "+
-			"negative control demonstrates", ByIDBacklogGrace)
+			"AcceptStreamByID while an Accept loop runs — the mesh host's swarm "+
+			"transport (stream 100) does exactly that from its session hook. SHRINKING it "+
+			"makes it likelier that the Accept loop takes such a stream first; "+
+			"a consumer that pre-arms, as this file's negative control does, "+
+			"never meets the race", ByIDBacklogGrace)
 	}
 	if MaxByIDBacklogPerStream < 1 {
 		t.Errorf("MaxByIDBacklogPerStream = %d disables the backlog entirely, so "+

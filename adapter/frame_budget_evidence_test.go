@@ -13,7 +13,7 @@ import (
 
 // An empty class set, a duplicate class, and an unknown class must all fail
 // closed. The unknown-class case is load-bearing: MaxAppMessageBudget resolves an
-// unknown class to the ClassSTREAM budget (65470), which exceeds the ClassRAW
+// unknown class to the ClassSTREAM budget (65469), which exceeds the ClassRAW
 // frame, so if the constructor did not gate eligibility a caller could obtain a
 // budget larger than the frame it actually rides. This is the fail-open that
 // FrameBudgetEvidence exists to close.
@@ -37,16 +37,16 @@ func TestNewFrameBudgetEvidenceFailsClosed(t *testing.T) {
 
 // Each single-class evidence carries exactly that class's post-Aether budget, and
 // those budgets are the pinned RAW/PROXY/STREAM values (frame size minus the
-// 66-byte Aether header + AEAD tag). If a frame size or the overhead moves, these
+// 67-byte full frame header and AEAD tag). If a frame size or the overhead moves, these
 // fail here.
 func TestFrameBudgetEvidencePerClassBudget(t *testing.T) {
 	for _, tc := range []struct {
 		class aether.TransportClass
 		want  int
 	}{
-		{aether.ClassRAW, 1334},
-		{aether.ClassPROXY, 32702},
-		{aether.ClassSTREAM, 65470},
+		{aether.ClassRAW, 1333},
+		{aether.ClassPROXY, 32701},
+		{aether.ClassSTREAM, 65469},
 	} {
 		e, err := NewFrameBudgetEvidence(tc.class)
 		if err != nil {
@@ -71,24 +71,24 @@ func TestFrameBudgetEvidenceMinimumIsSmallest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := all.Minimum(); got != 1334 {
-		t.Errorf("Minimum over {RAW,PROXY,STREAM}=%d, want 1334 (RAW is smallest)", got)
+	if got := all.Minimum(); got != 1333 {
+		t.Errorf("Minimum over {RAW,PROXY,STREAM}=%d, want 1333 (RAW is smallest)", got)
 	}
 	// Order of arguments must not change the minimum.
 	reordered, err := NewFrameBudgetEvidence(aether.ClassSTREAM, aether.ClassRAW, aether.ClassPROXY)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := reordered.Minimum(); got != 1334 {
-		t.Errorf("Minimum is order-dependent: %d, want 1334", got)
+	if got := reordered.Minimum(); got != 1333 {
+		t.Errorf("Minimum is order-dependent: %d, want 1333", got)
 	}
 	// A set without RAW takes the next-smallest (PROXY).
 	noRaw, err := NewFrameBudgetEvidence(aether.ClassPROXY, aether.ClassSTREAM)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := noRaw.Minimum(); got != 32702 {
-		t.Errorf("Minimum over {PROXY,STREAM}=%d, want 32702", got)
+	if got := noRaw.Minimum(); got != 32701 {
+		t.Errorf("Minimum over {PROXY,STREAM}=%d, want 32701", got)
 	}
 }
 
