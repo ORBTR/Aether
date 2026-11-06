@@ -6,6 +6,7 @@ package adapter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -524,6 +525,13 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 	if !st.state.CanSend() {
 		return st.cannotSend()
 	}
+	// A closed session will write nothing, so a Send does not wait for credit first;
+	// sendSingleFrame refuses each frame on it too, for a close during that wait.
+	select {
+	case <-st.session.CloseSignal():
+		return fmt.Errorf("stream %d: %w", st.streamID, aether.ErrSessionClosed)
+	default:
+	}
 
 	// Caller-block instrumentation. Measures wall-clock time the
 	// application spent inside Send (window.Consume + connWindow.Consume +
@@ -634,11 +642,23 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 		}
 	}
 
+	// A frame the scheduler refuses because the stream has left it (errLeftScheduler)
+	// is settled there (sendSingleFrame): the RESET's exit has returned what this Send
+	// charged, or releaseInFlight returns it, so the releases above must not run as
+	// well, or the connection window would get the bytes back twice.
+	queued := func(err error) error {
+		if errors.Is(err, errLeftScheduler) {
+			streamCredited, connCredited = false, false
+			return st.cannotSend()
+		}
+		return err
+	}
+
 	if fragments != nil {
 		// Large payload — send as multiple fragments
 		for _, frag := range fragments {
 			if err := st.sendSingleFrame(ctx, frag, aether.FlagFRAGMENT); err != nil {
-				return err
+				return queued(err)
 			}
 		}
 		// All fragments accepted — credit is now legitimately outstanding
@@ -652,7 +672,7 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 
 	// Small payload — send as single frame (existing fast path)
 	if err := st.sendSingleFrame(ctx, data, 0); err != nil {
-		return err
+		return queued(err)
 	}
 	streamCredited = false
 	connCredited = false
@@ -696,9 +716,26 @@ func (st *noiseStream) recordWrite(frame *aether.Frame, wire int64) (int64, bool
 	return wire, true
 }
 
+// errLeftScheduler is what sendSingleFrame returns when the scheduler no longer holds
+// the stream; Send reads it to answer the stream's end (cannotSend) and to leave
+// what sendSingleFrame settled alone.
+var errLeftScheduler = errors.New("stream left the scheduler")
+
 // sendSingleFrame sends one frame: a whole small message (extra 0) or one
-// fragment envelope (extra aether.FlagFRAGMENT).
+// fragment envelope (extra aether.FlagFRAGMENT). It refuses, queueing nothing, on a
+// closed session with aether.ErrSessionClosed: CloseWithError leaves the streams in
+// the scheduler, and the write loop that would take the frame has stopped. When
+// the scheduler refuses the frame or a repair, the stream has left it (Reset,
+// endByPeerReset, leaveSession call releaseStream after their settlement), so
+// nothing more of the message can go: it gives the connection window what this
+// stream charged after that settlement (releaseInFlight) and returns
+// errLeftScheduler.
 func (st *noiseStream) sendSingleFrame(ctx context.Context, data []byte, extra aether.FrameFlags) error {
+	select {
+	case <-st.session.CloseSignal():
+		return fmt.Errorf("stream %d: %w", st.streamID, aether.ErrSessionClosed)
+	default:
+	}
 	frame := &aether.Frame{
 		SenderID:   st.session.LocalPeerID(),
 		ReceiverID: st.session.RemotePeerID(),
@@ -726,12 +763,18 @@ func (st *noiseStream) sendSingleFrame(ctx context.Context, data []byte, extra a
 	}
 
 	// Enqueue via scheduler for priority-ordered sending
-	st.session.sched.Enqueue(st.streamID, frame)
+	if !st.session.sched.Enqueue(st.streamID, frame) {
+		st.releaseInFlight()
+		return errLeftScheduler
+	}
 	for _, repair := range repairs {
 		repair.StreamID = st.streamID
 		repair.SenderID = st.session.LocalPeerID()
 		repair.ReceiverID = st.session.RemotePeerID()
-		st.session.sched.Enqueue(st.streamID, repair)
+		if !st.session.sched.Enqueue(st.streamID, repair) {
+			st.releaseInFlight()
+			return errLeftScheduler
+		}
 	}
 	return nil
 }
@@ -928,7 +971,12 @@ func (st *noiseStream) finishSend() error {
 	}
 	st.sendWindow.Add(frame)
 	st.closeQueued.Store(true)
-	s.sched.Enqueue(st.streamID, frame)
+	if !s.sched.Enqueue(st.streamID, frame) {
+		// The stream has left the scheduler: a RESET has ended both halves and taken
+		// the CLOSE's place (Reset and endByPeerReset set closeDone), so there is
+		// nothing to close and Close returns nil, as it does after a reset.
+		return nil
+	}
 	return nil
 }
 

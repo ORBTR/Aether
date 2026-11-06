@@ -50,26 +50,29 @@ type WireVersions []WireVersion
 // (FECHeader.Covered), OPEN states the stream's initial credit, FEC level and
 // generation (OpenPayload), CLOSE states the stream's incarnation (ClosePayloadSize,
 // StreamIncarnation), and RESET states the stream's connection credit and
-// incarnation and, on a Full-profile session, is acknowledged by a RESET flagged
-// FlagACK and written again until that comes (ResetPayload). A peer that writes
-// any of them otherwise cannot share a session with this build: its CLOSE would
+// incarnation and is acknowledged by a RESET flagged FlagACK, which a Full-profile
+// writer waits for, writing the RESET again until it comes (ResetPayload). A peer
+// that writes any of them otherwise cannot share a session with this build: its CLOSE would
 // never be acknowledged, its OPENs, CLOSEs, repairs and RESETs would not parse, and
 // its RESETs would be written again without end. This build lists only version 5,
 // so ChooseWireVersions refuses a peer that offers an earlier frame grammar alone
 // before either side creates a session or a stream.
 // frame.short is the short-frame table; it is optional because a session that
 // does not choose it writes full frames only. reliability is the profile a
-// session's streams run: version 2 is the Full profile (adapter.NoiseSession's
+// session's streams run: version 3 is the Full profile (adapter.NoiseSession's
 // reliability.Engine per stream, with its composite ACK, retransmit, flow and
 // congestion frames) and the Lite profile (adapter.TCPSession on a natively
 // reliable byte stream, observation only, writing no flow or congestion frame,
-// with each stream's CLOSE behind its DATA and ending the peer's receive side) as
+// with each stream's CLOSE behind its DATA and ending the peer's receive side, and
+// each RESET acknowledged once, behind every frame of the stream it ends, while
+// its writer holds the ID against a local open until the acknowledgment comes) as
 // this build runs them. It is required because a peer running another profile
 // version reads the ACK, retransmit and flow frames of this one differently, so
 // no stream could be published between the two: a peer that expects WINDOW_UPDATE
-// on a Lite session would watch its credit run down with no grant coming, and one
+// on a Lite session would watch its credit run down with no grant coming, one
 // that sends CLOSE ahead of its DATA would lose its replies to this build's
-// readers.
+// readers, and one that does not acknowledge a Lite RESET would leave this build
+// holding the ID for the rest of the session.
 const (
 	WireVersionBounds      = "bounds"
 	WireVersionFragment    = "fragment"
@@ -86,7 +89,7 @@ const (
 	// outside this package build peer offers from it.
 	WireVersionFrameCurrent       uint16 = 5
 	wireVersionFrameShortCurrent  uint16 = 1
-	wireVersionReliabilityCurrent uint16 = 2
+	wireVersionReliabilityCurrent uint16 = 3
 )
 
 // MaxWireVersionsEncodedSize bounds one encoded set. The preface reader and

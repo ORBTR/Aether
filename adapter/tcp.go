@@ -102,6 +102,12 @@ type TCPSession struct {
 	// (tcpStream.incarnation).
 	streamGenerations atomic.Uint64
 
+	// pendingResets holds, per stream ID, the stream a RESET this side wrote names
+	// (sendReset, sendRefused) until the peer's acknowledgment of it comes
+	// (resetAcknowledged). registerStream refuses a local OpenStream of such an ID.
+	// Guarded by s.mu; at most streamCap entries (holdForResetLocked).
+	pendingResets map[uint64]aether.StreamIncarnation
+
 	// recvMemory is what this session's delivery queues hold, against the bounds
 	// profile's session and per-peer ceilings (tcpStream.enqueueDelivery), and the
 	// queues of ended streams, which housekeepingTick's sweep and makeQueueRoom
@@ -367,27 +373,37 @@ func (st *tcpStream) overrun(n int) {
 	_ = st.sendReset(aether.ResetFlowCtrl)
 }
 
-// sendReset moves the stream to reset, writes RESET(reason) to the peer and
-// takes the stream out of the session: s.streams, the scheduler and the stream
-// GC (releaseStream), and both directional compressors' per-stream state, an
-// unbounded map (codec_short.go Compressor.streams). Reset, the funnel for every
-// local teardown (a direct Reset, the stream GC's idle reap, the acceptor's
-// close), and overrun call it; it returns the RESET write's error. A stream that
-// has already left the session writes nothing and touches nothing: the peer has
-// finished with it, and a later stream may hold the ID, on both ends, which a
-// RESET under that ID would end, and whose scheduler slot and map entry a
-// release would take away.
+// sendReset moves the stream to reset, takes it out of the session (s.streams, the
+// scheduler, which drops what the stream still has queued, and the stream GC:
+// releaseStream), holds its ID against a local OpenStream until the peer
+// acknowledges the RESET (holdForResetLocked), writes RESET(reason) to the peer and
+// clears both directional compressors' per-stream state, an unbounded map
+// (codec_short.go Compressor.streams). Reset, the funnel for every local teardown (a
+// direct Reset, the stream GC's idle reap, the acceptor's close), and overrun call
+// it; it returns the RESET write's error. A stream that has already left the session
+// writes nothing and touches nothing: the peer has finished with it, and a later
+// stream may hold the ID, on both ends, which a RESET under that ID would end, and
+// whose scheduler slot and map entry a release would take away.
+//
+// The stream leaves before the RESET is written, so no DATA or CLOSE of it reaches the
+// conn after the RESET: Send and Close queue only for the stream s.streams holds
+// (queueFrame), the scheduler has dropped what was queued, and a frame the writeLoop
+// has already taken goes out ahead of the RESET (writeLoop). The hold is recorded in
+// the same step, before the write, since the peer's acknowledgment can be read before
+// the write returns.
 func (st *tcpStream) sendReset(reason aether.ResetReason) error {
 	s := st.session
 	s.mu.Lock()
-	cur, ok := s.streams[st.streamID]
-	inSession := ok && cur == st
-	s.mu.Unlock()
-	if !inSession {
+	if cur, ok := s.streams[st.streamID]; !ok || cur != st {
+		s.mu.Unlock()
 		return nil
 	}
 	st.state.Transition(aether.EventSendReset)
 	st.endSend()
+	delete(s.streams, st.streamID)
+	s.releaseStream(st.streamID)
+	s.holdForResetLocked(st.streamID, st.incarnation)
+	s.mu.Unlock()
 	payload := aether.EncodeResetPayload(aether.ResetPayload{Reason: reason, Incarnation: st.incarnation})
 	err := s.writeFrame(&aether.Frame{
 		SenderID:   s.LocalPeerID(),
@@ -397,12 +413,6 @@ func (st *tcpStream) sendReset(reason aether.ResetReason) error {
 		Length:     uint32(len(payload)),
 		Payload:    payload,
 	})
-	s.mu.Lock()
-	if cur, ok := s.streams[st.streamID]; ok && cur == st {
-		delete(s.streams, st.streamID)
-		s.releaseStream(st.streamID)
-	}
-	s.mu.Unlock()
 	st.recvQ.peerEnded()
 	s.trackEnded(st.recvQ)
 	s.txCompressor.RemoveStream(st.streamID)
@@ -788,36 +798,45 @@ func (s *TCPSession) deliverToStream(frame *aether.Frame) {
 }
 
 // registerStream performs an atomic check-and-insert for a freshly-constructed
-// tcpStream. When enforceRemoteCap is true and MaxConcurrentStreams would be
-// exceeded, sends RESET(ResetRefused) and returns nil — the caller drops the
-// frame. The check and the map write happen under a single s.mu.Lock so
-// concurrent peer OPENs cannot race past the cap. Each refusal counts in
-// streamRefused and charges abuse.ReasonStreamRefused.
-func (s *TCPSession) registerStream(st *tcpStream, enforceRemoteCap bool) *tcpStream {
+// tcpStream. It returns st when it inserted it, the stream already under the ID when
+// there is one (a duplicate), and nil with the refusal otherwise. When
+// enforceRemoteCap is true and MaxConcurrentStreams would be exceeded, it sends
+// RESET(ResetRefused) and returns nil — the caller drops the frame. The check and
+// the map write happen under a single s.mu.Lock so concurrent peer OPENs cannot race
+// past the cap. Each cap refusal counts in streamRefused and charges
+// abuse.ReasonStreamRefused.
+//
+// A local open (enforceRemoteCap false) of an ID whose RESET waits for the peer's
+// acknowledgment (pendingResets) is refused with aether.ErrDuplicateStreamID: the
+// peer may still hold the stream that RESET ends and write DATA under the ID, which
+// names no stream, so deliverToStream would hand it to the new one. The check is in
+// the same step as the insert, since sendReset records the hold as it takes the old
+// stream out. A peer's open is not refused: the peer opens the ID only after it has
+// read this side's RESET, and its DATA for the old stream precede that open on the
+// byte stream.
+func (s *TCPSession) registerStream(st *tcpStream, enforceRemoteCap bool) (*tcpStream, error) {
 	s.mu.Lock()
 	if existing, ok := s.streams[st.streamID]; ok {
 		s.mu.Unlock()
-		return existing // duplicate peer OPEN for open stream — return existing
+		return existing, nil // duplicate peer OPEN for open stream — return existing
+	}
+	if _, held := s.pendingResets[st.streamID]; held && !enforceRemoteCap {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("OpenStream stream=%d: its RESET awaits the peer's acknowledgment: %w", st.streamID, aether.ErrDuplicateStreamID)
 	}
 	// MaxConcurrentStreams cap applies to BOTH locally-initiated and
 	// peer-initiated stream opens. enforceRemoteCap=true means
 	// peer-initiated → on refusal, send a RESET so the peer gives up;
 	// enforceRemoteCap=false means locally-initiated → return nil and
 	// let the caller surface ErrStreamCapExhausted.
-	{
-		cap := s.opts.MaxConcurrentStreams
-		if cap <= 0 {
-			cap = DefaultTCPMaxConcurrentStreams
+	if cap := s.streamCap(); len(s.streams) >= cap {
+		s.mu.Unlock()
+		atomic.AddUint64(&s.streamRefused, 1)
+		s.reportAbuse(abuse.ReasonStreamRefused)
+		if enforceRemoteCap {
+			s.sendRefused(st.streamID, st.incarnation.Generation)
 		}
-		if len(s.streams) >= cap {
-			s.mu.Unlock()
-			atomic.AddUint64(&s.streamRefused, 1)
-			s.reportAbuse(abuse.ReasonStreamRefused)
-			if enforceRemoteCap {
-				s.sendRefused(st.streamID, st.incarnation.Generation)
-			}
-			return nil
-		}
+		return nil, fmt.Errorf("OpenStream cap=%d: %w", cap, aether.ErrStreamCapExhausted)
 	}
 	s.streams[st.streamID] = st
 	s.mu.Unlock()
@@ -826,23 +845,102 @@ func (s *TCPSession) registerStream(st *tcpStream, enforceRemoteCap bool) *tcpSt
 	if s.streamGC != nil {
 		s.streamGC.Register(st.streamID)
 	}
-	return st
+	return st, nil
 }
 
 // sendRefused answers a stream the peer opened and this side will not admit, with
 // RESET(ResetRefused), which the peer's handleReset reads as aether.ErrStreamRefused.
 // It names the stream by the generation the peer's SYN stated, so it ends that
-// stream and no later one under the ID.
+// stream and no later one under the ID. The ID is held against a local OpenStream
+// until the peer acknowledges the refusal, as after sendReset: the peer's DATA
+// written behind its SYN may still be on the way.
 func (s *TCPSession) sendRefused(streamID, generation uint64) {
+	inc := aether.StreamIncarnation{Generation: generation}
 	payload := aether.EncodeResetPayload(aether.ResetPayload{
 		Reason:      aether.ResetRefused,
-		Incarnation: aether.StreamIncarnation{Generation: generation},
+		Incarnation: inc,
 	})
+	s.mu.Lock()
+	s.holdForResetLocked(streamID, inc)
+	s.mu.Unlock()
 	s.writeFrame(&aether.Frame{
 		SenderID:   s.LocalPeerID(),
 		ReceiverID: s.RemotePeerID(),
 		StreamID:   streamID,
 		Type:       aether.TypeRESET,
+		Length:     uint32(len(payload)),
+		Payload:    payload,
+	})
+}
+
+// streamCap is the session's MaxConcurrentStreams, DefaultTCPMaxConcurrentStreams
+// when the options leave it unset: registerStream's bound on s.streams and
+// holdForResetLocked's on pendingResets.
+func (s *TCPSession) streamCap() int {
+	if cap := s.opts.MaxConcurrentStreams; cap > 0 {
+		return cap
+	}
+	return DefaultTCPMaxConcurrentStreams
+}
+
+// holdForResetLocked records that a RESET this side is about to write under id
+// names inc, so registerStream refuses a local OpenStream of id until the peer's
+// acknowledgment naming inc comes (resetAcknowledged). A later RESET under the ID
+// replaces an earlier one's entry. Past streamCap waiting RESETs, which only a peer
+// that acknowledges none of them reaches, the RESET is written with no hold, so such
+// a peer cannot grow the map; its own DATA reaching a stream this side opens again is
+// that peer's doing, since it can write DATA under any ID. sendReset and sendRefused
+// call it, holding s.mu.
+func (s *TCPSession) holdForResetLocked(id uint64, inc aether.StreamIncarnation) {
+	if s.pendingResets == nil {
+		s.pendingResets = make(map[uint64]aether.StreamIncarnation)
+	}
+	if _, replaced := s.pendingResets[id]; replaced || len(s.pendingResets) < s.streamCap() {
+		s.pendingResets[id] = inc
+	}
+}
+
+// resetAcknowledged takes the peer's acknowledgment of a RESET under id: when it
+// names the stream the waiting RESET names, the ID opens to a local OpenStream again.
+// With no stream under the ID, the receive compressor's state the acknowledgment's
+// full header created goes too, as sendReset's RemoveStream took the stream's, so an
+// ID reset and never reused keeps no entry. That state is the ID's last sequence
+// number, which the short DATA forms decode against: no DATA frame of a TCP-family
+// session sets one (Send writes 0), and the short control form carries its own, so a
+// short header from the peer decodes the same without it.
+// No quiet time follows, unlike a Noise session's (NoiseSession.resetAcknowledged): the
+// peer writes the acknowledgment after its stream has left its scheduler, behind every
+// frame of that stream its writeLoop had taken (writeLoop), and the byte stream keeps
+// that order, so nothing of the old stream follows it. An acknowledgment of an earlier
+// RESET under the ID, which a later one replaced, opens nothing. handleReset calls it
+// for a RESET flagged aether.FlagACK.
+func (s *TCPSession) resetAcknowledged(id uint64, inc aether.StreamIncarnation) {
+	s.mu.Lock()
+	if held, ok := s.pendingResets[id]; ok && held == inc {
+		delete(s.pendingResets, id)
+	}
+	_, live := s.streams[id]
+	s.mu.Unlock()
+	if !live {
+		s.rxCompressor.RemoveStream(id)
+	}
+}
+
+// acknowledgeReset answers the peer's RESET under id with a RESET flagged
+// aether.FlagACK that names the stream as the RESET did, stating the same reason and
+// no counts (aether.ResetPayload), which ends the hold the peer keeps on the ID
+// (holdForResetLocked on the peer). handleReset calls it for every RESET, whatever it
+// finds, once the stream it ends has left the scheduler, so the acknowledgment is
+// written behind every frame of that stream this side wrote. It is written once: the
+// transport delivers it.
+func (s *TCPSession) acknowledgeReset(id uint64, p aether.ResetPayload) {
+	payload := aether.EncodeResetPayload(aether.ResetPayload{Reason: p.Reason, Incarnation: p.Incarnation})
+	_ = s.writeFrame(&aether.Frame{
+		SenderID:   s.LocalPeerID(),
+		ReceiverID: s.RemotePeerID(),
+		StreamID:   id,
+		Type:       aether.TypeRESET,
+		Flags:      aether.FlagACK,
 		Length:     uint32(len(payload)),
 		Payload:    payload,
 	})
@@ -907,7 +1005,7 @@ func (s *TCPSession) handleOpen(frame *aether.Frame) {
 		sendEnded: make(chan struct{}),
 	}
 	candidate.incarnation = aether.StreamIncarnation{Generation: payload.Generation}
-	st := s.registerStream(candidate, true /* enforceRemoteCap */)
+	st, _ := s.registerStream(candidate, true /* enforceRemoteCap */)
 	if st == nil {
 		dbgTCP.Printf("handleOpen: refused stream=%d (cap reached)", frame.StreamID)
 		return
@@ -1012,21 +1110,25 @@ func (s *TCPSession) leaveIfEndedLocked(st *tcpStream) bool {
 	return true
 }
 
-// handleReset ends the stream the peer's RESET names (tcpStream.incarnation). A
-// RESET naming another stream than the one under the ID, written by the peer before
-// it read this side's own RESET of that stream, ends nothing and leaves the
-// compressors' state alone. A RESET flagged aether.FlagACK is a Full-profile
-// session's acknowledgment, which no TCP-family peer writes, since the transport
-// delivers every RESET once in order; it is not a RESET and changes nothing.
+// handleReset ends the stream the peer's RESET names (tcpStream.incarnation). Every
+// RESET is acknowledged (acknowledgeReset), what it finds or not, so the peer's hold
+// on the ID ends; a RESET flagged aether.FlagACK is that acknowledgment of one of this
+// side's (resetAcknowledged) and changes nothing else. A RESET naming another stream
+// than the one under the ID, written by the peer before it read this side's own RESET
+// of that stream, ends nothing and leaves the compressors' state alone. A RESET for a
+// stream this side does not hold crossed this side's RESET of it, or ends a stream this
+// side refused.
 func (s *TCPSession) handleReset(frame *aether.Frame) {
+	payload := aether.DecodeResetPayload(frame.Payload)
 	if frame.Flags.Has(aether.FlagACK) {
+		s.resetAcknowledged(frame.StreamID, payload.Incarnation)
 		return
 	}
-	payload := aether.DecodeResetPayload(frame.Payload)
 	s.mu.Lock()
 	st, ok := s.streams[frame.StreamID]
 	if ok && !st.namedBy(payload.Incarnation) {
 		s.mu.Unlock()
+		s.acknowledgeReset(frame.StreamID, payload)
 		return
 	}
 	if ok {
@@ -1048,6 +1150,9 @@ func (s *TCPSession) handleReset(frame *aether.Frame) {
 		s.releaseStream(frame.StreamID)
 	}
 	s.mu.Unlock()
+	// The stream has left s.streams and the scheduler, so no frame of it is queued
+	// behind the acknowledgment (sendReset's order, from the peer's side).
+	s.acknowledgeReset(frame.StreamID, payload)
 	s.txCompressor.RemoveStream(frame.StreamID) // both directional compressors hold per-stream state
 	s.rxCompressor.RemoveStream(frame.StreamID)
 	if ok {
@@ -1145,6 +1250,15 @@ func (s *TCPSession) DeliveryStats() *DeliveryStats {
 // A write that fails ends the session (failWrite): sessionWriter has already
 // retried a temporary error, and the transport carries frames in one sequence with
 // no retransmit, so the frame is lost and the conn's framing may be cut mid-frame.
+//
+// The loop holds writeMu from its Dequeue until the frames it took are written, so
+// a frame written straight through writeFrame never overtakes one the scheduler has
+// handed out: a frame still in the scheduler when its stream leaves it is dropped
+// (releaseStream), and one already taken is on the conn before the next writeFrame.
+// handleReset's acknowledgment relies on that to come after every frame of the
+// stream it ends, and sendReset's RESET and OpenStream's SYN to come after every
+// frame of the stream before them under the ID. failWrite runs after writeMu is
+// released, since the close path writes through writeFrame.
 func (s *TCPSession) writeLoop() {
 	ticker := time.NewTicker(2 * time.Millisecond)
 	defer ticker.Stop()
@@ -1157,6 +1271,7 @@ func (s *TCPSession) writeLoop() {
 		case <-wake:
 		}
 
+		s.writeMu.Lock()
 		frame, _ := s.sched.Dequeue()
 		// isProbe is irrelevant for the TCP transport — TCP has its own
 		// kernel-level flow control and aether's cwnd is not enforced
@@ -1164,6 +1279,7 @@ func (s *TCPSession) writeLoop() {
 		// single call site doesn't have to special-case Dequeue per
 		// transport.
 		if frame == nil {
+			s.writeMu.Unlock()
 			continue
 		}
 
@@ -1189,7 +1305,6 @@ func (s *TCPSession) writeLoop() {
 				batch = append(batch, next)
 			}
 			if len(batch) > 1 {
-				s.writeMu.Lock()
 				_, err := s.txCompressor.EncodeBatch(s.out, batch) // encode-side state
 				s.writeMu.Unlock()
 				if err != nil {
@@ -1210,7 +1325,9 @@ func (s *TCPSession) writeLoop() {
 			dbgTCP.Printf("writeLoop: TX stream=%d type=%d seq=%d len=%d",
 				frame.StreamID, frame.Type, frame.SeqNo, frame.Length)
 		}
-		if err := s.writeFrame(frame); err != nil {
+		err := s.encodeFrameLocked(frame)
+		s.writeMu.Unlock()
+		if err != nil {
 			dbgTCP.Printf("writeLoop: writeFrame err=%v stream=%d", err, frame.StreamID)
 			s.failWrite(err)
 			return
@@ -1235,7 +1352,12 @@ func (s *TCPSession) writeFrame(frame *aether.Frame) error {
 func (s *TCPSession) encodeFrame(frame *aether.Frame) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	return s.encodeFrameLocked(frame)
+}
 
+// encodeFrameLocked encodes frame onto the conn; the caller holds writeMu
+// (encodeFrame, and writeLoop across its Dequeue).
+func (s *TCPSession) encodeFrameLocked(frame *aether.Frame) error {
 	if s.opts.HeaderComp {
 		// All encoding goes through the TX-side compressor state (txCompressor).
 		// Control frames: PING/PONG/CLOSE/RESET → 4 bytes
@@ -1317,7 +1439,9 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 	// the typed sentinel ErrStreamCapExhausted so pool/dispatch
 	// callers can detect cap-hit via errors.Is and back off rather
 	// than closing the session.
-	// registerStream has a tri-state return — nil on cap-hit, the
+	// registerStream has a tri-state return — nil with its refusal on
+	// cap-hit (aether.ErrStreamCapExhausted) or on an ID whose RESET awaits
+	// the peer's acknowledgment (aether.ErrDuplicateStreamID), the
 	// PRE-EXISTING stream when cfg.StreamID is still live in s.streams
 	// (duplicate), or st on a fresh insert. A duplicate must not proceed
 	// with the detached, never-mapped st: the rollback defer below would
@@ -1327,13 +1451,9 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 	// error out — matching handleOpen's `st != candidate` guard — BEFORE
 	// the rollback defer is armed so no cleanup touches the pre-existing
 	// stream.
-	registered := s.registerStream(st, false)
+	registered, refused := s.registerStream(st, false)
 	if registered == nil {
-		cap := s.opts.MaxConcurrentStreams
-		if cap <= 0 {
-			cap = DefaultTCPMaxConcurrentStreams
-		}
-		return nil, fmt.Errorf("OpenStream cap=%d: %w", cap, aether.ErrStreamCapExhausted)
+		return nil, refused
 	}
 	if registered != st {
 		// Duplicate still-live StreamID (e.g. a pool recycling an ID
@@ -1678,8 +1798,8 @@ func (st *tcpStream) Send(ctx context.Context, data []byte) error {
 		Payload:    data,
 	}
 	st.session.queuedFrames.Store(frame, queuedFrame{st: st, cost: cost})
-	if !st.session.sched.Enqueue(st.streamID, frame) {
-		// A RESET has taken the stream out of the scheduler ahead of its state.
+	if !st.queueFrame(frame) {
+		// A RESET has taken the stream out of the session ahead of its state.
 		st.session.releaseSendRoom(frame)
 		return st.endError(fmt.Errorf("stream %d: cannot send (reset)", st.streamID))
 	}
@@ -1756,8 +1876,28 @@ func (st *tcpStream) Close() error {
 	s.mu.Lock()
 	st.closeFrame = frame
 	s.mu.Unlock()
-	s.sched.Enqueue(st.streamID, frame)
+	if !st.queueFrame(frame) {
+		// A RESET has taken the stream out of the session: it ended both halves, so
+		// there is nothing to close, and a Close after a reset returns nil.
+		return nil
+	}
 	return nil
+}
+
+// queueFrame puts one of this stream's frames in the scheduler and reports whether
+// it did, which it does only while s.streams holds this stream under its ID. The
+// check and the Enqueue are one step under s.mu, the lock sendReset and handleReset
+// take the stream out under, so a Send or Close that passed its state check before a
+// RESET queues nothing behind it, and nothing of this stream reaches the scheduler
+// slot of a later stream under the ID. Send and Close call it holding st.mu.
+func (st *tcpStream) queueFrame(frame *aether.Frame) bool {
+	s := st.session
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cur, ok := s.streams[st.streamID]; !ok || cur != st {
+		return false
+	}
+	return s.sched.Enqueue(st.streamID, frame)
 }
 
 // Reset abandons the stream from this side: it writes RESET(reason) and takes the

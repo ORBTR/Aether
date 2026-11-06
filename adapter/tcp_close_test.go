@@ -654,8 +654,8 @@ func TestTCPStream_ASYNPayloadIsNeverAMessage(t *testing.T) {
 }
 
 // TestTCPStream_DataBehindAResetIsRefused: the peer's RESET ends the stream, whose
-// consumer reads what it holds and then the end, and DATA behind the RESET is not a
-// message.
+// consumer reads what it holds and then the end, the session answers it with its
+// acknowledgment, and DATA behind the RESET is not a message.
 func TestTCPStream_DataBehindAResetIsRefused(t *testing.T) {
 	p := newLiteRawPeer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -666,8 +666,8 @@ func TestTCPStream_DataBehindAResetIsRefused(t *testing.T) {
 		rawReset(54, aether.ResetCancel),
 		&aether.Frame{StreamID: 54, Type: aether.TypeDATA, Payload: []byte("behind")},
 		&aether.Frame{StreamID: 2, Type: aether.TypePING})
-	if f := p.next(); f.Type != aether.TypePONG {
-		t.Fatalf("frame on the wire: type %v, want PONG", f.Type)
+	if seen := p.readUntilPong(); len(seen) != 1 || seen[0].StreamID != 54 || !seen[0].Flags.Has(aether.FlagACK) {
+		t.Fatalf("frames ahead of the PONG: %d %+v, want the RESET's acknowledgment alone", len(seen), seen)
 	}
 	st, err := p.sess.AcceptStream(ctx)
 	if err != nil {
