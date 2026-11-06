@@ -15,11 +15,15 @@ package nat
 import (
 	"context"
 	"errors"
+
+	aether "github.com/ORBTR/aether"
 )
 
-// StrategyConfig wires together the components a Strategy needs.
+// StrategyConfig wires together the components a Strategy needs. STUN takes the
+// aether.STUNClient seam, the type a Noise transport's GetSTUNClient returns; a
+// *STUNClient is one.
 type StrategyConfig struct {
-	STUN       *STUNClient
+	STUN       aether.STUNClient
 	PortMapper PortMapper // pass NullPortMapper{} when none configured
 }
 

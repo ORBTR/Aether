@@ -285,7 +285,7 @@ func (s *QUICSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (
 		if err := s.wireRefusal(); err != nil {
 			return nil, err
 		}
-		return nil, fmt.Errorf("session closed")
+		return nil, aether.ErrSessionClosed
 	default:
 	}
 	// No stream exists before the wire versions are chosen: a refused peer returns

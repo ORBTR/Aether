@@ -19,7 +19,6 @@ import (
 	vl1 "github.com/ORBTR/aether"
 	transportHealth "github.com/ORBTR/aether/health"
 	"github.com/flynn/noise"
-	"github.com/pion/stun"
 )
 
 func newNoiseConnDial(conn *net.UDPConn, remote *net.UDPAddr, remoteNode aether.NodeID, send, recv *noise.CipherState, maxPacket int, nt *NoiseTransport) *noiseConn {
@@ -301,7 +300,7 @@ func (l *noiseListener) runReader(ctx context.Context, conn *net.UDPConn) {
 		// a cross-origin dial's msg3, the routing preamble
 		// (EncodeRoutingPreamble, by its magic). A bare one would take this
 		// branch half the time.
-		// The STUN branch below IS guarded by stun.IsMessage (magic-cookie
+		// The STUN branch below IS guarded by aether.IsSTUNMessage (magic-cookie
 		// validated); this one has no equivalent, so DropQUICDemux counts every
 		// datagram diverted here: quic_demux climbing while noise-UDP fails is
 		// the signature of a bare Noise datagram taking this branch.
@@ -312,7 +311,7 @@ func (l *noiseListener) runReader(ctx context.Context, conn *net.UDPConn) {
 		}
 
 		// STUN packets
-		if pktType == PacketSTUN && stun.IsMessage(buf[:n]) {
+		if pktType == PacketSTUN && aether.IsSTUNMessage(buf[:n]) {
 			l.drops.count(DropSTUN)
 			l.transport.handleSTUNPacket(buf[:n])
 			continue

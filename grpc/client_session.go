@@ -173,7 +173,7 @@ sendLoop:
 // one, so a caller is not handed nil for bytes nothing will send.
 func (s *GrpcSession) Send(ctx context.Context, payload []byte) error {
 	if atomic.LoadInt32(&s.closed) == 1 {
-		return errors.New("session closed")
+		return aether.ErrSessionClosed
 	}
 	select {
 	case <-s.sendDone:
@@ -185,7 +185,7 @@ func (s *GrpcSession) Send(ctx context.Context, payload []byte) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-s.closeCh:
-		return errors.New("session closed")
+		return aether.ErrSessionClosed
 	case <-s.sendDone:
 		return s.streamEnded()
 	case s.sendCh <- payload:

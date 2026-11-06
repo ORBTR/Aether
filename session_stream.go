@@ -475,11 +475,15 @@ type StreamConfig struct {
 	LatencyClass LatencyClass
 
 	// MaxAge is the frame age a stream of a class that may lose frames tolerates.
-	// A NoiseSession hands it to its reliability.Engine, which stores it and reads
-	// it nowhere, so every stream's frames are delivered and retransmitted whatever
-	// their age, on every adapter.
-	// TODO: run it through RecvWindow.SetMaxAge and RetransmitQueue.SetMaxAge on the
-	// classes that may lose frames, and state it in OPEN so the accepting side runs it.
+	// A NoiseSession hands it to the stream's reliability.Engine, which runs it
+	// through RecvWindow.SetMaxAge (a buffered frame older than it is settled and
+	// counted dropped, not delivered) and RetransmitQueue.SetMaxAge (the RTO path
+	// stops resending a frame older than it). Only the side that opened the stream
+	// runs it: OPEN does not carry it, so the accepting side's windows run zero.
+	// TCP-family and QUIC sessions have no reliability engine and do not read it.
+	// Zero bounds no frame's age.
+	// TODO: run it only on the classes that may lose frames, and state it in OPEN so
+	// the accepting side runs it.
 	MaxAge time.Duration
 
 	// InitialCredit sets the flow control credit window for this stream.

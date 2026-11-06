@@ -734,7 +734,7 @@ func selectPacer(opts aether.SessionOptions) congestion.PacingPolicy {
 func (s *NoiseSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (aether.Stream, error) {
 	select {
 	case <-s.CloseSignal():
-		return nil, fmt.Errorf("session closed")
+		return nil, aether.ErrSessionClosed
 	default:
 	}
 

@@ -116,13 +116,13 @@ func TestAEL16_TeardownRaceDoesNotOrphanWaiterStream(t *testing.T) {
 		drained := acc.Close()
 
 		inFifo := false
-		select {
-		case s := <-acc.fifo:
+		acc.mu.Lock()
+		for _, s := range acc.fifo {
 			if s == Stream(st) {
 				inFifo = true
 			}
-		default:
 		}
+		acc.mu.Unlock()
 
 		places := 0
 		returned := got == Stream(st) && acceptErr == nil

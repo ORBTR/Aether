@@ -8,7 +8,7 @@
  * browser DialOverConn / AcceptOverConn (WASM WebSocket / DataChannel) path
  * share this one type. It reaches the owning server transport only through the
  * connHost interface, carrying no reference to the //go:build !js
- * NoiseTransport, its UDP listener, pion/stun, or the relay service. The
+ * NoiseTransport, its UDP listener, its STUN client, or the relay service. The
  * browser constructs it with a nil connHost (buildAetherConnectionOverConn in
  * dial_conn.go); every connHost call site is nil-guarded.
  */
@@ -35,7 +35,7 @@ import (
 // connHost is the narrow surface noiseConn needs from the owning server
 // transport (*NoiseTransport). Decoupling through an interface keeps noiseConn
 // build-tag agnostic: the concrete NoiseTransport — and everything it drags in
-// (the UDP listener, pion/stun, the relay service) — stays //go:build !js,
+// (the UDP listener, the STUN client, the relay service) — stays //go:build !js,
 // while noiseConn compiles for GOOS=js. The browser DialOverConn path leaves
 // this nil (all call sites nil-guard); the UDP path supplies the real
 // *NoiseTransport, which satisfies this interface (assertion in transport.go).

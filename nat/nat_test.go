@@ -18,11 +18,11 @@ func TestLegacyType_Mapping(t *testing.T) {
 		b    NATBehaviour
 		want aether.NATType
 	}{
-		{NATBehaviour{MappingEndpointIndependent, FilteringEndpointIndependent}, aether.NATFullCone},
-		{NATBehaviour{MappingEndpointIndependent, FilteringAddressDependent}, aether.NATRestricted},
-		{NATBehaviour{MappingEndpointIndependent, FilteringAddressPortDependent}, aether.NATPortRestricted},
-		{NATBehaviour{MappingAddressDependent, FilteringAddressDependent}, aether.NATSymmetric},
-		{NATBehaviour{MappingAddressPortDependent, FilteringAddressPortDependent}, aether.NATSymmetric},
+		{NATBehaviour{Mapping: MappingEndpointIndependent, Filtering: FilteringEndpointIndependent}, aether.NATFullCone},
+		{NATBehaviour{Mapping: MappingEndpointIndependent, Filtering: FilteringAddressDependent}, aether.NATRestricted},
+		{NATBehaviour{Mapping: MappingEndpointIndependent, Filtering: FilteringAddressPortDependent}, aether.NATPortRestricted},
+		{NATBehaviour{Mapping: MappingAddressDependent, Filtering: FilteringAddressDependent}, aether.NATSymmetric},
+		{NATBehaviour{Mapping: MappingAddressPortDependent, Filtering: FilteringAddressPortDependent}, aether.NATSymmetric},
 	}
 	for _, c := range cases {
 		if got := c.b.LegacyType(); got != c.want {
@@ -32,8 +32,8 @@ func TestLegacyType_Mapping(t *testing.T) {
 }
 
 func TestChooseMethod(t *testing.T) {
-	eim := NATBehaviour{MappingEndpointIndependent, FilteringAddressDependent}
-	apdm := NATBehaviour{MappingAddressPortDependent, FilteringAddressPortDependent}
+	eim := NATBehaviour{Mapping: MappingEndpointIndependent, Filtering: FilteringAddressDependent}
+	apdm := NATBehaviour{Mapping: MappingAddressPortDependent, Filtering: FilteringAddressPortDependent}
 
 	if m := ChooseMethod(eim, eim); m != PunchDirect {
 		t.Errorf("EIM/EIM: got %v, want PunchDirect", m)
@@ -54,7 +54,7 @@ func TestPunchRequest_SignVerifyRoundTrip(t *testing.T) {
 	r := &PunchRequest{
 		RequesterNodeID: "vl1_alice",
 		TargetNodeID:    "vl1_bob",
-		Behaviour:       NATBehaviour{MappingEndpointIndependent, FilteringAddressDependent},
+		Behaviour:       NATBehaviour{Mapping: MappingEndpointIndependent, Filtering: FilteringAddressDependent},
 		Timestamp:       time.Now().Unix(),
 	}
 	r.Sign(priv)
@@ -74,7 +74,7 @@ func TestPunchOffer_SignVerifyRoundTrip(t *testing.T) {
 	o := &PunchOffer{
 		ResponderNodeID: "vl1_bob",
 		RequesterNodeID: "vl1_alice",
-		Behaviour:       NATBehaviour{MappingAddressPortDependent, FilteringAddressPortDependent},
+		Behaviour:       NATBehaviour{Mapping: MappingAddressPortDependent, Filtering: FilteringAddressPortDependent},
 		Method:          PunchPortPrediction,
 		Timestamp:       time.Now().Unix(),
 	}

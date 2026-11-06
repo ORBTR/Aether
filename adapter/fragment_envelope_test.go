@@ -95,7 +95,7 @@ func TestSplitMessage_PayloadBeginningFRIsOrdinaryData(t *testing.T) {
 // shuffled, interleaved order each reassemble exactly once, byte for byte,
 // leaving nothing buffered.
 func TestFragmentLargeMessageRoundTrips(t *testing.T) {
-	const maxPayload = 1134 // MSSToMaxPayload(1200)
+	const maxPayload = 1133 // MSSToMaxPayload(1200)
 	msgA := make([]byte, 250_000)
 	msgB := make([]byte, 90_001)
 	for i := range msgA {

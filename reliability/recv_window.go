@@ -80,8 +80,9 @@ func NewRecvWindowWithCap(maxGap int, maxBytes int64) *RecvWindow {
 // Expired (RecvDelivery) and not as a message: it was acknowledged when it was
 // buffered, so no retransmit replaces it, and the caller has its charge to settle.
 // A CLOSE never expires (InsertEnd), since the receive side would never end.
-// Zero, the value every session's windows run at, delivers every buffered frame
-// whatever its age: aether.StreamConfig.MaxAge does not reach this call.
+// NewEngine calls it with EngineConfig.MaxAge when that is positive, which the
+// adapter's NoiseSession fills from the stream's aether.StreamConfig.MaxAge; zero
+// delivers every buffered frame whatever its age.
 func (w *RecvWindow) SetMaxAge(d time.Duration) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
