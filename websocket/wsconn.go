@@ -4,19 +4,29 @@
 package websocket
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/ORBTR/aether/quality"
+	"github.com/ORBTR/aether/rtt"
 	"github.com/gobwas/ws"
 )
 
+// ErrPongDeadline is what Read answers once the pong deadline has closed the connection:
+// a ping went unanswered, and nothing else was heard from the peer, for the keepalive
+// plan's Silence.
+var ErrPongDeadline = errors.New("websocket: the peer answered no ping within the keepalive deadline")
+
 // WSConn wraps a post-handshake net.Conn with WebSocket framing.
 // Implements net.Conn — transparent to gossip/RPC code.
-// Handles ping/pong at the frame level for proxy keepalive.
+// Handles ping/pong at the frame level for proxy keepalive, and holds the peer to a pong
+// deadline while it pings.
 type WSConn struct {
 	raw      net.Conn
 	isServer bool       // true = server side (reads client frames, writes server frames)
@@ -25,20 +35,34 @@ type WSConn struct {
 	closed   bool
 	pingStop chan struct{}
 	peerID   string
+
+	// The pong deadline's state. Read clears unanswered on every frame header it reads;
+	// sendPing sets unanswered to a ping's send time when it is clear and pingSent to every
+	// ping's; a pong turns pingSent into an RTT sample for pongRTT. pongDeadline reads
+	// unanswered and pongRTT, and sets silent before it closes raw.
+	unanswered atomic.Int64
+	pingSent   atomic.Int64
+	pongRTT    *rtt.Estimator
+	silent     atomic.Bool
 }
 
 // NewWSConn creates a WSConn adapter.
 // isServer: true if this side accepted the connection (affects frame masking per RFC 6455).
-// pingInterval: how often to send WebSocket ping frames (0 = no pings).
+// pingInterval: how often to send WebSocket ping frames (0 = no pings and no pong
+// deadline). While it pings, a peer that answers no ping and sends nothing else for the
+// keepalive plan's Silence (quality.Keepalive over this connection's own ping round
+// trips) has its connection closed, and Read answers ErrPongDeadline.
 func NewWSConn(raw net.Conn, isServer bool, peerID string, pingInterval time.Duration) *WSConn {
 	c := &WSConn{
 		raw:      raw,
 		isServer: isServer,
 		peerID:   peerID,
 		pingStop: make(chan struct{}),
+		pongRTT:  rtt.NewDefault(),
 	}
 	if pingInterval > 0 {
 		go c.pingLoop(pingInterval)
+		go c.pongDeadline()
 	}
 	return c
 }
@@ -57,9 +81,14 @@ func (c *WSConn) Read(p []byte) (int, error) {
 	for {
 		header, err := ws.ReadHeader(c.raw)
 		if err != nil {
+			if c.silent.Load() {
+				return 0, fmt.Errorf("%w: %v", ErrPongDeadline, err)
+			}
 			log.Printf("[WS-DIAG] Read: ReadHeader err=%v remote=%s", err, c.peerID)
 			return 0, err
 		}
+		heard := time.Now()
+		c.unanswered.Store(0)
 
 		// Cap the peer-advertised frame length before allocating.
 		// header.Length is an int64 read straight off the wire (gobwas/ws does
@@ -112,7 +141,11 @@ func (c *WSConn) Read(p []byte) (int, error) {
 			continue // read next frame
 
 		case ws.OpPong:
-			// Pong received — keepalive acknowledged, continue reading
+			// Pong received — keepalive acknowledged; the ping it answers gives the
+			// pong deadline a round-trip sample.
+			if sent := c.pingSent.Swap(0); sent != 0 {
+				c.pongRTT.Update(heard.Sub(time.Unix(0, sent)))
+			}
 			continue
 
 		case ws.OpClose:
@@ -225,7 +258,13 @@ func (c *WSConn) pingLoop(interval time.Duration) {
 
 // sendPing writes a single ping frame. Returns false on error so the
 // pingLoop can exit; callers don't need to log because sendPing logs.
+//
+// The ping is stamped before the write lock is taken, so a write stalled behind a peer
+// that reads nothing still starts the pong deadline's clock.
 func (c *WSConn) sendPing() bool {
+	now := time.Now().UnixNano()
+	c.unanswered.CompareAndSwap(0, now)
+	c.pingSent.Store(now)
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -243,6 +282,48 @@ func (c *WSConn) sendPing() bool {
 		return false
 	}
 	return true
+}
+
+// pongPlan is the keepalive plan quality.Keepalive derives from this connection's ping
+// round trips. The session keepalive (aether.RunKeepalive) derives its plan from the same
+// function over the session's probes, so the two layers let a silent peer go on one rule.
+func (c *WSConn) pongPlan() quality.KeepalivePlan {
+	return quality.Keepalive(quality.KeepaliveInputs{
+		SRTT:    c.pongRTT.SRTT(),
+		RTO:     c.pongRTT.RTO(),
+		Samples: c.pongRTT.SampleCount(),
+	})
+}
+
+// pongDeadline closes the connection once a ping has gone unanswered, with nothing else
+// heard from the peer, for the plan's Silence, checking every RetryGap. It runs apart from
+// pingLoop because a ping write can stall under mu behind a peer that reads nothing, and
+// closing raw is what unblocks that write and ends Read. It returns at Close or after it
+// has closed raw.
+func (c *WSConn) pongDeadline() {
+	for {
+		plan := c.pongPlan()
+		timer := time.NewTimer(plan.RetryGap)
+		select {
+		case <-c.pingStop:
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		since := c.unanswered.Load()
+		if since == 0 {
+			continue
+		}
+		silentFor := time.Since(time.Unix(0, since))
+		if silentFor <= plan.Silence() {
+			continue
+		}
+		c.silent.Store(true)
+		log.Printf("[WS] %s answered no ping for %s (pong deadline %s); closing", truncWSID(c.peerID),
+			silentFor.Round(time.Millisecond), plan.Silence())
+		_ = c.raw.Close()
+		return
+	}
 }
 
 // net.Conn interface delegation
