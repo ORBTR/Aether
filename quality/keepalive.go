@@ -25,7 +25,9 @@ type KeepaliveInputs struct {
 // session stays quiet between probes, how long one probe waits for an answer, and how
 // many unanswered probes in a row end the session. aether.RunKeepalive probes on it and
 // websocket.WSConn holds its pong deadline to Silence, so a peer that stops answering
-// is let go on one derived bound at both layers.
+// is let go on one derived bound at both layers. The Noise adapter's stall probe and
+// multipath's standby probe take their budgets from it, and the quic package takes
+// its connection keepalive and idle timeout from the plan for an unmeasured path.
 type KeepalivePlan struct {
 	Interval     time.Duration
 	ProbeTimeout time.Duration

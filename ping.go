@@ -33,19 +33,14 @@ type PingFrameWriter func(seqNo uint32) error
 // activity on the session. Returns the health monitor's averaged RTT once
 // LastActivity advances past the snapshot taken before the PING was sent.
 //
-// Behaviour shared between the Noise and TCP adapters — they have
+// Behaviour shared between the Noise, TCP and QUIC adapters — they have
 // identical zombie-session detection requirements: writeFrame can succeed
 // against a torn-down peer because the kernel buffers the datagram, so
 // returning the cached RTT immediately after a successful send is unsafe.
-// Both adapters' Ping run this loop, so the two transports observe one
+// Every adapter's Ping runs this loop, so the transports observe one
 // definition of "the peer is alive" — any inbound frame counts, so a peer
 // that sends other traffic within deadline counts as alive even if a PONG
 // never arrives (acceptable for keepalive; the goal is detecting silence).
-//
-// QUIC's Ping intentionally does NOT use this helper — it returns the
-// cached RTT without writing an aether PING frame because QUIC has its
-// own transport-level keepalive that fires session-close on idle. Keep
-// that asymmetry in mind before generalising.
 //
 // closeSignal is the session's IsClosed channel. The loop fast-fails the
 // moment that signal fires so callers do not get a stuck-send ping report
@@ -84,9 +79,10 @@ func WaitForActivityPing(
 	// Honour the caller's ctx deadline as the authoritative budget. Only
 	// fall back to PingDefaultDeadline when the caller hasn't set one: a
 	// keepalive loop passes a ctx whose deadline it derives from the path's
-	// RTO (the stall probe in reliabilityTick passes a 1 s one), and capping
-	// it at the 2 s PingDefaultDeadline would cut a 5 s budget on a slow
-	// path short; that budget MUST be the one that fires.
+	// RTO (as do reliabilityTick's stall probe and multipath's standby probe,
+	// through KeepalivePlanFor), and capping it at the 2 s PingDefaultDeadline
+	// would cut a 5 s budget on a slow path short; that budget MUST be the one
+	// that fires.
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		deadline = time.Now().Add(PingDefaultDeadline)

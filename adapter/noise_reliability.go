@@ -18,7 +18,57 @@ import (
 	"github.com/ORBTR/aether"
 	"github.com/ORBTR/aether/abuse"
 	"github.com/ORBTR/aether/congestion"
+	"github.com/ORBTR/aether/quality"
 )
+
+// stallProbe is one probeStalled answer, read by reliabilityTick's stall detector:
+// answered sends the session down its persistent-congestion exit, closed ends the
+// tick loop, and neither closes the session with ErrSessionStuck, whose log line
+// carries attempts and err.
+type stallProbe struct {
+	answered bool
+	closed   bool
+	attempts int
+	err      error
+}
+
+// probeStalled asks a session the stall detector found without progress whether its
+// path still answers before the detector declares anything: up to plan.Strikes pings
+// of plan.ProbeTimeout each, plan.RetryGap apart, returning at the first answer. plan
+// is the keepalive's own decision from the session's round trips, so a slow path is
+// given the time its measurements call for and a stalled session is judged on the
+// numbers the keepalive judges a silent peer on. Probing more than once matters on a
+// datagram path whose loss comes in bursts: one probe can land wholly inside a burst
+// and condemn a healthy session, and ErrSessionStuck is what the owning connection
+// manager reads as "fall back to the next protocol grade" (SessionStallThreshold), while
+// the quality tracker's dial cooldown for a failed path starts at 30 s and doubles per
+// failure to a 10 min cap (dialCooldownDuration), so the path stays abandoned at least 30 s.
+//
+// ping is the session's Ping; the tests pass their own. A close from another path
+// during a gap ends the probing with closed set.
+func (s *NoiseSession) probeStalled(plan quality.KeepalivePlan, ping func(context.Context) (time.Duration, error)) stallProbe {
+	var out stallProbe
+	for out.attempts < plan.Strikes {
+		probeCtx, cancel := context.WithTimeout(context.Background(), plan.ProbeTimeout)
+		_, out.err = ping(probeCtx)
+		cancel()
+		out.attempts++
+		if out.err == nil {
+			out.answered = true
+			return out
+		}
+		if out.attempts == plan.Strikes {
+			return out
+		}
+		select {
+		case <-time.After(plan.RetryGap):
+		case <-s.CloseSignal():
+			out.closed = true
+			return out
+		}
+	}
+	return out
+}
 
 // writeLoop reads from the scheduler and writes frames to the Noise
 // connection. Uses the pacer for rate-limited sending (supports both
@@ -642,50 +692,15 @@ func (s *NoiseSession) reliabilityTick() {
 				// transient false positive (CPU pause delayed our
 				// processing of inbound ACKs, OR a short packet-loss
 				// burst on a UDP path that recovers within seconds).
-				// We send up to 3 Pings spaced 1 s apart; if any one
-				// of them returns success the path is alive and we
-				// reset the stall clock. Only if ALL three fail do we
-				// declare the session stuck.
-				//
-				// Three 1 s probes rather than one 2 s probe: on a UDP
-				// path with bursty loss (a cross-region anycast path
-				// blacks out for ~200 ms at a time) one probe can land
-				// entirely inside a burst and condemn a healthy
-				// session, which then closes with ErrSessionStuck, the
-				// signal the owning connection manager reads as "fall
-				// back to the next protocol grade" (SessionStallThreshold);
-				// the quality tracker's dial cooldown for a failed path
-				// starts at 30 s and doubles per failure to a 10 min cap
-				// (dialCooldownDuration), so the path stays abandoned at
-				// least 30 s. Three probes a
-				// second apart cover ~3 s of wall time, long enough for
-				// such a burst to clear and short enough not to delay the
-				// close of a dead session noticeably.
-				const probeAttempts = 3
-				const probeTimeout = 1 * time.Second
-				const probeSpacing = 1 * time.Second
-				probeOK := false
-				var lastProbeErr error
-				for attempt := 0; attempt < probeAttempts; attempt++ {
-					probeCtx, probeCancel := context.WithTimeout(context.Background(), probeTimeout)
-					_, lastProbeErr = s.Ping(probeCtx)
-					probeCancel()
-					if lastProbeErr == nil {
-						probeOK = true
-						break
-					}
-					if attempt < probeAttempts-1 {
-						// Brief gap between probes so back-to-back
-						// retries don't all hit the same loss burst.
-						select {
-						case <-time.After(probeSpacing):
-						case <-s.CloseSignal():
-							// Session was closed by another path
-							// (e.g. external Close); stop probing.
-							return
-						}
-					}
+				// probeStalled asks the path before anything is declared
+				// and returns at the first answer.
+				probe := s.probeStalled(aether.KeepalivePlanFor(s), s.Ping)
+				if probe.closed {
+					// Session was closed by another path (e.g. external
+					// Close); stop probing.
+					return
 				}
+				probeOK := probe.answered
 				sessionAge := time.Since(s.CreatedAt())
 				warmupActive := warmupGrace > 0 && sessionAge < warmupGrace
 				if probeOK {
@@ -747,7 +762,7 @@ func (s *NoiseSession) reliabilityTick() {
 					continue
 				}
 				log.Printf("[STALL-DETECT] confirmed-stuck peer=%s age=%v warmup=%v effThresh=%s probesFailed=%d lastErr=%v — closing for fallback",
-					s.RemoteNodeID().Short(), sessionAge, warmupActive, effectiveThreshold, probeAttempts, lastProbeErr)
+					s.RemoteNodeID().Short(), sessionAge, warmupActive, effectiveThreshold, probe.attempts, probe.err)
 				s.dumpFlowDiagOnStall("confirmed-stuck")
 				s.CloseWithError(aether.ErrSessionStuck)
 				return
@@ -1090,7 +1105,7 @@ func (s *NoiseSession) writeFrame(frame *aether.Frame) error {
 
 // compressFrameLocked swaps the payload for its DEFLATE form when that is shorter.
 // Caller holds writeMu. A PATH_PROBE frame is never compressed: its payload is
-// zero padding sized by the pmtu.Prober to the path size it tests, which DEFLATE
+// zero padding sized from the path size the pmtu.Prober tests, which DEFLATE
 // would shrink to a few bytes, so the probe and its echo would cross any path and
 // the sweep would raise MSS to the largest size whatever the path carries.
 func (s *NoiseSession) compressFrameLocked(frame *aether.Frame) {

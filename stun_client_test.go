@@ -60,7 +60,9 @@ func TestNewSTUNClient_RefusesWithNothingRegisteredAndBuildsWithTheRegistered(t 
 	if c, err := NewSTUNClient(DefaultSTUNConfig()); !errors.Is(err, ErrSTUNNotComposed) || c != nil {
 		t.Fatalf("with nothing registered: %v, %v; want ErrSTUNNotComposed and no client", c, err)
 	}
-	RegisterSTUNClient(func(cfg STUNConfig) STUNClient { return &fakeSTUNClient{cfg: cfg} })
+	if err := RegisterSTUNClient(func(cfg STUNConfig) STUNClient { return &fakeSTUNClient{cfg: cfg} }); err != nil {
+		t.Fatalf("register: %v", err)
+	}
 	cfg := STUNConfig{Enabled: true, Servers: []string{"stun.example:3478"}}
 	c, err := NewSTUNClient(cfg)
 	if err != nil {
@@ -68,6 +70,37 @@ func TestNewSTUNClient_RefusesWithNothingRegisteredAndBuildsWithTheRegistered(t 
 	}
 	if got := c.Config(); len(got.Servers) != 1 || got.Servers[0] != cfg.Servers[0] {
 		t.Fatalf("the registered constructor did not receive the config: %+v", got)
+	}
+}
+
+// TestRegisterSTUNClient_ASecondRegistrationRefuses: once a constructor is registered a
+// second one is refused typed and the first keeps building; a nil constructor is refused
+// and registers nothing.
+func TestRegisterSTUNClient_ASecondRegistrationRefuses(t *testing.T) {
+	saved := stunClientConstructor.Load()
+	t.Cleanup(func() { stunClientConstructor.Store(saved) })
+
+	stunClientConstructor.Store(nil)
+	if err := RegisterSTUNClient(nil); err == nil {
+		t.Fatal("a nil constructor was registered")
+	}
+	if _, err := NewSTUNClient(DefaultSTUNConfig()); !errors.Is(err, ErrSTUNNotComposed) {
+		t.Fatalf("after a refused nil constructor: %v, want ErrSTUNNotComposed", err)
+	}
+	first := &fakeSTUNClient{}
+	if err := RegisterSTUNClient(func(STUNConfig) STUNClient { return first }); err != nil {
+		t.Fatalf("the first registration: %v", err)
+	}
+	second := &fakeSTUNClient{}
+	if err := RegisterSTUNClient(func(STUNConfig) STUNClient { return second }); !errors.Is(err, ErrSTUNClientRegistered) {
+		t.Fatalf("the second registration: %v, want ErrSTUNClientRegistered", err)
+	}
+	c, err := NewSTUNClient(DefaultSTUNConfig())
+	if err != nil {
+		t.Fatalf("after the refused registration: %v", err)
+	}
+	if c != STUNClient(first) {
+		t.Fatal("a refused registration replaced the first constructor")
 	}
 }
 

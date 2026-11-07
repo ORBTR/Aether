@@ -79,11 +79,15 @@ type Prober struct {
 	lastProbe  time.Time
 
 	// Callback to send a PATH_PROBE frame
-	sendProbe func(probeID uint32, paddingSize uint16) error
+	sendProbe func(probeID uint32, size uint16) error
 }
 
-// NewProber creates a PMTU prober with a callback for sending probes.
-func NewProber(sendProbe func(probeID uint32, paddingSize uint16) error) *Prober {
+// NewProber creates a PMTU prober with a callback for sending probes. size is the
+// MSS the probe tests: the callback sends a frame that long on the wire, so a
+// response confirms exactly the MSS OnProbeResponse then sets. What the frame's
+// header and seal take from that size is the session's knowledge (NewNoiseSession's
+// callback), since this package sees neither.
+func NewProber(sendProbe func(probeID uint32, size uint16) error) *Prober {
 	p := &Prober{
 		state:      ProbeIdle,
 		probeSizes: []int{SafeFloorMSS, 1280, 1400, 1500, 2000, 4000, 8000},
@@ -202,9 +206,8 @@ func (p *Prober) ShouldReprobe() bool {
 // pendingProbe is a probe decided under mu and sent after mu is released. The
 // zero value sends nothing.
 type pendingProbe struct {
-	sendProbe func(probeID uint32, paddingSize uint16) error
+	sendProbe func(probeID uint32, size uint16) error
 	probeID   uint32
-	padding   uint16
 	size      int
 }
 
@@ -217,14 +220,8 @@ func (p *Prober) nextProbeLocked() pendingProbe {
 	if p.probeIndex >= len(p.probeSizes) {
 		return pendingProbe{}
 	}
-	size := p.probeSizes[p.probeIndex]
-	paddingSize := uint16(size - 50) // subtract header
-	if paddingSize > 65535 {
-		paddingSize = 65535
-	}
-
 	p.probeSent = time.Now()
-	return pendingProbe{sendProbe: p.sendProbe, probeID: p.probeID, padding: paddingSize, size: size}
+	return pendingProbe{sendProbe: p.sendProbe, probeID: p.probeID, size: p.probeSizes[p.probeIndex]}
 }
 
 // send calls sendProbe for the probe. Callers hold no lock of the Prober's.
@@ -232,7 +229,7 @@ func (pp pendingProbe) send() {
 	if pp.sendProbe == nil {
 		return
 	}
-	if err := pp.sendProbe(pp.probeID, pp.padding); err != nil {
+	if err := pp.sendProbe(pp.probeID, uint16(pp.size)); err != nil {
 		log.Printf("[PMTU] Failed to send probe %d (size %d): %v", pp.probeID, pp.size, err)
 	}
 }

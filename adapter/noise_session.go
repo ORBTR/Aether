@@ -388,9 +388,8 @@ type NoiseSession struct {
 	// reliabilityTick reads and advances this.
 	lastFECPrune time.Time
 
-	// Connection identity and transport class
-	connID        aether.ConnectionID
-	classDefaults aether.TransportClassDefaults
+	// Connection identity
+	connID aether.ConnectionID
 
 	// Short header compression, per-stream state: separate encode (tx) and
 	// decode (rx) compressors, as TCPSession's. One shared instance would let
@@ -649,7 +648,6 @@ func newNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 
 	s.migrator = migration.NewMigrator()
 	// connID is owned by *BaseSession (initialised by NewBaseSession).
-	s.classDefaults = aether.DefaultsForClass(aether.ClassRAW)
 	s.streamGC = aether.NewStreamGC(aether.DefaultStreamIdleTimeout, func(streamID uint64) {
 		dbgNoise.Printf("StreamGC: resetting idle stream %d", streamID)
 		s.mu.Lock()
@@ -670,9 +668,13 @@ func newNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 		s.releaseStream(streamID)
 	})
 
-	// PMTU prober sends PATH_PROBE frames to discover maximum segment size
-	s.pmtuProber = pmtu.NewProber(func(probeID uint32, paddingSize uint16) error {
-		payload := aether.EncodePathProbe(probeID, paddingSize)
+	// PMTU prober sends PATH_PROBE frames to discover maximum segment size. size is
+	// the MSS under test, and MSSToMaxPayload's payload in a full frame, sealed, is
+	// that long on the wire: the probe is exactly the largest frame noiseStream.Send
+	// builds at that MSS, so the size a response confirms is the size the path
+	// carried, and a session with no frame key sends both 16 bytes shorter.
+	s.pmtuProber = pmtu.NewProber(func(probeID uint32, size uint16) error {
+		payload := aether.EncodePathProbe(probeID, uint16(MSSToMaxPayload(int(size))-aether.PathProbeMinSize))
 		frame := &aether.Frame{
 			SenderID:   s.LocalPeerID(),
 			ReceiverID: s.RemotePeerID(),

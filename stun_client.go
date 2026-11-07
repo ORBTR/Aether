@@ -41,12 +41,26 @@ type STUNClient interface {
 // and never runs without the discovery it asked for.
 var ErrSTUNNotComposed = errors.New("aether: STUN enabled and no STUN client composed")
 
+// ErrSTUNClientRegistered is RegisterSTUNClient's refusal of a second constructor:
+// every transport in the process builds its client through the one registered, so a
+// later registration would change the discovery of a transport built after it and
+// leave one built before it on the first.
+var ErrSTUNClientRegistered = errors.New("aether: a STUN client constructor is already registered")
+
 var stunClientConstructor atomic.Pointer[func(STUNConfig) STUNClient]
 
 // RegisterSTUNClient records the constructor NewSTUNClient calls. The nat package
-// calls it when it is linked; a later call replaces an earlier one.
-func RegisterSTUNClient(newClient func(STUNConfig) STUNClient) {
-	stunClientConstructor.Store(&newClient)
+// calls it when it is linked, and treats a refusal as a broken composition. A nil
+// constructor is refused, and so is any constructor once one is registered
+// (ErrSTUNClientRegistered); the one registered stays.
+func RegisterSTUNClient(newClient func(STUNConfig) STUNClient) error {
+	if newClient == nil {
+		return errors.New("aether: a nil STUN client constructor")
+	}
+	if !stunClientConstructor.CompareAndSwap(nil, &newClient) {
+		return ErrSTUNClientRegistered
+	}
+	return nil
 }
 
 // NewSTUNClient builds a STUN client for cfg with the registered constructor, or

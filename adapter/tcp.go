@@ -57,10 +57,9 @@ type TCPSession struct {
 	mu   sync.Mutex
 	conn net.Conn
 
-	layout        aether.StreamLayout
-	opts          aether.SessionOptions
-	classDefaults aether.TransportClassDefaults
-	streams       map[uint64]*tcpStream
+	layout  aether.StreamLayout
+	opts    aether.SessionOptions
+	streams map[uint64]*tcpStream
 
 	// acceptor owns per-StreamID accept dispatch — pinned waiters,
 	// per-ID backlog, and the FIFO that AcceptStream drains. Shared
@@ -465,22 +464,20 @@ func NewTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 // room and send that node's streams a typed reset.
 func newTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto aether.Protocol, opts aether.SessionOptions, sharedPeer bool) *TCPSession {
 	opts = aether.NormalizeSessionOptions(opts)
-	tc := aether.TransportClassForProtocol(proto)
 	base := aether.NewBaseSession(localNodeID, remoteNodeID, proto)
 	base.SetHealthMonitor(health.NewMonitor(0.2))
 	base.SetIdleTimeouts(opts.SessionIdleTimeout, aether.DefaultSessionIdleTimeout)
 	s := &TCPSession{
-		BaseSession:   base,
-		conn:          conn,
-		layout:        aether.DefaultStreamLayout(),
-		opts:          opts,
-		classDefaults: aether.DefaultsForClass(tc),
-		streams:       make(map[uint64]*tcpStream),
-		sched:         scheduler.NewScheduler(),
-		out:           newSessionWriter(conn, base.CloseSignal()),
-		txCompressor:  aether.NewCompressor(), // encode-side state
-		rxCompressor:  aether.NewCompressor(), // decode-side state
-		tickStop:      make(chan struct{}),
+		BaseSession:  base,
+		conn:         conn,
+		layout:       aether.DefaultStreamLayout(),
+		opts:         opts,
+		streams:      make(map[uint64]*tcpStream),
+		sched:        scheduler.NewScheduler(),
+		out:          newSessionWriter(conn, base.CloseSignal()),
+		txCompressor: aether.NewCompressor(), // encode-side state
+		rxCompressor: aether.NewCompressor(), // decode-side state
+		tickStop:     make(chan struct{}),
 
 		wireExchange:   newWireExchange(),
 		prefaceWritten: make(chan struct{}),

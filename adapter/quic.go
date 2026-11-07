@@ -57,6 +57,12 @@ type QUICSession struct {
 	wireOffer      aether.WireVersions
 	wireOfferErr   error
 	prefaceTimeout time.Duration
+
+	// probeOut is this side's probe stream (writeProbe), opened at the first PING or
+	// PONG it writes. probeMu holds one frame's write whole, since Ping's goroutine
+	// and serveProbes' answer share the stream.
+	probeMu  sync.Mutex
+	probeOut quic.SendStream
 }
 
 // quicWireRefusalCode is the QUIC application error a session closes with when its
@@ -138,7 +144,17 @@ func (s *QUICSession) exchangeWireVersions() {
 		s.refuseWire(err)
 		return
 	}
-	s.finishWireVersions(chosen, nil)
+	// writeProbe opens a unidirectional stream once the exchange has ended, and the
+	// peer's readPreface takes the first one this side opens, so the preface's stream
+	// is opened before the exchange ends.
+	select {
+	case <-written:
+	case <-s.CloseSignal():
+		return
+	}
+	if s.finishWireVersions(chosen, nil) {
+		s.serveProbes()
+	}
 }
 
 func (s *QUICSession) writePreface() error {
@@ -369,23 +385,96 @@ func (s *QUICSession) AcceptStreamByID(ctx context.Context, streamID uint64) (ae
 	return st, err
 }
 
-// Ping reports session liveness for keepalive. QUIC has its own
-// transport-layer keepalive so we don't write an aether-level PING
-// frame, but we DO need to surface session death to callers: the cached
-// RTT alone says nothing about a QUIC connection that has been torn down,
-// and a keepalive that read only it would keep the session registered in
-// the connection manager. So IsClosed is checked plus the underlying QUIC
-// connection's context, which fires on transport close, idle timeout, or
-// peer-initiated CONNECTION_CLOSE.
+// Ping writes a PING on this side's probe stream and waits for the peer's PONG, as the
+// Noise and TCP adapters do on their keepalive stream: aether.WaitForActivityPing holds
+// the wait, and the PONG feeds the session's RTT estimator, which aether.KeepalivePlanFor
+// reads. quic-go's own keepalive frames answer nothing a caller can read, so this
+// exchange is the session's only round-trip measurement. A connection QUIC has already
+// torn down (transport close, idle timeout, a peer's CONNECTION_CLOSE) answers
+// ErrSessionClosed, which multipath's probeNonPrimary and aether.RunKeepalive read as a
+// failed probe.
 func (s *QUICSession) Ping(ctx context.Context) (time.Duration, error) {
-	if s.IsClosed() {
-		return 0, aether.ErrSessionClosed
+	if err := s.awaitWire(ctx, s.CloseSignal()); err != nil {
+		return 0, err
 	}
 	if err := s.conn.Context().Err(); err != nil {
 		return 0, aether.ErrSessionClosed
 	}
-	_, avg := s.Health().RTT()
-	return avg, nil
+	return aether.WaitForActivityPing(ctx, s.Health(), s.CloseSignal(), func(seqNo uint32) error {
+		return s.writeProbe(ctx, &aether.Frame{
+			SenderID:   s.LocalPeerID(),
+			ReceiverID: s.RemotePeerID(),
+			StreamID:   aether.DefaultStreamLayout().Keepalive,
+			Type:       aether.TypePING,
+			SeqNo:      seqNo,
+		})
+	})
+}
+
+// writeProbe writes f on this side's probe stream: one unidirectional QUIC stream
+// carrying this side's PING and PONG frames, opened at the first of them. A
+// unidirectional stream takes no aether stream ID, so it cannot meet a stream the
+// application opened under the keepalive ID; acceptLoop only accepts bidirectional
+// streams. ctx's deadline, or PingDefaultDeadline without one, bounds a write the
+// peer's flow control holds, so a peer that stops reading cannot hold probeMu past it.
+func (s *QUICSession) writeProbe(ctx context.Context, f *aether.Frame) error {
+	s.probeMu.Lock()
+	defer s.probeMu.Unlock()
+	if s.probeOut == nil {
+		st, err := s.conn.OpenUniStreamSync(ctx)
+		if err != nil {
+			return fmt.Errorf("quic probe stream: %w", err)
+		}
+		s.probeOut = st
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(aether.PingDefaultDeadline)
+	}
+	if err := s.probeOut.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	_, err := aether.EncodeFrame(s.probeOut, f)
+	return err
+}
+
+// serveProbes reads the peer's probe stream until the connection ends: the one
+// unidirectional stream the peer opens after its preface. It answers each PING and
+// records each PONG through the same aether.ControlFrameHandler the Noise and TCP
+// adapters dispatch to, and refuses the stream at any other frame, since no other
+// frame travels on it. exchangeWireVersions runs it once the exchange has chosen a set.
+func (s *QUICSession) serveProbes() {
+	rs, err := s.conn.AcceptUniStream(s.conn.Context())
+	if err != nil {
+		return
+	}
+	control := &aether.ControlFrameHandler{
+		HealthMon: s.Health(),
+		Writer: func(f *aether.Frame) error {
+			ctx, cancel := context.WithTimeout(s.conn.Context(), aether.KeepalivePlanFor(s).ProbeTimeout)
+			defer cancel()
+			return s.writeProbe(ctx, f)
+		},
+		Sender:            s.LocalPeerID(),
+		Receiver:          s.RemotePeerID(),
+		KeepaliveStreamID: aether.DefaultStreamLayout().Keepalive,
+	}
+	for {
+		frame, err := aether.DecodeFrame(rs)
+		if err != nil {
+			return
+		}
+		s.Health().RecordActivity()
+		switch frame.Type {
+		case aether.TypePING:
+			control.HandlePing(frame)
+		case aether.TypePONG:
+			control.HandlePong(frame)
+		default:
+			rs.CancelRead(quic.StreamErrorCode(aether.ResetRefused))
+			return
+		}
+	}
 }
 
 func (s *QUICSession) GoAway(ctx context.Context, reason aether.GoAwayReason, message string) error {

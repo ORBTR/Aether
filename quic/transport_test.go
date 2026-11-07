@@ -10,9 +10,9 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"testing"
-	"time"
 
 	"github.com/ORBTR/aether"
+	"github.com/ORBTR/aether/quality"
 )
 
 // generateTestKey creates a valid Ed25519 key pair for testing
@@ -22,6 +22,28 @@ func generateTestKey(t *testing.T) ed25519.PrivateKey {
 		t.Fatalf("Failed to generate test key: %v", err)
 	}
 	return priv
+}
+
+// TestConnectionConfig_ComesFromTheKeepalivePlan: Dial and Listen's quic-go keepalive
+// and idle timeout are the plan for a path with nothing measured, whatever a config's
+// KeepAlive field holds.
+func TestConnectionConfig_ComesFromTheKeepalivePlan(t *testing.T) {
+	tr, err := NewQuicTransport(QuicTransportConfig{
+		LocalNode:  "test-node-id",
+		PrivateKey: generateTestKey(t),
+		KeepAlive:  12345,
+	})
+	if err != nil {
+		t.Fatalf("new transport: %v", err)
+	}
+	plan := quality.Keepalive(quality.KeepaliveInputs{})
+	got := tr.connectionConfig()
+	if got.KeepAlivePeriod != plan.Interval {
+		t.Fatalf("KeepAlivePeriod %v, want the plan's Interval %v", got.KeepAlivePeriod, plan.Interval)
+	}
+	if got.MaxIdleTimeout != plan.DeadPeerBound() {
+		t.Fatalf("MaxIdleTimeout %v, want the plan's DeadPeerBound %v", got.MaxIdleTimeout, plan.DeadPeerBound())
+	}
 }
 
 func TestQuicTransportConfigValidation(t *testing.T) {
@@ -37,7 +59,6 @@ func TestQuicTransportConfigValidation(t *testing.T) {
 			cfg: QuicTransportConfig{
 				LocalNode:  "test-node-id",
 				PrivateKey: validKey,
-				KeepAlive:  30 * time.Second,
 				ListenAddr: ":8443",
 			},
 			expectErr: false,
@@ -47,7 +68,6 @@ func TestQuicTransportConfigValidation(t *testing.T) {
 			cfg: QuicTransportConfig{
 				LocalNode:  "test-node-id",
 				PrivateKey: make([]byte, 32), // Too short
-				KeepAlive:  30 * time.Second,
 			},
 			expectErr: true,
 		},
@@ -56,7 +76,6 @@ func TestQuicTransportConfigValidation(t *testing.T) {
 			cfg: QuicTransportConfig{
 				LocalNode:  "test-node-id",
 				PrivateKey: []byte{},
-				KeepAlive:  30 * time.Second,
 			},
 			expectErr: true,
 		},

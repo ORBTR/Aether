@@ -104,9 +104,11 @@ func TestNoiseSession_BytesSentCountsPayloadOnEveryWrite(t *testing.T) {
 }
 
 // TestNoiseSession_PathProbeGoesAtItsPaddedSize: a PMTU probe reaches conn.Write
-// at least as long as the padding the prober sized it with, on a session that
-// compresses frames. The padding is zeros, so a deflated probe would be a few
-// bytes long and would test no path size.
+// exactly as long as the largest frame the MSS it tests would carry, on a session
+// that compresses frames. This session has no frame key, so that is the size less
+// the seal's tag, the size a keyed session's seal then fills. The padding is zeros,
+// so a deflated probe would be a few bytes long and would test no path size, and a
+// longer probe would have the sweep stop below what the path carries.
 func TestNoiseSession_PathProbeGoesAtItsPaddedSize(t *testing.T) {
 	chosen := aetherChosen(t)
 	c, s := loopbackPair(t)
@@ -122,8 +124,11 @@ func TestNoiseSession_PathProbeGoesAtItsPaddedSize(t *testing.T) {
 
 	drop.dropping.Store(true)
 	client.pmtuProber.StartProbe()
-	// The sweep's first probe is pmtu.SafeFloorMSS less the prober's 50-byte allowance.
-	const padding = pmtu.SafeFloorMSS - 50
+	// The sweep's first probe tests pmtu.SafeFloorMSS.
+	want := aether.FullFrameHeaderWireSize + MSSToMaxPayload(pmtu.SafeFloorMSS)
+	if want != pmtu.SafeFloorMSS-frameAEADTagSize {
+		t.Fatalf("premise wrong: a full frame at the floor is %d bytes before its seal", want)
+	}
 	drop.mu.Lock()
 	longest := 0
 	for _, l := range drop.lengths {
@@ -132,7 +137,7 @@ func TestNoiseSession_PathProbeGoesAtItsPaddedSize(t *testing.T) {
 		}
 	}
 	drop.mu.Unlock()
-	if longest < padding {
-		t.Fatalf("longest write after the probe started: %d bytes, want at least the probe's %d bytes of padding", longest, padding)
+	if longest != want {
+		t.Fatalf("longest write after the probe started: %d bytes, want the probe's %d", longest, want)
 	}
 }

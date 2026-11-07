@@ -262,20 +262,15 @@ const DefaultSessionIdleTimeout = 5 * time.Minute
 // expected cross-region RTT × retransmit cycle (5-10 s observed) plus
 // the periodic WINDOW_UPDATE re-emission interval (2 s).
 //
-// Sized at 120 s to give the keepalive layer time to declare the
-// session dead first when a path goes one-way-quiet. The previous
-// 30 s threshold fired BEFORE the per-peer keepalive retry budget
-// could complete (5 retries × 5 s warmup floor + 4 × 1 s gaps = 29 s
-// to first declared keepalive death, with the stall detector then
-// adding its own 3 × 1 s probe-before-close at exactly the wrong
-// moment). The combined effect on a freshly-installed noise-UDP
-// session whose first ping went one-way: stall detector fired at
-// 30 s, ran probe-before-close, declared stuck, closed the session
-// before keepalive could escalate to fallback. Sessions clustered at
-// ~34 s lifetime in connection_history. Pushing the threshold to
-// 120 s lets the keepalive layer own liveness; the stall detector
-// remains as a backstop for paths the keepalive declared healthy
-// but where streams have actually wedged.
+// Sized at 120 s so the keepalive layer declares a one-way-quiet
+// session dead first. Its retry budget on a new session is
+// quality.Keepalive's 5 probes × 5 s warmup floor + 4 × 1 s gaps = 29 s
+// to the first declared death, and a threshold inside that budget would
+// have the stall detector close a new noise-UDP session whose first ping
+// went one-way before keepalive could escalate to fallback. The stall
+// detector stays as a backstop for paths the keepalive declared healthy
+// but where streams have wedged, and its probe-before-close
+// (NoiseSession.probeStalled) runs on the same plan.
 const DefaultSessionStallThreshold = 120 * time.Second
 
 // DefaultSessionWarmupGrace is the initial-lifetime window during
