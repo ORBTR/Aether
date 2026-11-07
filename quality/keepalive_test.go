@@ -55,8 +55,42 @@ func TestTheDeadPeerBoundIsTheProbeCycle(t *testing.T) {
 	if got, want := Keepalive(KeepaliveInputs{}).DeadPeerBound(), 34*time.Second; got != want {
 		t.Errorf("a new session's DeadPeerBound = %s, want %s", got, want)
 	}
-	if got, want := Keepalive(KeepaliveInputs{SRTT: time.Hour, RTO: time.Hour, Samples: 100}).DeadPeerBound(), 109*time.Second; got != want {
-		t.Errorf("the largest DeadPeerBound = %s, want %s", got, want)
+	slowest := KeepaliveInputs{SRTT: time.Hour, RTO: time.Hour, Samples: 100}
+	if got, want := Keepalive(slowest).DeadPeerBound(), 109*time.Second; got != want {
+		t.Errorf("the largest DeadPeerBound with no loss = %s, want %s", got, want)
+	}
+
+	// Loss raises Strikes, so the largest bound is taken over the range a session's
+	// health.Monitor reports loss and instability in, 0 to 1, and over paths from a new
+	// session to the slowest the clamps admit. It is the 30 s interval ceiling, then
+	// keepaliveStrikesCeiling probes at the 15 s probe ceiling with a 1 s gap between each:
+	// 30 + 10*15 + 9 = 189 s. RunKeepalive ends a silent session within its plan's
+	// DeadPeerBound, so this is the longest any session holds a peer that stopped answering.
+	const largestBound = 189 * time.Second
+	var largest time.Duration
+	var largestAt KeepaliveInputs
+	for _, path := range []KeepaliveInputs{
+		{},
+		{SRTT: time.Millisecond, RTO: 200 * time.Millisecond, Samples: 8},
+		{SRTT: 4 * time.Second, RTO: 2 * time.Second, Samples: 20},
+		slowest,
+	} {
+		for step := 0; step <= 100; step++ {
+			for _, instability := range []float64{0, 0.5, 1} {
+				in := path
+				in.Loss, in.Instability = float64(step)/100, instability
+				bound := Keepalive(in).DeadPeerBound()
+				if bound > largestBound {
+					t.Errorf("inputs %+v give DeadPeerBound %s, past the largest %s", in, bound, largestBound)
+				}
+				if bound > largest {
+					largest, largestAt = bound, in
+				}
+			}
+		}
+	}
+	if largest != largestBound {
+		t.Errorf("the largest DeadPeerBound over the loss range = %s (at %+v), want %s", largest, largestAt, largestBound)
 	}
 }
 
