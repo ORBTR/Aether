@@ -27,9 +27,13 @@ type StreamGC struct {
 	mu           sync.Mutex
 	lastActivity map[uint64]time.Time // streamID → last activity timestamp
 	idleTimeout  time.Duration
-	resetFn      func(streamID uint64) // callback to reset idle stream
-	stopCh       chan struct{}
-	stopOnce     sync.Once
+	// sessionLifetime holds the IDs sweep never resets for being idle: the
+	// session's SessionLifetimeStreams. Written only by NewSessionStreamGC, before
+	// Start, so sweep reads it without the lock.
+	sessionLifetime map[uint64]struct{}
+	resetFn         func(streamID uint64) // callback to reset idle stream
+	stopCh          chan struct{}
+	stopOnce        sync.Once
 }
 
 // NewStreamGC creates a stream garbage collector.
@@ -39,11 +43,45 @@ func NewStreamGC(idleTimeout time.Duration, resetFn func(streamID uint64)) *Stre
 		idleTimeout = DefaultStreamIdleTimeout
 	}
 	return &StreamGC{
-		lastActivity: make(map[uint64]time.Time),
-		idleTimeout:  idleTimeout,
-		resetFn:      resetFn,
-		stopCh:       make(chan struct{}),
+		lastActivity:    make(map[uint64]time.Time),
+		idleTimeout:     idleTimeout,
+		sessionLifetime: make(map[uint64]struct{}),
+		resetFn:         resetFn,
+		stopCh:          make(chan struct{}),
 	}
+}
+
+// NewSessionStreamGC is the stream GC a session runs under opts: streams idle for
+// opts.StreamIdleTimeout are reset through resetFn, except the IDs below
+// StreamGCExemptBelow and the IDs in opts.SessionLifetimeStreams, which live as long
+// as the session. The TCP-family and Noise adapters both build their GC here, so the
+// two read one rule for which streams outlive their idleness.
+func NewSessionStreamGC(opts SessionOptions, resetFn func(streamID uint64)) *StreamGC {
+	g := NewStreamGC(opts.StreamIdleTimeout, resetFn)
+	for _, id := range opts.SessionLifetimeStreams {
+		g.sessionLifetime[id] = struct{}{}
+	}
+	return g
+}
+
+// streamGCSweepCeiling and streamGCSweepFloor bound how far apart Start sweeps: half the
+// idle timeout, so a stream is reset within one and a half idle timeouts of its last
+// frame, never more than 30 s apart and never under 10 ms.
+const (
+	streamGCSweepCeiling = 30 * time.Second
+	streamGCSweepFloor   = 10 * time.Millisecond
+)
+
+// sweepInterval is how far apart Start sweeps for this GC's idle timeout.
+func (g *StreamGC) sweepInterval() time.Duration {
+	every := g.idleTimeout / 2
+	if every > streamGCSweepCeiling {
+		return streamGCSweepCeiling
+	}
+	if every < streamGCSweepFloor {
+		return streamGCSweepFloor
+	}
+	return every
 }
 
 // RecordActivity marks a stream as active (called on every Send/Receive).
@@ -69,7 +107,7 @@ func (g *StreamGC) Unregister(streamID uint64) {
 
 // Start begins the periodic GC sweep. Call in a goroutine.
 func (g *StreamGC) Start() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(g.sweepInterval())
 	defer ticker.Stop()
 	for {
 		select {
@@ -100,6 +138,12 @@ func (g *StreamGC) sweep() {
 		// control). Boundary lives in StreamGCExemptBelow so sweep() and the
 		// type/const docs stay in sync. Dynamic application streams use higher IDs.
 		if streamID < StreamGCExemptBelow {
+			continue
+		}
+		// A session-lifetime channel idles because its producer is caught up, not
+		// because it was abandoned: both ends hold it open for the session, so a
+		// reset here would end a live channel under its reader.
+		if _, held := g.sessionLifetime[streamID]; held {
 			continue
 		}
 		if now.Sub(lastSeen) > g.idleTimeout {
