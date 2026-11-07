@@ -667,7 +667,7 @@ func (m *Manager) probeNonPrimary(ctx context.Context) {
 	m.mu.Unlock()
 
 	for _, t := range targets {
-		pingCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		pingCtx, cancel := context.WithTimeout(ctx, aether.KeepalivePlanFor(t.session).ProbeTimeout)
 		rtt, err := t.session.Ping(pingCtx)
 		cancel()
 		if err == nil {

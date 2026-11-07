@@ -20,13 +20,17 @@ import (
 	"time"
 
 	"github.com/ORBTR/aether"
+	"github.com/ORBTR/aether/quality"
 	"github.com/quic-go/quic-go"
 )
 
 // QuicTransportConfig configures the QUIC aether.
 type QuicTransportConfig struct {
-	LocalNode    aether.NodeID
-	PrivateKey   ed25519.PrivateKey
+	LocalNode  aether.NodeID
+	PrivateKey ed25519.PrivateKey
+	// KeepAlive is read by nothing: connectionConfig derives the keepalive.
+	// TODO: remove this field once the two composers outside this repository that
+	// set it, the mesh runtime and the endpoint agent's transport, stop setting it.
 	KeepAlive    time.Duration
 	ListenAddr   string
 	BindResolver aether.BindAddressResolver // Optional platform bind resolver (for standalone listen)
@@ -43,7 +47,6 @@ type QuicTransport struct {
 	localNode  aether.NodeID
 	privateKey ed25519.PrivateKey
 	tlsConfig  *tls.Config
-	keepAlive  time.Duration
 	listenAddr string
 	allow0RTT  bool
 	packetConn net.PacketConn  // if set, use this instead of creating a new socket
@@ -81,7 +84,6 @@ func NewQuicTransport(cfg QuicTransportConfig) (*QuicTransport, error) {
 		localNode:  cfg.LocalNode,
 		privateKey: cfg.PrivateKey,
 		tlsConfig:  tlsConfig,
-		keepAlive:  cfg.KeepAlive,
 		listenAddr: cfg.ListenAddr,
 		allow0RTT:  cfg.Allow0RTT,
 	}, nil
@@ -98,9 +100,25 @@ func NewQuicTransportFromConfig(cfg aether.Config) (*QuicTransport, error) {
 		LocalNode:  cfg.NodeID,
 		PrivateKey: cfg.PrivateKey,
 		ListenAddr: qc.ListenAddr,
-		KeepAlive:  qc.KeepAlive,
 		Allow0RTT:  qc.Allow0RTT,
 	})
+}
+
+// connectionConfig is the quic-go configuration Dial and Listen build a connection
+// with. quic-go fixes KeepAlivePeriod and MaxIdleTimeout when a connection starts, before
+// it has measured a round trip, so both come from quality.Keepalive for a path with
+// nothing measured: the probe cycle's Interval, and its DeadPeerBound as the idle
+// timeout, so a silent peer is let go on the bound every other transport's keepalive
+// holds. Past that point the numbers follow the path in two places: quic-go stretches
+// the period to 1.5 PTO on a slower path, and the session above this connection probes
+// on the plan aether.KeepalivePlanFor derives from its own round trips.
+func (t *QuicTransport) connectionConfig() *quic.Config {
+	plan := quality.Keepalive(quality.KeepaliveInputs{})
+	return &quic.Config{
+		KeepAlivePeriod: plan.Interval,
+		MaxIdleTimeout:  plan.DeadPeerBound(),
+		Allow0RTT:       t.allow0RTT,
+	}
 }
 
 // Dial establishes a QUIC connection to the provided target.
@@ -141,10 +159,7 @@ func (t *QuicTransport) Dial(ctx context.Context, target aether.Target) (aether.
 		return nil
 	}
 
-	quicCfg := &quic.Config{
-		KeepAlivePeriod: t.keepAlive,
-		Allow0RTT:       t.allow0RTT,
-	}
+	quicCfg := t.connectionConfig()
 
 	var conn quic.Connection
 	var err error
@@ -193,10 +208,7 @@ func (t *QuicTransport) Listen(ctx context.Context) (aether.Listener, error) {
 		addr = ":0"
 	}
 
-	quicListenCfg := &quic.Config{
-		KeepAlivePeriod: t.keepAlive,
-		Allow0RTT:       t.allow0RTT,
-	}
+	quicListenCfg := t.connectionConfig()
 	if t.allow0RTT {
 		earlyLn, listenErr := quic.ListenAddrEarly(addr, t.tlsConfig, quicListenCfg)
 		if listenErr != nil {

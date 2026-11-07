@@ -465,6 +465,19 @@ func (s *NoiseSession) admitSequenced(st *noiseStream, seq uint32, payload []byt
 	// the recvWindow/connWindow logic above; congestion state must not be.
 }
 
+// ackDelayBound is the most of a peer's reported AckDelay handleACK takes off an RTT
+// sample (RFC 9002 §5.3): the max_ack_delay the peer advertised in the handshake, or,
+// from a peer that advertised none (peerMaxAckDelay zero), the longest this build's
+// ACK engine holds an ACK, reliability.DefaultACKPolicy's MaxDelay. Delay reported past
+// the bound counts as path time, so a peer that overstates its delay cannot talk SRTT
+// and the RTO derived from it down.
+func (s *NoiseSession) ackDelayBound() time.Duration {
+	if s.peerMaxAckDelay > 0 {
+		return s.peerMaxAckDelay
+	}
+	return reliability.DefaultACKPolicy().MaxDelay
+}
+
 func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	s.mu.Lock()
 	st, ok := s.streams[frame.StreamID]
@@ -535,10 +548,7 @@ func (s *NoiseSession) handleACK(frame *aether.Frame) {
 	// inflating SRTT/RTO/RACK/TLP. Pick the most-recently-sent
 	// unretransmitted entry so the sample and AckDelay refer to the same
 	// frame.
-	maxDelay := s.classDefaults.KeepaliveInterval // use keepalive interval as max ACK delay clamp
-	if maxDelay <= 0 {
-		maxDelay = 25 * time.Millisecond
-	}
+	maxDelay := s.ackDelayBound()
 	var sampleEntry *reliability.SendEntry
 	for _, entry := range acked {
 		// An unwritten entry has no send time for an ACK to close an interval on.

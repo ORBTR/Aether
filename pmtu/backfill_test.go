@@ -11,17 +11,17 @@ import (
 )
 
 // recordingSender captures every probe emitted by the Prober so tests can
-// assert the exact (probeID, paddingSize) sequence. Returned errors let us
+// assert the exact (probeID, size) sequence. Returned errors let us
 // exercise the send-failure path.
 type recordingSender struct {
 	probeIDs []uint32
-	paddings []uint16
+	sizes    []uint16
 	err      error // returned by every call when non-nil
 }
 
-func (r *recordingSender) send(probeID uint32, paddingSize uint16) error {
+func (r *recordingSender) send(probeID uint32, size uint16) error {
 	r.probeIDs = append(r.probeIDs, probeID)
-	r.paddings = append(r.paddings, paddingSize)
+	r.sizes = append(r.sizes, size)
 	return r.err
 }
 
@@ -64,9 +64,9 @@ func TestStartProbe_SendsFirstProbe(t *testing.T) {
 	if rec.probeIDs[0] != 1 {
 		t.Errorf("first probeID: got %d, want 1", rec.probeIDs[0])
 	}
-	// First size is probeSizes[0] == 1200 (the safe floor); padding = size - 50 header.
-	if rec.paddings[0] != 1200-50 {
-		t.Errorf("first padding: got %d, want %d", rec.paddings[0], 1200-50)
+	// First size is probeSizes[0] == 1200 (the safe floor).
+	if rec.sizes[0] != 1200 {
+		t.Errorf("first size: got %d, want 1200", rec.sizes[0])
 	}
 	// MSS is unchanged until a response confirms a size.
 	if p.MSS() != SafeFloorMSS {
@@ -119,7 +119,7 @@ func TestFullDiscoveryWalk(t *testing.T) {
 	}
 
 	// Exactly len(wantSizes) probes should have been emitted, with monotonic IDs
-	// and padding == size-50.
+	// and the size each one tests.
 	if rec.count() != len(wantSizes) {
 		t.Fatalf("probe count: got %d, want %d", rec.count(), len(wantSizes))
 	}
@@ -127,8 +127,8 @@ func TestFullDiscoveryWalk(t *testing.T) {
 		if rec.probeIDs[i] != uint32(i+1) {
 			t.Errorf("probe %d ID: got %d, want %d", i, rec.probeIDs[i], i+1)
 		}
-		if int(rec.paddings[i]) != size-50 {
-			t.Errorf("probe %d padding: got %d, want %d", i, rec.paddings[i], size-50)
+		if int(rec.sizes[i]) != size {
+			t.Errorf("probe %d size: got %d, want %d", i, rec.sizes[i], size)
 		}
 	}
 }
@@ -256,9 +256,8 @@ func TestRestartAfterComplete(t *testing.T) {
 	if rec.probeIDs[len(rec.probeIDs)-1] != 8 {
 		t.Errorf("restart probeID: got %d, want 8", rec.probeIDs[len(rec.probeIDs)-1])
 	}
-	if int(rec.paddings[len(rec.paddings)-1]) != 1200-50 {
-		t.Errorf("restart padding: got %d, want %d (smallest size again)",
-			rec.paddings[len(rec.paddings)-1], 1200-50)
+	if rec.sizes[len(rec.sizes)-1] != 1200 {
+		t.Errorf("restart size: got %d, want 1200 (smallest size again)", rec.sizes[len(rec.sizes)-1])
 	}
 	// Responding to the restarted first probe drops MSS back to the smallest.
 	p.OnProbeResponse(8)

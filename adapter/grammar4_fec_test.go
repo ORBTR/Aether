@@ -306,6 +306,9 @@ func TestNoiseStream_ARepairFitsWhereItsFramesFit(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 		cs, ss := openFEC(t, ctx, client, server, uint64(1140+i), level)
+		// Send splits at the MSS of its call, so a sweep still raising it would make
+		// this message fewer frames than a repair group needs and no repair would go.
+		waitProbeSweepsDone(t, client, server)
 		mss := client.pmtuProber.MSS()
 		msg := make([]byte, 3*mss)
 		for k := range msg {

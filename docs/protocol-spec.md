@@ -822,7 +822,7 @@ Dial-path integration points: `peer_connections.go:833` in HSTLES, `wire/peers.g
 
 There is no negotiation header before the handshake; identity is established by the underlying transport crypto layer (Noise XX/XK static keys, QUIC TLS handshake, WebSocket Ed25519 header, gRPC metadata). The `NegotiateMode` / `ModeAether` / `ModeString` APIs are gone, and a peer that sends a 4-byte negotiation header fails at the first read.
 
-Wire grammars are negotiated per session generation as a named set (`wire_versions.go`). Each side offers entries in name order, each a list of versions and a required flag; aether registers `bounds` (credit and queue profile version 2, required: section 8.5), `fragment` (envelope version 2, required), `frame` (full-frame grammar 5, required), `frame.short` (version 1, optional) and `reliability` (version 3, required; version 3's Lite profile acknowledges a RESET, see §2.2's RESET row), and an application adds its own names through its options. For each name both sides list, the choice is the highest version in both lists; a required name with no common version, or one a side omits, refuses the session with `ErrWireVersionMismatch` (a `*WireVersionMismatchError` naming the entry and both lists) before any session or stream state exists; an optional one is left out. Under Noise the offer rides the NodeInfo inside the encrypted handshake; a TCP, WebSocket or gRPC session, and QUIC built through `NewSessionForProtocol` (all `TCPSession`), writes it as a bounded `AEWV` preface before its first frame and reads the peer's before decoding any; `adapter.QUICSession` exchanges none. Sessions report the choice through `aether.SessionWireVersions`.
+Wire grammars are negotiated per session generation as a named set (`wire_versions.go`). Each side offers entries in name order, each a list of versions and a required flag; aether registers `bounds` (credit and queue profile version 2, required: section 8.5), `fragment` (envelope version 2, required), `frame` (full-frame grammar 5, required), `frame.short` (version 1, optional) and `reliability` (version 3, required; version 3's Lite profile acknowledges a RESET, see §2.2's RESET row), and an application adds its own names through its options. For each name both sides list, the choice is the highest version in both lists; a required name with no common version, or one a side omits, refuses the session with `ErrWireVersionMismatch` (a `*WireVersionMismatchError` naming the entry and both lists) before any session or stream state exists; an optional one is left out. Under Noise the offer rides the NodeInfo inside the encrypted handshake; a TCP, WebSocket or gRPC session, and QUIC built through `NewSessionForProtocol` (all `TCPSession`), writes it as a bounded `AEWV` preface before its first frame and reads the peer's before decoding any; `adapter.QUICSession` exchanges the same preface on one unidirectional QUIC stream each way, and each side's next unidirectional stream is its probe stream, which carries that side's PING and PONG as full frames on the keepalive stream ID. Sessions report the choice through `aether.SessionWireVersions`.
 
 Frame grammar 5 is the grammar in which a Noise session's CLOSE takes a sequence number and is acknowledged and retransmitted, FEC_REPAIR names the frames it covers, OPEN carries the opener's initial credit, the stream's FEC level and the opener's generation, CLOSE and RESET name the stream's incarnation, RESET carries the stream's credit counts, and a Noise session's RESET is acknowledged by a RESET flagged ACK and written again until that comes (§2.2, §11.6). A build lists only the grammar it writes, so a peer offering only an earlier grammar is refused before any state.
 
@@ -837,17 +837,18 @@ Transports are classified by their packet-level behavior. The class determines p
 | Value | Class | Transports | Description |
 |-------|-------|-----------|-------------|
 | 0 | ClassRAW | Noise-UDP, QUIC | Packet-oriented. Full Aether protocol with aggressive retransmit and congestion control. |
-| 1 | ClassSTREAM | TCP, TLS | Byte-stream. Conservative retransmit (TCP handles), reduced keepalive. |
-| 2 | ClassPROXY | WebSocket, gRPC | Proxy-buffered. No retransmit (transport handles), increased keepalive frequency (prevent proxy timeout), reduced max frame size. |
+| 1 | ClassSTREAM | TCP, TLS | Byte-stream. Conservative retransmit (TCP handles). |
+| 2 | ClassPROXY | WebSocket, gRPC | Proxy-buffered. No retransmit (transport handles), reduced max frame size. |
 
 ### 16.2 Per-Class Defaults
 
 | Parameter | ClassRAW | ClassSTREAM | ClassPROXY |
 |-----------|----------|-------------|------------|
-| KeepaliveInterval | 15s | 30s | 10s |
 | MaxFrameSize | 1,400 bytes | 65,536 bytes | 32,768 bytes |
 | RetransmitEnabled | Yes | No | No |
 | AggressiveRetransmit | Yes | No | No |
+
+No class fixes a keepalive: `quality.Keepalive` derives the probe interval, probe timeout and dead-peer bound from the session's own round trips, on every class.
 
 Implementation: `transport_class.go`
 
@@ -1356,7 +1357,7 @@ Same session-API semantics across profiles — `Stream.Send()` / `Stream.Receive
 
 ## 29. Path MTU Discovery
 
-Uses `TypePATH_PROBE` with increasing payload sizes. Discovered PMTU sets MSS for congestion control and fragmentation threshold (section 24). Re-probed every 10 minutes.
+Uses `TypePATH_PROBE` with increasing payload sizes: the probe of a size is that many bytes on the wire once sealed, the same as the largest `DATA` frame at that MSS (51-byte full header, 6-byte probe header, padding, 16-byte AEAD tag). Discovered PMTU sets MSS for congestion control and fragmentation threshold (section 24). Re-probed every 10 minutes.
 
 ## 30. Multipath
 

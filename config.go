@@ -57,7 +57,6 @@ type NoiseConfig struct {
 // QUICConfig configures the QUIC transport.
 type QUICConfig struct {
 	ListenAddr string
-	KeepAlive  time.Duration
 	Allow0RTT  bool
 }
 
@@ -105,7 +104,6 @@ func DefaultConfig() Config {
 			RateLimitRate:    1000,
 		},
 		QUIC: &QUICConfig{
-			KeepAlive: 15 * time.Second,
 			// 0-RTT is off by default. The generic Connection.Send path
 			// writes arbitrary caller payload as QUIC early data, which TLS
 			// 0-RTT semantics allow an attacker to replay — unsafe for

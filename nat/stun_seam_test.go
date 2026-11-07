@@ -7,6 +7,7 @@
 package nat
 
 import (
+	"errors"
 	"net"
 	"testing"
 
@@ -28,6 +29,23 @@ func TestSTUNClient_RegisteredForTheSeam(t *testing.T) {
 	}
 	if got := sc.Config().Servers; len(got) != 1 || got[0] != "stun.example:3478" {
 		t.Fatalf("the client's servers: %v", got)
+	}
+}
+
+// TestSTUNClient_ASecondRegistrationIsRefused: with this package linked a composer
+// that registers a second constructor is refused typed, and NewSTUNClient keeps
+// building this package's client.
+func TestSTUNClient_ASecondRegistrationIsRefused(t *testing.T) {
+	err := aether.RegisterSTUNClient(func(aether.STUNConfig) aether.STUNClient { return nil })
+	if !errors.Is(err, aether.ErrSTUNClientRegistered) {
+		t.Fatalf("the second registration: %v, want ErrSTUNClientRegistered", err)
+	}
+	c, err := aether.NewSTUNClient(aether.DefaultSTUNConfig())
+	if err != nil {
+		t.Fatalf("NewSTUNClient after the refusal: %v", err)
+	}
+	if _, ok := c.(*STUNClient); !ok {
+		t.Fatalf("NewSTUNClient built a %T after the refusal, want *nat.STUNClient", c)
 	}
 }
 

@@ -42,10 +42,10 @@ func KeepalivePlanFor(s Session) quality.KeepalivePlan {
 // probes once one has gone unanswered, so a peer that stops answering is let go within the
 // plan's DeadPeerBound of the last frame heard from it.
 //
-// CONSUMED BY the composer that holds a session no node runtime runs a keepalive on: the
-// worker edge (cortex workeraccept) runs it beside each held worker session. A session
-// must run one keepalive: health.Monitor holds one pending probe sequence, so a second
-// keepalive probing the same session would take the other's answers.
+// CONSUMED BY the composer that holds a session no node runtime runs a keepalive on,
+// outside this repository: the worker edge runs it beside each held worker session. A
+// session must run one keepalive: health.Monitor holds one pending probe sequence, so a
+// second keepalive probing the same session would take the other's answers.
 //
 // It answers nil when ctx ends or s closes by other means, and ErrKeepaliveDeadline when it
 // closed s. It starts no goroutine, so it returns as soon as ctx ends between probes, and

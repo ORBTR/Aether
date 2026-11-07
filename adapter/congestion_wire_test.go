@@ -775,7 +775,9 @@ func TestNoiseSession_TheProspectiveSizeIsTheWriteLength(t *testing.T) {
 
 // TestNoiseSession_BBRCountsARetransmittedFrameOnce: BBR's inflight estimate returns
 // to zero after a frame written twice and acknowledged once, since one ACK takes back
-// one OnSend.
+// one OnSend. handleACK empties the send window before it calls the controller's OnAck,
+// so each wait is on the controller's own count: a window read at zero says nothing of
+// it yet, and a frame counted twice leaves the count above zero and the wait fails.
 func TestNoiseSession_BBRCountsARetransmittedFrameOnce(t *testing.T) {
 	client, server, tap := tappedPair(t)
 	bbr := congestion.NewBBRController()
@@ -785,8 +787,9 @@ func TestNoiseSession_BBRCountsARetransmittedFrameOnce(t *testing.T) {
 	const id = uint64(142)
 	cs, ss := openAccept(t, ctx, client, server, id)
 	st := asNoiseStream(t, cs)
-	waitUntil(t, 60*time.Second, "the first message acknowledged", func() bool { return st.sendWindow.InFlight() == 0 })
-	base := bbr.InFlightBytes()
+	waitUntil(t, 60*time.Second, "the first message acknowledged", func() bool {
+		return st.sendWindow.InFlight() == 0 && bbr.InFlightBytes() == 0
+	})
 	tap.drop.Store(true)
 	seq := st.sendWindow.Next()
 	if err := cs.Send(ctx, compressingFrame(t, 0)); err != nil {
@@ -799,7 +802,5 @@ func TestNoiseSession_BBRCountsARetransmittedFrameOnce(t *testing.T) {
 		t.Fatalf("no delivery: %v", ctx.Err())
 	}
 	waitUntil(t, 60*time.Second, "the frame acknowledged", func() bool { return st.sendWindow.InFlight() == 0 })
-	if got := bbr.InFlightBytes(); got > base {
-		t.Fatalf("BBR inflight %d after the ACK, was %d before the frame", got, base)
-	}
+	waitUntil(t, 60*time.Second, "BBR's inflight back at zero after the one ACK", func() bool { return bbr.InFlightBytes() == 0 })
 }

@@ -56,7 +56,9 @@ func (c *STUNClient) Config() aether.STUNConfig {
 var _ aether.STUNClient = (*STUNClient)(nil)
 
 func init() {
-	aether.RegisterSTUNClient(func(cfg aether.STUNConfig) aether.STUNClient { return NewSTUNClient(cfg) })
+	if err := aether.RegisterSTUNClient(func(cfg aether.STUNConfig) aether.STUNClient { return NewSTUNClient(cfg) }); err != nil {
+		panic(err)
+	}
 }
 
 // BindingRequest builds a binding request with a fresh transaction ID and returns

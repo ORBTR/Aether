@@ -51,7 +51,7 @@ const (
 // better on bursty-loss paths and is what Linux's TCP stack does.
 //
 // Persistent-congestion exit: when the adapter's probe-before-close path
-// (3 Pings within 3 s) succeeds, the path is provably alive, so the loss
+// (up to the keepalive plan's Strikes Pings) succeeds, the path is provably alive, so the loss
 // behind the cumulative OnLoss reductions that drove cwnd to the floor
 // is transient, not persistent congestion. ResetCWND()
 // restores cwnd to initialCWND and exits fast recovery, breaking the
