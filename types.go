@@ -240,6 +240,24 @@ type SessionOptions struct {
 	// take the stream first. Empty leaves every ID to the backlog grace and the
 	// FIFO.
 	ClaimedStreams []uint64
+
+	// SessionLifetimeStreams are the stream IDs this session carries for its whole
+	// life: a channel one side opens once per session and both sides hold until the
+	// session ends, as against a stream opened per call. The session's stream GC
+	// (NewSessionStreamGC) never resets one of them for being idle, whichever side
+	// opened it, so a caught-up channel that carries no frame for longer than
+	// StreamIdleTimeout stays open; every other ID at or above StreamGCExemptBelow is
+	// still reset once idle. The composer reads the IDs from the stream-ID registry
+	// both ends share, and both ends name the same ones: an end that leaves an ID out
+	// resets that channel under the other end's open consumer. Empty holds no ID
+	// past its idle timeout.
+	SessionLifetimeStreams []uint64
+
+	// StreamIdleTimeout is how long a stream of this session may carry no frame
+	// before its stream GC resets it with RESET(ResetTimeout); the GC sweeps at most
+	// half of it apart, so an idle stream is reset within one and a half times it.
+	// 0 = use DefaultStreamIdleTimeout.
+	StreamIdleTimeout time.Duration
 }
 
 // DefaultMaxConcurrentStreams is the default per-session stream cap for

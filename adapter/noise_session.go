@@ -648,7 +648,7 @@ func newNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 
 	s.migrator = migration.NewMigrator()
 	// connID is owned by *BaseSession (initialised by NewBaseSession).
-	s.streamGC = aether.NewStreamGC(aether.DefaultStreamIdleTimeout, func(streamID uint64) {
+	s.streamGC = aether.NewSessionStreamGC(opts, func(streamID uint64) {
 		dbgNoise.Printf("StreamGC: resetting idle stream %d", streamID)
 		s.mu.Lock()
 		st, ok := s.streams[streamID]

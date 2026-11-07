@@ -510,9 +510,10 @@ func newTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 		Refuse:    s.refuseUnaccepted,
 		Claimed:   opts.ClaimedStreams,
 	})
-	// Stream GC — identical policy to Noise; exempts well-known stream
-	// IDs 0-3 (control / keepalive).
-	s.streamGC = aether.NewStreamGC(aether.DefaultStreamIdleTimeout, func(streamID uint64) {
+	// Stream GC — the Noise adapter builds the same one: IDs below
+	// aether.StreamGCExemptBelow and opts.SessionLifetimeStreams are never reset
+	// for idleness; any other stream idle for opts.StreamIdleTimeout is.
+	s.streamGC = aether.NewSessionStreamGC(opts, func(streamID uint64) {
 		dbgTCP.Printf("StreamGC: resetting idle stream %d", streamID)
 		s.mu.Lock()
 		st, ok := s.streams[streamID]
