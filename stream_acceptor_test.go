@@ -7,6 +7,7 @@ package aether
 import (
 	"context"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -20,7 +21,9 @@ import (
 // streams 0-4 by ID one after another before its Accept loop starts, so a setup
 // stream whose OPEN came early is still its claimant's; it claims its swarm stream
 // (100) by ID from a goroutine while that loop runs, and a stream the loop takes
-// first reaches its dynamic-RPC handler, which cannot read swarm frames.
+// first reaches its dynamic-RPC handler, which cannot read swarm frames. An ID in
+// StreamAcceptorConfig.Claimed has no grace and never reaches the loop, which is
+// how such a host keeps its late claims (SessionOptions.ClaimedStreams).
 //
 // READ A FAILURE HERE AS "THE DISPATCH CONTRACT CHANGED", not as a flake. Each
 // test names what its own failure means.
@@ -296,5 +299,174 @@ func TestStreamAcceptor_GraceConstantIsLoadBearing(t *testing.T) {
 		t.Errorf("MaxByIDBacklogPerStream = %d disables the backlog entirely, so "+
 			"EVERY unclaimed stream goes straight to the FIFO with no grace at all",
 			MaxByIDBacklogPerStream)
+	}
+}
+
+// refusalRecorder is a StreamAcceptorConfig.Refuse that records what it was handed.
+type refusalRecorder struct {
+	mu  sync.Mutex
+	got []Stream
+}
+
+func (r *refusalRecorder) refuse(st Stream) {
+	r.mu.Lock()
+	r.got = append(r.got, st)
+	r.mu.Unlock()
+}
+
+func (r *refusalRecorder) refused() []Stream {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]Stream(nil), r.got...)
+}
+
+// TestStreamAcceptor_AStreamTheFIFOHasNoRoomForIsRefused: under NonBlockingDrop a
+// stream the full FIFO cannot take goes to Refuse, by each path that reaches the
+// FIFO: a backlog entry whose grace runs out, and a Notify past a full backlog. A
+// stream nothing holds would otherwise keep its session's slot, reservation and queue
+// while its opener waits on it.
+func TestStreamAcceptor_AStreamTheFIFOHasNoRoomForIsRefused(t *testing.T) {
+	rec := &refusalRecorder{}
+	a := NewStreamAcceptor(StreamAcceptorConfig{Mode: NonBlockingDrop, BufferSize: 1, Refuse: rec.refuse})
+	if !a.pushFIFO(&graceProbeStream{id: 10}) {
+		t.Fatal("premise: the FIFO refused its first stream")
+	}
+	aged := &graceProbeStream{id: 12}
+	if !a.Notify(aged) {
+		t.Fatal("Notify reported the stream undelivered onto an empty backlog")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for len(rec.refused()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := rec.refused(); len(got) != 1 || got[0] != aged {
+		t.Fatalf("refused %v after the grace, want the stream whose grace ran out onto a full FIFO", got)
+	}
+	var parked []*graceProbeStream
+	for i := 0; i < MaxByIDBacklogPerStream; i++ {
+		st := &graceProbeStream{id: 14}
+		parked = append(parked, st)
+		if !a.Notify(st) {
+			t.Fatalf("Notify %d of id 14 refused with backlog room", i)
+		}
+	}
+	past := &graceProbeStream{id: 14}
+	if a.Notify(past) {
+		t.Fatal("Notify past a full backlog onto a full FIFO reported the stream delivered")
+	}
+	// The parked streams' graces run out onto the same full FIFO, so each of them is
+	// refused too: every stream but the one the FIFO holds, exactly once.
+	want := map[Stream]bool{aged: true, past: true}
+	for _, st := range parked {
+		want[st] = true
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for len(rec.refused()) < len(want) && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	got := rec.refused()
+	seen := map[Stream]bool{}
+	for _, st := range got {
+		if !want[st] || seen[st] {
+			t.Fatalf("refused %v: stream %p refused twice or never notified", got, st)
+		}
+		seen[st] = true
+	}
+	if len(seen) != len(want) {
+		t.Fatalf("refused %d streams, want %d (the aged one, the one past the backlog and the %d parked)",
+			len(seen), len(want), len(parked))
+	}
+}
+
+// TestStreamAcceptor_ANotifyOnAClosedAcceptorIsRefused: Close has handed back what
+// the acceptor held for the session's teardown to reset; a stream notified after it is
+// handed to Refuse, so it is not left to nobody.
+func TestStreamAcceptor_ANotifyOnAClosedAcceptorIsRefused(t *testing.T) {
+	rec := &refusalRecorder{}
+	a := NewStreamAcceptor(StreamAcceptorConfig{Mode: NonBlockingDrop, Refuse: rec.refuse})
+	a.Close()
+	late := &graceProbeStream{id: 10}
+	if a.Notify(late) {
+		t.Fatal("a closed acceptor reported a stream delivered")
+	}
+	if got := rec.refused(); len(got) != 1 || got[0] != late {
+		t.Fatalf("refused %v, want the stream notified after Close", got)
+	}
+}
+
+// TestStreamAcceptor_AClaimedStreamWaitsForItsClaimantWhileAcceptRuns: an ID in
+// Claimed has no grace: while an Accept loop runs, its stream stays on the backlog
+// past ByIDBacklogGrace, Accept never sees it, and an AcceptByID armed long after
+// takes it. Without the claim the loop takes it (TestStreamAcceptor_AStreamPastItsGraceReachesAccept).
+func TestStreamAcceptor_AClaimedStreamWaitsForItsClaimantWhileAcceptRuns(t *testing.T) {
+	a := NewStreamAcceptor(StreamAcceptorConfig{Mode: NonBlockingDrop, Claimed: []uint64{101}})
+	loopCtx, stopLoop := context.WithCancel(context.Background())
+	defer stopLoop()
+	took := make(chan Stream, 1)
+	go func() {
+		if st, err := a.Accept(loopCtx); err == nil {
+			took <- st
+		}
+	}()
+	st := &graceProbeStream{id: 101}
+	if !a.Notify(st) {
+		t.Fatal("Notify refused a claimed stream onto an empty backlog")
+	}
+	time.Sleep(3 * ByIDBacklogGrace)
+	select {
+	case got := <-took:
+		t.Fatalf("the Accept loop took claimed stream %d", got.StreamID())
+	default:
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if got, err := a.AcceptByID(ctx, 101); err != nil || got != st {
+		t.Fatalf("the late claimant: %v, %v", got, err)
+	}
+	unclaimed := &graceProbeStream{id: 10}
+	if !a.Notify(unclaimed) {
+		t.Fatal("Notify refused an unclaimed stream onto an empty backlog")
+	}
+	select {
+	case got := <-took:
+		if got != unclaimed {
+			t.Fatalf("the Accept loop took stream %d, want the unclaimed 10", got.StreamID())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("an unclaimed stream did not reach the Accept loop past its grace")
+	}
+}
+
+// TestStreamAcceptor_AClaimedIDPastItsBacklogIsRefused: a claimed ID's streams never
+// fall through to the FIFO; the one past MaxByIDBacklogPerStream waiting unclaimed is
+// refused, and the claimant then takes the waiting ones in arrival order.
+func TestStreamAcceptor_AClaimedIDPastItsBacklogIsRefused(t *testing.T) {
+	rec := &refusalRecorder{}
+	a := NewStreamAcceptor(StreamAcceptorConfig{Mode: NonBlockingDrop, Refuse: rec.refuse, Claimed: []uint64{100}})
+	var parked []*graceProbeStream
+	for i := 0; i < MaxByIDBacklogPerStream; i++ {
+		st := &graceProbeStream{id: 100}
+		parked = append(parked, st)
+		if !a.Notify(st) {
+			t.Fatalf("Notify %d refused with backlog room", i)
+		}
+	}
+	past := &graceProbeStream{id: 100}
+	if a.Notify(past) {
+		t.Fatal("Notify past a claimed ID's full backlog reported the stream delivered")
+	}
+	if got := rec.refused(); len(got) != 1 || got[0] != past {
+		t.Fatalf("refused %v, want the stream past the claimed ID's backlog", got)
+	}
+	a.mu.Lock()
+	inFIFO := len(a.fifo)
+	a.mu.Unlock()
+	if inFIFO != 0 {
+		t.Fatalf("the FIFO holds %d streams of a claimed ID", inFIFO)
+	}
+	for i, want := range parked {
+		if got, err := a.AcceptByID(context.Background(), 100); err != nil || got != want {
+			t.Fatalf("AcceptByID %d: %v, %v; want the streams in arrival order", i, got, err)
+		}
 	}
 }

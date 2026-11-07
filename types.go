@@ -229,6 +229,17 @@ type SessionOptions struct {
 	// instead, from NoiseTransportConfig or the over-conn configs, and does
 	// not read this field.
 	WireVersions WireVersions
+
+	// ClaimedStreams are the stream IDs this session's consumers take only by
+	// AcceptStreamByID, for the session's life: the NoiseSession's and the
+	// TCPSession's acceptor (StreamAcceptorConfig.Claimed) holds a stream of such
+	// an ID for its claimant however late the claimant arms, never hands it to
+	// AcceptStream, and refuses it with RESET(ResetRefused) once
+	// MaxByIDBacklogPerStream of its ID wait unclaimed. A consumer that arms a
+	// claim while an AcceptStream loop runs names its ID here, or the loop can
+	// take the stream first. Empty leaves every ID to the backlog grace and the
+	// FIFO.
+	ClaimedStreams []uint64
 }
 
 // DefaultMaxConcurrentStreams is the default per-session stream cap for
