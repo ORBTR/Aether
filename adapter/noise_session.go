@@ -603,12 +603,15 @@ func newNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 
 	// Per-StreamID accept dispatch + AcceptStream FIFO — shared
 	// implementation in the root aether package. NonBlockingDrop: when the
-	// FIFO is full the OPEN-frame handler drops the stream rather than hold
-	// the readLoop, which runs handleOpen.
+	// FIFO is full the acceptor refuses the stream (refuseUnaccepted) rather
+	// than hold the readLoop, which runs handleOpen. Claimed: the IDs the
+	// session's consumers take only by AcceptStreamByID.
 	s.acceptor = aether.NewStreamAcceptor(aether.StreamAcceptorConfig{
 		Mode:      aether.NonBlockingDrop,
 		Closed:    base.CloseSignal(),
 		ErrClosed: aether.ErrSessionClosed,
+		Refuse:    s.refuseUnaccepted,
+		Claimed:   opts.ClaimedStreams,
 	})
 
 	// Wire the scheduler-depth histogram so every Enqueue /
@@ -848,8 +851,35 @@ func (s *NoiseSession) AcceptStreamByID(ctx context.Context, streamID uint64) (a
 // StreamAcceptor. The acceptor picks between a pinned ByID waiter, a
 // per-ID backlog slot, or the internal FIFO that AcceptStream drains.
 // Called by handleOpen, the path that produces a remotely-initiated stream.
+// Notify's false needs nothing here: the acceptor has already handed the
+// stream to refuseUnaccepted.
 func (s *NoiseSession) notifyStreamAccepted(st *noiseStream) {
 	s.acceptor.Notify(st)
+}
+
+// refuseUnaccepted ends a stream the peer opened that the acceptor will not hold
+// (aether.StreamAcceptorConfig.Refuse): the FIFO is full, its claimed ID's backlog
+// is full, or the acceptor has closed. No consumer will ever read it, so Reset
+// writes RESET(ResetRefused), which the opener's Send and Receive read as
+// aether.ErrStreamRefused, and releases its stream slot, credit reservation and
+// in-flight connection credit (Reset); the RESET states what this side granted,
+// so the opener takes back the rest of its charge. What the queue holds is
+// thrown away here, not left in the session's budget for the idle sweep
+// (sweepEndedQueues) to find: Reset keeps it for a reader, and this stream has
+// none. Each of Reset's paths takes the queue out of the credit count
+// (settleLocalReset's peerEnded, or releaseCharge for a stream that had left),
+// so discard has nothing to grant; what it returns goes to the peer as the
+// sweep's discard does, so a charge left by any path is not stranded. The empty
+// queue then leaves endedQueues, where Reset's trackEnded put it, as after
+// makeQueueRoom's discard.
+func (s *NoiseSession) refuseUnaccepted(st aether.Stream) {
+	ns, ok := st.(*noiseStream)
+	if !ok {
+		return
+	}
+	_ = ns.Reset(aether.ResetRefused)
+	s.grantConnCredit(ns.recvQ.discard())
+	s.forgetEnded(ns.recvQ)
 }
 
 // Identity / Capabilities / Protocol accessors are promoted from the

@@ -503,12 +503,15 @@ func newTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 	)
 	// Per-StreamID accept dispatch + AcceptStream FIFO — shared
 	// implementation in the root aether package. NonBlockingDrop: when the
-	// FIFO is full the OPEN-frame handler drops the stream rather than hold
-	// the readLoop, which runs handleOpen.
+	// FIFO is full the acceptor refuses the stream (refuseUnaccepted) rather
+	// than hold the readLoop, which runs handleOpen. Claimed: the IDs the
+	// session's consumers take only by AcceptStreamByID.
 	s.acceptor = aether.NewStreamAcceptor(aether.StreamAcceptorConfig{
 		Mode:      aether.NonBlockingDrop,
 		Closed:    base.CloseSignal(),
 		ErrClosed: aether.ErrSessionClosed,
+		Refuse:    s.refuseUnaccepted,
+		Claimed:   opts.ClaimedStreams,
 	})
 	// Stream GC — identical policy to Noise; exempts well-known stream
 	// IDs 0-3 (control / keepalive).
@@ -1028,8 +1031,32 @@ func (s *TCPSession) handleOpen(frame *aether.Frame) {
 // StreamAcceptor. The acceptor picks between a pinned ByID waiter, a
 // per-ID backlog slot, or the internal FIFO that AcceptStream drains.
 // Called by handleOpen, the path that produces a remotely-initiated stream.
+// Notify's false needs nothing here: the acceptor has already handed the
+// stream to refuseUnaccepted.
 func (s *TCPSession) notifyStreamAccepted(st *tcpStream) {
 	s.acceptor.Notify(st)
+}
+
+// refuseUnaccepted ends a stream the peer opened that the acceptor will not hold
+// (aether.StreamAcceptorConfig.Refuse): the FIFO is full, its claimed ID's backlog
+// is full, or the acceptor has closed. No consumer will ever read it, so Reset
+// writes RESET(ResetRefused), which the opener's Send and Receive read as
+// aether.ErrStreamRefused, and takes the stream out of s.streams, the scheduler
+// and the stream GC, freeing its slot under the stream cap (sendReset). What its
+// queue holds is thrown away here and its cost leaves the session's ceiling and
+// the peer's (recvQueue.discard), not left there for the idle sweep to find:
+// Reset keeps it for a reader, and this stream has none; the empty queue then
+// leaves endedQueues, where sendReset's trackEnded put it. A TCP-family stream
+// keeps no aether credit, so discard's grant is nothing to return (the sweep
+// passes no grant on this session either).
+func (s *TCPSession) refuseUnaccepted(st aether.Stream) {
+	ts, ok := st.(*tcpStream)
+	if !ok {
+		return
+	}
+	_ = ts.Reset(aether.ResetRefused)
+	ts.recvQ.discard()
+	s.forgetEnded(ts.recvQ)
 }
 
 // handleClose ends the stream's receive side at the peer's CLOSE: the messages

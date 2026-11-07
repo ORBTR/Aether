@@ -16,7 +16,9 @@ import (
 // AcceptStreamByID for every well-known stream before the peer can open
 // them, so the backlog should rarely exceed 1 in practice; the cap exists
 // to bound worst-case memory on a misbehaving peer that floods opens for
-// a single ID with no claimant waiting.
+// a single ID with no claimant waiting. For an ID in
+// StreamAcceptorConfig.Claimed a stream past the cap is refused instead
+// (StreamAcceptorConfig.Refuse): no consumer but that ID's claimant may take it.
 //
 // Exported so transport adapters in the adapter package can reference it
 // when wiring StreamAcceptor — they do not need their own duplicate.
@@ -31,7 +33,9 @@ const MaxByIDBacklogPerStream = 4
 // wire and the consuming goroutine calling AcceptStreamByID while an
 // Accept loop is running.
 //
-// Bypassed entirely when a waiter is already armed at notify time.
+// Bypassed entirely when a waiter is already armed at notify time, and never
+// runs for an ID in StreamAcceptorConfig.Claimed, whose streams stay on the
+// backlog until their claimant takes them.
 const ByIDBacklogGrace = 100 * time.Millisecond
 
 // AcceptChDefaultBuffer is the default FIFO depth used when
@@ -44,9 +48,10 @@ const AcceptChDefaultBuffer = 16
 // the FIFO when neither a pinned AcceptStreamByID waiter nor a backlog
 // slot accepted it.
 //
-//   - NonBlockingDrop: if the FIFO is full the stream is not queued and
-//     Notify returns false. Used by transports where the application is
-//     responsible for keeping AcceptStream calls hot (Noise, TCP).
+//   - NonBlockingDrop: if the FIFO is full the stream is not queued, the
+//     acceptor hands it to StreamAcceptorConfig.Refuse and Notify returns
+//     false. Used by transports whose readLoop runs Notify and must not wait
+//     on the application's AcceptStream calls (Noise, TCP).
 //   - BlockUntilClose: blocks until Accept or AcceptByID makes room in
 //     the FIFO or the session closes. Used by QUIC where the adapter
 //     wraps quic-go's own backpressure-aware accept channel and the
@@ -69,6 +74,30 @@ type StreamAcceptorConfig struct {
 	Mode       PushMode
 	Closed     <-chan struct{}
 	ErrClosed  error
+
+	// Refuse ends a stream the acceptor was handed and will not hold: Notify
+	// on a closed acceptor, a full FIFO under NonBlockingDrop (from Notify or
+	// when a backlog entry's grace runs out), or a claimed ID whose backlog is
+	// full. Such a stream reaches no consumer, so nothing else would end it, and
+	// it would hold its session's stream slot, credit reservation and queued
+	// bytes until the stream GC's idle timeout while its opener goes on sending
+	// into it. The NoiseSession and TCPSession pass a function that resets the
+	// stream with ResetRefused, which the opener reads as ErrStreamRefused, and
+	// releases what its queue holds at once. Called without the acceptor's lock
+	// and at most once per stream. Nil leaves a refused stream as it is: the
+	// QUIC adapter's BlockUntilClose push refuses only on a closed acceptor, and
+	// its connection's close cancels every stream it has.
+	Refuse func(Stream)
+
+	// Claimed are the stream IDs only AcceptByID takes, for the acceptor's
+	// whole life: a stream of such an ID waits on its backlog with no grace
+	// timer, never enters the FIFO, and is refused (Refuse) once its backlog
+	// holds MaxByIDBacklogPerStream. A claimant that arms its AcceptByID after
+	// ByIDBacklogGrace while an Accept loop runs gets its stream; without the
+	// claim the loop can take it first and hand it to a consumer that cannot
+	// read it. SessionOptions.ClaimedStreams fills it for the NoiseSession and
+	// the TCPSession, from the session's construction on.
+	Claimed []uint64
 }
 
 // StreamAcceptor is the transport-agnostic per-StreamID accept dispatch
@@ -92,12 +121,12 @@ type StreamAcceptor struct {
 	waiters map[uint64]chan Stream
 	backlog map[uint64][]Stream
 	// fifo holds, in arrival order and at most fifoCap of them, the streams
-	// Accept reads: those no waiter or backlog slot took, and backlog entries
-	// whose grace ran out. AcceptByID takes the first one of its ID out of
-	// it, so a stream that aged out of the backlog before its claimant armed
-	// is still the claimant's unless Accept took it first: a responder that
-	// claims its setup streams one after another by ID, with no Accept
-	// running, gets every one of them whatever its scheduling delay. The
+	// Accept reads: those of unclaimed IDs no waiter or backlog slot took, and
+	// backlog entries whose grace ran out. AcceptByID takes the first one of its
+	// ID out of it, so a stream that aged out of the backlog before its
+	// claimant armed is still the claimant's unless Accept took it first: a
+	// responder that claims its setup streams one after another by ID, with no
+	// Accept running, gets every one of them whatever its scheduling delay. The
 	// acceptor owns it so the Noise, TCP and QUIC adapters share one. mode
 	// selects what a push onto a full fifo does (NonBlockingDrop /
 	// BlockUntilClose). Guarded by mu.
@@ -119,6 +148,10 @@ type StreamAcceptor struct {
 	// reject Notify calls that race with teardown without depending on
 	// the caller to provide a non-nil closed channel.
 	isClosed bool
+	// refuse is cfg.Refuse; claimed is cfg.Claimed as a set, fixed at
+	// construction, so Notify reads it under mu with nothing to guard.
+	refuse  func(Stream)
+	claimed map[uint64]struct{}
 }
 
 // NewStreamAcceptor constructs a StreamAcceptor wired to a transport
@@ -135,6 +168,10 @@ func NewStreamAcceptor(cfg StreamAcceptorConfig) *StreamAcceptor {
 	if buf <= 0 {
 		buf = AcceptChDefaultBuffer
 	}
+	claimed := make(map[uint64]struct{}, len(cfg.Claimed))
+	for _, id := range cfg.Claimed {
+		claimed[id] = struct{}{}
+	}
 	return &StreamAcceptor{
 		waiters:   make(map[uint64]chan Stream),
 		backlog:   make(map[uint64][]Stream),
@@ -143,6 +180,16 @@ func NewStreamAcceptor(cfg StreamAcceptorConfig) *StreamAcceptor {
 		mode:      cfg.Mode,
 		closed:    cfg.Closed,
 		errClosed: cfg.ErrClosed,
+		refuse:    cfg.Refuse,
+		claimed:   claimed,
+	}
+}
+
+// refuseStream hands st to the configured Refuse, for a stream Notify or
+// flushBacklogEntry will not hold. Called without mu.
+func (a *StreamAcceptor) refuseStream(st Stream) {
+	if a.refuse != nil {
+		a.refuse(st)
 	}
 }
 
@@ -152,22 +199,25 @@ func NewStreamAcceptor(cfg StreamAcceptorConfig) *StreamAcceptor {
 //  1. A pinned AcceptStreamByID waiter for this StreamID — claimed
 //     immediately (out-of-order wire arrival cannot mis-route).
 //  2. The per-ID backlog if it has room (< MaxByIDBacklogPerStream).
-//     A ByIDBacklogGrace timer is armed; if no AcceptStreamByID claim
-//     arrives in that window the entry is removed from the backlog and
-//     pushed onto the FIFO, where a later AcceptStreamByID of its ID
-//     still finds it.
-//  3. The internal FIFO — Accept reads from it, and AcceptByID takes
-//     streams of its ID from it. Push semantics depend on the configured
-//     PushMode (refuse-on-full or block-until-close).
+//     For an unclaimed ID a ByIDBacklogGrace timer is armed; if no
+//     AcceptStreamByID claim arrives in that window the entry is removed
+//     from the backlog and pushed onto the FIFO, where a later
+//     AcceptStreamByID of its ID still finds it. A claimed ID's entry
+//     (StreamAcceptorConfig.Claimed) stays until its claimant takes it.
+//  3. For an unclaimed ID, the internal FIFO — Accept reads from it, and
+//     AcceptByID takes streams of its ID from it. Push semantics depend on
+//     the configured PushMode (refuse-on-full or block-until-close).
 //
-// Returns true when the stream was delivered (waiter, backlog, or FIFO
-// accepted under BlockUntilClose). Returns false when the acceptor is
-// already closed OR when NonBlockingDrop dropped the stream because
-// the FIFO was full.
+// Returns true when the stream was delivered (waiter, backlog, or FIFO).
+// Returns false, having handed the stream to StreamAcceptorConfig.Refuse,
+// when the acceptor is already closed, when a claimed ID's backlog is
+// full, or when NonBlockingDrop found the FIFO full. The adapters'
+// notifyStreamAccepted read nothing more from it: the refusal is done.
 func (a *StreamAcceptor) Notify(st Stream) bool {
 	a.mu.Lock()
 	if a.isClosed {
 		a.mu.Unlock()
+		a.refuseStream(st)
 		return false
 	}
 	id := st.StreamID()
@@ -178,15 +228,22 @@ func (a *StreamAcceptor) Notify(st Stream) bool {
 		ch <- st
 		return true
 	}
+	_, claimed := a.claimed[id]
 	backlog := a.backlog[id]
 	if len(backlog) < MaxByIDBacklogPerStream {
 		a.backlog[id] = append(backlog, st)
 		a.mu.Unlock()
-		time.AfterFunc(ByIDBacklogGrace, func() { a.flushBacklogEntry(st) })
+		if !claimed {
+			time.AfterFunc(ByIDBacklogGrace, func() { a.flushBacklogEntry(st) })
+		}
 		return true
 	}
 	a.mu.Unlock()
-	return a.pushFIFO(st)
+	if claimed || !a.pushFIFO(st) {
+		a.refuseStream(st)
+		return false
+	}
+	return true
 }
 
 // pushFIFO delivers a stream onto the internal FIFO using the
@@ -240,10 +297,11 @@ func (a *StreamAcceptor) takeFIFOLocked(i int) Stream {
 }
 
 // Accept returns the next stream from the FIFO. Blocks until either a
-// stream arrives, ctx is cancelled, or the session closes. Drives the
-// adapter's Session.AcceptStream surface: the Noise, TCP and QUIC
-// adapters' AcceptStream each delegate here, so the wait on (fifo,
-// ctx.Done, closed) exists once.
+// stream arrives, ctx is cancelled, or the session closes. It never returns
+// a stream of a claimed ID (StreamAcceptorConfig.Claimed), which never
+// enters the FIFO. Drives the adapter's Session.AcceptStream surface: the
+// Noise, TCP and QUIC adapters' AcceptStream each delegate here, so the wait
+// on (fifo, ctx.Done, closed) exists once.
 func (a *StreamAcceptor) Accept(ctx context.Context) (Stream, error) {
 	for {
 		a.mu.Lock()
@@ -396,8 +454,8 @@ const byIDNotifyDrainTimeout = 1 * time.Second
 // callers return errClosed via the ok=false branch.
 //
 // Idempotent: a second Close returns nil. Safe to call concurrently
-// with Notify / AcceptByID / Accept — a Notify racing Close ignores
-// the stream (returns false); AcceptByID and Accept racing Close
+// with Notify / AcceptByID / Accept — a Notify racing Close hands
+// the stream to Refuse (returns false); AcceptByID and Accept racing Close
 // return errClosed either via the `closed` channel select or via the
 // waiter-close branch.
 func (a *StreamAcceptor) Close() []Stream {
@@ -426,8 +484,11 @@ func (a *StreamAcceptor) Close() []Stream {
 // flushBacklogEntry runs when the per-stream grace timer fires. If the
 // stream is still parked on the backlog (no AcceptByID claimed it) it
 // is removed and pushed onto the FIFO so any FIFO AcceptStream
-// consumer, or a later AcceptByID of its ID, can pick it up. A no-op
-// when the stream was already drained by AcceptByID or by Close.
+// consumer, or a later AcceptByID of its ID, can pick it up; a FIFO that
+// refuses it (full under NonBlockingDrop, or closed after the removal, so
+// Close did not hand it back) hands it to Refuse, as no consumer holds it
+// any more. A no-op when the stream was already drained by AcceptByID or
+// by Close. Notify arms it only for an unclaimed ID.
 func (a *StreamAcceptor) flushBacklogEntry(st Stream) {
 	id := st.StreamID()
 	a.mu.Lock()
@@ -452,5 +513,7 @@ func (a *StreamAcceptor) flushBacklogEntry(st Stream) {
 		delete(a.backlog, id)
 	}
 	a.mu.Unlock()
-	a.pushFIFO(st)
+	if !a.pushFIFO(st) {
+		a.refuseStream(st)
+	}
 }

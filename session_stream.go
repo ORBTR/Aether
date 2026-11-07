@@ -40,7 +40,14 @@ type Session interface {
 	// either parked on a small per-ID backlog (drained by the next
 	// matching AcceptStreamByID call) or, when no backlog slot is
 	// available, fall through to the FIFO acceptCh so dynamic-stream
-	// consumers calling AcceptStream still see them.
+	// consumers calling AcceptStream still see them. On the Noise and
+	// TCP-family sessions an ID the session's options claim
+	// (SessionOptions.ClaimedStreams) never falls through: its streams wait
+	// for this call however late it comes, and one past the backlog is
+	// refused with RESET(ResetRefused). A stream their FIFO has no room for
+	// is refused the same way, so its opener reads ErrStreamRefused rather
+	// than waiting on a stream nobody holds. The QUIC adapter takes no
+	// options and claims no IDs, and its FIFO push waits for room instead.
 	//
 	// On session close, all blocked AcceptStreamByID callers return
 	// ErrSessionClosed.

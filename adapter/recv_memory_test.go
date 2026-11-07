@@ -9,6 +9,7 @@ package adapter
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"testing"
 	"time"
@@ -162,6 +163,45 @@ func acceptEach(t *testing.T, ctx context.Context, sess *TCPSession, n int) map[
 	return got
 }
 
+// acceptedStreams is what acceptAsync took: the streams keyed by ID, or the error
+// that stopped it with the count it had reached.
+type acceptedStreams struct {
+	got map[uint64]aether.Stream
+	err error
+}
+
+// acceptAsync takes n streams off the session's acceptor from a goroutine started
+// now, as a consumer's AcceptStream loop does. A test that opens more streams than
+// the acceptor's FIFO holds (aether.AcceptChDefaultBuffer) starts it before writing
+// them: a stream still on the backlog when its grace runs out onto a full FIFO is
+// refused (refuseUnaccepted), and writes slower than the grace put every stream there.
+func acceptAsync(ctx context.Context, sess *TCPSession, n int) <-chan acceptedStreams {
+	done := make(chan acceptedStreams, 1)
+	go func() {
+		got := make(map[uint64]aether.Stream, n)
+		for i := 0; i < n; i++ {
+			st, err := sess.AcceptStream(ctx)
+			if err != nil {
+				done <- acceptedStreams{err: fmt.Errorf("accept %d of %d: %w", i, n, err)}
+				return
+			}
+			got[st.StreamID()] = st
+		}
+		done <- acceptedStreams{got: got}
+	}()
+	return done
+}
+
+// awaitAccepted waits for acceptAsync's streams.
+func awaitAccepted(t *testing.T, ch <-chan acceptedStreams) map[uint64]aether.Stream {
+	t.Helper()
+	r := <-ch
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	return r.got
+}
+
 // liteSettled waits until the readLoop has served everything written before this
 // call, by the PONG it answers in order.
 func liteSettled(p *liteRawPeer, frames ...*aether.Frame) {
@@ -191,6 +231,7 @@ func TestTCPSession_DeliveryQueuesStayAtTheSessionCeiling(t *testing.T) {
 		frames = append(frames, liteFill(uint64(200+k), perStream, size)...)
 	}
 	var resets []*aether.Frame
+	acceptedCh := acceptAsync(ctx, p.sess, streams)
 	writeFrames(t, p.conn, append(frames, &aether.Frame{StreamID: 2, Type: aether.TypePING})...)
 	for {
 		f := p.next()
@@ -207,7 +248,7 @@ func TestTCPSession_DeliveryQueuesStayAtTheSessionCeiling(t *testing.T) {
 	if len(resets) != 1 || resets[0].StreamID != 200+streams-1 || aether.DecodeReset(resets[0].Payload) != aether.ResetFlowCtrl {
 		t.Fatalf("resets %+v, want RESET(ResetFlowCtrl) on the last stream", resets)
 	}
-	accepted := acceptEach(t, ctx, p.sess, streams)
+	accepted := awaitAccepted(t, acceptedCh)
 	first, over := accepted[200], accepted[200+streams-1]
 	for {
 		if _, err := over.Receive(ctx); err != nil {
@@ -256,6 +297,7 @@ func TestTCPSession_ResetQueuesMakeRoomAndTheSweepDiscardsAbandonedOnes(t *testi
 		frames = append(frames, liteFill(id, perStream, size)...)
 		frames = append(frames, rawReset(id, aether.ResetCancel))
 	}
+	abandonedCh := acceptAsync(ctx, p.sess, 17)
 	liteSettled(p, frames...)
 	if p.sess.recvCharged.Load() != 0 {
 		t.Fatalf("%d charged behind queues a RESET ended", p.sess.recvCharged.Load())
@@ -263,7 +305,7 @@ func TestTCPSession_ResetQueuesMakeRoomAndTheSweepDiscardsAbandonedOnes(t *testi
 	if got := p.sess.recvQueued.Load(); got > ceiling {
 		t.Fatalf("queued %d, ceiling %d", got, ceiling)
 	}
-	abandoned := acceptEach(t, ctx, p.sess, 17)
+	abandoned := awaitAccepted(t, abandonedCh)
 	var seen []*aether.Frame
 	writeFrames(t, p.conn, append(liteFill(500, perStream, size), &aether.Frame{StreamID: 2, Type: aether.TypePING})...)
 	for {
