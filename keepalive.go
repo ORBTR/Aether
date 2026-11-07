@@ -20,13 +20,21 @@ import (
 var ErrKeepaliveDeadline = errors.New("aether: the peer answered no keepalive probe within the dead-peer deadline")
 
 // KeepalivePlanFor is the keepalive plan quality.Keepalive derives for s from its health
-// monitor's SRTT, RTO and sample count. A session with no monitor yet gets the plan for
-// a path with nothing measured. RunKeepalive reads it before every wait and every probe,
-// so each probe cycle follows what the previous answers measured.
+// monitor's SRTT, RTO, sample count, probe loss and instability, the last two fed by
+// RunKeepalive's answered probes and the monitor's pong samples. A session with no
+// monitor yet gets the plan for a path with nothing measured. RunKeepalive reads it
+// before every wait and every probe, so each probe cycle follows what the previous
+// answers measured.
 func KeepalivePlanFor(s Session) quality.KeepalivePlan {
 	var in quality.KeepaliveInputs
 	if h := s.Health(); h != nil {
-		in = quality.KeepaliveInputs{SRTT: h.SRTT(), RTO: h.RTO(), Samples: h.SampleCount()}
+		in = quality.KeepaliveInputs{
+			SRTT:        h.SRTT(),
+			RTO:         h.RTO(),
+			Samples:     h.SampleCount(),
+			Loss:        h.ProbeLoss(),
+			Instability: h.Instability(),
+		}
 	}
 	return quality.Keepalive(in)
 }
@@ -67,6 +75,9 @@ func RunKeepalive(ctx context.Context, s Session) error {
 				return nil
 			}
 			if err == nil {
+				if h := s.Health(); h != nil {
+					h.RecordKeepaliveAnswer(missed)
+				}
 				break
 			}
 			missed++

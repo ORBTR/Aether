@@ -37,7 +37,18 @@ type Monitor struct {
 	lastRTT        time.Duration
 	rttEst         *rtt.Estimator // SRTT/RTTVar/RTO over ping-RTT samples
 	closed         int32          // atomic: 1 = closed
+	// probeLoss is the smoothed fraction of keepalive probes lost on a path that
+	// answered a later one (RecordKeepaliveAnswer); instability is the smoothed jump
+	// between consecutive pong samples as a fraction of SRTT (RecordPongRecv). Both
+	// are read by aether.KeepalivePlanFor into quality.KeepaliveInputs.
+	probeLoss   float64
+	instability float64
+	samples     uint64 // pong samples RecordPongRecv has taken, for instability's first pair
 }
+
+// probeEWMAGain is the weight a new observation gets in probeLoss and instability: the
+// gain RFC 6298 gives a new round trip in SRTT, so the three follow the path at one pace.
+const probeEWMAGain = 0.125
 
 // NewMonitor creates a health monitor with the given EMA smoothing
 // factor. emaAlpha controls how much weight new RTT samples get
@@ -90,6 +101,18 @@ func (m *Monitor) RecordPongRecv(seq uint32, sentAt time.Time) {
 	// that has stopped responding.
 	if seq != 0 && seq == m.pendingPingSeq {
 		sample := now.Sub(sentAt)
+		if srtt := m.rttEst.SRTT(); m.samples > 0 && srtt > 0 {
+			jump := float64(sample - m.lastRTT)
+			if jump < 0 {
+				jump = -jump
+			}
+			jump /= float64(srtt)
+			if jump > 1 {
+				jump = 1
+			}
+			m.instability += probeEWMAGain * (jump - m.instability)
+		}
+		m.samples++
 		m.lastRTT = sample
 		// Delegate the RFC 6298 math to the shared estimator. Its
 		// Update is internally locked, so calling under m.mu is
@@ -117,6 +140,35 @@ func (m *Monitor) IncrementMissedPings() int {
 	n := m.missedPings
 	m.mu.Unlock()
 	return n
+}
+
+// RecordKeepaliveAnswer records one keepalive probe answered after unanswered probes in
+// a row had gone unanswered: each of those counts as a lost probe and the answer as
+// one that was not, in probeLoss. A keepalive that ends the session on a silence
+// records nothing, so a dead peer's misses never raise the loss its bound is read from.
+func (m *Monitor) RecordKeepaliveAnswer(unanswered int) {
+	m.mu.Lock()
+	for i := 0; i < unanswered; i++ {
+		m.probeLoss += probeEWMAGain * (1 - m.probeLoss)
+	}
+	m.probeLoss -= probeEWMAGain * m.probeLoss
+	m.mu.Unlock()
+}
+
+// ProbeLoss is the smoothed fraction of keepalive probes lost on a path that went on
+// answering, from 0 to 1; zero until a probe is lost.
+func (m *Monitor) ProbeLoss() float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.probeLoss
+}
+
+// Instability is one minus the path's stability: the smoothed jump between consecutive
+// pong round trips as a fraction of SRTT, from 0 to 1; zero before the second sample.
+func (m *Monitor) Instability() float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.instability
 }
 
 // --- Read-only accessors (implement aether.HealthReporter) ---

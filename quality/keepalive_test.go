@@ -59,3 +59,57 @@ func TestTheDeadPeerBoundIsTheProbeCycle(t *testing.T) {
 		t.Errorf("the largest DeadPeerBound = %s, want %s", got, want)
 	}
 }
+
+// TestTheKeepalivePlanFollowsLoss: two sessions with the same round trips get plans that
+// differ only by their probe loss. A path that loses a quarter of its probes or fewer
+// keeps 5 strikes; a lossier one is held to more, so a healthy peer losing that share of
+// its probes is let go with chance at most 1 in 1000, and never more than 10.
+func TestTheKeepalivePlanFollowsLoss(t *testing.T) {
+	rtt := KeepaliveInputs{SRTT: 40 * time.Millisecond, RTO: 300 * time.Millisecond, Samples: 20}
+	steady := Keepalive(rtt)
+	for _, tc := range []struct {
+		loss    float64
+		strikes int
+	}{{0, 5}, {0.25, 5}, {0.3, 6}, {0.5, 10}, {0.9, 10}, {1, 10}} {
+		in := rtt
+		in.Loss = tc.loss
+		p := Keepalive(in)
+		if p.Strikes != tc.strikes {
+			t.Errorf("loss %.2f: %d strikes, want %d", tc.loss, p.Strikes, tc.strikes)
+		}
+		if p.Interval != steady.Interval || p.ProbeTimeout != steady.ProbeTimeout || p.RetryGap != steady.RetryGap {
+			t.Errorf("loss %.2f moved more than the strikes: %+v against %+v", tc.loss, p, steady)
+		}
+	}
+	lossy := rtt
+	lossy.Loss = 0.5
+	if Keepalive(lossy).DeadPeerBound() <= steady.DeadPeerBound() {
+		t.Error("a lossy path's dead-peer bound is no longer than a clean one's")
+	}
+}
+
+// TestTheKeepalivePlanFollowsStability: two converged sessions with the same SRTT and RTO
+// get probe timeouts that differ by their instability: a path whose round trips jump
+// waits up to twice as long for an answer, inside the same ceiling, and nothing else in
+// the plan moves.
+func TestTheKeepalivePlanFollowsStability(t *testing.T) {
+	rtt := KeepaliveInputs{SRTT: 400 * time.Millisecond, RTO: time.Second, Samples: 20}
+	for _, tc := range []struct {
+		instability float64
+		probe       time.Duration
+	}{{0, 4 * time.Second}, {0.25, 5 * time.Second}, {0.5, 6 * time.Second}, {1, 8 * time.Second}, {3, 8 * time.Second}} {
+		in := rtt
+		in.Instability = tc.instability
+		p := Keepalive(in)
+		if p.ProbeTimeout != tc.probe {
+			t.Errorf("instability %.2f: probe timeout %s, want %s", tc.instability, p.ProbeTimeout, tc.probe)
+		}
+		if p.Interval != Keepalive(rtt).Interval || p.Strikes != Keepalive(rtt).Strikes {
+			t.Errorf("instability %.2f moved more than the probe timeout: %+v", tc.instability, p)
+		}
+	}
+	slow := KeepaliveInputs{SRTT: 2 * time.Second, RTO: 3 * time.Second, Samples: 20, Instability: 1}
+	if got := Keepalive(slow).ProbeTimeout; got != 15*time.Second {
+		t.Errorf("an unstable slow path's probe timeout %s, want the 15 s ceiling", got)
+	}
+}
