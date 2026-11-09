@@ -138,7 +138,11 @@ func TestNoiseStream_TheResetsReaderTakesBackOnlyWhatItsGrantsDoNotCover(t *test
 
 // TestNoiseStream_CrossingResetsCorrectEachOther: both sides reset a stream and the
 // RESETs pass on the path. The client's arrives where the stream has gone, and the
-// count the server kept at its own RESET says what to take off its later grants.
+// count the server kept at its own RESET says what to take off its later grants. The
+// path holds the client's RESET and its copies, not the client's acknowledgment of the
+// server's RESET, which is a RESET flagged FlagACK on the same stream: handleReset
+// takes that as an acknowledgment (resetAcknowledged) and ends nothing, so handing it
+// to the server in place of the RESET would leave the count behind.
 func TestNoiseStream_CrossingResetsCorrectEachOther(t *testing.T) {
 	client, server, toServer, toClient := filteredPair(t, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -163,7 +167,7 @@ func TestNoiseStream_CrossingResetsCorrectEachOther(t *testing.T) {
 	toClient.setRule(func(f *aether.Frame) bool { return blocked.Load() && creditFrame(f) })
 	var held atomic.Pointer[aether.Frame]
 	toServer.setRule(func(f *aether.Frame) bool {
-		if f.Type == aether.TypeRESET && f.StreamID == 904 {
+		if f.Type == aether.TypeRESET && f.StreamID == 904 && !f.Flags.Has(aether.FlagACK) {
 			held.Store(f)
 			return true
 		}

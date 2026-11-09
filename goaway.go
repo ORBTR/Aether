@@ -12,9 +12,11 @@ import (
 // FrameWriter is the adapter-supplied callback that emits a single frame
 // on the underlying transport. Shared by every transport-agnostic helper
 // in the root package that needs to send a control frame without owning
-// the per-transport writeMu / compression / encryption pipeline. The
-// adapter is responsible for serialising concurrent calls (the Noise and
-// TCP adapters both wrap their writeFrame with a per-session writeMu).
+// the per-transport write lock / compression / encryption pipeline. The
+// adapter is responsible for serialising concurrent calls: the Noise
+// adapter's writeFrame holds its per-session writeMu, and the TCP adapter's
+// holds its write turn or, for a caller on its readLoop, hands the frame to
+// its writeLoop (TCPSession.queueControlFrame).
 type FrameWriter func(*Frame) error
 
 // BuildGoAwayFrame constructs a GOAWAY frame for emission on the given

@@ -69,11 +69,33 @@ type TCPSession struct {
 	// AcceptStream and AcceptStreamByID delegate to it.
 	acceptor *aether.StreamAcceptor
 
-	writeMu sync.Mutex
-	sched   *scheduler.Scheduler
+	// writeTurn is the one turn to write to the conn, a one-slot channel a writer
+	// fills (takeWriteTurn) before its first byte and empties (releaseWriteTurn) once
+	// its frame is written, so frames never interleave on the byte stream. It is a
+	// channel rather than a mutex because a writer with a context waits for it under
+	// that context: a Ping, an OpenStream's SYN and a GoAway return at their
+	// context's end while the writeLoop's write waits on a conn that takes nothing.
+	// newTCPSession holds it until the preface is written (writePreface).
+	writeTurn chan struct{}
+	sched     *scheduler.Scheduler
 	// out is the session's one path to the conn for frames and the preface: every
-	// writer holds writeMu and writes through it (sessionWriter).
+	// writer holds writeTurn and writes through it (sessionWriter).
 	out *sessionWriter
+	// control carries to the writeLoop every frame the readLoop answers the peer with:
+	// a RESET's acknowledgment, a refusal, a PONG, an overrun's RESET, an abuse GOAWAY
+	// (queueControl). The writeLoop writes them ahead of the scheduler's frames
+	// (writeControl), and the readLoop never writes to the conn: a readLoop waiting on
+	// a write stops reading, and two peers whose readLoops each wait on a write the
+	// other is not reading stop both sessions, on net.Pipe at once and on a socket once
+	// both buffers fill. Its room is the session's stream cap, the most RESETs a peer
+	// holds waiting for this side's acknowledgment (holdForResetLocked on the peer);
+	// the readLoop waits for room on a full queue, which a peer reaches only by sending
+	// more frames to answer than that while it reads nothing.
+	control chan controlWrite
+	// afterDequeue is a test seam, nil outside tests: the writeLoop calls it with each
+	// frame it has taken from the scheduler, holding the write turn, before it writes
+	// the frame, so a test can race a direct write against a frame already taken.
+	afterDequeue atomic.Pointer[func(*aether.Frame)]
 	// queuedFrames maps a DATA frame between Send and the conn to the room it took
 	// on its stream's sendRoom, which frameWritten gives back once it is written and
 	// releaseStream when the scheduler drops it. The map finds the stream the frame
@@ -153,6 +175,14 @@ type TCPSession struct {
 	// readPreface sets it from the chosen set before readLoop decodes a
 	// frame; only readLoop reads it.
 	fragRecv *FragmentReceiver
+}
+
+// controlWrite is one entry of the control queue: a frame for the writeLoop to write
+// and what runs once it is written, outside the write turn. A nil frame writes
+// nothing and runs only after, which is how the abuse close follows its GOAWAY.
+type controlWrite struct {
+	frame *aether.Frame
+	after func()
 }
 
 // queuedFrame is what a frame on its way to the conn holds on its stream's sendRoom.
@@ -356,9 +386,9 @@ func (st *tcpStream) enqueueDelivery(payload []byte) bool {
 // ends the receive side, so Receive returns every message recvQ holds and then
 // aether.ErrStreamOverrun, then writes the peer RESET(ResetFlowCtrl), which the
 // peer's handleReset reads as aether.ErrStreamOverrun, and takes the stream out
-// of the session (sendReset). The receive side ends first so the consumer's end
-// does not wait on that write. It runs on the readLoop, whose RESET write is the
-// same kind of write as its PONG and its refusal RESET (registerStream).
+// of the session (queueReset). The receive side ends first so the consumer's end
+// does not wait on that RESET. It runs on the readLoop, so the RESET goes to the
+// writeLoop through the control queue, as its PONG and its refusal RESET do.
 // No abuse is charged: an honest sender reaches it by sending faster than the
 // consumer reads.
 func (st *tcpStream) overrun(n int) {
@@ -369,7 +399,7 @@ func (st *tcpStream) overrun(n int) {
 	dbgTCP.Printf("enqueueDelivery: stream %d delivery queue full (%d bytes unread, next %d), resetting with ResetFlowCtrl",
 		st.streamID, st.recvQ.queuedBytes(), n)
 	st.closeRecvOnce()
-	_ = st.sendReset(aether.ResetFlowCtrl)
+	st.queueReset(aether.ResetFlowCtrl)
 }
 
 // sendReset moves the stream to reset, takes it out of the session (s.streams, the
@@ -392,6 +422,45 @@ func (st *tcpStream) overrun(n int) {
 // the write returns.
 func (st *tcpStream) sendReset(reason aether.ResetReason) error {
 	s := st.session
+	frame := st.leaveForReset(reason)
+	if frame == nil {
+		return nil
+	}
+	err := s.writeFrame(frame)
+	st.recvQ.peerEnded()
+	s.trackEnded(st.recvQ)
+	s.txCompressor.RemoveStream(st.streamID)
+	s.rxCompressor.RemoveStream(st.streamID)
+	return err
+}
+
+// queueReset is sendReset for a caller that must not wait on the conn: the readLoop
+// (overrun, and refuseUnaccepted through handleOpen) and the acceptor's backlog timer.
+// It hands the RESET to the writeLoop (queueControl), which writes it behind every
+// frame of the stream it had already taken, as sendReset's write is, and drops the
+// transmit compressor's state for the ID once it is written, since writing it as a
+// full frame records that state again (forgetTransmitState). The receive side's
+// state goes at once, as the peer's later frames for the stream decode the same
+// without it.
+func (st *tcpStream) queueReset(reason aether.ResetReason) {
+	s := st.session
+	frame := st.leaveForReset(reason)
+	if frame == nil {
+		return
+	}
+	st.recvQ.peerEnded()
+	s.trackEnded(st.recvQ)
+	s.rxCompressor.RemoveStream(st.streamID)
+	id := st.streamID
+	_ = s.queueControl(frame, func() { s.forgetTransmitState(id) })
+}
+
+// leaveForReset is the first half of sendReset and queueReset: under s.mu it moves the
+// stream to reset, takes it out of s.streams and the scheduler (releaseStream) and
+// records the hold on its ID, and it returns the RESET to write, or nil for a stream
+// that has already left the session.
+func (st *tcpStream) leaveForReset(reason aether.ResetReason) *aether.Frame {
+	s := st.session
 	s.mu.Lock()
 	if cur, ok := s.streams[st.streamID]; !ok || cur != st {
 		s.mu.Unlock()
@@ -404,19 +473,14 @@ func (st *tcpStream) sendReset(reason aether.ResetReason) error {
 	s.holdForResetLocked(st.streamID, st.incarnation)
 	s.mu.Unlock()
 	payload := aether.EncodeResetPayload(aether.ResetPayload{Reason: reason, Incarnation: st.incarnation})
-	err := s.writeFrame(&aether.Frame{
+	return &aether.Frame{
 		SenderID:   s.LocalPeerID(),
 		ReceiverID: s.RemotePeerID(),
 		StreamID:   st.streamID,
 		Type:       aether.TypeRESET,
 		Length:     uint32(len(payload)),
 		Payload:    payload,
-	})
-	st.recvQ.peerEnded()
-	s.trackEnded(st.recvQ)
-	s.txCompressor.RemoveStream(st.streamID)
-	s.rxCompressor.RemoveStream(st.streamID)
-	return err
+	}
 }
 
 // NewTCPSession creates an Aether session over a TCP-family connection.
@@ -474,7 +538,7 @@ func newTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 		opts:         opts,
 		streams:      make(map[uint64]*tcpStream),
 		sched:        scheduler.NewScheduler(),
-		out:          newSessionWriter(conn, base.CloseSignal()),
+		writeTurn:    make(chan struct{}, 1),
 		txCompressor: aether.NewCompressor(), // encode-side state
 		rxCompressor: aether.NewCompressor(), // decode-side state
 		tickStop:     make(chan struct{}),
@@ -483,19 +547,28 @@ func newTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 		prefaceWritten: make(chan struct{}),
 		prefaceTimeout: wireVersionsPrefaceTimeout,
 	}
+	// A write that starts once the session has closed (CloseWithError's RESETs of
+	// unaccepted streams) waits for the conn at most one keepalive probe's wait on
+	// this path, so a close on a conn that takes nothing still reaches its conn.Close.
+	s.out = newSessionWriter(conn, base.CloseSignal(), func() time.Duration {
+		return aether.KeepalivePlanFor(s).ProbeTimeout
+	})
+	s.control = make(chan controlWrite, s.streamCap())
 	s.joinPeerMemory(remoteNodeID, sharedPeer)
 	s.wireOffer, s.wireOfferErr = aether.LocalWireVersions(opts.WireVersions)
 	// Per-peer abuse tracker — per-session registry by default,
 	// overridable via SetAbuseScoreRegistry for cross-session scoring.
 	// The tracker wraps the registry plus the threshold-breaker
-	// GoAway + close hooks so reportAbuse stays a one-liner.
+	// GoAway + close hooks so reportAbuse stays a one-liner. The readLoop
+	// reports most abuse, so the GOAWAY goes through the control queue and the
+	// close follows it there (closeBehindControl).
 	s.abuseTracker = aether.NewAbuseTracker(
 		abuse.New[aether.NodeID](abuse.DefaultConfig()),
 		remoteNodeID,
 		func(reason aether.GoAwayReason, msg string) error {
-			return s.GoAway(context.Background(), reason, msg)
+			return aether.SendGoAway(s.queueControlFrame, s.LocalPeerID(), s.RemotePeerID(), s.layout.Control, reason, msg)
 		},
-		s.CloseWithError,
+		s.closeBehindControl,
 		dbgTCP.Printf,
 	)
 	// Per-StreamID accept dispatch + AcceptStream FIFO — shared
@@ -543,11 +616,11 @@ func newTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 	// through, so no transport can leak a deadline into a live session.
 	_ = conn.SetDeadline(time.Time{})
 
-	// The preface is the first thing written. Every frame write holds
-	// writeMu, so taking it here and releasing it in writePreface, once the
+	// The preface is the first thing written. Every frame write holds the
+	// write turn, so taking it here and releasing it in writePreface, once the
 	// preface write returns, orders the preface ahead of any frame whichever
 	// goroutine writes first.
-	s.writeMu.Lock()
+	s.writeTurn <- struct{}{}
 	s.wireTimer.Store(time.AfterFunc(s.prefaceTimeout, func() {
 		if s.finishWireVersions(aether.NegotiatedWireVersions{}, errWireVersionsPrefaceTimeout) {
 			s.CloseWithError(errWireVersionsPrefaceTimeout)
@@ -561,9 +634,9 @@ func newTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 }
 
 // writePreface writes this session's wire version preface, then releases
-// the writeMu newTCPSession took. A malformed local offer writes nothing.
+// the write turn newTCPSession took. A malformed local offer writes nothing.
 // A failed write ends the exchange, if it is still open, and closes the
-// session. writeMu is released before any close so the close path's own
+// session. The turn is released before any close so the close path's own
 // frame writes cannot wait on it.
 func (s *TCPSession) writePreface() {
 	err := s.wireOfferErr
@@ -573,7 +646,7 @@ func (s *TCPSession) writePreface() {
 			err = fmt.Errorf("wire versions preface write: %w", err)
 		}
 	}
-	s.writeMu.Unlock()
+	s.releaseWriteTurn()
 	close(s.prefaceWritten)
 	if err != nil {
 		s.finishWireVersions(aether.NegotiatedWireVersions{}, err)
@@ -854,7 +927,10 @@ func (s *TCPSession) registerStream(st *tcpStream, enforceRemoteCap bool) (*tcpS
 // It names the stream by the generation the peer's SYN stated, so it ends that
 // stream and no later one under the ID. The ID is held against a local OpenStream
 // until the peer acknowledges the refusal, as after sendReset: the peer's DATA
-// written behind its SYN may still be on the way.
+// written behind its SYN may still be on the way. Its callers run on the readLoop
+// (handleOpen, registerStream for a peer's open), so the refusal goes to the writeLoop
+// through the control queue, and the transmit compressor's state its full header
+// records goes once it is written (forgetTransmitState).
 func (s *TCPSession) sendRefused(streamID, generation uint64) {
 	inc := aether.StreamIncarnation{Generation: generation}
 	payload := aether.EncodeResetPayload(aether.ResetPayload{
@@ -864,14 +940,14 @@ func (s *TCPSession) sendRefused(streamID, generation uint64) {
 	s.mu.Lock()
 	s.holdForResetLocked(streamID, inc)
 	s.mu.Unlock()
-	s.writeFrame(&aether.Frame{
+	_ = s.queueControl(&aether.Frame{
 		SenderID:   s.LocalPeerID(),
 		ReceiverID: s.RemotePeerID(),
 		StreamID:   streamID,
 		Type:       aether.TypeRESET,
 		Length:     uint32(len(payload)),
 		Payload:    payload,
-	})
+	}, func() { s.forgetTransmitState(streamID) })
 }
 
 // streamCap is the session's MaxConcurrentStreams, DefaultTCPMaxConcurrentStreams
@@ -910,9 +986,12 @@ func (s *TCPSession) holdForResetLocked(id uint64, inc aether.StreamIncarnation)
 // session sets one (Send writes 0), and the short control form carries its own, so a
 // short header from the peer decodes the same without it.
 // No quiet time follows, unlike a Noise session's (NoiseSession.resetAcknowledged): the
-// peer writes the acknowledgment after its stream has left its scheduler, behind every
-// frame of that stream its writeLoop had taken (writeLoop), and the byte stream keeps
-// that order, so nothing of the old stream follows it. An acknowledgment of an earlier
+// peer queues the acknowledgment for its writeLoop only after its stream has left its
+// scheduler and s.streams (handleReset), so no frame of that stream can be queued behind
+// it, and its one writeLoop writes every frame it had already taken before it takes the
+// acknowledgment from the control queue (writeLoop holds the write turn from each
+// Dequeue through that frame's write). The byte stream keeps that order, so nothing of
+// the old stream follows the acknowledgment. An acknowledgment of an earlier
 // RESET under the ID, which a later one replaced, opens nothing. handleReset calls it
 // for a RESET flagged aether.FlagACK.
 func (s *TCPSession) resetAcknowledged(id uint64, inc aether.StreamIncarnation) {
@@ -930,13 +1009,17 @@ func (s *TCPSession) resetAcknowledged(id uint64, inc aether.StreamIncarnation) 
 // acknowledgeReset answers the peer's RESET under id with a RESET flagged
 // aether.FlagACK that names the stream as the RESET did, stating the same reason and
 // no counts (aether.ResetPayload), which ends the hold the peer keeps on the ID
-// (holdForResetLocked on the peer). handleReset calls it for every RESET, whatever it
-// finds, once the stream it ends has left the scheduler, so the acknowledgment is
-// written behind every frame of that stream this side wrote. It is written once: the
-// transport delivers it.
+// (holdForResetLocked on the peer). handleReset calls it on the readLoop for every
+// RESET, whatever it finds, once the stream it ends has left the scheduler, and it
+// queues the acknowledgment for the writeLoop (queueControl) rather than writing it, so
+// the readLoop goes on reading while the conn is full; the writeLoop writes it behind
+// every frame of that stream it had taken (resetAcknowledged on the peer reads that
+// order). It is written once: the transport delivers it. Once it is written, the
+// transmit compressor's state its full header recorded goes unless a stream holds the
+// ID again (forgetTransmitState).
 func (s *TCPSession) acknowledgeReset(id uint64, p aether.ResetPayload) {
 	payload := aether.EncodeResetPayload(aether.ResetPayload{Reason: p.Reason, Incarnation: p.Incarnation})
-	_ = s.writeFrame(&aether.Frame{
+	_ = s.queueControl(&aether.Frame{
 		SenderID:   s.LocalPeerID(),
 		ReceiverID: s.RemotePeerID(),
 		StreamID:   id,
@@ -944,7 +1027,21 @@ func (s *TCPSession) acknowledgeReset(id uint64, p aether.ResetPayload) {
 		Flags:      aether.FlagACK,
 		Length:     uint32(len(payload)),
 		Payload:    payload,
-	})
+	}, func() { s.forgetTransmitState(id) })
+}
+
+// forgetTransmitState drops the transmit compressor's state for id once a frame this
+// side wrote for an ID with no stream (an acknowledgment, a refusal, a queued RESET)
+// has gone: its full header recorded the state (RecordFullHeader), and an ID reset and
+// never reused would otherwise keep the entry for the session's life. A stream that
+// holds the ID again by then keeps its state. The writeLoop runs it after the write.
+func (s *TCPSession) forgetTransmitState(id uint64) {
+	s.mu.Lock()
+	_, live := s.streams[id]
+	s.mu.Unlock()
+	if !live {
+		s.txCompressor.RemoveStream(id)
+	}
 }
 
 // unregisterStream undoes registerStream — removes the stream from the
@@ -1037,14 +1134,16 @@ func (s *TCPSession) notifyStreamAccepted(st *tcpStream) {
 
 // refuseUnaccepted ends a stream the peer opened that the acceptor will not hold
 // (aether.StreamAcceptorConfig.Refuse): the FIFO is full, its claimed ID's backlog
-// is full, or the acceptor has closed. No consumer will ever read it, so Reset
-// writes RESET(ResetRefused), which the opener's Send and Receive read as
+// is full, or the acceptor has closed. No consumer will ever read it, so it queues
+// RESET(ResetRefused), which the opener's Send and Receive read as
 // aether.ErrStreamRefused, and takes the stream out of s.streams, the scheduler
-// and the stream GC, freeing its slot under the stream cap (sendReset). What its
-// queue holds is thrown away here and its cost leaves the session's ceiling and
+// and the stream GC, freeing its slot under the stream cap (queueReset), then ends
+// its receive side as Reset does. It runs on the readLoop (handleOpen's Notify) and
+// on the acceptor's backlog timer, so the RESET goes through the control queue. What
+// its queue holds is thrown away here and its cost leaves the session's ceiling and
 // the peer's (recvQueue.discard), not left there for the idle sweep to find:
 // Reset keeps it for a reader, and this stream has none; the empty queue then
-// leaves endedQueues, where sendReset's trackEnded put it. A TCP-family stream
+// leaves endedQueues, where queueReset's trackEnded put it. A TCP-family stream
 // keeps no aether credit, so discard's grant is nothing to return (the sweep
 // passes no grant on this session either).
 func (s *TCPSession) refuseUnaccepted(st aether.Stream) {
@@ -1052,7 +1151,8 @@ func (s *TCPSession) refuseUnaccepted(st aether.Stream) {
 	if !ok {
 		return
 	}
-	_ = ts.Reset(aether.ResetRefused)
+	ts.queueReset(aether.ResetRefused)
+	ts.closeRecvOnce()
 	ts.recvQ.discard()
 	s.forgetEnded(ts.recvQ)
 }
@@ -1176,9 +1276,10 @@ func (s *TCPSession) handleReset(frame *aether.Frame) {
 	}
 	s.mu.Unlock()
 	// The stream has left s.streams and the scheduler, so no frame of it is queued
-	// behind the acknowledgment (sendReset's order, from the peer's side).
+	// behind the acknowledgment (sendReset's order, from the peer's side). The
+	// transmit compressor's state goes once the acknowledgment is written
+	// (acknowledgeReset), the receive side's now.
 	s.acknowledgeReset(frame.StreamID, payload)
-	s.txCompressor.RemoveStream(frame.StreamID) // both directional compressors hold per-stream state
 	s.rxCompressor.RemoveStream(frame.StreamID)
 	if ok {
 		st.closeRecvOnce()
@@ -1223,16 +1324,18 @@ func (s *TCPSession) closedError() error {
 }
 
 // controlHandler returns a ControlFrameHandler bound to this session's
-// scheduler, health monitor and frame writer, for PING, PONG and PRIORITY. It
-// has no window to serve: this session's dispatchFrame never calls
-// HandleWindowUpdate, the one method that reads ConnWindow.
+// scheduler, health monitor and control queue, for PING, PONG and PRIORITY. Its
+// writer is queueControlFrame because the readLoop runs it: a PONG goes to the
+// writeLoop and the readLoop goes on reading. It has no window to serve: this
+// session's dispatchFrame never calls HandleWindowUpdate, the one method that
+// reads ConnWindow.
 // WakeScheduler is false because the TCP writeLoop runs on a 2 ms
 // ticker rather than blocking on Consume, so no writer waits for a wake.
 func (s *TCPSession) controlHandler() *aether.ControlFrameHandler {
 	return &aether.ControlFrameHandler{
 		HealthMon:         s.Health(),
 		Sched:             s.sched,
-		Writer:            s.writeFrame,
+		Writer:            s.queueControlFrame,
 		Sender:            s.LocalPeerID(),
 		Receiver:          s.RemotePeerID(),
 		KeepaliveStreamID: s.layout.Keepalive,
@@ -1270,118 +1373,256 @@ func (s *TCPSession) DeliveryStats() *DeliveryStats {
 // When multiple frames are queued, they're batched into a single write (0x85).
 // A short ticker (2ms) provides batching window — gives the scheduler a
 // chance to accumulate frames for coalescing — but the loop also consumes
-// the wake channel so it serves bursty traffic with minimal latency.
+// the wake channel so it serves bursty traffic with minimal latency. The
+// readLoop's answers (control) wake it too, and it writes them ahead of the
+// scheduler's frames on each turn (writeControl).
 //
 // A write that fails ends the session (failWrite): sessionWriter has already
 // retried a temporary error, and the transport carries frames in one sequence with
 // no retransmit, so the frame is lost and the conn's framing may be cut mid-frame.
 //
-// The loop holds writeMu from its Dequeue until the frames it took are written, so
-// a frame written straight through writeFrame never overtakes one the scheduler has
-// handed out: a frame still in the scheduler when its stream leaves it is dropped
-// (releaseStream), and one already taken is on the conn before the next writeFrame.
-// handleReset's acknowledgment relies on that to come after every frame of the
-// stream it ends, and sendReset's RESET and OpenStream's SYN to come after every
-// frame of the stream before them under the ID. failWrite runs after writeMu is
-// released, since the close path writes through writeFrame.
+// The loop holds the write turn from its Dequeue until the frames it took are
+// written, so a frame written straight through writeFrame never overtakes one the
+// scheduler has handed out: a frame still in the scheduler when its stream leaves it
+// is dropped (releaseStream), and one already taken is on the conn before the next
+// writeFrame. sendReset's RESET and OpenStream's SYN rely on that to come after every
+// frame of the stream before them under the ID, and the control queue's entries are
+// taken only between those turns, so handleReset's acknowledgment, queued once the
+// stream it ends has left the scheduler, comes after every frame of that stream.
+// failWrite runs after the turn is released, since the close path writes through
+// writeFrame.
 func (s *TCPSession) writeLoop() {
 	ticker := time.NewTicker(2 * time.Millisecond)
 	defer ticker.Stop()
 	wake := s.sched.WakeCh()
 	for {
+		var first *controlWrite
 		select {
 		case <-s.CloseSignal():
 			return
 		case <-ticker.C:
 		case <-wake:
+		case c := <-s.control:
+			first = &c
 		}
-
-		s.writeMu.Lock()
-		frame, _ := s.sched.Dequeue()
-		// isProbe is irrelevant for the TCP transport — TCP has its own
-		// kernel-level flow control and aether's cwnd is not enforced
-		// here. The signature is the scheduler's, kept consistent so a
-		// single call site doesn't have to special-case Dequeue per
-		// transport.
-		if frame == nil {
-			s.writeMu.Unlock()
-			continue
-		}
-
-		// Check for batch opportunity — coalesce up to 16 queued frames.
-		// Skip batching when the head frame is stream-0 (gossip): gossip
-		// frames are already ~64KB max-size chunks, so batching gains
-		// nothing in compression but extends the writeMu hold and HoL-
-		// blocks stream-1 (RPC). Releasing writeMu after every gossip
-		// frame lets stream-1 interleave instead of waiting for a 16-
-		// frame snapshot burst to drain. Skipping stream-0 batching
-		// gives per-frame fairness on the one shared writeMu; a
-		// writeLoop per class would give the same without the per-frame
-		// release.
-		// A batch is itself a short form (0x85), so only a session whose
-		// grammar has the short forms coalesces.
-		if s.opts.HeaderComp && s.txCompressor.ShortForms() && frame.StreamID != 0 && s.sched.Len() > 0 {
-			batch := []*aether.Frame{frame}
-			for s.sched.Len() > 0 && len(batch) < 16 {
-				next, _ := s.sched.Dequeue()
-				if next == nil {
-					break
-				}
-				batch = append(batch, next)
+		if first != nil || len(s.control) > 0 {
+			if !s.writeControl(first) {
+				return
 			}
-			if len(batch) > 1 {
-				_, err := s.txCompressor.EncodeBatch(s.out, batch) // encode-side state
-				s.writeMu.Unlock()
-				if err != nil {
-					dbgTCP.Printf("writeLoop: batch err=%v count=%d", err, len(batch))
-					s.failWrite(err)
-					return
-				}
-				for _, written := range batch {
-					s.frameWritten(written)
-				}
-				continue
-			}
-			// Only 1 frame — fall through to single write
-			frame = batch[0]
 		}
-
-		if s.opts.FrameLogging || frame.StreamID == 0 {
-			dbgTCP.Printf("writeLoop: TX stream=%d type=%d seq=%d len=%d",
-				frame.StreamID, frame.Type, frame.SeqNo, frame.Length)
-		}
-		err := s.encodeFrameLocked(frame)
-		s.writeMu.Unlock()
-		if err != nil {
-			dbgTCP.Printf("writeLoop: writeFrame err=%v stream=%d", err, frame.StreamID)
-			s.failWrite(err)
+		if !s.writeScheduled() {
 			return
 		}
-		s.frameWritten(frame)
 	}
+}
+
+// writeControl writes first and what else the control queue holds, up to its room,
+// under one write turn, then runs each entry's after with the turn released, since an
+// after may write (the abuse close's RESETs). It reports false once the loop is to
+// stop: the session closed, or a write failed and ended it (failWrite).
+func (s *TCPSession) writeControl(first *controlWrite) bool {
+	if s.takeWriteTurn(context.Background()) != nil {
+		return false
+	}
+	var afters []func()
+	next := first
+	for n := 0; n < cap(s.control); n++ {
+		if next == nil {
+			select {
+			case c := <-s.control:
+				next = &c
+			default:
+			}
+			if next == nil {
+				break
+			}
+		}
+		if next.frame != nil {
+			if err := s.encodeFrameLocked(next.frame); err != nil {
+				s.releaseWriteTurn()
+				dbgTCP.Printf("writeLoop: control write err=%v stream=%d", err, next.frame.StreamID)
+				s.failWrite(err)
+				return false
+			}
+		}
+		if next.after != nil {
+			afters = append(afters, next.after)
+		}
+		next = nil
+	}
+	s.releaseWriteTurn()
+	for _, after := range afters {
+		after()
+	}
+	return true
+}
+
+// writeScheduled takes the scheduler's next frame, or a batch of them, and writes it
+// under one write turn held from the Dequeue through the write (writeLoop's order). It
+// reports false once the loop is to stop.
+func (s *TCPSession) writeScheduled() bool {
+	if s.takeWriteTurn(context.Background()) != nil {
+		return false
+	}
+	frame, _ := s.sched.Dequeue()
+	// isProbe is irrelevant for the TCP transport — TCP has its own
+	// kernel-level flow control and aether's cwnd is not enforced
+	// here. The signature is the scheduler's, kept consistent so a
+	// single call site doesn't have to special-case Dequeue per
+	// transport.
+	if frame == nil {
+		s.releaseWriteTurn()
+		return true
+	}
+	if hook := s.afterDequeue.Load(); hook != nil {
+		(*hook)(frame)
+	}
+
+	// Check for batch opportunity — coalesce up to 16 queued frames.
+	// Skip batching when the head frame is stream-0 (gossip): gossip
+	// frames are already ~64KB max-size chunks, so batching gains
+	// nothing in compression but extends the write turn and HoL-
+	// blocks stream-1 (RPC). Releasing the turn after every gossip
+	// frame lets stream-1 interleave instead of waiting for a 16-
+	// frame snapshot burst to drain. Skipping stream-0 batching
+	// gives per-frame fairness on the one shared write turn; a
+	// writeLoop per class would give the same without the per-frame
+	// release.
+	// A batch is itself a short form (0x85), so only a session whose
+	// grammar has the short forms coalesces.
+	if s.opts.HeaderComp && s.txCompressor.ShortForms() && frame.StreamID != 0 && s.sched.Len() > 0 {
+		batch := []*aether.Frame{frame}
+		for s.sched.Len() > 0 && len(batch) < 16 {
+			next, _ := s.sched.Dequeue()
+			if next == nil {
+				break
+			}
+			batch = append(batch, next)
+		}
+		if len(batch) > 1 {
+			_, err := s.txCompressor.EncodeBatch(s.out, batch) // encode-side state
+			s.releaseWriteTurn()
+			if err != nil {
+				dbgTCP.Printf("writeLoop: batch err=%v count=%d", err, len(batch))
+				s.failWrite(err)
+				return false
+			}
+			for _, written := range batch {
+				s.frameWritten(written)
+			}
+			return true
+		}
+		// Only 1 frame — fall through to single write
+		frame = batch[0]
+	}
+
+	if s.opts.FrameLogging || frame.StreamID == 0 {
+		dbgTCP.Printf("writeLoop: TX stream=%d type=%d seq=%d len=%d",
+			frame.StreamID, frame.Type, frame.SeqNo, frame.Length)
+	}
+	err := s.encodeFrameLocked(frame)
+	s.releaseWriteTurn()
+	if err != nil {
+		dbgTCP.Printf("writeLoop: writeFrame err=%v stream=%d", err, frame.StreamID)
+		s.failWrite(err)
+		return false
+	}
+	s.frameWritten(frame)
+	return true
+}
+
+// queueControl hands frame to the writeLoop through the control queue and returns at
+// once while the queue has room, so a readLoop caller goes on reading; after runs once
+// the frame is written, with the write turn released. On a full queue it waits for
+// room or the session's close. On a closed session it queues nothing and answers
+// aether.ErrSessionClosed: the writeLoop has stopped.
+func (s *TCPSession) queueControl(frame *aether.Frame, after func()) error {
+	select {
+	case <-s.CloseSignal():
+		return aether.ErrSessionClosed
+	default:
+	}
+	select {
+	case s.control <- controlWrite{frame: frame, after: after}:
+		return nil
+	case <-s.CloseSignal():
+		return aether.ErrSessionClosed
+	}
+}
+
+// queueControlFrame is queueControl with nothing to run after the write: the
+// aether.FrameWriter of the readLoop's control handler (PONG) and of the abuse
+// tracker's GOAWAY.
+func (s *TCPSession) queueControlFrame(frame *aether.Frame) error {
+	return s.queueControl(frame, nil)
+}
+
+// closeBehindControl is the abuse tracker's close: it queues the session's close behind
+// the GOAWAY the tracker has just queued, so the peer reads why before the conn ends,
+// and the reporter, the readLoop for most abuse, does not wait on the conn. A peer that
+// reads nothing keeps the close waiting until the session's keepalive lets it go.
+func (s *TCPSession) closeBehindControl(err error) error {
+	if qerr := s.queueControl(nil, func() { _ = s.CloseWithError(err) }); qerr != nil {
+		return s.CloseWithError(err)
+	}
+	return nil
+}
+
+// takeWriteTurn waits for the write turn under ctx: it answers ctx's error when ctx
+// ends first, and closedError when the session closes while it waits, so a writer
+// behind a write the conn holds returns at its own context's end and none waits on a
+// closed session. A free turn is taken whatever the session's state, so the RESETs
+// CloseWithError writes still reach a conn that takes them.
+func (s *TCPSession) takeWriteTurn(ctx context.Context) error {
+	select {
+	case s.writeTurn <- struct{}{}:
+		return nil
+	default:
+	}
+	select {
+	case s.writeTurn <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.CloseSignal():
+		return s.closedError()
+	}
+}
+
+// releaseWriteTurn gives the write turn back; the holder calls it once per take.
+func (s *TCPSession) releaseWriteTurn() {
+	<-s.writeTurn
 }
 
 // writeFrame serializes and writes a single frame to the TCP connection.
 // With opts.HeaderComp it takes a short form when the TX Compressor admits
 // one, which it does only on a session whose chosen set has frame.short.
 func (s *TCPSession) writeFrame(frame *aether.Frame) error {
-	err := s.encodeFrame(frame)
+	return s.writeFrameCtx(context.Background(), frame)
+}
+
+// writeFrameCtx is writeFrame under the caller's context: it waits for the write turn
+// under ctx, and its write gives up at ctx's end while no byte of the frame has reached
+// the conn (sessionWriter.beginFrame), answering ctx's error with the session open and
+// its framing whole. Once part of the frame is on the conn the frame is written whole.
+// Ping, OpenStream's SYN and GoAway write through it. Its failure path runs with the
+// turn released, because the close path's own frame writes take the turn.
+func (s *TCPSession) writeFrameCtx(ctx context.Context, frame *aether.Frame) error {
+	if err := s.takeWriteTurn(ctx); err != nil {
+		return err
+	}
+	s.out.beginFrame(ctx)
+	err := s.encodeFrameLocked(frame)
+	s.out.endFrame()
+	s.releaseWriteTurn()
 	if err != nil && s.out.failed() {
 		s.failWrite(err)
 	}
 	return err
 }
 
-// encodeFrame is writeFrame's encoding under writeMu. writeFrame's failure path runs
-// outside it, because the close path's own frame writes take writeMu.
-func (s *TCPSession) encodeFrame(frame *aether.Frame) error {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	return s.encodeFrameLocked(frame)
-}
-
-// encodeFrameLocked encodes frame onto the conn; the caller holds writeMu
-// (encodeFrame, and writeLoop across its Dequeue).
+// encodeFrameLocked encodes frame onto the conn; the caller holds the write turn
+// (writeFrameCtx, writeControl, and writeScheduled across its Dequeue).
 func (s *TCPSession) encodeFrameLocked(frame *aether.Frame) error {
 	if s.opts.HeaderComp {
 		// All encoding goes through the TX-side compressor state (txCompressor).
@@ -1532,7 +1773,7 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 		Length:     uint32(len(openPayload)),
 		Payload:    openPayload,
 	}
-	if err := s.writeFrame(frame); err != nil {
+	if err := s.writeFrameCtx(ctx, frame); err != nil {
 		return nil, fmt.Errorf("send SYN+DATA: %w", err)
 	}
 
@@ -1578,10 +1819,12 @@ func (s *TCPSession) AcceptStreamByID(ctx context.Context, streamID uint64) (aet
 // Ping sends a PING frame and waits for inbound activity (PONG or any
 // other frame) before reporting RTT. Delegates to
 // aether.WaitForActivityPing for the polling loop — see that helper
-// for the zombie-session detection rationale.
+// for the zombie-session detection rationale. The PING is written under ctx
+// (writeFrameCtx), so a keepalive probe on a conn that takes nothing returns at
+// its context's end and counts as unanswered (aether.RunKeepalive).
 func (s *TCPSession) Ping(ctx context.Context) (time.Duration, error) {
 	return aether.WaitForActivityPing(ctx, s.Health(), s.CloseSignal(), func(seqNo uint32) error {
-		return s.writeFrame(&aether.Frame{
+		return s.writeFrameCtx(ctx, &aether.Frame{
 			SenderID:   s.LocalPeerID(),
 			ReceiverID: s.RemotePeerID(),
 			StreamID:   s.layout.Keepalive,
@@ -1591,8 +1834,10 @@ func (s *TCPSession) Ping(ctx context.Context) (time.Duration, error) {
 	})
 }
 
+// GoAway writes GOAWAY(reason, message) to the peer under ctx (writeFrameCtx).
 func (s *TCPSession) GoAway(ctx context.Context, reason aether.GoAwayReason, message string) error {
-	return aether.SendGoAway(s.writeFrame, s.LocalPeerID(), s.RemotePeerID(), s.layout.Control, reason, message)
+	write := func(frame *aether.Frame) error { return s.writeFrameCtx(ctx, frame) }
+	return aether.SendGoAway(write, s.LocalPeerID(), s.RemotePeerID(), s.layout.Control, reason, message)
 }
 
 func (s *TCPSession) Close() error {
