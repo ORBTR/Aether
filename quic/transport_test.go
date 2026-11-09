@@ -10,6 +10,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"testing"
+	"time"
 
 	"github.com/ORBTR/aether"
 	"github.com/ORBTR/aether/quality"
@@ -24,14 +25,15 @@ func generateTestKey(t *testing.T) ed25519.PrivateKey {
 	return priv
 }
 
-// TestConnectionConfig_ComesFromTheKeepalivePlan: Dial and Listen's quic-go keepalive
-// and idle timeout are the plan for a path with nothing measured, whatever a config's
-// KeepAlive field holds.
+// TestConnectionConfig_ComesFromTheKeepalivePlan: Dial and Listen's quic-go keepalive is
+// the plan's Interval for a path with nothing measured, and the idle timeout is the
+// longest DeadPeerBound any plan can hold: no plan the session keepalive derives from its
+// own round trips, loss and stability is cut short by the connection going idle first,
+// and the timeout is no longer than the longest of them.
 func TestConnectionConfig_ComesFromTheKeepalivePlan(t *testing.T) {
 	tr, err := NewQuicTransport(QuicTransportConfig{
 		LocalNode:  "test-node-id",
 		PrivateKey: generateTestKey(t),
-		KeepAlive:  12345,
 	})
 	if err != nil {
 		t.Fatalf("new transport: %v", err)
@@ -41,8 +43,29 @@ func TestConnectionConfig_ComesFromTheKeepalivePlan(t *testing.T) {
 	if got.KeepAlivePeriod != plan.Interval {
 		t.Fatalf("KeepAlivePeriod %v, want the plan's Interval %v", got.KeepAlivePeriod, plan.Interval)
 	}
-	if got.MaxIdleTimeout != plan.DeadPeerBound() {
-		t.Fatalf("MaxIdleTimeout %v, want the plan's DeadPeerBound %v", got.MaxIdleTimeout, plan.DeadPeerBound())
+	var longest time.Duration
+	for _, path := range []quality.KeepaliveInputs{
+		{},
+		{SRTT: time.Millisecond, RTO: 200 * time.Millisecond, Samples: 8},
+		{SRTT: 4 * time.Second, RTO: 2 * time.Second, Samples: 20},
+		{SRTT: time.Hour, RTO: time.Hour, Samples: 100},
+	} {
+		for step := 0; step <= 20; step++ {
+			for _, instability := range []float64{0, 0.5, 1} {
+				in := path
+				in.Loss, in.Instability = float64(step)/20, instability
+				bound := quality.Keepalive(in).DeadPeerBound()
+				if got.MaxIdleTimeout < bound {
+					t.Fatalf("MaxIdleTimeout %v ends a session whose plan (inputs %+v) holds its peer for %v", got.MaxIdleTimeout, in, bound)
+				}
+				if bound > longest {
+					longest = bound
+				}
+			}
+		}
+	}
+	if got.MaxIdleTimeout != longest {
+		t.Fatalf("MaxIdleTimeout %v, want the longest DeadPeerBound a plan holds, %v", got.MaxIdleTimeout, longest)
 	}
 }
 

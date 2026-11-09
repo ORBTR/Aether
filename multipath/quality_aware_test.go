@@ -277,7 +277,7 @@ func TestStop_TerminatesEnsureGoroutine(t *testing.T) {
 // TestPickByQuality_SkipsFlappingAndDeadPaths is the AE-M-10 regression.
 // PickByQuality must not hand back a session on a PathDead or PathFlapping
 // path (both keep a live session — a flapping path's Ping still succeeds,
-// a dead path within deadResurrectCooldown too), which would silently
+// a dead path within deadPathWaitLocked too), which would silently
 // defeat the flapping demote and primary-failure failover. It must also
 // resurrect flapping paths whose demote window has elapsed so a recovered
 // path is selectable again.
@@ -341,7 +341,7 @@ func TestPickByQuality_SkipsFlappingAndDeadPaths(t *testing.T) {
 		t.Errorf("Case A (flapping): want WS session ok=true, got=%v ok=%v", got, ok)
 	}
 
-	// Case B — dead path within deadResurrectCooldown (session still
+	// Case B — dead path within deadPathWaitLocked (session still
 	// alive) must be shunned.
 	noisePath.State = PathDead
 	noisePath.flappingUntil = time.Time{}

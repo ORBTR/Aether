@@ -15,17 +15,10 @@ package nat
 import (
 	"context"
 	"errors"
-
-	aether "github.com/ORBTR/aether"
 )
 
 // StrategyConfig wires together the components a Strategy needs.
 type StrategyConfig struct {
-	// STUN is read by nothing in this package: a Strategy decides from the
-	// NATBehaviour its caller passes and runs no discovery of its own.
-	// TODO: remove this field once the two composers outside this repository that
-	// set it, the mesh runtime and the endpoint agent's transport, stop setting it.
-	STUN       aether.STUNClient
 	PortMapper PortMapper // pass NullPortMapper{} when none configured
 }
 

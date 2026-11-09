@@ -39,6 +39,8 @@ Transports with native capabilities (QUIC, TCP) skip the redundant Aether layers
 
 ### 1.1 Header Layout (50 bytes)
 
+On the wire every full frame begins with one discriminator byte, `0x01` (`FullFrameDiscriminator`, `codec.go`), and the 50-byte header follows it unchanged, so a full frame occupies 51 bytes before its payload (`FullFrameHeaderWireSize`). The offsets below count from the first header byte, after the discriminator. A first byte that is neither the discriminator nor a short form the session negotiated (section 23) is refused with `ErrFrameDiscriminator` after that one byte is read.
+
 ```
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
@@ -89,9 +91,9 @@ All multi-byte fields are **big-endian** (network byte order).
 
 ### 1.4 Maximum Frame Size
 
-- Header: 50 bytes (fixed)
+- Header: 50 bytes (fixed), behind the 1-byte discriminator: 51 bytes before the payload on the wire
 - Payload: 0 to 16,777,216 bytes
-- Maximum total frame: 16,777,266 bytes
+- Maximum total frame: 16,777,267 bytes on the wire (discriminator, header and payload)
 - AEAD overhead: 16 bytes (Poly1305 auth tag, included in Length when ENCRYPTED)
 
 ---
@@ -649,7 +651,7 @@ If two or more frames are missing in the same sub-group, FEC cannot recover — 
 
 ### 11.8 Disabled Streams
 
-FEC is disabled (FECNone) on streams used for gossip, keepalive, and control. These streams have application-level recovery: gossip re-syncs every 10-30s, keepalive retries 3 times before declaring dead, and control has its own handshake retry logic. Disabling FEC on these streams saves 200-600 KB per Noise connection.
+FEC is disabled (FECNone) on streams used for gossip, keepalive, and control. These streams have application-level recovery: gossip re-syncs every 10-30s, the keepalive probes again up to its plan's Strikes in a row before it lets the peer go (`quality.Keepalive`), and control has its own handshake retry logic. Disabling FEC on these streams saves 200-600 KB per Noise connection.
 
 ---
 
@@ -836,19 +838,17 @@ Transports are classified by their packet-level behavior. The class determines p
 
 | Value | Class | Transports | Description |
 |-------|-------|-----------|-------------|
-| 0 | ClassRAW | Noise-UDP, QUIC | Packet-oriented. Full Aether protocol with aggressive retransmit and congestion control. |
-| 1 | ClassSTREAM | TCP, TLS | Byte-stream. Conservative retransmit (TCP handles). |
-| 2 | ClassPROXY | WebSocket, gRPC | Proxy-buffered. No retransmit (transport handles), reduced max frame size. |
+| 0 | ClassRAW | Noise-UDP, QUIC | Packet-oriented. MTU-safe frame ceiling. |
+| 1 | ClassSTREAM | TCP, TLS | Byte-stream. Large frame ceiling. |
+| 2 | ClassPROXY | WebSocket, gRPC | Proxy-buffered. Reduced frame ceiling. |
 
 ### 16.2 Per-Class Defaults
 
 | Parameter | ClassRAW | ClassSTREAM | ClassPROXY |
 |-----------|----------|-------------|------------|
 | MaxFrameSize | 1,400 bytes | 65,536 bytes | 32,768 bytes |
-| RetransmitEnabled | Yes | No | No |
-| AggressiveRetransmit | Yes | No | No |
 
-No class fixes a keepalive: `quality.Keepalive` derives the probe interval, probe timeout and dead-peer bound from the session's own round trips, on every class.
+No class decides retransmission: a session acknowledges and retransmits under its reliability profile, the Full profile on Noise and the Lite profile on the natively reliable transports (section 17). No class fixes a keepalive: `quality.Keepalive` derives the probe interval, probe timeout and dead-peer bound from the session's own round trips, on every class.
 
 Implementation: `transport_class.go`
 
@@ -918,7 +918,7 @@ Relay nodes can inspect `SenderID` and `ReceiverID` for routing decisions withou
 | Frame validate failure (unknown Type, oversize, etc.) | Drop frame + `reportAbuse(ReasonMalformedFrame)` |
 | AEAD auth failure | Drop frame + `reportAbuse(ReasonDecryptFail)` (tampered or replayed) |
 | GOAWAY received | Stop opening new streams, drain existing |
-| Keepalive timeout (3 x interval) | Close connection |
+| Keepalive: the plan's Strikes probes in a row unanswered, within the plan's `DeadPeerBound` (`quality.Keepalive`) | Close session with `ErrKeepaliveDeadline` |
 | Anti-replay rejection | Drop frame + `reportAbuse(ReasonReplayDetected)` |
 | Stream-cap overflow | Send RESET(Refused) + `reportAbuse(ReasonStreamRefused)` |
 | Composite ACK guard tripped (§34 S1) | Drop ACK + `reportAbuse(ReasonACKValidation)` |
@@ -989,13 +989,15 @@ Implementation: `migration/migration.go`.
 
 ## 23. Short Headers (v2)
 
-After session establishment, most frames can use compact short headers instead of the full 50-byte header. The first byte (indicator) determines the format. Indicators in the range `0x00`-`0x7F` are interpreted as a full 50-byte header (the first byte falls within valid Type values). Indicators `0x82`-`0x87` select a short header format.
+After session establishment, most frames can use compact short headers instead of the full 50-byte header. The first byte (indicator) alone determines the format. `0x01` (`FullFrameDiscriminator`) is a full frame: the 50-byte header follows it (section 1.1). Indicators `0x82`-`0x88` select a short header format, and are read only on a session that negotiated `frame.short` (section 15). Every other first byte, and a short form on a session without them, is refused with `ErrFrameDiscriminator` after that one byte is read.
 
 ### 23.1 Indicator Byte Registry
 
 | Range | Meaning |
 |-------|---------|
-| `0x00`-`0x7F` | Full 50-byte header (byte is the Type field) |
+| `0x00` | Refused (`ErrFrameDiscriminator`) |
+| `0x01` | Full frame discriminator (`FullFrameDiscriminator`): the 50-byte header follows |
+| `0x02`-`0x7F` | Refused (`ErrFrameDiscriminator`) |
 | `0x80`-`0x81` | Reserved (v1 deleted indicators, never reuse) |
 | `0x82` | Data short header |
 | `0x83` | Control short header |
@@ -1003,15 +1005,16 @@ After session establishment, most frames can use compact short headers instead o
 | `0x85` | Batch short header |
 | `0x86` | Data varint header |
 | `0x87` | Encrypted data short header |
-| `0x88`-`0x8F` | Reserved for future short header formats (detection range) |
-| `0x90`-`0xF7` | Reserved (not matched by `IsShortHeader`) — currently routed to full-header decode + will fail Type check; do not use for new header formats without updating the detection range |
+| `0x88` | ACK-full short header |
+| `0x89`-`0x8F` | Reserved for future short header formats (detection range) |
+| `0x90`-`0xF7` | Reserved (not matched by `IsShortHeader`) — refused (`ErrFrameDiscriminator`); do not use for new header formats without updating the detection range |
 | `0xF8`-`0xFA` | Reserved — resume sub-protocol prefixes (`resumeAcceptPrefix`=0xF8, `resumeRejectPrefix`=0xF9, `resumePrefix`=0xFA) — see §31 |
 | `0xFB`-`0xFC` | Reserved |
 | `0xFD` | `dialNoncePrefix` — routes handshake responses via pending-dial table, see `noise/session.go` |
 | `0xFE` | `retryPrefix` — S3 stateless retry cookie, see §34.2 |
 | `0xFF` | Reserved (v1 deleted indicator, never reuse) |
 
-**Detection range**: `IsShortHeader(b)` in `codec_short.go` returns true only for `0x82 <= b <= 0x8F`. Bytes `0x90`-`0xF7` are NOT detected as short headers — they fall through to the full-header decode path, which will fail `Type.IsValid()` and route to abuse scoring via `Frame.Validate()`. Bytes `0xF8`-`0xFE` are intercepted by the UDP listener (`noise/session.go:runReader`) for the resume / retry / dial-nonce sub-protocols BEFORE reaching the Aether codec.
+**Detection range**: `IsShortHeader(b)` in `codec_short.go` returns true only for `0x82 <= b <= 0x8F`. `IsShortHeader` is not the test of a frame's form: `ReadNextFrame` (`frame_reader.go`) reads `0x01` as a full frame and the short forms the session negotiated as short, and refuses every other first byte with `ErrFrameDiscriminator`, `0x90`-`0xF7` included. Bytes `0xF8`-`0xFE` are intercepted by the UDP listener (`noise/session.go:runReader`) for the resume / retry / dial-nonce sub-protocols BEFORE reaching the Aether codec.
 
 ### 23.2 Short Header Formats
 
@@ -1019,10 +1022,11 @@ After session establishment, most frames can use compact short headers instead o
 |:-:|--------|:-:|----------|
 | `0x82` | Data short | 9 bytes | Unencrypted DATA, uint16 StreamID + uint32 Length |
 | `0x83` | Control short | 8 bytes | PING/PONG/CLOSE/RESET with no payload, SeqNo carried (CLOSE and RESET always carry a payload in frame grammar 5, so neither takes it) |
-| `0x84` | ACK short | 11 bytes (lite) or 3+N (full) | Composite ACK |
+| `0x84` | ACK short | 11 bytes | Composite ACK with no gaps (lite) |
 | `0x85` | Batch | 2+N x sub | Multiple frames per write |
 | `0x86` | Data varint | 6-10 bytes | Small DATA, varint Length |
 | `0x87` | Encrypted data | 9 bytes | Encrypted DATA, Nonce-in-payload |
+| `0x88` | ACK full | 5+N bytes | Composite ACK with gaps or extensions (full) |
 
 #### 23.2.1 Data Short (`0x82`) — 9 bytes
 
@@ -1049,7 +1053,7 @@ Implementation: `codec_short.go` — `ShortDataSize = 9`, field at offset [3:5] 
 - No payload, no Length; `[indicator:1][type:1][streamID:2][seqNo:4]`, which carries PING/PONG correlation. A CLOSE or RESET carries its incarnation in frame grammar 5, so it never takes this form, and a payload-less CLOSE or RESET decoded from it is refused as malformed
 - Used for high-frequency keepalive without header overhead
 
-#### 23.2.3 ACK Short (`0x84`) — 11 bytes (lite) or 3+N (full)
+#### 23.2.3 ACK Short (`0x84` lite, 11 bytes; `0x88` full, 5+N bytes)
 
 **ACK-lite (no gaps):**
 ```
@@ -1059,9 +1063,9 @@ Total: 11 bytes
 
 **ACK-full (gaps exist):**
 ```
-[0x84:1][StreamID:2][BaseACK:4][AckDelay:2][BitmapLen:1][Bitmap:N][Flags:1][extensions...]
+[0x88:1][StreamID:2][Length:2][CompositeACK payload:Length]
 ```
-Total: 3 + CompositeACK payload size
+Total: 5 + CompositeACK payload size. Lite and full have distinct indicators, so the decoder never infers the layout from payload bytes; a payload longer than 65,535 bytes is refused (`ErrShortFormOverflow`) and the ACK goes as a full frame.
 
 - Composite ACK payload format is identical to section 2.8
 - StreamID identifies which stream is being acknowledged
@@ -1251,7 +1255,7 @@ Each fragment is a separate Aether frame with its own SeqNo. The existing reliab
 
 ### 24.6 Small Payload Fast Path
 
-Payloads smaller than `MSS - overhead` (where overhead = 50-byte Aether header + 16-byte Noise encryption tag) take the existing single-frame path with zero fragmentation overhead.
+Payloads up to `MSS - overhead` (where overhead = the 51-byte full frame header on the wire, the 1-byte discriminator and the 50-byte header, plus the 16-byte AEAD tag; `MSSToMaxPayload`) take the existing single-frame path with zero fragmentation overhead.
 
 ---
 

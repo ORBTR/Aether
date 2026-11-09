@@ -8,29 +8,25 @@ import (
 	"time"
 )
 
-// TransportConfig tunes VL1 transport behaviour.
+// TransportConfig tunes VL1 transport behaviour. It carries no keepalive, suspect
+// or dead timing: a session's probe interval, probe timeout and dead-peer bound are
+// the plan KeepalivePlanFor derives from its own round trips.
 type TransportConfig struct {
-	DialTimeout       time.Duration
-	HandshakeTimeout  time.Duration
-	KeepAliveInterval time.Duration
-	SuspectTimeout    time.Duration
-	DeadTimeout       time.Duration
-	MaxPathCount      int
-	STUN              STUNConfig // STUN NAT detection configuration
+	DialTimeout      time.Duration
+	HandshakeTimeout time.Duration
+	MaxPathCount     int
+	STUN             STUNConfig // STUN NAT detection configuration
 }
 
-// DefaultTransportConfig returns the dial, handshake, keepalive, suspect and
-// dead timings, the path count and the STUN settings a VL1 transport runs
-// with when its consumer sets none; no caller in this repository reads it.
+// DefaultTransportConfig returns the dial and handshake timings, the path count
+// and the STUN settings a VL1 transport runs with when its consumer sets none; no
+// caller in this repository reads it.
 func DefaultTransportConfig() TransportConfig {
 	return TransportConfig{
-		DialTimeout:       5 * time.Second,
-		HandshakeTimeout:  3 * time.Second,
-		KeepAliveInterval: 5 * time.Second,
-		SuspectTimeout:    10 * time.Second,
-		DeadTimeout:       20 * time.Second,
-		MaxPathCount:      3,
-		STUN:              DefaultSTUNConfig(),
+		DialTimeout:      5 * time.Second,
+		HandshakeTimeout: 3 * time.Second,
+		MaxPathCount:     3,
+		STUN:             DefaultSTUNConfig(),
 	}
 }
 

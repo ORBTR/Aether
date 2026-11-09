@@ -108,7 +108,10 @@ func TestAckDelayBound_IsThePeersMaxAckDelay(t *testing.T) {
 // TestHandleACK_DelayPastTheBoundCountsAsPathTime: an ACK reporting more delay than the
 // peer's bound takes only the bound off its RTT sample, so a peer that overstates its
 // delay cannot talk SRTT down. The first frame seeds SRTT and min_rtt near 50 ms; the
-// second took 200 ms and its ACK claims 150 ms of that, against a 25 ms bound.
+// second took 200 ms and its ACK claims 100 ms of that, against a 25 ms bound. The
+// estimator keeps the raw sample whenever taking the delay off would leave it under
+// min_rtt (rtt.Estimator.UpdateWithDelay); 200 ms less the whole 100 ms claim stays well
+// above min_rtt, so that guard never decides this sample and only the bound does.
 func TestHandleACK_DelayPastTheBoundCountsAsPathTime(t *testing.T) {
 	s := &NoiseSession{streams: make(map[uint64]*noiseStream)}
 	s.SetCongestionController(congestion.NewCUBICController())
@@ -140,7 +143,7 @@ func TestHandleACK_DelayPastTheBoundCountsAsPathTime(t *testing.T) {
 	if seeded < 50*time.Millisecond {
 		t.Fatalf("premise wrong: the first sample left SRTT at %v", seeded)
 	}
-	ackAfter(200*time.Millisecond, 150*time.Millisecond)
+	ackAfter(200*time.Millisecond, 100*time.Millisecond)
 	// 7/8 of the old SRTT and 1/8 of a sample of at least 200-25 ms.
 	want := seeded*7/8 + 175*time.Millisecond/8
 	if got := st.rtt.SRTT(); got < want {
