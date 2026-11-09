@@ -9,6 +9,7 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -17,6 +18,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ORBTR/aether"
+	"github.com/ORBTR/aether/flow"
 )
 
 // TestNoiseStream_ASendOnAClosedSessionIsTyped: once a NoiseSession closes, a Send
@@ -45,7 +49,11 @@ func TestNoiseStream_ASendOnAClosedSessionIsTyped(t *testing.T) {
 // and leaves the connection window as it found it: the bytes it charged come back
 // once, by releaseInFlight, and not a second time by Send's own release, which would
 // hand the session credit another stream still holds (here a message the peer has
-// not read).
+// not read). The scheduler's exit here has no RESET settlement before it, so the test
+// waits for the stream's own grant of its opening message as well as the connection's:
+// releaseInFlight returns the stream window's whole outstanding count to the
+// connection window, and a stream grant still on its way when the scheduler lets the
+// stream go would count bytes whose connection grant has already come back.
 func TestNoiseStream_ASendTheSchedulerRefusesIsRefusedAndReturnsItsCredit(t *testing.T) {
 	client, server := noisePairWithRealms(t, nil, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -58,6 +66,9 @@ func TestNoiseStream_ASendTheSchedulerRefusesIsRefusedAndReturnsItsCredit(t *tes
 	}
 	held := messageCredit(int64(len(unread)))
 	waitSendWindowEmpty(t, cs, "the opening message acknowledged")
+	waitFor(t, "the stream's grant of the opening message", func() bool {
+		return cs.window.Outstanding() == 0
+	})
 	waitFor(t, "the connection charge down to the unread message", func() bool {
 		return client.connWindow.Stats().Outstanding == held
 	})
@@ -70,6 +81,126 @@ func TestNoiseStream_ASendTheSchedulerRefusesIsRefusedAndReturnsItsCredit(t *tes
 	}
 	if got := cs.window.Outstanding(); got != 0 {
 		t.Fatalf("stream credit outstanding %d after the refused Send, want 0", got)
+	}
+}
+
+// TestNoiseStream_ACloseWakesASendWaitingForCredit: a Send waiting for stream credit,
+// its peer reading nothing, returns aether.ErrSessionClosed as soon as its session
+// closes, rather than waiting out flow.ConsumeTimeout and answering backpressure: the
+// close ends the credit wait (flow.StreamWindow.ConsumeUntil).
+func TestNoiseStream_ACloseWakesASendWaitingForCredit(t *testing.T) {
+	client, server := noisePairWithRealms(t, nil, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	cs, _ := openWithCredit(t, ctx, client, server, 968, 0)
+	done := make(chan error, 1)
+	go func() {
+		for {
+			if err := cs.Send(ctx, make([]byte, 900)); err != nil {
+				done <- err
+				return
+			}
+		}
+	}()
+	waitFor(t, "the stream's credit spent", func() bool { return cs.window.Available() < messageCredit(900) })
+	time.Sleep(100 * time.Millisecond) // the next Send is in its credit wait
+	start := time.Now()
+	_ = client.Close()
+	select {
+	case err := <-done:
+		if !errors.Is(err, aether.ErrSessionClosed) || errors.Is(err, flow.ErrCreditExhausted) {
+			t.Fatalf("the waiting Send returned %v, want aether.ErrSessionClosed", err)
+		}
+		if took := time.Since(start); took >= flow.ConsumeTimeout/2 {
+			t.Fatalf("the waiting Send returned %s after the close", took)
+		}
+	case <-time.After(flow.ConsumeTimeout / 2):
+		t.Fatalf("a Send waiting for credit still blocked %s after its session closed", flow.ConsumeTimeout/2)
+	}
+}
+
+// TestNoiseStream_ASendPastItsCheckWhenAResetEndsTheStreamReturnsItsCredit: a Send
+// that passed its state check before a RESET ended the stream, and charges its credit
+// after the RESET's settlement, gives that credit back whether its frame reached the
+// scheduler before the stream left it or after: a RESET's exit takes the stream out of
+// the scheduler before it returns what the stream still holds
+// (leaveSchedulerThenSettle). The test runs, at the exit's last point before the
+// scheduler exit, what such a Send does once its stream credit is charged and its last
+// state check passed (sendStreamCharged), for this side's Reset and for the peer's
+// RESET, and the connection charge comes back to what it was.
+func TestNoiseStream_ASendPastItsCheckWhenAResetEndsTheStreamReturnsItsCredit(t *testing.T) {
+	for _, byPeer := range []bool{false, true} {
+		name := "this side's Reset"
+		if byPeer {
+			name = "the peer's RESET"
+		}
+		t.Run(name, func(t *testing.T) {
+			client, server := noisePairWithRealms(t, nil, nil)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			cs, ss := openWithCredit(t, ctx, client, server, 970, 0)
+			waitSendWindowEmpty(t, cs, "the opening message acknowledged")
+			waitFor(t, "the opening message's grants", func() bool {
+				return cs.window.Outstanding() == 0 && client.connWindow.Stats().Outstanding == 0
+			})
+			ran := make(chan error, 1)
+			msg := []byte("past its check")
+			hook := func() {
+				n := messageCredit(int64(len(msg)))
+				if err := cs.window.Consume(ctx, n); err != nil {
+					ran <- err
+					return
+				}
+				ran <- cs.sendStreamCharged(ctx, msg, n)
+			}
+			cs.beforeSchedulerExit.Store(&hook)
+			if byPeer {
+				_ = ss.Reset(aether.ResetCancel)
+			} else {
+				_ = cs.Reset(aether.ResetCancel)
+			}
+			select {
+			case err := <-ran:
+				t.Logf("the Send past its check returned %v", err)
+			case <-time.After(10 * time.Second):
+				t.Fatal("the RESET's exit never reached its scheduler exit")
+			}
+			waitFor(t, "the connection charge back to none", func() bool { return client.connWindow.Stats().Outstanding == 0 })
+			waitFor(t, "the session's in-flight count back to none", func() bool { return client.inFlightBytes.Load() == 0 })
+		})
+	}
+}
+
+// TestNoiseStream_AResetStreamQueuesNothingUnderTheIDsNextStream: a frame of a stream
+// the session no longer holds under its ID, as from a Send that passed its checks
+// before a RESET and resumes after the ID's next stream has opened, is refused and
+// leaves the next stream's scheduler queue as it was: the scheduler keys its queues by
+// ID, and the frame is numbered in the old stream's sequence (queueFrame).
+func TestNoiseStream_AResetStreamQueuesNothingUnderTheIDsNextStream(t *testing.T) {
+	client, server := noisePairWithRealms(t, nil, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	const id = 972
+	old, _ := openWithCredit(t, ctx, client, server, id, 0)
+	if err := old.Reset(aether.ResetCancel); err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+	var next aether.Stream
+	waitFor(t, "the ID open again", func() bool {
+		st, err := client.OpenStream(ctx, aether.StreamConfig{StreamID: id, Reliability: aether.ReliableOrdered, Priority: 128})
+		if err != nil {
+			return false
+		}
+		next = st
+		return true
+	})
+	_ = next
+	before := client.sched.QueueLen(id)
+	if err := old.sendSingleFrame(ctx, []byte("late"), 0); !errors.Is(err, errLeftScheduler) {
+		t.Fatalf("a frame of the reset stream: %v, want errLeftScheduler", err)
+	}
+	if got := client.sched.QueueLen(id); got != before {
+		t.Fatalf("the next stream's queue went from %d to %d", before, got)
 	}
 }
 

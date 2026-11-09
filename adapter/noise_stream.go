@@ -203,6 +203,12 @@ type noiseStream struct {
 	// an ACK, breaking the deadlock where cwnd ≤ inFlight prevents any
 	// further sends.
 	tlp *congestion.TLP
+
+	// beforeSchedulerExit is a test seam, nil outside tests: a RESET's exit (Reset,
+	// endByPeerReset) calls it after the RESET's settlement and before the stream
+	// leaves the scheduler, so a test can run there what a Send already past its
+	// last state check does (sendStreamCharged).
+	beforeSchedulerExit atomic.Pointer[func()]
 }
 
 // createStream creates a new stream with full reliability infrastructure via Engine.
@@ -526,13 +532,23 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 		return st.cannotSend()
 	}
 	// A closed session will write nothing, so a Send does not wait for credit first;
-	// sendSingleFrame refuses each frame on it too, for a close during that wait.
+	// the credit waits end at the close (ConsumeUntil), and sendSingleFrame refuses
+	// each frame on a closed session too, for a close that comes after them.
 	select {
 	case <-st.session.CloseSignal():
 		return fmt.Errorf("stream %d: %w", st.streamID, aether.ErrSessionClosed)
 	default:
 	}
+	return st.sendAdmitted(ctx, data)
+}
 
+// sendAdmitted is Send past its state and session checks: it charges the stream and
+// connection credit and queues the message's frames (sendStreamCharged). A RESET may
+// end the stream from here on (Reset, endByPeerReset), and every charge this makes
+// after that RESET's settlement comes back once: by releaseInFlight, which the exit
+// runs after the stream has left the scheduler, for a frame queued before that, and
+// by sendSingleFrame's own releaseInFlight for a frame the scheduler refuses.
+func (st *noiseStream) sendAdmitted(ctx context.Context, data []byte) error {
 	// Caller-block instrumentation. Measures wall-clock time the
 	// application spent inside Send (window.Consume + connWindow.Consume +
 	// sendSingleFrame for each fragment) from entry to return. Samples
@@ -572,8 +588,8 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 	// path. Same below-floor skip as the aggregate to keep the fast-path
 	// (uncontended) noise out of the percentile distribution.
 	perStreamStart := time.Now()
-	if err := st.window.Consume(ctx, n); err != nil {
-		return fmt.Errorf("stream %d: %w", st.streamID, err)
+	if err := st.window.ConsumeUntil(ctx, n, st.session.CloseSignal()); err != nil {
+		return st.creditWaitError(err, "")
 	}
 	if d := time.Since(perStreamStart); d >= streamSendBlockFloor {
 		st.session.perStreamWindowWaitHist.Record(d)
@@ -585,6 +601,15 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 		st.window.ReleaseUnsent(n)
 		return st.cannotSend()
 	}
+	return st.sendStreamCharged(ctx, data, n)
+}
+
+// sendStreamCharged is the rest of sendAdmitted once the stream's n bytes of credit
+// are charged and its state still let it send: it charges the connection credit and
+// queues the message's frames, giving back what it charged on any failure. A RESET
+// that comes between that state check and the frames' queueing is the race the exit's
+// order closes (leaveSchedulerThenSettle).
+func (st *noiseStream) sendStreamCharged(ctx context.Context, data []byte, n int64) error {
 	streamCredited := true
 	defer func() {
 		if streamCredited {
@@ -593,8 +618,8 @@ func (st *noiseStream) Send(ctx context.Context, data []byte) error {
 	}()
 
 	connWaitStart := time.Now()
-	if err := st.session.connWindow.Consume(ctx, n); err != nil {
-		return fmt.Errorf("stream %d conn: %w", st.streamID, err)
+	if err := st.session.connWindow.ConsumeUntil(ctx, n, st.session.CloseSignal()); err != nil {
+		return st.creditWaitError(err, " conn")
 	}
 	if d := time.Since(connWaitStart); d >= streamSendBlockFloor {
 		st.session.connWindowWaitHist.Record(d)
@@ -716,6 +741,18 @@ func (st *noiseStream) recordWrite(frame *aether.Frame, wire int64) (int64, bool
 	return wire, true
 }
 
+// creditWaitError is what sendAdmitted answers for a credit wait that failed: the
+// session's close when the wait ended at it (flow.ErrWaitEnded), aether.ErrSessionClosed
+// as every other Send on a closed session answers, and the window's own error,
+// backpressure or the caller's context, otherwise; which names the window in the
+// message.
+func (st *noiseStream) creditWaitError(err error, which string) error {
+	if errors.Is(err, flow.ErrWaitEnded) {
+		return fmt.Errorf("stream %d%s: %w: %w", st.streamID, which, aether.ErrSessionClosed, err)
+	}
+	return fmt.Errorf("stream %d%s: %w", st.streamID, which, err)
+}
+
 // errLeftScheduler is what sendSingleFrame returns when the scheduler no longer holds
 // the stream; Send reads it to answer the stream's end (cannotSend) and to leave
 // what sendSingleFrame settled alone.
@@ -725,11 +762,14 @@ var errLeftScheduler = errors.New("stream left the scheduler")
 // fragment envelope (extra aether.FlagFRAGMENT). It refuses, queueing nothing, on a
 // closed session with aether.ErrSessionClosed: CloseWithError leaves the streams in
 // the scheduler, and the write loop that would take the frame has stopped. When
-// the scheduler refuses the frame or a repair, the stream has left it (Reset,
-// endByPeerReset, leaveSession call releaseStream after their settlement), so
-// nothing more of the message can go: it gives the connection window what this
-// stream charged after that settlement (releaseInFlight) and returns
-// errLeftScheduler.
+// the scheduler refuses the frame or a repair, the stream has left it, so nothing
+// more of the message can go: it gives the connection window what this stream
+// charged after the exit's settlement (releaseInFlight) and returns
+// errLeftScheduler. Of the exits that take a stream out of the scheduler, Reset and
+// endByPeerReset run their RESET's settlement first; leaveSession has none, and a
+// Send never meets it, because it needs this side's CLOSE acknowledged, which
+// finishSend queues only once no Send is in progress (sendsActive), and every Send
+// after it finds the state closed.
 func (st *noiseStream) sendSingleFrame(ctx context.Context, data []byte, extra aether.FrameFlags) error {
 	select {
 	case <-st.session.CloseSignal():
@@ -763,7 +803,7 @@ func (st *noiseStream) sendSingleFrame(ctx context.Context, data []byte, extra a
 	}
 
 	// Enqueue via scheduler for priority-ordered sending
-	if !st.session.sched.Enqueue(st.streamID, frame) {
+	if !st.queueFrame(frame) {
 		st.releaseInFlight()
 		return errLeftScheduler
 	}
@@ -771,12 +811,32 @@ func (st *noiseStream) sendSingleFrame(ctx context.Context, data []byte, extra a
 		repair.StreamID = st.streamID
 		repair.SenderID = st.session.LocalPeerID()
 		repair.ReceiverID = st.session.RemotePeerID()
-		if !st.session.sched.Enqueue(st.streamID, repair) {
+		if !st.queueFrame(repair) {
 			st.releaseInFlight()
 			return errLeftScheduler
 		}
 	}
 	return nil
+}
+
+// queueFrame puts one of this stream's frames in the scheduler and reports whether it
+// did, which it does only while s.streams holds this stream under its ID: the check
+// and the Enqueue are one step under s.mu, the lock every exit takes the stream out of
+// s.streams under (Reset, handleReset, endSuperseded, leaveSession, the stream GC)
+// before it unregisters the ID. The scheduler keys its queues by ID alone, so without
+// the check a Send past its state check when the stream is reset, resuming once the
+// peer has acknowledged the RESET and the ID's next stream has registered, would put
+// this stream's frame, numbered in this stream's sequence, in the next stream's
+// queue, and leave the connection credit it charged on windows nothing settles
+// again. sendSingleFrame calls it for each frame and repair.
+func (st *noiseStream) queueFrame(frame *aether.Frame) bool {
+	s := st.session
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cur, ok := s.streams[st.streamID]; !ok || cur != st {
+		return false
+	}
+	return s.sched.Enqueue(st.streamID, frame)
 }
 
 // Receive returns the next whole message from recvQ. After closeRecvOnce has
@@ -1151,7 +1211,9 @@ func (st *noiseStream) Reset(reason aether.ResetReason) error {
 	// s.streams entry (when it is this stream, not a later one on the same
 	// ID), the credit reservation, the scheduler and stream GC registrations
 	// (releaseStream) and the receive side (closeRecvOnce), the set
-	// handleReset releases for a peer-initiated RESET. The stream GC's sweep
+	// handleReset releases for a peer-initiated RESET. The stream leaves the
+	// scheduler before what Sends charged after the settlement is returned
+	// (leaveSchedulerThenSettle). The stream GC's sweep
 	// and CloseWithError's acceptor drain call Reset for a stream still in
 	// s.streams, and createStream counts every entry against
 	// MaxConcurrentStreams, so a Reset that left the entry or the GC
@@ -1168,9 +1230,8 @@ func (st *noiseStream) Reset(reason aether.ResetReason) error {
 		delete(st.session.streams, st.streamID)
 	}
 	st.session.mu.Unlock()
-	st.releaseInFlight()
+	st.leaveSchedulerThenSettle()
 	st.releaseReservation()
-	st.session.releaseStream(st.streamID)
 	st.session.trackEnded(st.recvQ)
 	st.closeRecvOnce()
 	return err
@@ -1280,8 +1341,26 @@ func (st *noiseStream) leaveSession() {
 	s.trackEnded(st.recvQ)
 }
 
+// leaveSchedulerThenSettle is the end of a RESET's exit (Reset, endByPeerReset) once
+// the stream is out of s.streams: it takes the stream out of the scheduler and the
+// stream GC (releaseStream), then gives back what the stream still holds
+// (releaseInFlight). In that order a Send already past its state check (sendAdmitted)
+// either queued its frame before the scheduler let the stream go, and its charge is in
+// the windows releaseInFlight empties, or meets the scheduler's refusal and returns its
+// charge itself (sendSingleFrame). The other order would let a Send charge after
+// releaseInFlight and queue before releaseStream, whose drop of the frame no release
+// would follow, keeping its connection credit for the session's life.
+func (st *noiseStream) leaveSchedulerThenSettle() {
+	if hook := st.beforeSchedulerExit.Load(); hook != nil {
+		(*hook)()
+	}
+	st.session.releaseStream(st.streamID)
+	st.releaseInFlight()
+}
+
 // releaseInFlight settles what a stream ended by a RESET still holds once it is
-// out of session.streams (Reset here; handleReset on the readLoop). It gives the
+// out of session.streams and the scheduler (leaveSchedulerThenSettle), and what a
+// Send charged on a stream the scheduler refused (sendSingleFrame). It gives the
 // session's in-flight byte counter back every frame this stream's SendWindow holds:
 // handleACK looks the stream up there and returns when it is absent, so after the
 // removal no ACK can take these entries out of the window, and a charge left in the

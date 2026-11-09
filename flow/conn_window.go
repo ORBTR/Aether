@@ -116,14 +116,29 @@ func NewConnWindow(initialCredit int64) *ConnWindow {
 // up to ConsumeTimeout via sem.Acquire and failing with ErrCreditExhausted.
 // Every byte is charged; control frames never call it (see MinGuaranteedWindow).
 func (w *ConnWindow) Consume(ctx context.Context, n int64) error {
+	return w.ConsumeUntil(ctx, n, nil)
+}
+
+// ConsumeUntil is Consume whose wait also ends when done closes, answering
+// ErrWaitEnded with nothing charged: the connection-level mirror of
+// StreamWindow.ConsumeUntil, which noiseStream.Send calls with its session's close
+// signal. The watch starts only once the fast acquire has failed.
+func (w *ConnWindow) ConsumeUntil(ctx context.Context, n int64, done <-chan struct{}) error {
 	if n <= 0 {
 		return nil
 	}
-	acquireCtx, cancel := context.WithTimeout(ctx, ConsumeTimeout)
-	defer cancel()
-	if err := w.sem.Acquire(acquireCtx, n); err != nil {
-		return fmt.Errorf("aether flow: insufficient connection credit after %s (need %d, have %d): %w: %w",
-			ConsumeTimeout, n, w.Available(), ErrCreditExhausted, err)
+	if !w.sem.TryAcquire(n) {
+		acquireCtx, cancel := context.WithTimeout(ctx, ConsumeTimeout)
+		defer cancel()
+		stopWatch := endWaitOn(done, cancel)
+		err := w.sem.Acquire(acquireCtx, n)
+		if ended := stopWatch(); err != nil && ended {
+			return fmt.Errorf("aether flow: connection credit wait for %d: %w", n, ErrWaitEnded)
+		}
+		if err != nil {
+			return fmt.Errorf("aether flow: insufficient connection credit after %s (need %d, have %d): %w: %w",
+				ConsumeTimeout, n, w.Available(), ErrCreditExhausted, err)
+		}
 	}
 	w.mu.Lock()
 	w.dataOutstanding += n

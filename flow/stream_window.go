@@ -112,6 +112,41 @@ var ErrCreditExhausted = errors.New("aether flow: credit exhausted")
 // ConsumeTimeout is how long Consume waits for credit before returning an error.
 const ConsumeTimeout = 10 * time.Second
 
+// ErrWaitEnded is what a credit wait answers when the done channel its caller passed
+// to ConsumeUntil closes before the credit comes: what owns the window has ended (the
+// adapter passes its session's close signal), so no grant will come, and the caller
+// answers that end instead. It does not wrap ErrCreditExhausted, since no credit was
+// found short; nothing has been charged.
+var ErrWaitEnded = errors.New("aether flow: the credit wait ended")
+
+// endWaitOn cancels a credit wait's context when done closes, and returns the stop
+// that ends the watch and reports whether done had closed. A nil done never closes,
+// and the watch starts no goroutine. StreamWindow.ConsumeUntil and
+// ConnWindow.ConsumeUntil call it on their blocking path only, so a wait that finds
+// credit at once costs nothing.
+func endWaitOn(done <-chan struct{}, cancel context.CancelFunc) (stop func() bool) {
+	if done == nil {
+		return func() bool { return false }
+	}
+	quit := make(chan struct{})
+	go func() {
+		select {
+		case <-done:
+			cancel()
+		case <-quit:
+		}
+	}()
+	return func() bool {
+		close(quit)
+		select {
+		case <-done:
+			return true
+		default:
+			return false
+		}
+	}
+}
+
 // StreamWindow implements per-stream credit-based flow control.
 //
 // Sender side: Consume blocks until credit is available (up to ConsumeTimeout)
@@ -359,6 +394,16 @@ func (w *StreamWindow) TryConsume(n int64) bool {
 // noiseStream.Send wraps (errors.Is matches) and returns to its caller as typed
 // backpressure.
 func (w *StreamWindow) Consume(ctx context.Context, n int64) error {
+	return w.ConsumeUntil(ctx, n, nil)
+}
+
+// ConsumeUntil is Consume whose wait also ends when done closes, answering
+// ErrWaitEnded with nothing charged. noiseStream.Send passes its session's close
+// signal: a closed session's write loop has stopped and no grant will reach the
+// window, so a Send waiting for credit when its session closes returns the close at
+// once, typed as aether.ErrSessionClosed, rather than waiting out ConsumeTimeout and
+// reading as backpressure.
+func (w *StreamWindow) ConsumeUntil(ctx context.Context, n int64, done <-chan struct{}) error {
 	if n <= 0 {
 		return nil
 	}
@@ -398,12 +443,17 @@ func (w *StreamWindow) Consume(ctx context.Context, n int64) error {
 		starveStart = time.Now()
 	}
 
+	stopWatch := endWaitOn(done, cancel)
 	err := w.sem.Acquire(acquireCtx, n)
+	ended := stopWatch()
 
 	if w.grantStarveHist != nil {
 		w.grantStarveHist.Record(time.Since(starveStart))
 	}
 
+	if err != nil && ended {
+		return fmt.Errorf("aether flow: stream credit wait for %d: %w", n, ErrWaitEnded)
+	}
 	if err != nil {
 		avail := w.Available()
 		dbgFlow.Printf("Consume TIMEOUT need=%d have=%d outstanding=%d maxSize=%d",
