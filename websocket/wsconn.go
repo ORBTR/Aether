@@ -285,8 +285,13 @@ func (c *WSConn) sendPing() bool {
 }
 
 // pongPlan is the keepalive plan quality.Keepalive derives from this connection's ping
-// round trips. The session keepalive (aether.RunKeepalive) derives its plan from the same
-// function over the session's probes, so the two layers let a silent peer go on one rule.
+// round trips, read by pongDeadline at every check. The session keepalive
+// (aether.RunKeepalive, through aether.KeepalivePlanFor) derives its plan from the same
+// function over the session's probes and also passes their loss and instability, which
+// this connection does not measure: it holds one outstanding ping (pingSent) and counts
+// no misses. The two plans therefore agree only on a path with neither; under loss or
+// instability the session plan's strikes and probe timeout grow while this one's stay,
+// so a silent peer on a WebSocket session is let go by whichever deadline passes first.
 func (c *WSConn) pongPlan() quality.KeepalivePlan {
 	return quality.Keepalive(quality.KeepaliveInputs{
 		SRTT:    c.pongRTT.SRTT(),
