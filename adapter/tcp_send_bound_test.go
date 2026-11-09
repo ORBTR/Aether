@@ -306,7 +306,7 @@ func TestSessionWriter_AClosedSessionStopsTheRetry(t *testing.T) {
 	defer c.Close()
 	defer s.Close()
 	closed := make(chan struct{})
-	w := newSessionWriter(&flakyConn{Conn: c, failAfter: 0, every: 1}, closed)
+	w := newSessionWriter(&flakyConn{Conn: c, failAfter: 0, every: 1}, closed, nil)
 	go func() { _, _ = io.Copy(io.Discard, s) }()
 	close(closed)
 	start := time.Now()
