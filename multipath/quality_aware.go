@@ -90,7 +90,7 @@ type qualityState struct {
 
 	// probeOnce gates RunProbeLoop start so EnsureK can launch it
 	// idempotently on first call. The probe loop pings non-primary
-	// paths every probeInterval so dead/standby paths can resurrect
+	// paths every probe cycle (probeCycleLocked) so dead/standby paths can resurrect
 	// based on real liveness signal — without it, dead-path recovery
 	// only happens opportunistically when something calls PickPath /
 	// PickByQuality, and no probe measures a standby path's RTT.
@@ -274,7 +274,7 @@ func (m *Manager) PickByQuality(op quality.DispatchOp) (aether.Session, bool) {
 		// selection, mirroring PickPath and promotebestStandby
 		// (manager.go). A flapping path's session is still alive (its
 		// Ping succeeds — the RecordTLPReset premise) and a dead path
-		// within deadResurrectCooldown also has a live session, so both
+		// within deadPathWaitLocked also has a live session, so both
 		// pass the nil/IsClosed guard above and would win on DispatchRank,
 		// silently defeating the flapping demote and primary-failure
 		// failover. The resurrection calls above return any path whose

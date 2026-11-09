@@ -92,6 +92,9 @@ func TestTheDeadPeerBoundIsTheProbeCycle(t *testing.T) {
 	if largest != largestBound {
 		t.Errorf("the largest DeadPeerBound over the loss range = %s (at %+v), want %s", largest, largestAt, largestBound)
 	}
+	if got := LargestDeadPeerBound(); got != largestBound {
+		t.Errorf("LargestDeadPeerBound = %s, want the largest a plan reaches, %s", got, largestBound)
+	}
 }
 
 // TestTheKeepalivePlanFollowsLoss: two sessions with the same round trips get plans that

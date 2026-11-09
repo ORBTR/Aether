@@ -6,24 +6,25 @@ package aether
 
 import "fmt"
 
-// TransportClass classifies transports by their packet-level behavior.
-// Used to degrade Aether behavior on transports that don't provide
-// packet-level control (WS/gRPC introduce buffering and HOL blocking).
+// TransportClass classifies transports by their packet-level behavior. Its one
+// per-class value is the frame ceiling DefaultsForClass gives, which
+// adapter.MaxAppMessageBudget reads. Whether a session acknowledges and
+// retransmits is its reliability profile's (Full on Noise, Lite on the
+// natively reliable transports), not its class's.
 type TransportClass uint8
 
 const (
-	// ClassRAW is for packet-oriented transports (UDP, QUIC).
-	// Full Aether protocol with aggressive retransmit and congestion control.
+	// ClassRAW is for packet-oriented transports (UDP, QUIC): an MTU-safe
+	// frame ceiling.
 	ClassRAW TransportClass = 0
 
-	// ClassSTREAM is for byte-stream transports (TCP, TLS).
-	// Conservative retransmit (TCP handles).
+	// ClassSTREAM is for byte-stream transports (TCP, TLS): a large frame
+	// ceiling.
 	ClassSTREAM TransportClass = 1
 
-	// ClassPROXY is for proxy-buffered transports (WS, gRPC).
-	// No retransmit (transport handles), reduced max frame size. How often
-	// a session on one probes is quality.Keepalive's decision from the
-	// session's own round trips, as on every class.
+	// ClassPROXY is for proxy-buffered transports (WS, gRPC): a reduced
+	// frame ceiling. How often a session on one probes is quality.Keepalive's
+	// decision from the session's own round trips, as on every class.
 	ClassPROXY TransportClass = 2
 )
 
@@ -57,9 +58,7 @@ func TransportClassForProtocol(proto Protocol) TransportClass {
 
 // TransportClassDefaults holds per-class tuning parameters.
 type TransportClassDefaults struct {
-	MaxFrameSize         int  // maximum Aether frame payload
-	RetransmitEnabled    bool // whether Aether retransmit is active
-	AggressiveRetransmit bool // use short RTO for fast recovery
+	MaxFrameSize int // maximum Aether frame payload
 }
 
 // DefaultsForClass returns the tuning parameters for a transport class.
@@ -67,21 +66,15 @@ func DefaultsForClass(c TransportClass) TransportClassDefaults {
 	switch c {
 	case ClassRAW:
 		return TransportClassDefaults{
-			MaxFrameSize:         1400, // MTU-safe for UDP
-			RetransmitEnabled:    true,
-			AggressiveRetransmit: true, // short RTO
+			MaxFrameSize: 1400, // MTU-safe for UDP
 		}
 	case ClassSTREAM:
 		return TransportClassDefaults{
-			MaxFrameSize:         65536, // TCP can handle large frames
-			RetransmitEnabled:    false, // TCP provides reliability
-			AggressiveRetransmit: false,
+			MaxFrameSize: 65536, // TCP can handle large frames
 		}
 	case ClassPROXY:
 		return TransportClassDefaults{
-			MaxFrameSize:         32768, // reduced — avoid proxy buffer overflow
-			RetransmitEnabled:    false, // transport provides reliability
-			AggressiveRetransmit: false,
+			MaxFrameSize: 32768, // reduced — avoid proxy buffer overflow
 		}
 	default:
 		return DefaultsForClass(ClassSTREAM)

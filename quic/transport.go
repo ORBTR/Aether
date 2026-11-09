@@ -26,12 +26,8 @@ import (
 
 // QuicTransportConfig configures the QUIC aether.
 type QuicTransportConfig struct {
-	LocalNode  aether.NodeID
-	PrivateKey ed25519.PrivateKey
-	// KeepAlive is read by nothing: connectionConfig derives the keepalive.
-	// TODO: remove this field once the two composers outside this repository that
-	// set it, the mesh runtime and the endpoint agent's transport, stop setting it.
-	KeepAlive    time.Duration
+	LocalNode    aether.NodeID
+	PrivateKey   ed25519.PrivateKey
 	ListenAddr   string
 	BindResolver aether.BindAddressResolver // Optional platform bind resolver (for standalone listen)
 
@@ -106,17 +102,21 @@ func NewQuicTransportFromConfig(cfg aether.Config) (*QuicTransport, error) {
 
 // connectionConfig is the quic-go configuration Dial and Listen build a connection
 // with. quic-go fixes KeepAlivePeriod and MaxIdleTimeout when a connection starts, before
-// it has measured a round trip, so both come from quality.Keepalive for a path with
-// nothing measured: the probe cycle's Interval, and its DeadPeerBound as the idle
-// timeout, so a silent peer is let go on the bound every other transport's keepalive
-// holds. Past that point the numbers follow the path in two places: quic-go stretches
-// the period to 1.5 PTO on a slower path, and the session above this connection probes
-// on the plan aether.KeepalivePlanFor derives from its own round trips.
+// it has measured a round trip, and sends the idle timeout to the peer in its transport
+// parameters, so neither can follow the path afterwards. The decision to let a silent
+// peer go is therefore the session's: the session above this connection probes with
+// PING and PONG on the plan aether.KeepalivePlanFor derives from its own round trips,
+// loss and stability. KeepAlivePeriod is the Interval of the plan for a path with nothing
+// measured, the shortest a plan's Interval can be, so a NAT mapping on the path sees a
+// packet at least that often between session probes (quic-go stretches it to 1.5 PTO on
+// a slower path).
+// MaxIdleTimeout is quality.LargestDeadPeerBound, so the connection going idle never
+// ends a session before its plan's DeadPeerBound has passed.
 func (t *QuicTransport) connectionConfig() *quic.Config {
 	plan := quality.Keepalive(quality.KeepaliveInputs{})
 	return &quic.Config{
 		KeepAlivePeriod: plan.Interval,
-		MaxIdleTimeout:  plan.DeadPeerBound(),
+		MaxIdleTimeout:  quality.LargestDeadPeerBound(),
 		Allow0RTT:       t.allow0RTT,
 	}
 }

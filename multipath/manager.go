@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/ORBTR/aether"
+	"github.com/ORBTR/aether/quality"
 )
 
 // PathState tracks the health state of a single transport path.
@@ -104,8 +105,8 @@ type Path struct {
 	// LastFailure timestamp drives the dead→standby resurrection path.
 	// OnPrimaryFailure stamps this when marking PathDead; the probe loop
 	// (and PickByQuality / PickPath opportunistically) check that
-	// `time.Now().Sub(LastFailure) >= deadResurrectCooldown` before
-	// re-considering the path as a standby candidate.
+	// deadPathWaitLocked has passed since it before re-considering the
+	// path as a standby candidate.
 	LastFailure time.Time
 
 	// Level 3 weighted scheduling counters. weight is derived from
@@ -128,14 +129,6 @@ type Path struct {
 	flappingUntil  time.Time
 }
 
-// deadResurrectCooldown is the minimum time a path stays in PathDead
-// before becoming a probe/promotion candidate again. Without this,
-// either every probe attempt would slam a dead path immediately after
-// failure (wasteful churn) or PathDead would be permanent. 30s
-// matches the probeInterval default so the
-// next probe tick is the first chance for resurrection.
-const deadResurrectCooldown = 30 * time.Second
-
 // Manager manages multiple paths to a single peer.
 type Manager struct {
 	mu      sync.Mutex
@@ -147,7 +140,9 @@ type Manager struct {
 	// set (every primaryProbeEvery-th tick).
 	probeTick uint64
 
-	// Configuration
+	// Configuration. probeInterval is the probe cycle a caller set through
+	// SetProbeInterval; zero, the default, has probeCycleLocked derive the
+	// cycle from the paths' keepalive plans.
 	probeInterval   time.Duration
 	stabilityPeriod time.Duration
 	maxFailures     int
@@ -183,18 +178,17 @@ func (m *Manager) now() time.Time {
 // NewManager creates a multipath manager.
 func NewManager() *Manager {
 	return &Manager{
-		probeInterval:   30 * time.Second,
 		stabilityPeriod: 60 * time.Second,
 		maxFailures:     3,
 	}
 }
 
-// SetProbeInterval overrides the cadence at which RunProbeLoop pings
-// non-primary paths. Default 30s; callers that need to beat a faster
-// underlying-conn idle close (Fly 6PN UDP / cross-region NAT) should
-// drop this to 5-8s so the keepalive PING reaches the peer before the
-// kernel conntrack / NAT mapping reaps the socket. Call before
-// RunProbeLoop — the running ticker captures the value at start.
+// SetProbeInterval fixes the cycle at which RunProbeLoop pings non-primary
+// paths, and with it how long a dead path waits before it is reconsidered
+// (deadPathWaitLocked). Without it the cycle is derived from the paths'
+// keepalive plans (probeCycleLocked). RunProbeLoop reads the cycle before
+// every round, so a call takes effect from the next round. d <= 0 is
+// ignored.
 func (m *Manager) SetProbeInterval(d time.Duration) {
 	if d <= 0 {
 		return
@@ -480,7 +474,7 @@ func (m *Manager) ShouldSendRedundant(latencyClass aether.LatencyClass) bool {
 
 // OnPrimaryFailure handles primary path failure — instant failover to standby.
 // Marks the failed path PathDead and stamps LastFailure so the probe loop
-// (or opportunistic resurrection) can revive it after deadResurrectCooldown.
+// (or opportunistic resurrection) can revive it once deadPathWaitLocked has passed.
 //
 // Dead-on-arrival recovery: if every other path is also PathDead (a
 // network blip can kill all transports simultaneously) promotebestStandby
@@ -521,10 +515,48 @@ func (m *Manager) OnPrimaryFailure() {
 	m.promotebestStandby()
 }
 
+// probeCycleLocked is how long RunProbeLoop waits between probe rounds: the
+// interval a caller set through SetProbeInterval, else the shortest
+// Interval among the keepalive plans aether.KeepalivePlanFor derives for
+// the paths with a live session, so the path whose own round trips call
+// for the closest watch sets the round. With no live path it is the
+// Interval of the plan for a path with nothing measured. Caller holds m.mu.
+func (m *Manager) probeCycleLocked() time.Duration {
+	if m.probeInterval > 0 {
+		return m.probeInterval
+	}
+	var cycle time.Duration
+	for _, p := range m.paths {
+		if p.Session == nil || p.Session.IsClosed() {
+			continue
+		}
+		if iv := aether.KeepalivePlanFor(p.Session).Interval; cycle == 0 || iv < cycle {
+			cycle = iv
+		}
+	}
+	if cycle == 0 {
+		cycle = quality.Keepalive(quality.KeepaliveInputs{}).Interval
+	}
+	return cycle
+}
+
+// deadPathWaitLocked is how long p stays in PathDead before it is a probe and
+// promotion candidate again: one probe cycle of its own, the interval a
+// caller set through SetProbeInterval or else the Interval of p's keepalive
+// plan. A dead path is so reconsidered at the first probe round after one
+// cycle of fresh evidence, rather than slammed by the next round after its
+// failure or held dead for good. Caller holds m.mu.
+func (m *Manager) deadPathWaitLocked(p *Path) time.Duration {
+	if m.probeInterval > 0 {
+		return m.probeInterval
+	}
+	return aether.KeepalivePlanFor(p.Session).Interval
+}
+
 // resurrectExpiredDeadPathsLocked transitions PathDead paths back to
-// PathStandby once they've cooled down past deadResurrectCooldown. Called
-// from PickByQuality + PickPath (opportunistic, no extra goroutine) and
-// from the probe loop. Caller must hold m.mu.
+// PathStandby once deadPathWaitLocked has passed since their failure.
+// Called from PickByQuality + PickPath (opportunistic, no extra goroutine)
+// and from the probe loop. Caller must hold m.mu.
 func (m *Manager) resurrectExpiredDeadPathsLocked() {
 	now := time.Now()
 	for _, p := range m.paths {
@@ -536,7 +568,7 @@ func (m *Manager) resurrectExpiredDeadPathsLocked() {
 		if p.Session == nil || p.Session.IsClosed() {
 			continue
 		}
-		if !p.LastFailure.IsZero() && now.Sub(p.LastFailure) < deadResurrectCooldown {
+		if !p.LastFailure.IsZero() && now.Sub(p.LastFailure) < m.deadPathWaitLocked(p) {
 			continue
 		}
 		p.State = PathStandby
@@ -582,19 +614,13 @@ func (m *Manager) resurrectExpiredFlappingPathsLocked() {
 // Exits when ctx is cancelled. Safe to call once per manager; calling
 // multiple times spawns multiple loops (caller's responsibility).
 //
-// RunProbeLoop is what drives probeInterval, stabilityPeriod,
+// RunProbeLoop is what drives the probe cycle, stabilityPeriod,
 // maxFailures and the OnProbeSuccess hook (probeNonPrimary); without it
-// a dead path returns to standby only through the cooldown checks
-// PickPath and PickByQuality run opportunistically, and no probe
-// measures a standby path's RTT.
+// a dead path returns to standby only through the deadPathWaitLocked
+// checks PickPath and PickByQuality run opportunistically, and no probe
+// measures a standby path's RTT. It waits probeCycleLocked before every
+// round, so the cycle follows what the previous round's answers measured.
 func (m *Manager) RunProbeLoop(ctx context.Context) {
-	interval := m.probeInterval
-	if interval <= 0 {
-		interval = 30 * time.Second
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
 	// Also exit when the manager's Stop() is called — the qstate.stop
 	// channel is closed by Stop(), so we listen on both. Without this
 	// the probe loop would outlive the manager's qstate teardown and
@@ -607,12 +633,18 @@ func (m *Manager) RunProbeLoop(ctx context.Context) {
 	m.mu.Unlock()
 
 	for {
+		m.mu.Lock()
+		cycle := m.probeCycleLocked()
+		m.mu.Unlock()
+		timer := time.NewTimer(cycle)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
 		case <-stopCh:
+			timer.Stop()
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			m.probeNonPrimary(ctx)
 		}
 	}
@@ -620,8 +652,8 @@ func (m *Manager) RunProbeLoop(ctx context.Context) {
 
 // primaryProbeEvery is the modulus that determines how often probeNonPrimary
 // ALSO probes the primary path. Tied to the global probe counter — every Nth
-// probe tick includes the primary. 4 gives a primary-liveness check every
-// ~2 minutes at the default 30s tick. Probing the primary is how a silently
+// probe round includes the primary, so the primary is checked once every
+// four probe cycles. Probing the primary is how a silently
 // wedged primary (cwnd-stuck, app reads block, no explicit error) is
 // detected: the only other signal is OnPrimaryFailure, which the connection
 // manager that owns this Manager's sessions calls when it removes one on an

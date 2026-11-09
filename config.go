@@ -25,7 +25,6 @@ type Config struct {
 
 	// Shared services
 	STUN    STUNConfig
-	Health  HealthConfig
 	Tickets *TicketConfig
 
 	// Platform
@@ -60,10 +59,11 @@ type QUICConfig struct {
 	Allow0RTT  bool
 }
 
-// WebSocketConfig configures the WebSocket transport.
+// WebSocketConfig configures the WebSocket transport. Its ping interval is the
+// websocket package's own (pingInterval), and its pong deadline the keepalive plan
+// the connection derives from its pings.
 type WebSocketConfig struct {
-	ListenAddr   string
-	PingInterval time.Duration
+	ListenAddr string
 }
 
 // GRPCConfig configures the gRPC transport.
@@ -71,15 +71,6 @@ type WebSocketConfig struct {
 type GRPCConfig struct {
 	ListenAddr string
 	TLSConfig  *tls.Config
-}
-
-// HealthConfig configures session health monitoring.
-type HealthConfig struct {
-	PingInterval   time.Duration
-	SuspectTimeout time.Duration
-	DeadTimeout    time.Duration
-	MaxMissedPings int
-	EMAAlpha       float64
 }
 
 // TicketConfig configures session ticket resumption.
@@ -111,17 +102,8 @@ func DefaultConfig() Config {
 			// data.
 			Allow0RTT: false,
 		},
-		WebSocket: &WebSocketConfig{
-			PingInterval: 10 * time.Second,
-		},
-		GRPC: &GRPCConfig{},
-		STUN: DefaultSTUNConfig(),
-		Health: HealthConfig{
-			PingInterval:   5 * time.Second,
-			SuspectTimeout: 10 * time.Second,
-			DeadTimeout:    20 * time.Second,
-			MaxMissedPings: 3,
-			EMAAlpha:       0.2,
-		},
+		WebSocket: &WebSocketConfig{},
+		GRPC:      &GRPCConfig{},
+		STUN:      DefaultSTUNConfig(),
 	}
 }

@@ -37,11 +37,16 @@ type KeepaliveInputs struct {
 
 // KeepalivePlan is the keepalive's decision for one probe cycle: how long a healthy
 // session stays quiet between probes, how long one probe waits for an answer, and how
-// many unanswered probes in a row end the session. aether.RunKeepalive probes on it and
-// websocket.WSConn holds its pong deadline to Silence, so a peer that stops answering
-// is let go on one derived bound at both layers. The Noise adapter's stall probe and
-// multipath's standby probe take their budgets from it, and the quic package takes
-// its connection keepalive and idle timeout from the plan for an unmeasured path.
+// many unanswered probes in a row end the session. aether.RunKeepalive probes on the plan
+// aether.KeepalivePlanFor derives from the session's round trips, probe loss and
+// instability. websocket.WSConn holds its pong deadline to Silence of a plan from its own
+// ping round trips, which carry no loss or instability, so the two plans agree only on a
+// path with neither; otherwise a silent peer on a WebSocket session is let go by whichever
+// layer's deadline passes first. The Noise adapter's stall probe and multipath's standby
+// probes take their budgets and cycle from the session's plan. The quic package takes its
+// connection keepalive from the plan for an unmeasured path and its idle timeout from
+// LargestDeadPeerBound, so the connection never goes idle before the session's own plan
+// lets the peer go.
 type KeepalivePlan struct {
 	Interval     time.Duration
 	ProbeTimeout time.Duration
@@ -61,6 +66,21 @@ func (p KeepalivePlan) Silence() time.Duration {
 // Silence.
 func (p KeepalivePlan) DeadPeerBound() time.Duration {
 	return p.Interval + p.Silence()
+}
+
+// LargestDeadPeerBound is the longest DeadPeerBound any plan Keepalive derives can hold:
+// the interval ceiling, then the strikes ceiling's probes at the probe ceiling with the
+// retry gap between them. quic.QuicTransport sets its connections' idle timeout to it,
+// because quic-go fixes that timeout when the connection starts, before any round trip
+// is measured, and a shorter one would end a session whose measured plan still holds its
+// peer.
+func LargestDeadPeerBound() time.Duration {
+	return KeepalivePlan{
+		Interval:     keepaliveIntervalCeiling,
+		ProbeTimeout: keepaliveProbeCeiling,
+		Strikes:      keepaliveStrikesCeiling,
+		RetryGap:     keepaliveRetryGap,
+	}.DeadPeerBound()
 }
 
 const (
