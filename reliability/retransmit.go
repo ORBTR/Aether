@@ -380,6 +380,26 @@ func (q *RetransmitQueue) Remove(seqNo uint32) {
 	q.removeBySeq(seqNo)
 }
 
+// Clear drops every entry and reports how many it dropped, for a stream that has
+// ended: its frames are owed no retransmit, so an entry left here would be handed to
+// whatever the caller's next Dequeue feeds, and the adapter's reliability tick, which
+// works from a snapshot of its streams, could put an ended stream's frame under an ID
+// the next stream has taken. noiseStream.teardown calls it. It does not call onEvict:
+// no reliable frame of a live stream loses its safety net here.
+func (q *RetransmitQueue) Clear() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	n := len(q.queue.data)
+	for i := range q.queue.data {
+		q.queue.data[i].index = -1
+		q.queue.data[i] = nil
+	}
+	q.queue.data = q.queue.data[:0]
+	clear(q.seqIndex)
+	q.bufferedBytes = 0
+	return n
+}
+
 // AckedOnDequeueCount returns the number of retransmit entries dropped
 // at Dequeue time because their underlying SendEntry was already Acked
 // by ProcessCompositeACK in the window before Remove ran. A non-zero

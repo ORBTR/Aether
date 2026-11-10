@@ -139,3 +139,29 @@ func TestRetransmitQueue_Ordering(t *testing.T) {
 		t.Errorf("first dequeue: got SeqNo %v, want 1", f)
 	}
 }
+
+// TestRetransmitQueue_ClearDropsEveryEntry: Clear empties the queue, its byte count and
+// its index, calls no eviction hook, and the queue takes entries again afterwards.
+func TestRetransmitQueue_ClearDropsEveryEntry(t *testing.T) {
+	rtt := NewRTTEstimator()
+	q := NewRetransmitQueue(rtt, 0)
+	evicted := 0
+	q.SetOnEvict(func(*RetransmitEntry) { evicted++ })
+	q.Enqueue(&aether.Frame{Type: aether.TypeDATA, SeqNo: 1, Payload: []byte("one")})
+	q.Enqueue(&aether.Frame{Type: aether.TypeDATA, SeqNo: 2, Payload: []byte("two")})
+	if got := q.Clear(); got != 2 {
+		t.Fatalf("Clear reported %d, want 2", got)
+	}
+	if q.Len() != 0 || q.BufferedBytes() != 0 || q.NextDueIn() != time.Hour || evicted != 0 {
+		t.Fatalf("after Clear: Len %d, BufferedBytes %d, NextDueIn %s, evicted %d", q.Len(), q.BufferedBytes(), q.NextDueIn(), evicted)
+	}
+	q.Remove(1)
+	q.Enqueue(&aether.Frame{Type: aether.TypeDATA, SeqNo: 1, Payload: []byte("again")})
+	if q.Len() != 1 || q.BufferedBytes() != 5 {
+		t.Fatalf("after a new Enqueue: Len %d, BufferedBytes %d", q.Len(), q.BufferedBytes())
+	}
+	q.Remove(1)
+	if q.Len() != 0 {
+		t.Fatalf("Remove after Clear left %d entries", q.Len())
+	}
+}

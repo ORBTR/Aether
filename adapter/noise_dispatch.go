@@ -1064,9 +1064,10 @@ func (s *NoiseSession) endByPeerReset(st *noiseStream, payload aether.ResetPaylo
 	}
 	st.settlePeerReset(payload, granted)
 	// Out of s.streams, so no ACK reaches this stream again: once it is out of
-	// the scheduler too, what the peer's RESET leaves charged goes back to the
-	// session's in-flight counter and connection window, a Send's charge made
-	// after the settlement included (leaveSchedulerThenSettle).
+	// the scheduler too, what its send window holds goes back to the session's
+	// in-flight counter, and a stream charge a Send made after the settlement
+	// goes back to the stream window, that Send returning its own connection
+	// charge (leaveSchedulerThenSettle, commitConnCharge).
 	st.leaveSchedulerThenSettle()
 	st.releaseReservation()
 	s.trackEnded(st.recvQ)

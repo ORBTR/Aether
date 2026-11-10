@@ -52,7 +52,9 @@ func TestQUICSession_ExchangesTheWireVersionPreface(t *testing.T) {
 // TestQUICSession_RefusesAPeerWithNoCommonVersion: a required entry with no version
 // both sides list refuses the session on both ends before any stream exists, whichever
 // end's close reaches the other first, and OpenStream and AcceptStream name the
-// refusal.
+// refusal. The session records the refusal as its close reason just after it ends the
+// exchange, which is what releases OpenStream (refuseWire, then closeRefused), so the
+// reason is read once it has been recorded.
 func TestQUICSession_RefusesAPeerWithNoCommonVersion(t *testing.T) {
 	cc, sc := quicLoopbackConns(t)
 	entry := func(v uint16) aether.WireVersion {
@@ -71,6 +73,7 @@ func TestQUICSession_RefusesAPeerWithNoCommonVersion(t *testing.T) {
 	if got := client.Metrics().ActiveStreams; got != 0 {
 		t.Fatalf("client holds %d streams", got)
 	}
+	waitFor(t, "the client's close reason", func() bool { return client.CloseErr() != nil })
 	if !errors.Is(client.CloseErr(), aether.ErrWireVersionMismatch) {
 		t.Fatalf("client close reason %v", client.CloseErr())
 	}

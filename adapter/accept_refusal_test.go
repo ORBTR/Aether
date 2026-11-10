@@ -214,3 +214,78 @@ func TestSessions_AClaimedStreamReachesItsLateClaimantNotTheAcceptLoop(t *testin
 		claimantArrivesLate(t, client, server, 101)
 	})
 }
+
+// liteRawPeerWithOptions is newLiteRawPeer with the TCPSession's options chosen by
+// the test.
+func liteRawPeerWithOptions(t *testing.T, opts aether.SessionOptions) *liteRawPeer {
+	t.Helper()
+	sess, conn := rawPeer(t, opts)
+	_ = conn.SetDeadline(time.Now().Add(60 * time.Second))
+	offer, err := aether.ReadWireVersionsPreface(conn)
+	if err != nil {
+		t.Fatalf("read preface: %v", err)
+	}
+	if err := aether.WriteWireVersionsPreface(conn, frameOnlyOffer()); err != nil {
+		t.Fatalf("write preface: %v", err)
+	}
+	chosen, err := aether.ChooseWireVersions(frameOnlyOffer(), offer)
+	if err != nil {
+		t.Fatalf("choose: %v", err)
+	}
+	return &liteRawPeer{t: t, sess: sess, conn: conn, decoder: wireDecoder(chosen)}
+}
+
+// TestTCPSession_AFullClaimedBacklogIsRefusedWithoutTheReadLoopWriting: the session's
+// options claim an ID no consumer has armed, and the peer opens and resets it more
+// times than its by-ID backlog holds (aether.MaxByIDBacklogPerStream), so the acceptor
+// refuses the excess on the readLoop (refuseUnaccepted). The peer reads nothing while
+// it writes, so a readLoop that wrote the refusal itself would stop at that write: the
+// DATA the peer sends behind the refused opens must still reach its stream, and once
+// the peer reads, a RESET(ResetRefused) for the claimed ID is on the wire.
+func TestTCPSession_AFullClaimedBacklogIsRefusedWithoutTheReadLoopWriting(t *testing.T) {
+	const claimed = 700
+	opts := aether.DefaultSessionOptions()
+	opts.ClaimedStreams = []uint64{claimed}
+	p := liteRawPeerWithOptions(t, opts)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	const id = 40
+	writeFrames(t, p.conn, synFrame(id))
+	st, err := p.sess.AcceptStream(ctx)
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	open := func(gen uint64) *aether.Frame {
+		return &aether.Frame{StreamID: claimed, Type: aether.TypeDATA, Flags: aether.FlagSYN,
+			Payload: aether.EncodeOpenPayload(aether.OpenPayload{Reliability: aether.ReliableOrdered, Generation: gen})}
+	}
+	reset := func(gen uint64) *aether.Frame {
+		return &aether.Frame{StreamID: claimed, Type: aether.TypeRESET, Payload: aether.EncodeResetPayload(aether.ResetPayload{
+			Reason: aether.ResetCancel, Incarnation: aether.StreamIncarnation{Generation: gen, WriterOpened: true}})}
+	}
+	var frames []*aether.Frame
+	for g := uint64(1); g <= aether.MaxByIDBacklogPerStream+2; g++ {
+		frames = append(frames, open(1000+g), reset(1000+g))
+	}
+	frames = append(frames, &aether.Frame{StreamID: id, Type: aether.TypeDATA, Payload: []byte("after")})
+	writeFrames(t, p.conn, frames...)
+	if r := <-receiveAsync(ctx, st, 5*time.Second); r.err != nil || string(r.data) != "after" {
+		t.Fatalf("the DATA behind a full claimed backlog's refusal: %q, %v; the readLoop waited on a write", r.data, r.err)
+	}
+	refused := false
+	for i := 0; i < 4*len(frames) && !refused; i++ {
+		_ = p.conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		f, _, _, err := aether.ReadNextFrame(p.conn, p.decoder)
+		if err != nil {
+			break
+		}
+		if f.StreamID == claimed && f.Type == aether.TypeRESET && !f.Flags.Has(aether.FlagACK) {
+			if rp := aether.DecodeResetPayload(f.Payload); rp.Reason == aether.ResetRefused {
+				refused = true
+			}
+		}
+	}
+	if !refused {
+		t.Fatal("no RESET(ResetRefused) for the claimed ID on the wire: the backlog never filled, so the refusal was never reached")
+	}
+}

@@ -1193,7 +1193,7 @@ The encoder follows a 13-step decision tree to select the optimal header format 
 12. Otherwise, is it a plain DATA frame?
     YES -> Data short (0x82, 9 bytes)
 
-13. Fallback -> Full header (50 bytes)
+13. Fallback -> Full header (51 bytes)
 ```
 
 Steps are evaluated in order; the first match wins. The batch step (9) is applied as a wrapper after individual frames have been encoded by steps 6-8 and 10-12.
