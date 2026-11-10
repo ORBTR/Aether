@@ -24,19 +24,27 @@ var ErrKeepaliveDeadline = errors.New("aether: the peer answered no keepalive pr
 // RunKeepalive's answered probes and the monitor's pong samples. A session with no
 // monitor yet gets the plan for a path with nothing measured. RunKeepalive reads it
 // before every wait and every probe, so each probe cycle follows what the previous
-// answers measured.
+// answers measured. It reads no standby path; multipath.Manager.KeepalivePlanFor is the
+// plan of a session its manager holds beside other paths to the same peer.
 func KeepalivePlanFor(s Session) quality.KeepalivePlan {
-	var in quality.KeepaliveInputs
-	if h := s.Health(); h != nil {
-		in = quality.KeepaliveInputs{
-			SRTT:        h.SRTT(),
-			RTO:         h.RTO(),
-			Samples:     h.SampleCount(),
-			Loss:        h.ProbeLoss(),
-			Instability: h.Instability(),
-		}
+	return quality.Keepalive(KeepaliveInputsFor(s))
+}
+
+// KeepaliveInputsFor is the measurements KeepalivePlanFor reads from s's health monitor,
+// with no standby. multipath.Manager.KeepalivePlanFor adds the standby input to them, so
+// both plans read the session's own measurements the same way.
+func KeepaliveInputsFor(s Session) quality.KeepaliveInputs {
+	h := s.Health()
+	if h == nil {
+		return quality.KeepaliveInputs{}
 	}
-	return quality.Keepalive(in)
+	return quality.KeepaliveInputs{
+		SRTT:        h.SRTT(),
+		RTO:         h.RTO(),
+		Samples:     h.SampleCount(),
+		Loss:        h.ProbeLoss(),
+		Instability: h.Instability(),
+	}
 }
 
 // RunKeepalive probes s on its keepalive stream until ctx ends or s closes, and ends s
