@@ -20,6 +20,7 @@ import (
 	"github.com/ORBTR/aether/congestion"
 	"github.com/ORBTR/aether/flow"
 	"github.com/ORBTR/aether/reliability"
+	"github.com/ORBTR/aether/scheduler"
 )
 
 // streamSendBlockFloor is the minimum noiseStream.Send wall-clock duration
@@ -174,6 +175,13 @@ type noiseStream struct {
 	// Zero only for a stream built outside createStream, which then sends no
 	// fragments.
 	generation uint64
+
+	// schedReg is the stream's registration with the session's scheduler, made in
+	// createStream under s.mu before the stream is published and read-only after. The
+	// write loop drops a frame the scheduler names another registration for
+	// (frameStream), and the stream's exit unregisters this registration only
+	// (releaseStream), so neither reaches a later stream under the ID.
+	schedReg scheduler.Registration
 
 	// incarnation names this stream among those that have used its ID on the
 	// session, as this side states it: the opener's generation, this stream's own
@@ -429,6 +437,22 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 		return nil, err
 	}
 	st.reserved.Store(credit)
+	// The scheduler registration precedes publication, under the lock queueFrame checks
+	// s.streams under, so the ID's registration is this stream's whenever s.streams
+	// holds it. It replaces the registration of a stream whose exit has taken it out of
+	// s.streams and not yet out of the scheduler, whose queued frames are that stream's
+	// and go with it.
+	//
+	// The caller's LatencyClass MUST be honoured: the RPC caller that opens stream 1
+	// sets ClassINTERACTIVE, and dropping it leaves RPC dispatch competing with gossip
+	// at the lowest priority. ClassUnset (the zero value) means the caller did not
+	// specify one: DefaultLatencyClass(streamID), not ClassREALTIME, which would
+	// funnel every default-config stream past the scheduler's 10% bandwidth cap.
+	class := cfg.LatencyClass
+	if class == aether.ClassUnset {
+		class = aether.DefaultLatencyClass(streamID)
+	}
+	st.schedReg = s.sched.RegisterWithClass(streamID, cfg.Priority, cfg.Dependency, class)
 	s.streams[streamID] = st
 	// A RESET for this ID from here on is this stream's, not the crossing of an
 	// earlier one (handleReset's resetGrants).
@@ -437,21 +461,6 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 
 	// Register with stream GC for idle timeout tracking
 	s.streamGC.Register(streamID)
-
-	// Propagate cfg.LatencyClass to the scheduler. The caller's setting
-	// MUST be honoured: the RPC caller that opens stream 1 sets
-	// ClassINTERACTIVE and dropping it leaves RPC dispatch competing
-	// with gossip at the lowest priority.
-	//
-	// ClassUnset (zero value) means the caller didn't specify a class —
-	// fall back to DefaultLatencyClass(streamID) rather than treating
-	// the omission as ClassREALTIME, which would funnel every
-	// default-config stream past the scheduler's 10% bandwidth cap.
-	class := cfg.LatencyClass
-	if class == aether.ClassUnset {
-		class = aether.DefaultLatencyClass(streamID)
-	}
-	s.sched.RegisterWithClass(streamID, cfg.Priority, cfg.Dependency, class)
 	return st, nil
 }
 
@@ -1403,7 +1412,7 @@ func (st *noiseStream) leaveSession() {
 	delete(s.streams, st.streamID)
 	s.mu.Unlock()
 	st.releaseReservation()
-	s.releaseStream(st.streamID)
+	s.releaseStream(st.streamID, st.schedReg)
 	s.trackEnded(st.recvQ)
 }
 
@@ -1422,7 +1431,7 @@ func (st *noiseStream) leaveSchedulerThenSettle() {
 	if hook := st.beforeSchedulerExit.Load(); hook != nil {
 		(*hook)()
 	}
-	st.session.releaseStream(st.streamID)
+	st.session.releaseStream(st.streamID, st.schedReg)
 	st.releaseInFlight()
 }
 

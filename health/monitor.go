@@ -44,6 +44,9 @@ type Monitor struct {
 	probeLoss   float64
 	instability float64
 	samples     uint64 // pong samples RecordPongRecv has taken, for instability's first pair
+	// pingsRecv counts the PINGs the peer sent that this side answered
+	// (RecordPingRecv); PingsReceived reads it.
+	pingsRecv atomic.Uint64
 }
 
 // probeEWMAGain is the weight a new observation gets in probeLoss and instability: the
@@ -131,6 +134,23 @@ func (m *Monitor) PingSentAt() time.Time {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.lastPingSent
+}
+
+// RecordPingRecv counts one PING the peer sent. aether.ControlFrameHandler.HandlePing
+// calls it for each PING it answers, on every session type, so the count is the peer's
+// probing of this side and not this side's own, which RecordPingSent and RecordPongRecv
+// track.
+func (m *Monitor) RecordPingRecv() {
+	m.pingsRecv.Add(1)
+}
+
+// PingsReceived returns how many PINGs the peer has sent on the session
+// (RecordPingRecv). A peer probes a session it holds, so a count that moves says the
+// peer keeps this session, which the session's received-frame count does not: that
+// count includes the handshake's frames, which a peer that then refuses the session
+// sends too. Each session's Metrics states it as SessionMetrics.PingsReceived.
+func (m *Monitor) PingsReceived() uint64 {
+	return m.pingsRecv.Load()
 }
 
 // IncrementMissedPings increments the missed ping counter and returns the new count.

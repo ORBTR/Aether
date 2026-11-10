@@ -44,7 +44,7 @@ const (
 	// lite would desync the stream.
 	ShortACKFullIndicator byte = 0x88 // Composite ACK-full, 5-byte hdr + payload
 
-	ShortDataSize = 9 // [indicator:1][streamID:2][seqDelta:2][length:4]
+	ShortDataSize = 9 // [indicator:1][streamID:2][seqLow:2][length:4]
 	// ShortDataVarMaxLength is the longest payload NoiseSession sends in the
 	// varint short form (EncodeVarLength's one-byte range).
 	ShortDataVarMaxLength = 127
@@ -114,7 +114,10 @@ func shortStreamID(f *Frame) (uint16, error) {
 // Per-stream and session state
 // ────────────────────────────────────────────────────────────────────────────
 
-// StreamCompState tracks per-stream compression state for SeqNo deltas.
+// StreamCompState is one stream's state for the short DATA forms: lastSeqNo, the SeqNo
+// of the last frame encoded (ShouldCompressData's bound) or decoded (reconstructSeqNo's
+// reference) on the stream, and frameCount, which spaces the periodic full header
+// (ShortHeaderFullInterval).
 type StreamCompState struct {
 	mu         sync.Mutex
 	lastSeqNo  uint32
@@ -949,7 +952,7 @@ func (c *Compressor) DecodeDataShortVar(r io.Reader) (*Frame, error) {
 	if !c.ShortForms() {
 		return nil, c.refuseShort(ShortDataVarIndicator)
 	}
-	var hdr [4]byte // streamID + seqDelta
+	var hdr [4]byte // streamID + seqLow
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, err
 	}

@@ -238,6 +238,14 @@ type SessionMetrics struct {
 	// (RecordPongRecv feeds the estimator only on that match).
 	HealthSRTTUs uint64 `json:"healthSrttUs,omitempty"`
 
+	// PingsReceived is the count of PINGs the peer has sent on the session, from the
+	// session's health.Monitor (PingsReceived), which every session type's PING
+	// handler feeds (ControlFrameHandler.HandlePing). A peer probes only a session it
+	// holds, so a holder that redials when the session ends can read a count that
+	// moved as the peer having admitted the session, which FramesRecv cannot say: it
+	// counts the handshake's frames too.
+	PingsReceived uint64 `json:"pingsReceived,omitempty"`
+
 	// Observability histograms surfaced as p50/p99 microseconds — the
 	// minimum cardinality that lets operators localize the bimodal RPC
 	// latency tail. Source histograms live on

@@ -664,8 +664,10 @@ func newNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 			// invoking this callback, so Unregister here is a no-op on
 			// that side but harmless.
 			_ = st.Reset(aether.ResetTimeout)
+			s.releaseStream(streamID, st.schedReg)
+			return
 		}
-		s.releaseStream(streamID)
+		s.releaseStream(streamID, 0)
 	})
 
 	// PMTU prober sends PATH_PROBE frames to discover maximum segment size. size is
@@ -936,12 +938,22 @@ func (s *NoiseSession) GoAway(ctx context.Context, reason aether.GoAwayReason, m
 //
 // All operations are idempotent: calling for a streamID that was
 // already unregistered is a no-op on both the scheduler and the GC.
-func (s *NoiseSession) releaseStream(streamID uint64) {
+//
+// reg is the ending stream's scheduler registration (noiseStream.schedReg): only that
+// registration leaves the scheduler, so a stream the peer opened under the ID after the
+// ending stream left s.streams keeps its own (Scheduler.UnregisterRegistration). Zero
+// removes whatever registration the ID has, for the stream GC's call for an ID it found
+// no stream under.
+func (s *NoiseSession) releaseStream(streamID uint64, reg scheduler.Registration) {
 	// The frames Unregister hands back need no credit returned here: a RESET's
 	// exit has settled the connection window for all this stream had charged, these
 	// included (noiseStream.settleLocalReset, settlePeerReset), and leaveSession's
 	// stream has none, its send window having emptied on its CLOSE's ACK.
-	s.sched.Unregister(streamID)
+	if reg != 0 {
+		s.sched.UnregisterRegistration(streamID, reg)
+	} else {
+		s.sched.Unregister(streamID)
+	}
 	if s.streamGC != nil {
 		s.streamGC.Unregister(streamID)
 	}
@@ -1624,7 +1636,8 @@ func (s *NoiseSession) Metrics() aether.SessionMetrics {
 		// (RttP50/95/99) which only updates on DATA-frame ACKs; on a
 		// session with no application traffic the per-stream values
 		// stay 0 while HealthSRTT still reflects ping-derived liveness.
-		HealthSRTTUs: uint64(s.Health().SRTT().Microseconds()),
+		HealthSRTTUs:  uint64(s.Health().SRTT().Microseconds()),
+		PingsReceived: s.Health().PingsReceived(),
 
 		// Observability histograms (write syscall, writeLoop park, cwnd
 		// block, grant starve, cwnd util) and the TLP / RACK counters.

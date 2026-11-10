@@ -19,6 +19,7 @@ import (
 	"github.com/ORBTR/aether/abuse"
 	"github.com/ORBTR/aether/congestion"
 	"github.com/ORBTR/aether/quality"
+	"github.com/ORBTR/aether/scheduler"
 )
 
 // stallProbe is one probeStalled answer, read by reliabilityTick's stall detector:
@@ -89,14 +90,22 @@ func (s *NoiseSession) probeStalled(plan quality.KeepalivePlan, ping func(contex
 // of its stream, so the frames reach the wire out of sequence and the peer reports
 // gaps nothing lost, and Dequeue would charge the stream's WFQ deficit and the
 // REALTIME and BULK counters once per attempt for one frame sent.
+//
+// Every frame the scheduler hands out comes with the registration it was queued
+// under (Scheduler.DequeueFrom), and held keeps it. A frame whose registration is no
+// longer the one the stream under its ID holds is a frame of a stream that has ended,
+// and is dropped, as Scheduler.Unregister drops what such a stream still had queued
+// (frameStream): written, it would be recorded on the next stream's send window and
+// read by that stream's peer as its own.
 func (s *NoiseSession) writeLoop() {
 	wake := s.sched.WakeCh()
 	var pacingTimer *time.Timer
-	// held, heldSize and heldPlain: the frame waiting on the gate or the pacer,
-	// its prospective wire size and its length before deflate, so a retry does
-	// not deflate it again.
+	// held, heldSize, heldPlain and heldReg: the frame waiting on the gate or the
+	// pacer, its prospective wire size and its length before deflate, so a retry does
+	// not deflate it again, and the scheduler registration it came from.
 	var held *aether.Frame
 	var heldSize, heldPlain int64
+	var heldReg scheduler.Registration
 	// cwndBlockHist: when CanSend returns false the writeLoop holds the
 	// frame + parks. We mark the wall-clock at first rejection
 	// (cwndBlockStart non-zero), and on the next successful CanSend we
@@ -133,25 +142,29 @@ func (s *NoiseSession) writeLoop() {
 
 			var frame *aether.Frame
 			var isProbe bool
+			var reg scheduler.Registration
 			if held != nil {
-				frame = s.sched.DequeueProbe()
+				frame, reg = s.sched.DequeueProbeFrom()
 				isProbe = frame != nil
 				if frame == nil {
-					frame = held
+					frame, reg = held, heldReg
 				}
 			} else {
-				frame, isProbe = s.sched.Dequeue()
+				frame, isProbe, reg = s.sched.DequeueFrom()
 			}
 			if frame == nil {
 				break // empty — fall through to park on wake/closed
 			}
 
-			st := s.sequencedFrameStream(frame)
-			if frame == held && st == nil && sequencedFrame(frame) {
-				// The stream left while its frame waited here. Scheduler.Unregister
-				// dropped every frame still in the stream's queue for the same reason.
-				held = nil
-				endCwndBlock()
+			st, ended := s.frameStream(frame, reg)
+			if ended {
+				// The frame's stream has ended, here or while the frame waited in held:
+				// nothing of it goes on the wire, as Scheduler.Unregister drops every
+				// frame still in such a stream's queue.
+				if frame == held {
+					held = nil
+					endCwndBlock()
+				}
 				continue
 			}
 
@@ -189,7 +202,7 @@ func (s *NoiseSession) writeLoop() {
 			if !isProbe {
 				other := s.totalInFlightBytes() - recorded
 				if other > 0 && !s.congestion().CanSend(other+frameSize) {
-					held, heldSize, heldPlain = frame, frameSize, plain
+					held, heldSize, heldPlain, heldReg = frame, frameSize, plain, reg
 					atomic.AddUint64(&s.cansendFalseReenqueues, 1)
 					// Mark block-entry on the first reject in a
 					// run. Subsequent rejects keep the earlier start so
@@ -226,7 +239,7 @@ func (s *NoiseSession) writeLoop() {
 						st.queueProbe(frame)
 					}
 				} else {
-					held, heldSize, heldPlain = frame, frameSize, plain
+					held, heldSize, heldPlain, heldReg = frame, frameSize, plain, reg
 				}
 				if pacingTimer == nil {
 					pacingTimer = time.NewTimer(wait)
@@ -991,17 +1004,26 @@ func sequencedFrame(frame *aether.Frame) bool {
 	return frame.Type == aether.TypeDATA || frame.Type == aether.TypeCLOSE
 }
 
-// sequencedFrameStream returns the stream whose send window may hold frame, or nil
-// for any other frame or a stream that has left s.streams. The write loop calls it
-// per frame before the CanSend gate, which needs the frame's recorded count from that
-// window, and passes the stream on to the write boundary.
-func (s *NoiseSession) sequencedFrameStream(frame *aether.Frame) *noiseStream {
-	if !sequencedFrame(frame) {
-		return nil
-	}
+// frameStream reads a frame the scheduler handed out under registration reg. ended
+// is true when s.streams holds no stream under the frame's ID whose registration is
+// reg (noiseStream.schedReg): the stream the frame was queued for has left, and the
+// ID may now be another stream's. Otherwise st is that stream when its send window
+// may hold the frame (sequencedFrame), nil for a frame no send window tracks. The
+// write loop calls it per frame before the CanSend gate, which needs the frame's
+// recorded count from that window, and passes the stream on to the write boundary.
+// Every registration is a stream's (createStream), made under s.mu before the stream
+// is published, so a stream s.streams holds always has its registration.
+func (s *NoiseSession) frameStream(frame *aether.Frame, reg scheduler.Registration) (st *noiseStream, ended bool) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.streams[frame.StreamID]
+	cur, ok := s.streams[frame.StreamID]
+	s.mu.Unlock()
+	if !ok || cur.schedReg != reg {
+		return nil, true
+	}
+	if !sequencedFrame(frame) {
+		return nil, false
+	}
+	return cur, false
 }
 
 // countFrameSent feeds Metrics()'s per-session frame and byte counters. Count
@@ -1183,22 +1205,23 @@ func (s *NoiseSession) emitFrameLocked(frame *aether.Frame, st *noiseStream) (in
 // short forms and RecordFullHeader advance the directional compressor.
 func (s *NoiseSession) encodeFrameLocked(buf *bytes.Buffer, frame *aether.Frame) error {
 	if s.opts.HeaderComp {
-		// Control frames (not encrypted, no payload) → 4 bytes
+		// Control frames with no payload (PING, PONG) → 0x83, 8 bytes
 		if s.txCompressor.ShouldCompressControl(frame) {
 			s.txCompressor.EncodeControlShort(buf, frame)
 			return nil
 		}
-		// ACK frames → 11 bytes (lite) or 3+N (full)
+		// ACK frames → 0x84, 11 bytes (no gaps), or 0x88, 5 bytes + the CompositeACK payload
 		if s.txCompressor.ShouldCompressACK(frame) {
 			s.txCompressor.EncodeACKShort(buf, frame)
 			return nil
 		}
-		// Encrypted DATA → 9 bytes + Nonce-in-payload
+		// Encrypted DATA → 0x87. No frame reaches it: ShouldCompressData refuses every
+		// frame flagged FlagENCRYPTED, so an encrypted frame takes the full header.
 		if frame.Flags.Has(aether.FlagENCRYPTED) && s.txCompressor.ShouldCompressData(frame) {
 			s.txCompressor.EncodeEncryptedDataShort(buf, frame)
 			return nil
 		}
-		// Unencrypted DATA → 6-9 bytes
+		// Unencrypted DATA → 0x86, 6 bytes, up to ShortDataVarMaxLength; 0x82, 9 bytes, above
 		if s.txCompressor.ShouldCompressData(frame) {
 			if frame.Length <= aether.ShortDataVarMaxLength {
 				s.txCompressor.EncodeDataShortVar(buf, frame)

@@ -508,7 +508,7 @@ func (s *QUICSession) Metrics() aether.SessionMetrics {
 	s.mu.Lock()
 	streamCount := len(s.streams)
 	s.mu.Unlock()
-	return aether.SessionMetrics{RTT: avg, ActiveStreams: streamCount}
+	return aether.SessionMetrics{RTT: avg, ActiveStreams: streamCount, PingsReceived: s.Health().PingsReceived()}
 }
 
 // ────────────────────────────────────────────────────────────────────────────
