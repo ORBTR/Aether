@@ -1020,28 +1020,28 @@ After session establishment, most frames can use compact short headers instead o
 
 | Indicator | Format | Size | Use Case |
 |:-:|--------|:-:|----------|
-| `0x82` | Data short | 9 bytes | Unencrypted DATA, uint16 StreamID + uint32 Length |
+| `0x82` | Data short | 9 bytes | Unencrypted DATA, uint16 StreamID, low 16 bits of SeqNo, uint32 Length |
 | `0x83` | Control short | 8 bytes | PING/PONG/CLOSE/RESET with no payload, SeqNo carried (CLOSE and RESET always carry a payload in frame grammar 5, so neither takes it) |
 | `0x84` | ACK short | 11 bytes | Composite ACK with no gaps (lite) |
-| `0x85` | Batch | 2+N x sub | Multiple frames per write |
-| `0x86` | Data varint | 6-10 bytes | Small DATA, varint Length |
-| `0x87` | Encrypted data | 9 bytes | Encrypted DATA, Nonce-in-payload |
+| `0x85` | Batch | 2+N x sub | Multiple frames per write; children `0x82`-`0x84`, `0x86`, `0x88` or a full frame |
+| `0x86` | Data varint | 6, 7 or 10 bytes | Small DATA, canonical varint Length |
+| `0x87` | Encrypted data | 9 bytes | Encrypted DATA, Nonce-in-payload; decoded, written by no sender |
 | `0x88` | ACK full | 5+N bytes | Composite ACK with gaps or extensions (full) |
 
 #### 23.2.1 Data Short (`0x82`) — 9 bytes
 
 ```
-[0x82:1][StreamID:2][SeqDelta:2][Length:4][Payload:var]
+[0x82:1][StreamID:2][SeqLow:2][Length:4][Payload:var]
 ```
 
 - StreamID is uint16 (supports streams 0-65535; streams > 65535 require full header)
-- **SeqDelta** is a uint16 delta from the last sequence number on this stream (not the raw SeqNo). The decoder reconstructs the full SeqNo: `seqNo = lastSeqNo + seqDelta`
+- **SeqLow** is the low 16 bits of the frame's absolute SeqNo, not a delta. The decoder rebuilds the SeqNo as the value with those low bits closest to the one after the last SeqNo it recorded for the stream (`reconstructSeqNo`), so a frame lost or reordered on the path shifts no later frame's number; a rebuilt value past the 32-bit space is refused with `ErrSequenceWrap`. The sender writes this form only for a SeqNo from 0 to 65,535 above the last it recorded for the stream (`ShouldCompressData`), and the full header otherwise (section 23.4)
 - Length is uint32 payload length
 - SenderID/ReceiverID inherited from session state
 - Type is implicitly DATA (0x01), Flags implicitly 0x00
 - A full 50-byte header is sent every 64 frames per stream (`ShortHeaderFullInterval`) for state resynchronization
 
-Implementation: `codec_short.go` — `ShortDataSize = 9`, field at offset [3:5] is `seqDelta`
+Implementation: `codec_short.go` — `ShortDataSize = 9`; bytes [3:5] are `uint16(SeqNo)` (`EncodeDataShort`), read by `reconstructSeqNo`
 
 #### 23.2.2 Control Short (`0x83`) — 8 bytes
 
@@ -1076,32 +1076,34 @@ Total: 5 + CompositeACK payload size. Lite and full have distinct indicators, so
 [0x85:1][Count:1][SubFrame_0][SubFrame_1]...[SubFrame_N-1]
 ```
 
-- Count: number of sub-frames (1-255)
-- Each sub-frame is a complete short header frame (any format 0x82-0x87)
+- Count: number of sub-frames (1-255); a count of 0 is refused
+- Each sub-frame is written in the first short form it qualifies for: `0x83` (control), `0x84` or `0x88` (ACK), `0x86` (DATA up to 127 bytes), `0x82` (other DATA), and otherwise as a complete full frame behind `0x01` (`EncodeBatch`)
+- A `0x87` sub-frame is refused: its decrypt gate reads the indicator, which inside a batch is `0x85`, so its payload would reach the consumer undecrypted
 - Enables multiple frames to be sent in a single write syscall
-- Sub-frames MUST NOT be nested batches (no 0x85 inside 0x85)
+- Sub-frames MUST NOT be nested batches (no 0x85 inside 0x85); any other first byte inside a batch is refused (`ErrFrameDiscriminator`)
 
 #### 23.2.5 Data Varint (`0x86`) — 6-10 bytes
 
 ```
-[0x86:1][StreamID:2][SeqDelta:2][Length:varint][Payload:var]
+[0x86:1][StreamID:2][SeqLow:2][Length:varint][Payload:var]
 ```
 
-- Length is encoded as a varint (1-5 bytes), saving space for small payloads
-- Optimal for payloads < 128 bytes (Length fits in 1 byte, total header = 6 bytes)
+- Length is a varint in its one canonical form (`EncodeVarLength`): 1 byte for 0-127 (the value), 2 bytes for 128-16,383 (`0x80` or'd with the high 6 bits, then the low 8 bits), 5 bytes above (`0xFF`, then the uint32 big-endian). Any other encoding of a value is refused with `ErrVarLengthNoncanonical` before anything it would size is read. The header is 6, 7 or 10 bytes
+- NoiseSession writes this form for payloads up to 127 bytes (`ShortDataVarMaxLength`), a 6-byte header, and `0x82` above
 - Otherwise identical to Data Short (0x82)
 
 #### 23.2.6 Encrypted Data (`0x87`) — 9 bytes
 
 ```
-[0x87:1][StreamID:2][SeqDelta:2][Length:4][EncryptedPayload:var]
+[0x87:1][StreamID:2][SeqLow:2][Length:4][EncryptedPayload:var]
 ```
 
+- No sender writes this form: `ShouldCompressData` keeps every frame flagged `FlagENCRYPTED` on the full header. A receiver decodes it (`DecodeEncryptedDataShort`), outside a batch only (section 23.2.4)
 - Header is identical to Data Short (0x82) but indicates encrypted payload
 - Nonce is carried inside the payload envelope (not in the header)
 - Encrypted payload envelope: `[Nonce:12][Ciphertext:var][Tag:16]`
 - Length field includes the full envelope: 12 (nonce) + ciphertext_len + 16 (tag)
-- AEAD additional data = the 9-byte short header itself (all bytes before payload)
+- AEAD additional data is the 38-byte frame header the receiver rebuilds for the frame (`Frame.HeaderBytes`, `FrameEncryptor.DecryptWithNonce`), not the 9 bytes on the wire: SenderID and ReceiverID from session state, StreamID as 8 bytes, Type DATA, Flags 0, the rebuilt SeqNo, AckNo 0, and Length the ciphertext plus tag
 
 ### 23.3 Session State
 
@@ -1115,13 +1117,13 @@ Short headers omit fields that are constant or derivable from session state:
 | AckNo | Omitted; use dedicated ACK short (`0x84`) or piggyback in full header |
 | Flags | Implicit per format (e.g., `0x87` implies ENCRYPTED) |
 
-### 23.4 Per-Stream SeqDelta State
+### 23.4 Per-Stream Sequence State
 
-Each stream tracks its own independent sequence state for delta compression:
+Each stream tracks its own independent sequence state for the short DATA forms:
 
-- **Sender side:** Maintains per-stream `lastSeqNo`. SeqDelta = `currentSeqNo - lastSeqNo`.
-- **Receiver side:** Reconstructs full SeqNo: `seqNo = lastSeqNo + seqDelta`.
-- SeqDelta in short headers is uint16 (max delta 65535). If the delta exceeds 65535, a full header is used.
+- **Sender side:** Maintains per-stream `lastSeqNo`, the SeqNo of the last frame it encoded on the stream in any form. A DATA frame takes a short form only when its SeqNo is from 0 to 65,535 above `lastSeqNo`; any other, a retransmit below it included, takes the full header.
+- **Receiver side:** Keeps the last SeqNo it decoded on the stream and rebuilds each short form's SeqNo from the low 16 bits the frame carries, as the closest value to the one after it (section 23.2.1).
+- The short forms carry the low 16 bits of the absolute SeqNo, not a delta, so the receiver's state needs no frame before it to have arrived.
 - SeqNo is scoped to a stream — each stream has independent tracking starting at 0.
 - On stream OPEN (or a DATA frame flagged FlagSYN), SeqNo resets to 0.
 

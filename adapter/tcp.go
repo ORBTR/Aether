@@ -1995,6 +1995,7 @@ func (s *TCPSession) Metrics() aether.SessionMetrics {
 		// TCP/WS/gRPC have no reliability engine, so only StreamRefused
 		// applies. Other security counters live on the Noise path.
 		StreamRefused: s.StreamRefusedCount(),
+		PingsReceived: s.Health().PingsReceived(),
 	}
 }
 

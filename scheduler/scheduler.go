@@ -53,6 +53,10 @@ type Scheduler struct {
 	// queue-mutation and counter-add.
 	queueDepth atomic.Int64
 
+	// registrations numbers the registrations: RegisterWithClass gives each the next
+	// value, so no two registrations of one scheduler share a Registration.
+	registrations uint64
+
 	// depthHist is the optional scheduler-depth histogram. Wired
 	// by the owning session via SetDepthHist; nil disables sampling
 	// (default for schedulers constructed via NewScheduler). Sampled on
@@ -62,8 +66,17 @@ type Scheduler struct {
 	depthHist *metrics.Uint32Ring
 }
 
+// Registration names one registration of a stream ID with the scheduler. The zero
+// value names none. A session that reuses an ID for a later stream registers it again
+// and gets a new Registration, so a frame Dequeue hands out (DequeueFrom) can be told
+// from a frame of the stream that held the ID before (NoiseSession's write loop drops
+// such a frame), and an ended stream's exit can leave alone the registration its
+// successor holds (UnregisterRegistration).
+type Registration uint64
+
 type scheduledStream struct {
 	streamID     uint64
+	reg          Registration
 	weight       uint8
 	dependency   uint64 // parent stream ID (0 = root)
 	latencyClass aether.LatencyClass
@@ -176,12 +189,17 @@ func (s *Scheduler) MarkRetransmit(streamID uint64) {
 }
 
 // Register adds a stream to the scheduler with the given weight, dependency, and latency class.
-func (s *Scheduler) Register(streamID uint64, weight uint8, dependency uint64) {
-	s.RegisterWithClass(streamID, weight, dependency, aether.DefaultLatencyClass(streamID))
+func (s *Scheduler) Register(streamID uint64, weight uint8, dependency uint64) Registration {
+	return s.RegisterWithClass(streamID, weight, dependency, aether.DefaultLatencyClass(streamID))
 }
 
-// RegisterWithClass adds a stream with an explicit latency class.
-func (s *Scheduler) RegisterWithClass(streamID uint64, weight uint8, dependency uint64, class aether.LatencyClass) {
+// RegisterWithClass adds a stream with an explicit latency class and returns the
+// registration's name. A registration already under the ID is replaced: what it still
+// held is dropped as Unregister drops it, and the ID keeps its place in the round-robin
+// order. NoiseSession.createStream registers a stream before it publishes it, under the
+// lock its exits take the stream out under, so the ID's next stream can replace the
+// registration of a stream whose exit has not yet unregistered it.
+func (s *Scheduler) RegisterWithClass(streamID uint64, weight uint8, dependency uint64, class aether.LatencyClass) Registration {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -189,13 +207,35 @@ func (s *Scheduler) RegisterWithClass(streamID uint64, weight uint8, dependency 
 		weight = DefaultWeight
 	}
 
+	s.registrations++
+	reg := Registration(s.registrations)
+	if prev, ok := s.streams[streamID]; ok {
+		s.dropQueuedLocked(prev)
+	} else {
+		s.order = append(s.order, streamID)
+	}
 	s.streams[streamID] = &scheduledStream{
 		streamID:     streamID,
+		reg:          reg,
 		weight:       weight,
 		dependency:   dependency,
 		latencyClass: class,
 	}
-	s.order = append(s.order, streamID)
+	return reg
+}
+
+// dropQueuedLocked takes what a registration still holds out of the depth count and
+// returns it. Callers hold s.mu and remove or replace the registration.
+func (s *Scheduler) dropQueuedLocked(ss *scheduledStream) (droppedFrames []*aether.Frame, droppedProbe *aether.Frame) {
+	if len(ss.queue) > 0 {
+		droppedFrames = append([]*aether.Frame(nil), ss.queue...)
+		s.queueDepth.Add(-int64(len(ss.queue)))
+	}
+	droppedProbe = ss.probe
+	if droppedProbe != nil {
+		s.queueDepth.Add(-1)
+	}
+	return droppedFrames, droppedProbe
 }
 
 // Unregister removes a stream from the scheduler and drops its queued frames
@@ -211,16 +251,29 @@ func (s *Scheduler) RegisterWithClass(streamID uint64, weight uint8, dependency 
 func (s *Scheduler) Unregister(streamID uint64) (droppedFrames []*aether.Frame, droppedProbe *aether.Frame) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.unregisterLocked(streamID, 0)
+}
 
-	if ss, ok := s.streams[streamID]; ok {
-		if len(ss.queue) > 0 {
-			droppedFrames = append([]*aether.Frame(nil), ss.queue...)
-			s.queueDepth.Add(-int64(len(ss.queue)))
-		}
-		droppedProbe = ss.probe
-		if droppedProbe != nil {
-			s.queueDepth.Add(-1)
-		}
+// UnregisterRegistration is Unregister for the registration reg alone: when the ID is
+// registered again since (RegisterWithClass), the later registration stays as it is and
+// nothing is dropped. NoiseSession.releaseStream passes the ending stream's registration,
+// since a stream the peer opens under the ID can register between that stream's leaving
+// s.streams and its exit reaching the scheduler.
+func (s *Scheduler) UnregisterRegistration(streamID uint64, reg Registration) (droppedFrames []*aether.Frame, droppedProbe *aether.Frame) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.unregisterLocked(streamID, reg)
+}
+
+// unregisterLocked removes the ID's registration, or only reg's when reg is not zero.
+// Callers hold s.mu.
+func (s *Scheduler) unregisterLocked(streamID uint64, reg Registration) (droppedFrames []*aether.Frame, droppedProbe *aether.Frame) {
+	ss, ok := s.streams[streamID]
+	if ok && reg != 0 && ss.reg != reg {
+		return nil, nil
+	}
+	if ok {
+		droppedFrames, droppedProbe = s.dropQueuedLocked(ss)
 	}
 	delete(s.streams, streamID)
 
@@ -340,17 +393,25 @@ func (s *Scheduler) EnqueueProbe(streamID uint64, frame *aether.Frame) {
 // gate refused: a probe goes outside the congestion window (RFC 8985 §7.5), so a
 // refused frame must not stand in front of it.
 func (s *Scheduler) DequeueProbe() *aether.Frame {
+	frame, _ := s.DequeueProbeFrom()
+	return frame
+}
+
+// DequeueProbeFrom is DequeueProbe that also names the registration the probe came
+// from (DequeueFrom).
+func (s *Scheduler) DequeueProbeFrom() (*aether.Frame, Registration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.dequeueProbeLocked(s.order)
 }
 
-// dequeueProbeLocked takes the first pending probe in order. Callers hold s.mu.
+// dequeueProbeLocked takes the first pending probe in order and names its
+// registration. Callers hold s.mu.
 // Walks order so probes are drained in a stable, registration-ordered sequence
 // rather than map-iteration order (deterministic ordering helps tests + log
 // readability without affecting correctness). Probes do not consume the REALTIME
 // cap counters — they are recovery traffic, not application traffic.
-func (s *Scheduler) dequeueProbeLocked(order []uint64) *aether.Frame {
+func (s *Scheduler) dequeueProbeLocked(order []uint64) (*aether.Frame, Registration) {
 	for _, streamID := range order {
 		ss, ok := s.streams[streamID]
 		if !ok || ss.probe == nil {
@@ -359,9 +420,9 @@ func (s *Scheduler) dequeueProbeLocked(order []uint64) *aether.Frame {
 		frame := ss.probe
 		ss.probe = nil
 		s.queueDepth.Add(-1)
-		return frame
+		return frame, ss.reg
 	}
-	return nil
+	return nil, 0
 }
 
 // Dequeue returns the next frame to send and whether it is a TLP probe.
@@ -379,6 +440,16 @@ func (s *Scheduler) dequeueProbeLocked(order []uint64) *aether.Frame {
 // (CanSend) for this frame, per RFC 8985 §7.5. isProbe=false means the
 // frame goes through normal cwnd flow control.
 func (s *Scheduler) Dequeue() (*aether.Frame, bool) {
+	frame, isProbe, _ := s.DequeueFrom()
+	return frame, isProbe
+}
+
+// DequeueFrom is Dequeue that also names the registration the frame came from, zero
+// with no frame. Frames are queued by stream ID, and a session that reuses an ID
+// registers it again for the next stream (RegisterWithClass), so the ID alone does not
+// say whose frame it is: NoiseSession's write loop compares the registration with the
+// one the stream now under the ID holds, and drops a frame of a stream that has ended.
+func (s *Scheduler) DequeueFrom() (*aether.Frame, bool, Registration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -390,13 +461,13 @@ func (s *Scheduler) Dequeue() (*aether.Frame, bool) {
 	// would otherwise cause an index skip or out-of-bounds crash. The
 	// copy is cheap (uint64 per stream) and immune to mutation.
 	if len(s.order) == 0 {
-		return nil, false
+		return nil, false, 0
 	}
 	order := append([]uint64(nil), s.order...)
 
 	// 1. TLP probes have absolute priority.
-	if frame := s.dequeueProbeLocked(order); frame != nil {
-		return frame, true
+	if frame, reg := s.dequeueProbeLocked(order); frame != nil {
+		return frame, true, reg
 	}
 
 	// 2. Determine if REALTIME is over its bandwidth cap
@@ -425,9 +496,9 @@ func (s *Scheduler) Dequeue() (*aether.Frame, bool) {
 	// makes forward progress.
 	if s.nonBulkStreak >= bulkStarvationLimit {
 		s.nonBulkStreak = 0
-		if frame, _ := s.dequeueFromClass(aether.ClassBULK, order, false); frame != nil {
+		if frame, _, reg := s.dequeueFromClass(aether.ClassBULK, order, false); frame != nil {
 			s.totalBytes += int64(aether.HeaderSize) + int64(frame.Length)
-			return frame, false
+			return frame, false, reg
 		}
 		// No BULK queued — fall through to the normal priority order.
 	}
@@ -439,7 +510,7 @@ func (s *Scheduler) Dequeue() (*aether.Frame, bool) {
 		// Fold capped REALTIME streams into the INTERACTIVE round so their
 		// frames still make progress at INTERACTIVE priority.
 		demoteRealtime := realtimeCapped && targetClass == aether.ClassINTERACTIVE
-		frame, isRealtime := s.dequeueFromClass(targetClass, order, demoteRealtime)
+		frame, isRealtime, reg := s.dequeueFromClass(targetClass, order, demoteRealtime)
 		if frame != nil {
 			// Track bandwidth per class for REALTIME cap. A demoted REALTIME
 			// frame served in the INTERACTIVE round still counts as REALTIME
@@ -455,11 +526,11 @@ func (s *Scheduler) Dequeue() (*aether.Frame, bool) {
 			} else {
 				s.nonBulkStreak++
 			}
-			return frame, false
+			return frame, false, reg
 		}
 	}
 
-	return nil, false
+	return nil, false, 0
 }
 
 // bulkStarvationLimit is the number of consecutive non-BULK dequeues after
@@ -475,8 +546,9 @@ const bulkStarvationLimit = 16
 // targetClass — used to serve a capped (demoted) REALTIME class in the
 // INTERACTIVE round (Dequeue). The returned bool reports whether the chosen
 // frame belonged to a REALTIME stream so the caller charges the REALTIME
-// bandwidth counter correctly.
-func (s *Scheduler) dequeueFromClass(targetClass aether.LatencyClass, order []uint64, includeRealtime bool) (*aether.Frame, bool) {
+// bandwidth counter correctly, and the Registration names the registration it came
+// from (DequeueFrom).
+func (s *Scheduler) dequeueFromClass(targetClass aether.LatencyClass, order []uint64, includeRealtime bool) (*aether.Frame, bool, Registration) {
 	var bestIdx int = -1
 	var bestFinish float64
 
@@ -512,7 +584,7 @@ func (s *Scheduler) dequeueFromClass(targetClass aether.LatencyClass, order []ui
 	}
 
 	if bestIdx == -1 {
-		return nil, false
+		return nil, false, 0
 	}
 
 	streamID := order[bestIdx]
@@ -549,7 +621,7 @@ func (s *Scheduler) dequeueFromClass(targetClass aether.LatencyClass, order []ui
 	// inside the same s.mu critical section that owns ss.isRetransmit.
 	ss.isRetransmit = false
 
-	return frame, ss.latencyClass == aether.ClassREALTIME
+	return frame, ss.latencyClass == aether.ClassREALTIME, ss.reg
 }
 
 // IsEmpty returns true if all stream queues — including pending TLP

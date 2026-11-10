@@ -57,12 +57,16 @@ type ControlFrameHandler struct {
 	WakeScheduler bool
 }
 
-// HandlePing emits a PONG for the inbound PING. The PONG echoes the
+// HandlePing counts the inbound PING on the session's health monitor
+// (health.Monitor.RecordPingRecv) and emits a PONG for it. The PONG echoes the
 // PING's SeqNo so the sender can derive RTT on receipt. Errors from the
 // frame writer are swallowed: a failed PONG just means the next keepalive
 // cycle will retry, and the readLoop that calls this has no caller to
 // return the error to.
 func (h *ControlFrameHandler) HandlePing(frame *Frame) {
+	if h.HealthMon != nil {
+		h.HealthMon.RecordPingRecv()
+	}
 	_ = h.Writer(&Frame{
 		SenderID:   h.Sender,
 		ReceiverID: h.Receiver,
