@@ -16,6 +16,7 @@ import (
 	"io/fs"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -49,16 +50,24 @@ func TestNoiseStream_ASendOnAClosedSessionIsTyped(t *testing.T) {
 // and leaves the connection window as it found it: the bytes it charged come back
 // once, by releaseInFlight, and not a second time by Send's own release, which would
 // hand the session credit another stream still holds (here a message the peer has
-// not read). The scheduler's exit here has no RESET settlement before it, so the test
-// waits for the stream's own grant of its opening message as well as the connection's:
-// releaseInFlight returns the stream window's whole outstanding count to the
-// connection window, and a stream grant still on its way when the scheduler lets the
-// stream go would count bytes whose connection grant has already come back.
+// not read). The scheduler's exit here has no RESET settlement before it, so
+// releaseInFlight settles the stream itself, returning to the connection window what
+// the stream's Sends charged there less what the stream's grants say came back
+// (settleCharges); a stream grant still on its way would count the opening message
+// as unreturned when its connection grant has come, and return it twice. The peer's
+// stream grants are held on the path until the test's wait for them, which lets
+// them through, so a wait that is missing leaves the grant held every time.
 func TestNoiseStream_ASendTheSchedulerRefusesIsRefusedAndReturnsItsCredit(t *testing.T) {
-	client, server := noisePairWithRealms(t, nil, nil)
+	client, server, _, toClient := filteredPair(t, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	cs, _ := openWithCredit(t, ctx, client, server, 962, 0)
+	const id = 962
+	var holdGrants atomic.Bool
+	holdGrants.Store(true)
+	toClient.setRule(func(f *aether.Frame) bool {
+		return holdGrants.Load() && f.StreamID == id && f.Type == aether.TypeWINDOW
+	})
+	cs, _ := openWithCredit(t, ctx, client, server, id, 0)
 	other, _ := openWithCredit(t, ctx, client, server, 964, 0)
 	unread := []byte("unread by the peer")
 	if err := other.Send(ctx, unread); err != nil {
@@ -66,12 +75,15 @@ func TestNoiseStream_ASendTheSchedulerRefusesIsRefusedAndReturnsItsCredit(t *tes
 	}
 	held := messageCredit(int64(len(unread)))
 	waitSendWindowEmpty(t, cs, "the opening message acknowledged")
-	waitFor(t, "the stream's grant of the opening message", func() bool {
-		return cs.window.Outstanding() == 0
-	})
 	waitFor(t, "the connection charge down to the unread message", func() bool {
 		return client.connWindow.Stats().Outstanding == held
 	})
+	deadline := time.Now().Add(15 * time.Second)
+	for holdGrants.Store(false); cs.window.Outstanding() != 0; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the stream's grant of the opening message: %d outstanding after 15 s", cs.window.Outstanding())
+		}
+	}
 	client.sched.Unregister(cs.streamID)
 	if err := cs.Send(ctx, []byte("refused")); err == nil {
 		t.Fatal("a Send the scheduler refused returned nil")
@@ -277,5 +289,132 @@ func TestEveryEnqueueResultIsRead(t *testing.T) {
 	}
 	for _, at := range dropped {
 		t.Errorf("an Enqueue result is dropped at %s", at)
+	}
+}
+
+// TestNoiseStream_ASendChargingConnCreditAfterTheResetsExitReturnsIt: a Send that
+// charged its stream credit and passed its last state check before a RESET ended the
+// stream, and charges its connection credit only once the RESET's exit has finished,
+// leaves the connection window as it found it, for this side's Reset and for the
+// peer's RESET. The exit has returned what the stream window held by then, this
+// Send's stream charge among it, while the connection window had no charge of this
+// Send's yet; the connection charge the Send makes afterwards meets a stream the
+// scheduler no longer holds, and nothing but the Send itself is left to return it.
+// The stream charge is made at the exit's last point before the scheduler exit
+// (beforeSchedulerExit), and the rest of the Send (sendStreamCharged) runs once the
+// exit has taken the stream out of the session.
+func TestNoiseStream_ASendChargingConnCreditAfterTheResetsExitReturnsIt(t *testing.T) {
+	for _, byPeer := range []bool{false, true} {
+		name := "this side's Reset"
+		if byPeer {
+			name = "the peer's RESET"
+		}
+		t.Run(name, func(t *testing.T) {
+			client, server := noisePairWithRealms(t, nil, nil)
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			cs, ss := openWithCredit(t, ctx, client, server, 974, 0)
+			waitSendWindowEmpty(t, cs, "the opening message acknowledged")
+			waitFor(t, "the opening message's grants", func() bool {
+				return cs.window.Outstanding() == 0 && client.connWindow.Stats().Outstanding == 0
+			})
+			msg := []byte("charged its stream before the reset")
+			n := messageCredit(int64(len(msg)))
+			charged := make(chan error, 1)
+			hook := func() { charged <- cs.window.Consume(ctx, n) }
+			cs.beforeSchedulerExit.Store(&hook)
+			if byPeer {
+				_ = ss.Reset(aether.ResetCancel)
+			} else {
+				_ = cs.Reset(aether.ResetCancel)
+			}
+			select {
+			case err := <-charged:
+				if err != nil {
+					t.Fatalf("stream charge: %v", err)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("the RESET's exit never reached its scheduler exit")
+			}
+			cs.beforeSchedulerExit.Store(nil)
+			waitFor(t, "the exit finished", func() bool { return !holdsSelf(cs) })
+			time.Sleep(50 * time.Millisecond)
+			err := cs.sendStreamCharged(ctx, msg, n)
+			if err == nil {
+				t.Fatal("the resumed Send on the reset stream returned nil")
+			}
+			waitFor(t, "the connection charge back to none", func() bool { return client.connWindow.Stats().Outstanding == 0 })
+		})
+	}
+}
+
+// TestNoiseStream_ASendRacingAResetReturnsExactlyItsConnectionCharge: a Send charges
+// its stream window, then its connection window, and a RESET can fall between the
+// two. Whether its stream charge came before the RESET's settlement (the Send had
+// passed its state check) or after it (the exit's last point before the scheduler
+// exit, beforeSchedulerExit), the connection window ends where it would have without
+// the Send: the settlement returns only what the stream's Sends had charged there,
+// and the Send returns its own later charge. Beside another stream's unread message
+// the connection window still holds that message's charge, so a settlement that
+// returned this Send's stream charge as if it were a connection charge would show as
+// the other stream's credit handed back early.
+func TestNoiseStream_ASendRacingAResetReturnsExactlyItsConnectionCharge(t *testing.T) {
+	for _, after := range []bool{false, true} {
+		for _, beside := range []bool{false, true} {
+			name := "stream charge before the RESET"
+			if after {
+				name = "stream charge after the settlement"
+			}
+			if beside {
+				name += ", beside an unread message"
+			}
+			t.Run(name, func(t *testing.T) {
+				client, server := noisePairWithRealms(t, nil, nil)
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				cs, _ := openWithCredit(t, ctx, client, server, 976, 0)
+				var held int64
+				if beside {
+					other, _ := openWithCredit(t, ctx, client, server, 978, 0)
+					unread := []byte("unread by the peer")
+					if err := other.Send(ctx, unread); err != nil {
+						t.Fatalf("send on the other stream: %v", err)
+					}
+					held = messageCredit(int64(len(unread)))
+				}
+				waitSendWindowEmpty(t, cs, "the opening message acknowledged")
+				waitFor(t, "the opening message's grants", func() bool {
+					return cs.window.Outstanding() == 0 && client.connWindow.Stats().Outstanding == held
+				})
+				msg := []byte("racing the reset")
+				n := messageCredit(int64(len(msg)))
+				if after {
+					charged := make(chan error, 1)
+					hook := func() { charged <- cs.window.Consume(ctx, n) }
+					cs.beforeSchedulerExit.Store(&hook)
+					_ = cs.Reset(aether.ResetCancel)
+					if err := <-charged; err != nil {
+						t.Fatalf("stream charge: %v", err)
+					}
+					cs.beforeSchedulerExit.Store(nil)
+				} else {
+					if err := cs.window.Consume(ctx, n); err != nil {
+						t.Fatalf("stream charge: %v", err)
+					}
+					_ = cs.Reset(aether.ResetCancel)
+				}
+				waitFor(t, "the exit finished", func() bool { return !holdsSelf(cs) })
+				if err := cs.sendStreamCharged(ctx, msg, n); err == nil {
+					t.Fatal("the resumed Send on the reset stream returned nil")
+				}
+				if got := client.connWindow.Stats().Outstanding; got != held {
+					t.Fatalf("connection charge %d after the Send, want %d", got, held)
+				}
+				cs.releaseInFlight()
+				if got := client.connWindow.Stats().Outstanding; got != held {
+					t.Fatalf("connection charge %d after releaseInFlight, want %d", got, held)
+				}
+			})
+		}
 	}
 }

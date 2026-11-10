@@ -205,9 +205,9 @@ func (s *Scheduler) RegisterWithClass(streamID uint64, weight uint8, dependency 
 // Send (releaseSendRoom). NoiseSession.releaseStream discards the return: the credit
 // a dropped frame carries was charged by the stream's Send before it called Enqueue,
 // NoiseSession settles a reset stream's whole outstanding connection credit at the
-// RESET (noiseStream.settleLocalReset, settlePeerReset, by StreamWindow.ReleaseAll),
-// which covers these frames, and a stream that leaves on both CLOSEs has no frame
-// left here.
+// RESET (noiseStream.settleLocalReset, settlePeerReset, through settleCharges, from
+// the connection charges the stream's Sends recorded before it), which covers these
+// frames, and a stream that leaves on both CLOSEs has no frame left here.
 func (s *Scheduler) Unregister(streamID uint64) (droppedFrames []*aether.Frame, droppedProbe *aether.Frame) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

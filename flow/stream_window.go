@@ -518,9 +518,10 @@ func (w *StreamWindow) Charged() int64 {
 
 // ReleaseAll returns every outstanding byte to the window and reports how many,
 // for a stream a RESET has ended: no grant for these bytes will reach this
-// window. noiseStream.Reset and handleReset settle the connection window, which
-// outlives the stream and charged the same bytes, from this count and the counts
-// the RESET states. A Send blocked in Consume wakes and finds the stream's state
+// window. noiseStream.releaseInFlight calls it once the stream's credit is
+// settled (ReleaseAllCharged, which the RESET's settlement reads instead), for
+// what Sends charged after that settlement and return to the connection window
+// themselves. A Send blocked in Consume wakes and finds the stream's state
 // closed. Idempotent: a second call reports what was charged since, so 0 on a
 // stream that has left.
 func (w *StreamWindow) ReleaseAll() int64 {
@@ -532,6 +533,24 @@ func (w *StreamWindow) ReleaseAll() int64 {
 		w.sem.Release(n)
 	}
 	return n
+}
+
+// ReleaseAllCharged is ReleaseAll that also returns Charged as it stood at the same
+// instant: both counts are read and the outstanding bytes released under one hold of
+// the window's lock, so no Consume or ReleaseUnsent falls between them and charged
+// minus released is exactly what grants had returned by then. noiseStream's RESET
+// settlement (settleCharges) reads the pair against the connection charge its Sends
+// recorded, so a stream charge whose Send has not charged the connection yet is not
+// returned to the connection window as if it had.
+func (w *StreamWindow) ReleaseAllCharged() (released, charged int64) {
+	w.mu.Lock()
+	released, charged = w.dataOutstanding, w.charged
+	w.dataOutstanding = 0
+	w.mu.Unlock()
+	if released > 0 {
+		w.sem.Release(released)
+	}
+	return released, charged
 }
 
 // ApplyUpdate processes a received WINDOW_UPDATE frame, where `credit` is

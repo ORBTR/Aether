@@ -503,3 +503,28 @@ func TestStreamWindow_ChargedCountsWhatSendsCharged(t *testing.T) {
 		t.Fatalf("Charged %d after ReleaseAll", got)
 	}
 }
+
+// TestStreamWindow_ReleaseAllChargedReportsOneInstant: ReleaseAllCharged releases what
+// is outstanding and reports it with Charged as they stood together, so charged less
+// released is what grants had returned; the window's credit comes back, and a second
+// call reports only what was charged since.
+func TestStreamWindow_ReleaseAllChargedReportsOneInstant(t *testing.T) {
+	w := NewStreamWindow(4096)
+	if err := w.Consume(context.Background(), 1000); err != nil {
+		t.Fatal(err)
+	}
+	w.ApplyUpdate(300)
+	released, charged := w.ReleaseAllCharged()
+	if released != 700 || charged != 1000 {
+		t.Fatalf("ReleaseAllCharged = %d, %d; want 700, 1000", released, charged)
+	}
+	if got := w.Available(); got != 4096 {
+		t.Fatalf("Available %d after ReleaseAllCharged, want the whole window", got)
+	}
+	if !w.TryConsume(100) {
+		t.Fatal("TryConsume refused after the release")
+	}
+	if released, charged := w.ReleaseAllCharged(); released != 100 || charged != 1100 {
+		t.Fatalf("second ReleaseAllCharged = %d, %d; want 100, 1100", released, charged)
+	}
+}

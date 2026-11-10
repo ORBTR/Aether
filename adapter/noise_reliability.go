@@ -218,7 +218,13 @@ func (s *NoiseSession) writeLoop() {
 				// waits > PTO) the probe would never reach the wire, converting
 				// a recoverable tail loss into a session stall.
 				if isProbe {
-					s.sched.EnqueueProbe(frame.StreamID, frame)
+					// The probe goes back only to the stream whose send window wrote
+					// it and only while s.streams still holds that stream: a stream
+					// reset and reopened under the ID since the probe was dequeued
+					// would take it as a frame of its own sequence (queueProbe).
+					if st != nil && st.sendWindow.WrittenFrame(frame.SeqNo) == frame {
+						st.queueProbe(frame)
+					}
 				} else {
 					held, heldSize, heldPlain = frame, frameSize, plain
 				}
@@ -392,6 +398,13 @@ func (s *NoiseSession) totalInFlightBytes() int64 {
 	return v
 }
 
+// tickSnapshotTaken is a test seam, nil outside tests: reliabilityTick calls it with
+// its session once it has taken its snapshot of s.streams and before it works on any
+// stream in it, so a test can end a stream and open the next one under its ID there,
+// as a RESET, its acknowledgment and a local open can between the two on a running
+// session, and see what the tick then does with the ended stream it still holds.
+var tickSnapshotTaken atomic.Pointer[func(*NoiseSession)]
+
 // reliabilityTick checks for retransmission timeouts periodically.
 //
 // Lock discipline: the stream list is snapshotted under a brief s.mu and
@@ -470,6 +483,9 @@ func (s *NoiseSession) reliabilityTick() {
 			}
 			streamsCount := len(s.streams)
 			s.mu.Unlock()
+			if hook := tickSnapshotTaken.Load(); hook != nil {
+				(*hook)(s)
+			}
 
 			if emitHealth {
 				if dropper, ok := s.conn.(interface{ InboxDrops() uint64 }); ok {
@@ -494,12 +510,12 @@ func (s *NoiseSession) reliabilityTick() {
 				// ACK-starved sessions where RACK has nothing to work
 				// with (no fack established yet). BackoffRTO still runs
 				// so the RTO interval grows on persistent loss.
-				// A stream a RESET has taken out of the scheduler (its snapshot
-				// entry outlives the removal) is owed no retransmit, and its clocks
-				// are left alone.
+				// A stream a RESET has taken out of s.streams (its snapshot entry
+				// outlives the removal) is owed no retransmit, and its clocks are
+				// left alone; queueRetransmit keeps its frame off a later stream that
+				// has taken the ID.
 				if frame := st.retransmitQ.Dequeue(); frame != nil {
-					s.sched.MarkRetransmit(streamID)
-					if s.sched.Enqueue(streamID, frame) {
+					if st.queueRetransmit(frame) {
 						st.sendWindow.BumpXmitTime(frame.SeqNo, tickNow)
 						// Back off at most once per RTO interval, not once per
 						// retransmitted frame: a burst loss of N frames drained
@@ -555,8 +571,7 @@ func (s *NoiseSession) reliabilityTick() {
 						var actuallyRetx uint64
 						for _, seq := range lost {
 							if written := st.sendWindow.WrittenFrame(seq); written != nil {
-								s.sched.MarkRetransmit(streamID)
-								if s.sched.Enqueue(streamID, written) {
+								if st.queueRetransmit(written) {
 									st.sendWindow.BumpXmitTime(seq, tickNow)
 									actuallyRetx++
 								}
@@ -585,8 +600,7 @@ func (s *NoiseSession) reliabilityTick() {
 						// or still queued behind the CanSend gate, and with no
 						// probe recovery would fall back to RTO silently.
 						probeFrame, probeSeq := st.sendWindow.HighestWritten()
-						if probeFrame != nil {
-							s.sched.EnqueueProbe(streamID, probeFrame)
+						if probeFrame != nil && st.queueProbe(probeFrame) {
 							st.sendWindow.BumpXmitTime(probeSeq, tickNow)
 							st.tlp.MarkProbeSent(probeSeq)
 							// tlpFiresTotal: increment only when
