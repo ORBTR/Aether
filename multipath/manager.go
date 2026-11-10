@@ -146,6 +146,10 @@ type Manager struct {
 	probeInterval   time.Duration
 	stabilityPeriod time.Duration
 	maxFailures     int
+	// keepaliveProbes is set by TakeProbesFromKeepalive: probe rounds ping no path and
+	// each path's probe results arrive through RecordKeepaliveProbe from the keepalive
+	// that already probes its session.
+	keepaliveProbes bool
 
 	// Redundancy level
 	redundantRealtime bool // Level 2: send REALTIME on both paths
@@ -196,6 +200,99 @@ func (m *Manager) SetProbeInterval(d time.Duration) {
 	m.mu.Lock()
 	m.probeInterval = d
 	m.mu.Unlock()
+}
+
+// TakeProbesFromKeepalive is for a caller that runs a keepalive on every session it adds
+// as a path: health.Monitor holds one pending probe sequence per session
+// (RecordPingSent), so probeNonPrimary's Pings beside that keepalive would take each
+// other's answers and leave the estimator without round-trip samples. From the next
+// probe round on, RunProbeLoop pings no path and only returns dead and flapping paths
+// whose wait has passed to standby; the caller's keepalive hands each probe's result to
+// RecordKeepaliveProbe instead.
+func (m *Manager) TakeProbesFromKeepalive() {
+	m.mu.Lock()
+	m.keepaliveProbes = true
+	m.mu.Unlock()
+}
+
+// RecordKeepaliveProbe takes the result of one keepalive probe of session, one of m's
+// paths, as probeNonPrimary takes its own Ping's: an answer records rtt and the success
+// and returns a probing path to standby; err records a failed probe, leaving the path's
+// state alone. A dead path still waiting out deadPathWaitLocked and a flapping path are
+// left as they are, as probeNonPrimary skips them. A session m does not hold is ignored.
+func (m *Manager) RecordKeepaliveProbe(session aether.Session, rtt time.Duration, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, p := range m.paths {
+		if p.Session != session {
+			continue
+		}
+		if p.State == PathDead || p.State == PathFlapping {
+			return
+		}
+		now := time.Now()
+		if err != nil {
+			p.LastProbe = now
+			p.LastFailure = now
+			return
+		}
+		p.RTT = rtt
+		p.LastSuccess = now
+		p.ConsecutiveFailures = 0
+		if p.State == PathProbing {
+			p.State = PathStandby
+		}
+		return
+	}
+}
+
+// KeepalivePlanFor is the keepalive plan for session, one of m's paths: the plan
+// aether.KeepalivePlanFor derives from the session's own measurements, with the standby
+// input taken from the best other live path m holds (standbyForLocked). A session m does
+// not hold gets aether.KeepalivePlanFor's plan.
+func (m *Manager) KeepalivePlanFor(session aether.Session) quality.KeepalivePlan {
+	in := aether.KeepaliveInputsFor(session)
+	m.mu.Lock()
+	in.Standby = m.standbyForLocked(session)
+	m.mu.Unlock()
+	return quality.Keepalive(in)
+}
+
+// standbyForLocked is the standby input for session: of m's other paths whose session is
+// open and that are active or standby (promotebestStandby passes a dead or flapping path
+// over, and a probing path's liveness is still in question), the one whose latest
+// probe was answered, most samples first; the zero StandbyInputs when session is not one
+// of m's paths or no other path qualifies. A path's latest probe was answered when no
+// failure is stamped after its last success, from probeNonPrimary or RecordKeepaliveProbe
+// alike. Caller holds m.mu.
+func (m *Manager) standbyForLocked(session aether.Session) quality.StandbyInputs {
+	held := false
+	for _, p := range m.paths {
+		if p.Session == session {
+			held = true
+			break
+		}
+	}
+	if !held {
+		return quality.StandbyInputs{}
+	}
+	var best quality.StandbyInputs
+	for _, p := range m.paths {
+		if p.Session == session || p.Session == nil || p.Session.IsClosed() {
+			continue
+		}
+		if p.State != PathActive && p.State != PathStandby {
+			continue
+		}
+		in := quality.StandbyInputs{Answering: !p.LastFailure.After(p.LastSuccess)}
+		if h := p.Session.Health(); h != nil {
+			in.Samples = h.SampleCount()
+		}
+		if (in.Answering && !best.Answering) || (in.Answering == best.Answering && in.Samples > best.Samples) {
+			best = in
+		}
+	}
+	return best
 }
 
 // EnableRedundantRealtime activates Level 2 — REALTIME frames on both paths.
@@ -472,6 +569,36 @@ func (m *Manager) ShouldSendRedundant(latencyClass aether.LatencyClass) bool {
 	return m.redundantRealtime && latencyClass == aether.ClassREALTIME && len(m.paths) > 1
 }
 
+// OnPathFailure handles the failure of session's path, for a caller that learns which
+// session failed but not whether it was the primary. A failed primary fails over as
+// OnPrimaryFailure does, and it reports true when another path took over. A failed
+// standby is marked PathDead with LastFailure stamped, as OnPrimaryFailure marks a
+// primary, and the primary keeps the traffic: OnPrimaryFailure on a standby's failure
+// would mark the healthy primary dead and could promote the failing standby itself, which
+// promotebestStandby still counts as live. A session m does not hold changes nothing.
+// It reports false for anything but a failover.
+func (m *Manager) OnPathFailure(session aether.Session) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, p := range m.paths {
+		if p.Session != session {
+			continue
+		}
+		if i == m.primary {
+			if len(m.paths) <= 1 {
+				return false
+			}
+			m.onPrimaryFailureLocked()
+			return true
+		}
+		p.State = PathDead
+		p.LastFailure = time.Now()
+		p.ConsecutiveFailures++
+		return false
+	}
+	return false
+}
+
 // OnPrimaryFailure handles primary path failure — instant failover to standby.
 // Marks the failed path PathDead and stamps LastFailure so the probe loop
 // (or opportunistic resurrection) can revive it once deadPathWaitLocked has passed.
@@ -487,7 +614,12 @@ func (m *Manager) ShouldSendRedundant(latencyClass aether.LatencyClass) bool {
 func (m *Manager) OnPrimaryFailure() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.onPrimaryFailureLocked()
+}
 
+// onPrimaryFailureLocked is OnPrimaryFailure under m.mu, which OnPathFailure holds while
+// it finds the failed session's path, so the primary cannot change between the two.
+func (m *Manager) onPrimaryFailureLocked() {
 	if len(m.paths) <= 1 {
 		return // no standby to failover to
 	}
@@ -620,6 +752,8 @@ func (m *Manager) resurrectExpiredFlappingPathsLocked() {
 // checks PickPath and PickByQuality run opportunistically, and no probe
 // measures a standby path's RTT. It waits probeCycleLocked before every
 // round, so the cycle follows what the previous round's answers measured.
+// Under TakeProbesFromKeepalive a round pings nothing and only returns dead
+// and flapping paths whose wait has passed to standby.
 func (m *Manager) RunProbeLoop(ctx context.Context) {
 	// Also exit when the manager's Stop() is called — the qstate.stop
 	// channel is closed by Stop(), so we listen on both. Without this
@@ -661,14 +795,18 @@ func (m *Manager) RunProbeLoop(ctx context.Context) {
 const primaryProbeEvery uint64 = 4
 
 // probeNonPrimary pings every non-primary path (and the primary on every
-// primaryProbeEvery-th invocation). Holds m.mu only to snapshot the path
-// list — actual Ping calls happen outside the lock so a slow ping doesn't
-// block the path pickers that take m.mu (PrimarySession, PickPath,
-// PickByQuality).
+// primaryProbeEvery-th invocation), and under TakeProbesFromKeepalive no
+// path. Holds m.mu only to snapshot the path list — actual Ping calls happen
+// outside the lock so a slow ping doesn't block the path pickers that take
+// m.mu (PrimarySession, PickPath, PickByQuality).
 func (m *Manager) probeNonPrimary(ctx context.Context) {
 	m.mu.Lock()
 	m.resurrectExpiredDeadPathsLocked()
 	m.resurrectExpiredFlappingPathsLocked()
+	if m.keepaliveProbes {
+		m.mu.Unlock()
+		return
+	}
 	m.probeTick++
 	probePrimary := m.probeTick%primaryProbeEvery == 0
 	type probeTarget struct {

@@ -150,3 +150,48 @@ func TestTheKeepalivePlanFollowsStability(t *testing.T) {
 		t.Errorf("an unstable slow path's probe timeout %s, want the 15 s ceiling", got)
 	}
 }
+
+// TestAMeasuredStandbyPathLowersTheStrikesFloor: a converged session whose peer holds a
+// converged standby path that answers its probes is held to the loss rule's strikes with
+// a floor of 2 in place of 5, because the floor's reason, a session otherwise carrying
+// traffic, no longer holds when the traffic moves to the standby. The loss rule (a healthy
+// peer is let go with chance at most 1 in 1000) is unchanged, so a lossy path keeps its
+// strikes, and nothing else in the plan moves. A standby that has not converged or whose
+// latest probe went unanswered, or a session that has not converged, keeps the plan's
+// Strikes.
+func TestAMeasuredStandbyPathLowersTheStrikesFloor(t *testing.T) {
+	rtt := KeepaliveInputs{SRTT: 40 * time.Millisecond, RTO: 300 * time.Millisecond, Samples: 20}
+	measured := StandbyInputs{Samples: 8, Answering: true}
+	for _, tc := range []struct {
+		loss    float64
+		strikes int
+	}{{0, 2}, {0.01, 2}, {0.05, 3}, {0.1, 3}, {0.2, 5}, {0.25, 5}, {0.3, 6}, {0.5, 10}, {1, 10}} {
+		alone := rtt
+		alone.Loss = tc.loss
+		with := alone
+		with.Standby = measured
+		p, without := Keepalive(with), Keepalive(alone)
+		if p.Strikes != tc.strikes {
+			t.Errorf("loss %.2f with a measured standby: %d strikes, want %d", tc.loss, p.Strikes, tc.strikes)
+		}
+		if p.Strikes > without.Strikes {
+			t.Errorf("loss %.2f: %d strikes with a standby, past the %d without one", tc.loss, p.Strikes, without.Strikes)
+		}
+		if p.Interval != without.Interval || p.ProbeTimeout != without.ProbeTimeout || p.RetryGap != without.RetryGap {
+			t.Errorf("loss %.2f: the standby moved more than the strikes: %+v against %+v", tc.loss, p, without)
+		}
+	}
+	for _, tc := range []struct {
+		name string
+		in   KeepaliveInputs
+	}{
+		{"no standby", rtt},
+		{"standby warming up", KeepaliveInputs{SRTT: rtt.SRTT, RTO: rtt.RTO, Samples: 20, Standby: StandbyInputs{Samples: 7, Answering: true}}},
+		{"standby not answering", KeepaliveInputs{SRTT: rtt.SRTT, RTO: rtt.RTO, Samples: 20, Standby: StandbyInputs{Samples: 20}}},
+		{"session warming up", KeepaliveInputs{SRTT: rtt.SRTT, RTO: rtt.RTO, Samples: 7, Standby: measured}},
+	} {
+		if got := Keepalive(tc.in).Strikes; got != keepaliveStrikes {
+			t.Errorf("%s: %d strikes, want the plan's %d", tc.name, got, keepaliveStrikes)
+		}
+	}
+}

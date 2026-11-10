@@ -15,7 +15,8 @@ import (
 // Instability) and the WebSocket transport from the estimator it feeds with its ping
 // and pong times, which measures no loss or instability and leaves both zero, so both
 // decide from the path they measured and never from the transport or grade the session
-// runs on.
+// runs on. Standby is filled only by multipath.Manager.KeepalivePlanFor, the one reader
+// that holds the peer's other paths.
 type KeepaliveInputs struct {
 	// SRTT is the smoothed round-trip time; zero before the first answered probe.
 	SRTT time.Duration
@@ -33,6 +34,20 @@ type KeepaliveInputs struct {
 	// consecutive answered probes' round trips, as a fraction of SRTT, from 0 to 1.
 	// Zero for a path whose round trips hold steady, or with fewer than two answers.
 	Instability float64
+	// Standby is the best other path to the same peer, as the multipath manager holding
+	// both measured it; the zero value is no other path.
+	Standby StandbyInputs
+}
+
+// StandbyInputs is what a keepalive decision reads about another live path to the same
+// peer: how far that path's own estimator has converged and whether its latest probe was
+// answered. multipath.Manager.KeepalivePlanFor fills it from the path it holds beside the
+// session; Keepalive reads it into Strikes. The zero value reads as no standby.
+type StandbyInputs struct {
+	// Samples is how many answered probes the standby path's estimator has measured.
+	Samples uint64
+	// Answering is true when the standby path's latest probe was answered.
+	Answering bool
 }
 
 // KeepalivePlan is the keepalive's decision for one probe cycle: how long a healthy
@@ -106,6 +121,11 @@ const (
 	// on a datagram path, or a reliable transport retransmitting one, must not end a
 	// session that is otherwise carrying traffic.
 	keepaliveStrikes = 5
+	// keepaliveStrikesWithStandby replaces keepaliveStrikes as the floor when the peer
+	// holds a measured standby path (StandbyInputs): the session's traffic moves to that
+	// path when the session is let go, so the higher floor's reason does not hold, and one
+	// unanswered probe still never ends a session.
+	keepaliveStrikesWithStandby = 2
 	// keepaliveStrikesCeiling bounds how far loss raises Strikes, so a lossy path's
 	// dead peer is still let go within a bounded DeadPeerBound.
 	keepaliveStrikesCeiling = 10
@@ -123,10 +143,13 @@ const (
 // until the estimator has 8 samples, so a path whose round trips jump waits longer than
 // its smoothed RTO trails them; Strikes = 5, raised on a lossy path to the fewest
 // probes a healthy peer loses all of with chance at most 1 in 1000, at most 10; a 1 s
-// gap between retries. A zero SRTT or RTO (no answered probe yet, or no estimator)
-// takes the floor. It is a pure function of its inputs, so two sessions with the same
-// measurements get the same plan and two with different measurements get plans that
-// follow them.
+// gap between retries. When the session's estimator has 8 samples and in.Standby is a
+// path with 8 samples whose latest probe was answered, the floor under Strikes is 2 in
+// place of 5 and the loss rule is unchanged, so a lossy path keeps its strikes and the
+// budget is never above the one without the standby. A zero SRTT or RTO (no answered
+// probe yet, or no estimator) takes the floor. It is a pure function of its inputs, so
+// two sessions with the same measurements get the same plan and two with different
+// measurements get plans that follow them.
 func Keepalive(in KeepaliveInputs) KeepalivePlan {
 	interval := clampDuration(2*in.SRTT, keepaliveIntervalFloor, keepaliveIntervalCeiling)
 	probeFloor := keepaliveProbeFloor
@@ -135,28 +158,40 @@ func Keepalive(in KeepaliveInputs) KeepalivePlan {
 	}
 	widen := 1 + clampFraction(in.Instability)
 	probe := clampDuration(time.Duration(float64(4*in.RTO)*widen), probeFloor, keepaliveProbeCeiling)
+	floor := keepaliveStrikes
+	if in.Samples >= keepaliveWarmupSamples && in.Standby.measured() {
+		floor = keepaliveStrikesWithStandby
+	}
 	return KeepalivePlan{
 		Interval:     interval,
 		ProbeTimeout: probe,
-		Strikes:      strikesFor(in.Loss),
+		Strikes:      strikesFor(in.Loss, floor),
 		RetryGap:     keepaliveRetryGap,
 	}
 }
 
+// measured reports whether the standby path can take the session's traffic on the
+// evidence of its own probes: its estimator has as many samples as the probe timeout's
+// warmup asks of a session, and its latest probe was answered. A path still warming up
+// or going unanswered is no standby, so a session beside one keeps the plan's Strikes.
+func (s StandbyInputs) measured() bool {
+	return s.Answering && s.Samples >= keepaliveWarmupSamples
+}
+
 // strikesFor is how many unanswered probes in a row end a session on a path losing
 // loss of its probes: the fewest whose all being lost has chance at most
-// keepaliveFalseDeath, held between keepaliveStrikes and keepaliveStrikesCeiling.
-func strikesFor(loss float64) int {
+// keepaliveFalseDeath, held between floor and keepaliveStrikesCeiling.
+func strikesFor(loss float64, floor int) int {
 	loss = clampFraction(loss)
 	if loss == 0 {
-		return keepaliveStrikes
+		return floor
 	}
 	if loss >= 1 {
 		return keepaliveStrikesCeiling
 	}
 	k := int(math.Ceil(math.Log(keepaliveFalseDeath) / math.Log(loss)))
-	if k < keepaliveStrikes {
-		return keepaliveStrikes
+	if k < floor {
+		return floor
 	}
 	if k > keepaliveStrikesCeiling {
 		return keepaliveStrikesCeiling

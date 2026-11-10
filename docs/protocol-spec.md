@@ -1367,7 +1367,7 @@ Uses `TypePATH_PROBE` with increasing payload sizes: the probe of a size is that
 
 ### 30.1 Level 1 — Active/Standby
 
-One primary path carries all traffic. One or more standby paths receive periodic probes (every 30s). Instant failover when the primary dies: the best standby is promoted to primary based on quality score. Failback occurs after a 60-second stability period.
+One primary path carries all traffic. One or more standby paths are probed once per keepalive plan Interval: by the manager's probe loop (`RunProbeLoop`, at the shortest Interval among its paths' plans or the interval a caller sets), or, after `TakeProbesFromKeepalive`, by each session's own keepalive, which hands every probe's result to `RecordKeepaliveProbe` while the loop pings nothing, so a session has one prober (the HSTLES mesh runtime runs this mode). A session's keepalive plan read through `Manager.KeepalivePlanFor` takes a standby input: beside another live path whose estimator has converged and whose latest probe was answered, a converged session's Strikes floor is 2 instead of 5 and the loss rule is unchanged (`quality.Keepalive`). Instant failover when the primary dies: the best standby is promoted to primary based on quality score; a failed standby is only marked dead (`OnPathFailure`). Failback occurs after a 60-second stability period.
 
 ### 30.2 Level 2 — Redundant Realtime
 
