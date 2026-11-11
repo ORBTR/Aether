@@ -175,8 +175,9 @@ func (e *FrameEncryptor) nextNonce() aether.Nonce {
 	}
 	// nonce = per-encryptor random prefix (nonce[0:4]) || monotonic
 	// counter (nonce[4:12]). The prefix separates nonce spaces across every
-	// encryptor instance that shares a key — the single s.encryptor encrypts
-	// AND decrypts, so interop forces one key across both directions, and a
+	// encryptor instance that shares a key — a NoiseSession's one encryptor
+	// (its frameKey) encrypts AND decrypts, so interop forces one key across
+	// both directions, and a
 	// re-installed/resumed key restarts the counter at 0 — while the counter
 	// still guarantees uniqueness within an instance for up to 2^64 frames.
 	// The prefix is carried on the wire in frame.Nonce, so decrypt is

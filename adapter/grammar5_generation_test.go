@@ -191,20 +191,26 @@ func TestNoiseSession_EveryResetIsAcknowledgedAndANamesakeAcknowledgmentStopsNot
 // TestNoiseSession_AWaitingResetIsWrittenUntilAcknowledged: a RESET waits until its
 // acknowledgment comes, written again at a wait that doubles from its stream's RTO up
 // to resetRetransmitMaxWait and is never given up while the session lives. Past the
-// session's stream cap of waiting RESETs, a RESET is not kept and its ID's quiet time
-// starts at once.
+// session's stream cap of waiting refusals, a refusal is not kept and its ID's quiet
+// time starts at once.
 func TestNoiseSession_AWaitingResetIsWrittenUntilAcknowledged(t *testing.T) {
 	client, _ := noisePairWithRealms(t, nil, nil)
 	inc := aether.StreamIncarnation{Generation: 5, WriterOpened: true}
 	now := time.Now()
 	ping := &aether.Frame{Type: aether.TypePING, StreamID: client.layout.Control}
-	client.mu.Lock()
-	if client.pendingResets == nil {
-		client.pendingResets = make(map[uint64]*pendingReset)
+	keep := func(id uint64, p *pendingReset) {
+		if client.pendingResets == nil {
+			client.pendingResets = make(map[resetKey]*pendingReset)
+			client.pendingByID = make(map[uint64]int)
+		}
+		client.pendingResets[resetKey{id: id, inc: inc}] = p
+		client.pendingByID[id]++
+		client.pendingRefusals++
+		client.pendingResetCount.Add(1)
 	}
-	p := &pendingReset{frame: ping, inc: inc, rto: 300 * time.Millisecond, wait: 300 * time.Millisecond, next: now.Add(300 * time.Millisecond)}
-	client.pendingResets[910] = p
-	client.pendingResetCount.Add(1)
+	client.mu.Lock()
+	p := &pendingReset{frame: ping, rto: 300 * time.Millisecond, wait: 300 * time.Millisecond, next: now.Add(300 * time.Millisecond)}
+	keep(910, p)
 	client.mu.Unlock()
 	var waits []time.Duration
 	at := now
@@ -228,22 +234,20 @@ func TestNoiseSession_AWaitingResetIsWrittenUntilAcknowledged(t *testing.T) {
 		t.Fatal("a waiting RESET was given up")
 	}
 	client.mu.Lock()
-	delete(client.pendingResets, 910)
-	client.pendingResetCount.Add(-1)
+	client.dropPendingLocked(resetKey{id: 910, inc: inc})
 	client.mu.Unlock()
 
 	limit := aether.DefaultMaxConcurrentStreams
 	for i := 0; i < limit; i++ {
 		client.mu.Lock()
-		client.pendingResets[uint64(20000+i)] = &pendingReset{frame: ping, inc: inc, rto: time.Hour, wait: time.Hour, next: now.Add(time.Hour)}
-		client.pendingResetCount.Add(1)
+		keep(uint64(20000+i), &pendingReset{frame: ping, rto: time.Hour, wait: time.Hour, next: now.Add(time.Hour)})
 		client.mu.Unlock()
 	}
 	if err := client.writeReset(911, aether.ResetPayload{Incarnation: inc}, time.Second, nil); err != nil {
 		t.Fatalf("writeReset past the cap: %v", err)
 	}
 	client.mu.Lock()
-	_, pending := client.pendingResets[911]
+	pending := client.resetPendingLocked(911)
 	_, quiet := client.recentlyLeft[911]
 	client.mu.Unlock()
 	if pending || !quiet {

@@ -425,13 +425,15 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 	// would not be gated by the configured cap. enforceRemoteCap=true
 	// means peer-initiated → reply with RESET so the peer gives up;
 	// enforceRemoteCap=false means locally-initiated → return nil and
-	// let the caller surface the typed ErrStreamCapExhausted.
+	// let the caller surface the typed ErrStreamCapExhausted. A stream whose
+	// RESET waits for the peer's acknowledgment keeps its place under the cap
+	// (pendingStreams, moved there from s.streams in writeReset's one step): its
+	// connection charge settles on the peer's statement, so its RESET must stay
+	// kept and written again until that comes, and the cap that bounds the kept
+	// RESETs is this one, refusing the open, never the RESET.
 	{
-		cap := s.opts.MaxConcurrentStreams
-		if cap <= 0 {
-			cap = aether.DefaultMaxConcurrentStreams
-		}
-		if len(s.streams) >= cap {
+		cap := s.streamCapLocked()
+		if len(s.streams)+s.pendingStreams >= cap {
 			s.mu.Unlock()
 			s.reportAbuse(abuse.ReasonStreamRefused)
 			s.refuseStream(st, enforceRemoteCap)
@@ -1307,13 +1309,13 @@ func (st *noiseStream) Reset(reason aether.ResetReason) error {
 	st.closeDone.Store(true)
 	p := st.settleLocalReset(reason)
 	p.Incarnation = st.incarnation
-	// Send the wire RESET first, then release the local state: teardown, the
-	// s.streams entry (when it is this stream, not a later one on the same
-	// ID), the credit reservation, the scheduler and stream GC registrations
-	// (releaseStream) and the receive side (closeRecvOnce), the set
-	// handleReset releases for a peer-initiated RESET. The stream leaves the
-	// scheduler before the stream charges Sends made after the settlement are
-	// released (leaveSchedulerThenSettle). The stream GC's sweep
+	// writeReset takes the stream out of s.streams (when it is this stream, not a
+	// later one on the same ID) in the step that keeps its RESET, then writes the
+	// RESET; the local state goes after: teardown, the credit reservation, the
+	// scheduler and stream GC registrations (releaseStream) and the receive side
+	// (closeRecvOnce), the set handleReset releases for a peer-initiated RESET. The
+	// stream leaves the scheduler before the stream charges Sends made after the
+	// settlement are released (leaveSchedulerThenSettle). The stream GC's sweep
 	// and CloseWithError's acceptor drain call Reset for a stream still in
 	// s.streams, and createStream counts every entry against
 	// MaxConcurrentStreams, so a Reset that left the entry or the GC
@@ -1327,11 +1329,6 @@ func (st *noiseStream) Reset(reason aether.ResetReason) error {
 	// (notePeerConsumed).
 	err := st.session.writeReset(st.streamID, p, st.resetRTO(), st)
 	st.teardown()
-	st.session.mu.Lock()
-	if cur, ok := st.session.streams[st.streamID]; ok && cur == st {
-		delete(st.session.streams, st.streamID)
-	}
-	st.session.mu.Unlock()
 	st.leaveSchedulerThenSettle()
 	st.releaseReservation()
 	st.session.trackEnded(st.recvQ)
@@ -1372,27 +1369,30 @@ func (st *noiseStream) settleLocalReset(reason aether.ResetReason) aether.ResetP
 // acknowledgment of the RESET, says was not consumed. A peer that overstates Consumed
 // holds back its own grants' worth of this side's sends, which it could do by not
 // granting, and one that understates it hands this side credit its own ceilings
-// still hold it to. superseded is endSuperseded's end, for a RESET that never
-// arrived: no statement comes, so the charge stays (notePeerConsumed's comment).
-func (st *noiseStream) settlePeerReset(p aether.ResetPayload, superseded bool) {
+// still hold it to. unstated is endSuperseded's end of a stream whose superseding
+// OPEN names another stream (or none) as the opener's earlier one: no statement of
+// this stream comes, so the charge stays (notePeerConsumed's comment).
+func (st *noiseStream) settlePeerReset(p aether.ResetPayload, unstated bool) {
 	if st.window == nil || st.session.connWindow == nil {
 		return
 	}
 	st.settleCharges()
-	if !superseded {
+	if !unstated {
 		st.notePeerConsumed(p.Consumed)
 	}
 }
 
 // notePeerConsumed takes the peer's statement of what its consumer returned of this
 // stream's sends through connection grants (aether.ResetPayload.Consumed, from its
-// RESET of the stream or its acknowledgment of this side's), once: a second
-// statement, the acknowledgment after a crossing RESET or a copy, changes nothing.
-// When the stream's connection charge is closed (settleCharges) it returns the
-// charge less consumed (returnUnconsumed); otherwise settleCharges' caller does. A
-// stream ended with no statement, superseded by a later OPEN of the peer's whose
-// RESET never arrived (endSuperseded), keeps that charge: nothing on the wire says
-// what the peer consumed, and a guess either strands credit or returns it twice.
+// RESET of the stream or its acknowledgment of this side's, or
+// aether.OpenPayload.PriorConsumed from the OPEN that supersedes the stream), once:
+// a second statement, the acknowledgment after a crossing RESET or a copy, changes
+// nothing. When the stream's connection charge is closed (settleCharges) it returns
+// the charge less consumed (returnUnconsumed); otherwise settleCharges' caller does.
+// A stream ended with no statement, superseded by an OPEN of the peer's that names
+// another stream as its earlier one (endSuperseded), keeps that charge: nothing on
+// the wire says what the peer consumed, and a guess either strands credit or returns
+// it twice.
 func (st *noiseStream) notePeerConsumed(consumed uint64) {
 	st.chargeMu.Lock()
 	if st.peerStated {

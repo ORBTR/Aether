@@ -1069,10 +1069,10 @@ func (s *NoiseSession) prepareFrame(frame *aether.Frame, recorded, recordedPlain
 // the count the frame is charged is the one emitFrameLocked measures.
 func (s *NoiseSession) wireSizeLocked(frame *aether.Frame) int64 {
 	length := int64(frame.Length)
-	if s.encryptsLocked(frame) {
+	if fk := s.frameKey.Load(); s.encryptsLocked(fk, frame) {
 		// An encrypted frame always takes the full header
 		// (Compressor.ShouldCompressData refuses FlagENCRYPTED).
-		return int64(aether.FullFrameHeaderWireSize) + length + int64(s.encryptor.Overhead())
+		return int64(aether.FullFrameHeaderWireSize) + length + int64(fk.enc.Overhead())
 	}
 	if s.opts.HeaderComp && s.txCompressor.ShouldCompressData(frame) {
 		return int64(aether.ShortDataWireSize(frame.Length)) + length
@@ -1080,10 +1080,13 @@ func (s *NoiseSession) wireSizeLocked(frame *aether.Frame) int64 {
 	return int64(aether.FullFrameHeaderWireSize) + length
 }
 
-// encryptsLocked reports whether emitFrameLocked will seal this frame, the
-// conditions there and in FrameEncryptor.Encrypt (which seals no empty frame).
-func (s *NoiseSession) encryptsLocked(frame *aether.Frame) bool {
-	return s.encryptor != nil && s.opts.Encryption && !frame.Flags.Has(aether.FlagENCRYPTED) &&
+// encryptsLocked reports whether emitFrameLocked will seal this frame under fk, the
+// frame key its caller loaded (nil before SetSessionKey): the conditions there and in
+// FrameEncryptor.Encrypt (which seals no empty frame). A key installed between the
+// prediction and the write makes emitFrameLocked seal a frame predicted unsealed, and
+// the count the frame is charged is the one emitFrameLocked measures.
+func (s *NoiseSession) encryptsLocked(fk *sessionFrameKey, frame *aether.Frame) bool {
+	return fk != nil && s.opts.Encryption && !frame.Flags.Has(aether.FlagENCRYPTED) &&
 		frame.Payload != nil && frame.Length != 0
 }
 
@@ -1170,9 +1173,10 @@ func (s *NoiseSession) emitFrameLocked(frame *aether.Frame, st *noiseStream) (in
 	// TLP probe, which can follow one another back to back) re-runs this
 	// code on a sendWindow frame whose Payload the first send already
 	// swapped to ciphertext, and the FlagENCRYPTED check is what keeps the
-	// second pass from sealing ciphertext again.
-	if s.encryptor != nil && s.opts.Encryption && !frame.Flags.Has(aether.FlagENCRYPTED) {
-		if err := s.encryptor.Encrypt(frame); err != nil {
+	// second pass from sealing ciphertext again. The frame key is loaded once
+	// (frameKey), so the check and the Encrypt read the same key.
+	if fk := s.frameKey.Load(); fk != nil && s.opts.Encryption && !frame.Flags.Has(aether.FlagENCRYPTED) {
+		if err := fk.enc.Encrypt(frame); err != nil {
 			return 0, false, fmt.Errorf("aether encrypt: %w", err)
 		}
 	}
