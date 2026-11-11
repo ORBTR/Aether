@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/ORBTR/aether"
+	"github.com/ORBTR/aether/flow"
 )
 
 // reopenWhenFree opens id on client as soon as OpenStream stops refusing it with
@@ -120,9 +121,11 @@ func TestNoiseSession_ALostResetIsWrittenAgainAndItsIDWaitsForTheAcknowledgment(
 
 // TestNoiseSession_EveryResetIsAcknowledgedAndANamesakeAcknowledgmentStopsNothing:
 // a RESET the server reads is answered with a RESET flagged FlagACK naming the same
-// stream, which stops the client's copies and starts the ID's quiet time. An
+// stream and stating, as Consumed, what the server's consumer returned of the client's
+// sends on it, which stops the client's copies and starts the ID's quiet time. An
 // acknowledgment naming another stream under the ID stops nothing, and the server
-// answers a second copy of a RESET it has already read, which finds no stream.
+// answers a RESET for a stream it never held, which finds no stream and no note, with
+// Consumed 0.
 func TestNoiseSession_EveryResetIsAcknowledgedAndANamesakeAcknowledgmentStopsNothing(t *testing.T) {
 	client, server, toServer, toClient := filteredPair(t, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
@@ -147,9 +150,10 @@ func TestNoiseSession_EveryResetIsAcknowledgedAndANamesakeAcknowledgmentStopsNot
 	}
 	waitLong(t, "the acknowledgment", func() bool { return client.pendingResetCount.Load() == 0 })
 	mu.Lock()
-	if len(acks) != 1 || acks[0].Incarnation != inc || acks[0].Charged != 0 || acks[0].Released != 0 || acks[0].Consumed != 0 {
+	if want := uint64(messageCredit(int64(len("hello")))); len(acks) != 1 || acks[0].Incarnation != inc ||
+		acks[0].Charged != 0 || acks[0].Released != 0 || acks[0].Consumed != want {
 		mu.Unlock()
-		t.Fatalf("acknowledgments %+v; want one naming %+v with no counts", acks, inc)
+		t.Fatalf("acknowledgments %+v; want one naming %+v stating Consumed %d and no other count", acks, inc, want)
 	}
 	mu.Unlock()
 	client.mu.Lock()
@@ -165,11 +169,11 @@ func TestNoiseSession_EveryResetIsAcknowledgedAndANamesakeAcknowledgmentStopsNot
 	var hold atomic.Bool
 	hold.Store(true)
 	toServer.setRule(func(f *aether.Frame) bool { return hold.Load() && f.Type == aether.TypeRESET && f.StreamID == 906 })
-	if err := client.writeReset(906, aether.ResetPayload{Reason: aether.ResetCancel, Incarnation: wanted}, 50*time.Millisecond); err != nil {
+	if err := client.writeReset(906, aether.ResetPayload{Reason: aether.ResetCancel, Incarnation: wanted}, 50*time.Millisecond, nil); err != nil {
 		t.Fatalf("writeReset: %v", err)
 	}
-	client.resetAcknowledged(906, aether.StreamIncarnation{Generation: 78, WriterOpened: true})
-	client.resetAcknowledged(906, aether.StreamIncarnation{Generation: 77})
+	client.resetAcknowledged(906, aether.StreamIncarnation{Generation: 78, WriterOpened: true}, 0)
+	client.resetAcknowledged(906, aether.StreamIncarnation{Generation: 77}, 0)
 	if client.pendingResetCount.Load() != 1 {
 		t.Fatal("an acknowledgment of another stream stopped the waiting RESET")
 	}
@@ -179,8 +183,8 @@ func TestNoiseSession_EveryResetIsAcknowledgedAndANamesakeAcknowledgmentStopsNot
 	})
 	mu.Lock()
 	defer mu.Unlock()
-	if len(acks) != 2 || acks[1].Incarnation != wanted {
-		t.Fatalf("acknowledgments %+v; want the second naming %+v", acks, wanted)
+	if len(acks) != 2 || acks[1].Incarnation != wanted || acks[1].Consumed != 0 {
+		t.Fatalf("acknowledgments %+v; want the second naming %+v with Consumed 0", acks, wanted)
 	}
 }
 
@@ -235,7 +239,7 @@ func TestNoiseSession_AWaitingResetIsWrittenUntilAcknowledged(t *testing.T) {
 		client.pendingResetCount.Add(1)
 		client.mu.Unlock()
 	}
-	if err := client.writeReset(911, aether.ResetPayload{Incarnation: inc}, time.Second); err != nil {
+	if err := client.writeReset(911, aether.ResetPayload{Incarnation: inc}, time.Second, nil); err != nil {
 		t.Fatalf("writeReset past the cap: %v", err)
 	}
 	client.mu.Lock()
@@ -336,10 +340,10 @@ func TestNoiseSession_ALateCloseOrResetEndsNothingOfTheNextStream(t *testing.T) 
 // TestNoiseSession_AnOpenOfALaterGenerationReplacesAStreamItsResetNeverReached: the
 // peer has left a stream it opened and its RESET never arrived. Its OPEN of the ID at
 // a higher generation ends the stream as the RESET would have, the stream's consumer
-// reading what it holds and then io.EOF, and admits the next stream. Of what the
-// server granted on the stream, which here passes the stream's credit, it holds back
-// at most that credit: no more than the peer's RESET could have taken back. An OPEN
-// at the same or a lower generation, a duplicate or a late copy, changes nothing.
+// reading what it holds and then io.EOF, and admits the next stream. The server holds
+// back none of its grants: the reader of a RESET never withholds, and its grants on
+// the stream return what its consumer took. An OPEN at the same or a lower
+// generation, a duplicate or a late copy, changes nothing.
 func TestNoiseSession_AnOpenOfALaterGenerationReplacesAStreamItsResetNeverReached(t *testing.T) {
 	client, server, _, _ := filteredPair(t, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
@@ -402,14 +406,8 @@ func TestNoiseSession_AnOpenOfALaterGenerationReplacesAStreamItsResetNeverReache
 	if after := server.admitted.held(); after != before {
 		t.Fatalf("the server's ledger holds %d after the replacement, %d before: the replaced stream's reservation stayed", after, before)
 	}
-	if withheld := server.connWindow.Stats().RecvCredit - creditBefore; withheld > reserved {
-		t.Fatalf("the replacement held back %d of the server's grants; want at most the stream's credit %d", withheld, reserved)
-	}
-	for _, c := range []struct{ granted, reserved, withheld int64 }{{9000, 4096, 4096}, {100, 4096, 100}, {0, 4096, 0}} {
-		p := supersededReset(aether.ResetPayload{Reason: aether.ResetCancel, Consumed: 7}, c.granted, c.reserved)
-		if p.Consumed != 0 || p.Charged < p.Released || int64(p.Charged-p.Released) != c.granted-c.withheld {
-			t.Fatalf("supersededReset(granted %d, reserved %d) = %+v; want %d held back", c.granted, c.reserved, p, c.withheld)
-		}
+	if withheld := server.connWindow.Stats().RecvCredit - creditBefore; withheld > 0 {
+		t.Fatalf("the replacement held back %d of the server's grants; want none", withheld)
 	}
 }
 
@@ -437,30 +435,53 @@ func TestNoiseSession_NamedByReadsTheGenerationAndTheOpener(t *testing.T) {
 	}
 }
 
-// TestNoiseSession_ACrossingResetOfAnotherStreamLeavesTheNote: a note kept at this
-// side's RESET is taken only by the peer's RESET of the same stream; a RESET under the
-// ID naming another stream leaves it.
+// TestNoiseSession_ACrossingResetOfAnotherStreamLeavesTheNote: a stream waiting at
+// this side's RESET for the peer's statement is settled only by the peer's RESET of
+// the same stream, at its Consumed; a RESET under the ID naming another stream leaves
+// it waiting, and the note of what this side granted on it stays for the
+// acknowledgment of any copy.
 func TestNoiseSession_ACrossingResetOfAnotherStreamLeavesTheNote(t *testing.T) {
 	_, server := noisePairWithRealms(t, nil, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
 	inc := aether.StreamIncarnation{Generation: 7, WriterOpened: true}
-	server.noteResetGrants(950, 5000, inc)
+	key := resetKey{id: 950, inc: inc}
+	st := &noiseStream{streamID: 950, session: server, window: flow.NewStreamWindow(0), incarnation: inc}
+	const charged, consumed = 1000, 400
+	if err := server.connWindow.Consume(ctx, charged); err != nil {
+		t.Fatalf("consume: %v", err)
+	}
+	st.commitConnCharge(charged)
+	st.settleCharges()
+	server.noteResetGrants(950, inc, 5000)
+	server.mu.Lock()
+	server.awaitingStatement = map[resetKey]*noiseStream{key: st}
+	server.mu.Unlock()
+	before := connOutstanding(server)
 	reset := func(g uint64) {
-		p := aether.EncodeResetPayload(aether.ResetPayload{Reason: aether.ResetCancel, Charged: 1000, Incarnation: aether.StreamIncarnation{Generation: g}})
+		p := aether.EncodeResetPayload(aether.ResetPayload{Reason: aether.ResetCancel, Consumed: consumed, Incarnation: aether.StreamIncarnation{Generation: g}})
 		server.handleReset(&aether.Frame{StreamID: 950, Type: aether.TypeRESET, Length: uint32(len(p)), Payload: p})
 	}
 	reset(8)
 	server.mu.Lock()
-	_, kept := server.resetGrants[950]
+	_, waiting := server.awaitingStatement[key]
 	server.mu.Unlock()
-	if !kept {
-		t.Fatal("a RESET of another stream took the note")
+	if !waiting || connOutstanding(server) != before {
+		t.Fatalf("a RESET of another stream settled the waiting one (waiting %v, outstanding %d of %d)", waiting, connOutstanding(server), before)
 	}
 	reset(7)
 	server.mu.Lock()
-	_, kept = server.resetGrants[950]
+	_, waiting = server.awaitingStatement[key]
+	_, noted := server.resetGrants[key]
 	server.mu.Unlock()
-	if kept {
-		t.Fatal("the crossing RESET of the same stream left the note")
+	if waiting {
+		t.Fatal("the crossing RESET of the same stream left it waiting")
+	}
+	if got := before - connOutstanding(server); got != charged-consumed {
+		t.Fatalf("the crossing RESET returned %d; want the charge less its Consumed, %d", got, charged-consumed)
+	}
+	if !noted {
+		t.Fatal("the crossing RESET took the note its copies' acknowledgments state")
 	}
 }
 

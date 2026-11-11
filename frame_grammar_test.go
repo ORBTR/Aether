@@ -340,6 +340,9 @@ func TestShortFormGoldens(t *testing.T) {
 			}
 			rx := shortFormCompressor(t)
 			primeCompressor(rx)
+			// The decoder of a session holding a frame key, the one session that reads
+			// 0x87 (AcceptEncryptedShort).
+			rx.AcceptEncryptedShort()
 			r := bytes.NewReader(g.wire)
 			f, ind, batch, err := ReadNextFrame(r, rx)
 			if err != nil {

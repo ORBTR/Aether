@@ -727,35 +727,39 @@ type StreamIncarnation struct {
 // [4 reason][8 charged][8 released][8 consumed][8 incarnation], all big-endian.
 const ResetPayloadSize = 36
 
-// ResetPayload is the decoded payload of a RESET frame. The three counts say what
-// the stream's connection credit stood at when its sender wrote the RESET, in the
-// credit adapter.NoiseSession's Send charges, so the two sides settle that credit
-// exactly once whichever grants were on the path at the time:
+// ResetPayload is the decoded payload of a RESET frame. On adapter.NoiseSession
+// (the Full profile) its Consumed settles the stream's connection credit exactly
+// once, in the credit Send charges, whichever grants were on the path at the time:
 //
-//   - Charged is all the writer's sends on the stream have charged.
-//   - Released is the part of Charged the writer took back at this RESET, what no
-//     grant had returned by then. Charged-Released is what its grants had returned.
+//   - Charged is all the writer's sends on the stream charged to its stream window.
+//   - Released is the part of Charged the writer's stream window still held at this
+//     RESET, what no stream grant had returned by then.
 //   - Consumed is the credit of the peer's messages on this stream the writer's
 //     consumer has returned through connection grants, which stop at this RESET.
 //
-// A stream's peer that reads it (handleReset) takes back of its own charge only
-// what Consumed does not cover, since those grants still arrive, and takes off its
-// later connection grants what it has granted past Charged-Released, since the
-// writer has taken that back already. A refusal, which holds no stream, and a
-// TCP-family or QUIC session, whose transport owns flow control, state zero counts
-// (and those sessions do not read them).
+// Each side settles the connection charge of its own sends on the stream on the
+// peer's statement of Consumed and on nothing else: the peer's RESET of the stream,
+// or the peer's acknowledgment of this side's RESET, whichever comes first. It gives
+// back what its sends charged less Consumed, since the grants for Consumed still
+// arrive and nothing returns the rest, and it withholds none of its own grants.
+// Charged and Released are stated for the stream window's own accounting and no
+// reader settles on them. A refusal, which holds no stream, and a TCP-family or QUIC
+// session, whose transport owns flow control, state zero counts (and those sessions
+// do not read them).
 //
 // Incarnation is the stream the RESET ends (StreamIncarnation); a refusal states
 // the generation of the OPEN it refuses, opened by the peer. A RESET flagged
 // FlagACK is a NoiseSession's acknowledgment of a RESET it read, whatever that
 // RESET found: it states the acknowledged RESET's incarnation exactly as that
-// RESET stated it, zero counts and the same reason, and its reader neither settles
-// anything nor answers it. A NoiseSession writes each RESET again until its
+// RESET stated it, the same reason, Charged and Released zero, and as Consumed
+// what the acknowledging side's consumer had returned of the RESET writer's sends
+// on the stream (zero for a stream it never held), and its reader settles on that
+// Consumed and answers nothing. A NoiseSession writes each RESET again until its
 // acknowledgment comes (adapter.NoiseSession's pending RESETs), because a RESET
 // lost on a datagram path would leave the peer's stream live under an ID this
-// side may open again. A TCP-family session writes neither the acknowledgment nor
-// a second copy, its transport delivering every frame once in order, and ignores
-// a RESET flagged FlagACK.
+// side may open again. A TCP-family session writes its acknowledgment once with
+// zero counts and no second copy of a RESET, its transport delivering every frame
+// once in order.
 type ResetPayload struct {
 	Reason      ResetReason
 	Charged     uint64

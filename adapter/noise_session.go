@@ -95,9 +95,15 @@ type NoiseSession struct {
 	fecEvictedLeft atomic.Uint64
 	fecRecovered   atomic.Uint64
 
-	// resetGrants keeps, for a stream this side reset, what it had granted, for the
-	// peer's RESET crossing it (noteResetGrants, handleReset). Guarded by mu.
-	resetGrants map[uint64]resetGrant
+	// resetGrants keeps, for a stream a RESET of either side's ended here, what this
+	// side's consumer had returned of the peer's sends on it (noteResetGrants), the
+	// Consumed every acknowledgment of a copy of the peer's RESET of that stream
+	// states (handleReset). awaitingStatement holds each stream whose RESET this side
+	// wrote and whose connection charge waits for the peer's statement: the
+	// acknowledgment (resetAcknowledged) or the peer's crossing RESET (handleReset).
+	// Both are keyed by the stream as this side names it (resetKey). Guarded by mu.
+	resetGrants       map[resetKey]resetGrant
+	awaitingStatement map[resetKey]*noiseStream
 
 	// pendingResets holds, per stream ID, the RESET this side wrote last under the
 	// ID and has had no acknowledgment of (writeReset, resetAcknowledged), which
@@ -1043,20 +1049,36 @@ func (s *NoiseSession) sweepRecentlyLeft(now time.Time) {
 	}
 }
 
-// resetGrant is what a stream this side reset had granted when it did, and the
-// stream as this side's RESET named it (noteResetGrants).
+// resetKey names a stream among those that have used an ID on the session: the ID
+// and the stream's incarnation as this side states it (noiseStream.incarnation). A
+// RESET of the peer's names the stream with WriterOpened the other way round
+// (peerNamed), its acknowledgment of this side's RESET exactly as that RESET did.
+type resetKey struct {
+	id  uint64
+	inc aether.StreamIncarnation
+}
+
+// peerNamed is the key of the stream a frame of the peer's names by inc.
+func peerNamed(id uint64, inc aether.StreamIncarnation) resetKey {
+	return resetKey{id: id, inc: aether.StreamIncarnation{Generation: inc.Generation, WriterOpened: !inc.WriterOpened}}
+}
+
+// resetGrant is what this side's consumer had returned of the peer's sends on a
+// stream through connection grants when a RESET ended it here, final from then on
+// (recvQueue.peerEnded), and when (noteResetGrants).
 type resetGrant struct {
 	granted int64
 	at      time.Time
-	inc     aether.StreamIncarnation
 }
 
-// resetGrantLifetime is how long a note waits for a crossing RESET. Two RESETs cross
-// within a path's delay of each other, and the peer writes its RESET again at most
-// resetRetransmitMaxWait apart until this side acknowledges it (retransmitResets), so
-// a crossing RESET reaches its note unless every copy of it is lost for this long; one
-// that comes later finds no note, and its writer keeps the overlap's credit twice, as
-// past the map's bound.
+// resetGrantLifetime is how long a note answers copies of the peer's RESET. The peer
+// writes its RESET again at most resetRetransmitMaxWait apart until an acknowledgment
+// reaches it (retransmitResets), and it settles on the first acknowledgment or on
+// this side's crossing RESET, so only a copy whose every earlier acknowledgment was
+// lost needs the note, and one that comes later than this finds none, as past the
+// map's bound: its acknowledgment states Consumed 0, and the peer takes back what
+// this side's consumer had returned as well as receiving those grants, which its
+// connection window holds at what it has outstanding.
 const resetGrantLifetime = 30 * time.Second
 
 // resetRetransmitMaxWait is the longest wait between two copies of a RESET no
@@ -1090,7 +1112,14 @@ type pendingReset struct {
 // once with the ID's quiet time started, so such a peer cannot grow the map; an OPEN
 // of the ID reaching that peer's copy of a stream it opened replaces the stream there
 // by its higher generation (handleOpen). Reset and sendRefused call it.
-func (s *NoiseSession) writeReset(streamID uint64, p aether.ResetPayload, rto time.Duration) error {
+//
+// st is the stream the RESET ends, nil for a refusal, which holds none: it waits in
+// awaitingStatement for the peer's statement of what it consumed of st's sends
+// (noiseStream.notePeerConsumed), under the same bound. Past it st keeps the part of
+// its connection charge the peer never consumed: only a peer that answers none of
+// this side's RESETs fills the map, and its session holds credit nothing returns
+// until its idle timeout ends it.
+func (s *NoiseSession) writeReset(streamID uint64, p aether.ResetPayload, rto time.Duration, st *noiseStream) error {
 	payload := aether.EncodeResetPayload(p)
 	frame := &aether.Frame{
 		SenderID:   s.LocalPeerID(),
@@ -1123,6 +1152,12 @@ func (s *NoiseSession) writeReset(streamID uint64, p aether.ResetPayload, rto ti
 	} else {
 		s.startQuietLocked(streamID, now, rto)
 	}
+	if st != nil && len(s.awaitingStatement) < limit {
+		if s.awaitingStatement == nil {
+			s.awaitingStatement = make(map[resetKey]*noiseStream)
+		}
+		s.awaitingStatement[resetKey{id: streamID, inc: p.Incarnation}] = st
+	}
 	s.mu.Unlock()
 	return s.writeFrame(frame)
 }
@@ -1135,20 +1170,28 @@ func (s *NoiseSession) resetPendingLocked(id uint64) bool {
 	return ok
 }
 
-// resetAcknowledged takes the peer's acknowledgment of a RESET under streamID: when
-// it names the stream the waiting RESET names, the RESET stops and the ID's quiet
-// time starts. An acknowledgment of an earlier RESET under the ID, which a later one
-// replaced, stops nothing. handleReset calls it for a RESET flagged FlagACK.
-func (s *NoiseSession) resetAcknowledged(streamID uint64, inc aether.StreamIncarnation) {
+// resetAcknowledged takes the peer's acknowledgment of a RESET under streamID, which
+// names the stream as that RESET did (inc) and states what the peer's consumer had
+// returned of this side's sends on it (consumed): the stream waiting for that
+// statement (awaitingStatement) settles its connection charge on it, unless the
+// peer's crossing RESET settled it first. When it names the stream the waiting RESET
+// names, the RESET stops and the ID's quiet time starts. An acknowledgment of an
+// earlier RESET under the ID, which a later one replaced, stops nothing, and still
+// settles the stream it names. handleReset calls it for a RESET flagged FlagACK.
+func (s *NoiseSession) resetAcknowledged(streamID uint64, inc aether.StreamIncarnation, consumed uint64) {
+	key := resetKey{id: streamID, inc: inc}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	p, ok := s.pendingResets[streamID]
-	if !ok || p.inc != inc {
-		return
+	st := s.awaitingStatement[key]
+	delete(s.awaitingStatement, key)
+	if p, ok := s.pendingResets[streamID]; ok && p.inc == inc {
+		delete(s.pendingResets, streamID)
+		s.pendingResetCount.Add(-1)
+		s.startQuietLocked(streamID, time.Now(), p.rto)
 	}
-	delete(s.pendingResets, streamID)
-	s.pendingResetCount.Add(-1)
-	s.startQuietLocked(streamID, time.Now(), p.rto)
+	s.mu.Unlock()
+	if st != nil {
+		st.notePeerConsumed(consumed)
+	}
 }
 
 // startQuietLocked starts id's quiet time (reopenQuietRTOs of rto from now). Caller
@@ -1404,7 +1447,9 @@ func (s *NoiseSession) MSS() int { return s.pmtuProber.MSS() }
 
 // SetSessionKey sets the per-frame encryption key and enables AEAD encryption.
 // The key should be derived from the Noise handshake shared secret.
-// When set, all outbound frames are encrypted and inbound frames are decrypted.
+// When set, all outbound frames are encrypted and inbound frames are decrypted, and
+// the session's decoder reads the encrypted short form 0x87, which it refuses before
+// a key is set.
 func (s *NoiseSession) SetSessionKey(key [32]byte) error {
 	// Reject a second install so a key is never silently re-installed into
 	// a fresh FrameEncryptor whose ordered nonce counter restarts at 0.
@@ -1420,6 +1465,9 @@ func (s *NoiseSession) SetSessionKey(key [32]byte) error {
 	}
 	s.encryptor = enc
 	s.sessionKey = key[:]
+	// The frame key is what authenticates a 0x87 frame's payload, so the decoder
+	// reads that form from here on (processIncomingFrame decrypts it).
+	s.rxCompressor.AcceptEncryptedShort()
 	return nil
 }
 

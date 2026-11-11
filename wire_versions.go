@@ -85,9 +85,14 @@ const (
 	WireVersionFragmentCurrent uint16 = 2
 	// WireVersionFrameCurrent is the full-frame grammar version this build
 	// writes and reads (the OPEN, CLOSE, RESET and FEC_REPAIR payload layouts,
-	// CLOSE's sequence number and RESET's acknowledgment are part of it); tests
-	// outside this package build peer offers from it.
-	WireVersionFrameCurrent       uint16 = 5
+	// CLOSE's sequence number, RESET's acknowledgment and the Consumed it states
+	// are part of it); tests outside this package build peer offers from it. A
+	// build lists only this version: a peer whose RESET acknowledgment states no
+	// Consumed, and which takes back a reset stream's charge at its own RESET and
+	// withholds its later grants, would settle a stream's connection credit twice or
+	// never against this build's (adapter.NoiseSession's handleReset), so it is
+	// refused at the handshake.
+	WireVersionFrameCurrent       uint16 = 6
 	wireVersionFrameShortCurrent  uint16 = 1
 	wireVersionReliabilityCurrent uint16 = 3
 )

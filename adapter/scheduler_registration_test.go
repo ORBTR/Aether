@@ -76,9 +76,9 @@ func deferPacing(client *NoiseSession) *deferringPacer {
 // TestNoiseStream_AHeldFrameOfAnEndedStreamStaysOffTheIDsNextStream: the write loop
 // holds a DATA frame the pacer deferred, and while it waits on its pacing timer the
 // frame's stream is reset and the next stream opens under the same ID. The frame
-// belongs to the stream that ended (MTS 2.4 item 6: a reset removes exactly that
-// generation), so the write loop drops it as Scheduler.Unregister drops what the stream
-// still had queued, and the next stream's peer reads only what the next stream sent.
+// belongs to the stream that ended, whose registration the RESET's exit removed
+// (releaseStream, Scheduler.UnregisterRegistration), so the write loop drops it
+// (frameStream) as Scheduler.Unregister drops what the stream still had queued, and the next stream's peer reads only what the next stream sent.
 // A write loop that looks the frame's stream up by ID writes it on the next stream's
 // send window instead, and the next stream's peer reads it as its own.
 func TestNoiseStream_AHeldFrameOfAnEndedStreamStaysOffTheIDsNextStream(t *testing.T) {

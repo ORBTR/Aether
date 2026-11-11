@@ -52,8 +52,9 @@ func TestOpenPayloadGolden(t *testing.T) {
 }
 
 // earlierFrameOffer is this build's own offer with the frame grammar entry
-// listing only the version before the current one: a peer whose OPEN, CLOSE and
-// RESET name no stream generation and whose RESET is never acknowledged.
+// listing only the version before the current one: a peer whose RESET
+// acknowledgment states no Consumed and which settles a reset stream's connection
+// credit by taking it back at its own RESET and withholding its later grants.
 func earlierFrameOffer(t *testing.T) WireVersions {
 	t.Helper()
 	own, err := LocalWireVersions(nil)
@@ -77,8 +78,8 @@ func earlierFrameOffer(t *testing.T) WireVersions {
 // *WireVersionMismatchError naming the frame entry and both lists, whichever
 // side is local, so neither side reaches session state.
 func TestFrameGrammarNegotiation(t *testing.T) {
-	if WireVersionFrameCurrent != 5 {
-		t.Fatalf("WireVersionFrameCurrent = %d; the OPEN, CLOSE and RESET naming their stream's generation and the acknowledged RESET are grammar 5", WireVersionFrameCurrent)
+	if WireVersionFrameCurrent != 6 || WireVersionFrameCurrent-1 != 5 {
+		t.Fatalf("WireVersionFrameCurrent = %d; the RESET acknowledgment stating Consumed is grammar 6, and the earlier grammar every peer of this build refuses is 5", WireVersionFrameCurrent)
 	}
 	own, err := LocalWireVersions(nil)
 	if err != nil {
