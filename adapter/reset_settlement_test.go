@@ -19,6 +19,7 @@ import (
 
 	"github.com/ORBTR/aether"
 	"github.com/ORBTR/aether/flow"
+	"github.com/ORBTR/aether/reliability"
 )
 
 // openRetryingDuplicate opens id on s, retrying while the ID is still held by a stream
@@ -39,10 +40,14 @@ func openRetryingDuplicate(ctx context.Context, s aether.Session, id uint64, wit
 // another, beside a stream whose one message the peer never reads, and returns the
 // client's and the server's connection outstanding once both have settled, with the
 // unread message's charge, which each side's window also holds for a message of its
-// own the other side never reads. mode picks the RESET: "local" is the client's Reset, "peer"
-// the server's Reset with the client's own Reset crossing it, and "peeronly" the
-// server's Reset alone. In the peer modes the server's stream sends three messages the
-// client never reads before its Reset, so the server's own charge is settled too.
+// own the other side never reads. mode picks the RESET: "local" is the client's Reset,
+// "localcross" the client's Reset with the server's own Reset crossing it, "peer" the
+// server's Reset with the client's own Reset crossing it, "peeronly" the server's Reset
+// alone, and "both" the two Resets at once from two goroutines. In every mode but
+// "local" the server's stream sends three messages the client never reads before any
+// Reset, so the server's own charge is settled too: the crossing modes settle each side
+// on the other's crossing RESET (handleReset's crossing branch), the others on the
+// acknowledgment (resetAcknowledged) or the peer's RESET that ends the stream.
 func resetSettlementRounds(t *testing.T, mode string, rounds int) (client, server int64, held int64) {
 	t.Helper()
 	const unreadID = 990
@@ -127,10 +132,22 @@ func resetSettlementRounds(t *testing.T, mode string, rounds int) (client, serve
 			}()
 		}
 		time.Sleep(time.Duration(rng.Intn(1500)) * time.Microsecond)
-		if byPeer {
-			_ = ss.Reset(aether.ResetCancel)
-		} else {
+		switch mode {
+		case "local":
 			_ = cs.Reset(aether.ResetCancel)
+		case "localcross":
+			_ = cs.Reset(aether.ResetCancel)
+			_ = ss.Reset(aether.ResetCancel)
+		case "peer", "peeronly":
+			_ = ss.Reset(aether.ResetCancel)
+		case "both":
+			var resets sync.WaitGroup
+			resets.Add(2)
+			go func() { defer resets.Done(); _ = cs.Reset(aether.ResetCancel) }()
+			go func() { defer resets.Done(); _ = ss.Reset(aether.ResetCancel) }()
+			resets.Wait()
+		default:
+			t.Fatalf("unknown mode %q", mode)
 		}
 		wg.Wait()
 		switch mode {
@@ -154,7 +171,8 @@ func resetSettlementRounds(t *testing.T, mode string, rounds int) (client, serve
 
 // TestNoiseStream_SendsRacingResetsReturnExactlyTheirConnectionCharge: Sends racing a
 // RESET on one stream after another leave each side's connection window holding exactly
-// what no RESET ended, whichever side resets and whether the two sides' RESETs cross:
+// what no RESET ended, whichever side resets and whether the two sides' RESETs cross,
+// in either order or at once:
 // each ends at the charge of its one message the other side never reads, the server's
 // sends on the reset streams, which the client never read, included. More is a leak; less is a charge returned twice, which shows as
 // the unread message's credit handed back early (ReleaseUnsent caps at what is
@@ -164,7 +182,7 @@ func TestNoiseStream_SendsRacingResetsReturnExactlyTheirConnectionCharge(t *test
 	if v, err := strconv.Atoi(os.Getenv("RESET_SETTLEMENT_ROUNDS")); err == nil && v > 0 {
 		rounds = v
 	}
-	for _, mode := range []string{"local", "peer", "peeronly"} {
+	for _, mode := range []string{"local", "localcross", "peer", "peeronly", "both"} {
 		t.Run(mode, func(t *testing.T) {
 			client, server, held := resetSettlementRounds(t, mode, rounds)
 			t.Logf("%s, %d rounds: client outstanding %d, server outstanding %d, want %d each", mode, rounds, client, server, held)
@@ -253,6 +271,77 @@ func TestRecvQueue_NothingIsGrantedPastTheRESETsStatement(t *testing.T) {
 	}
 	if got := q.peerEnded(); got != 10 {
 		t.Fatalf("the statement moved to %d after the RESET", got)
+	}
+}
+
+// TestNoiseStream_AFrameSettledPastTheRESETIsNotReturnedTwice: handleData looks a
+// stream up and then delivers what its receive window hands back, and a Reset on
+// another goroutine may end the stream between the two; a frame the window then gives
+// up on (settleExpired) is one the peer's settlement already returns, since the RESET's
+// Consumed did not count it, so granting it as well would hand its credit back twice.
+// Over two live sessions the client's message A is lost on the path and the message
+// after it, B, reaches the server's receive window and waits there for A; the server
+// resets the stream and the client settles on the RESET; then the server's readLoop
+// step is run on the ended stream with B expired. The client's connection window must
+// hold exactly its unread message's charge: below it is B's credit returned twice,
+// which ApplyUpdate shows only while an unread charge is outstanding above it.
+func TestNoiseStream_AFrameSettledPastTheRESETIsNotReturnedTwice(t *testing.T) {
+	const unreadID, id = 1030, 1032
+	client, server, toServer, _ := filteredPair(t, func(o *aether.SessionOptions) {
+		o.SessionLifetimeStreams = append(o.SessionLifetimeStreams, unreadID)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	other, _ := openWithCredit(t, ctx, client, server, unreadID, 0)
+	unread := make([]byte, 4096)
+	if err := other.Send(ctx, unread); err != nil {
+		t.Fatalf("send unread: %v", err)
+	}
+	held := messageCredit(int64(len(unread)))
+	waitFor(t, "only the unread message charged", func() bool { return connOutstanding(client) == held })
+
+	cs, ss := openWithCredit(t, ctx, client, server, id, 0)
+	waitSendWindowEmpty(t, cs, "the opening message acknowledged")
+	waitFor(t, "the opening message's credit back", func() bool { return connOutstanding(client) == held })
+	var lostSeq atomic.Int64
+	lostSeq.Store(-1)
+	toServer.setRule(func(f *aether.Frame) bool {
+		if f.StreamID != id || f.Type != aether.TypeDATA {
+			return false
+		}
+		lostSeq.CompareAndSwap(-1, int64(f.SeqNo))
+		return int64(f.SeqNo) == lostSeq.Load()
+	})
+	lost, waiting := []byte("message A, lost on the path"), []byte("message B, waiting for A")
+	if err := cs.Send(ctx, lost); err != nil {
+		t.Fatalf("send A: %v", err)
+	}
+	if err := cs.Send(ctx, waiting); err != nil {
+		t.Fatalf("send B: %v", err)
+	}
+	waitFor(t, "B waiting in the server's receive window for A", func() bool { return ss.recvWindow.BufferedCount() == 1 })
+	twice := messageCredit(int64(len(waiting)))
+	charged := messageCredit(int64(len(lost))) + twice
+	waitFor(t, "A and B charged", func() bool { return connOutstanding(client) == held+charged })
+	if held < twice {
+		t.Fatalf("premise: the unread charge %d is below B's %d, so a double return would be capped away", held, twice)
+	}
+
+	if err := ss.Reset(aether.ResetCancel); err != nil {
+		t.Fatalf("server reset: %v", err)
+	}
+	waitFor(t, "the client settled on the server's RESET", func() bool { return connOutstanding(client) == held })
+	// A grant the expiry would make goes out at once (ConnWindow.ReceiverConsume's timed
+	// trigger) once GrantMaxInterval has passed since the server's last grant.
+	time.Sleep(flow.GrantMaxInterval + 100*time.Millisecond)
+	ss.settleExpired(reliability.RecvDelivery{Payload: waiting, Expired: true})
+
+	end := time.Now().Add(3 * time.Second)
+	for time.Now().Before(end) {
+		if got := connOutstanding(client); got != held {
+			t.Fatalf("client outstanding %d after the expiry past the RESET, want %d (B's credit is %d)", got, held, twice)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
