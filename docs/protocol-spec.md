@@ -309,28 +309,33 @@ BestEffort mode accepts additional parameters in the OPEN payload:
 
 ### 6.2 Key Derivation
 
-Session keys are derived from the transport handshake shared secret via HKDF-SHA256. Three separate keys are derived with distinct info strings, ensuring cryptographic separation.
+Session keys are derived from a shared secret of at least 32 bytes that both ends hold, which the caller of `DeriveKeyring` supplies, via HKDF-SHA256. Each end derives its own keyring, naming itself first; the two keyrings mirror each other. Separate keys are derived with distinct info strings, ensuring cryptographic separation.
 
 ```
 PRK = HKDF-Extract(salt=nil, IKM=sharedSecret)
+id(x) = uvarint(len(x)) || x
 
-EncryptionKey = HKDF-Expand(PRK, info="aether-enc-v1"  || localID || remoteID, L=32)
-AuthKey       = HKDF-Expand(PRK, info="aether-auth-v1" || localID || remoteID, L=32)
-IVKey         = HKDF-Expand(PRK, info="aether-iv-v1"   || localID || remoteID, L=32)
+EncryptionKey = HKDF-Expand(PRK, info="aether-enc-v1"  || id(localID)  || id(remoteID), L=32)
+OpenKey       = HKDF-Expand(PRK, info="aether-enc-v1"  || id(remoteID) || id(localID),  L=32)
+AuthKey       = HKDF-Expand(PRK, info="aether-auth-v1" || id(lower)    || id(higher),   L=32)
+IVKey         = HKDF-Expand(PRK, info="aether-iv-v1"   || id(localID)  || id(remoteID), L=32)
 ```
 
 - **Salt:** nil (HKDF uses a zero-length salt internally)
-- **IKM:** shared secret from Noise handshake output (minimum 32 bytes)
-- **Info strings:** `"aether-enc-v1"`, `"aether-auth-v1"`, `"aether-iv-v1"` — each prefixed with the concatenation of localID and remoteID strings to bind keys to the specific session
-- **EncryptionKey:** ChaCha20-Poly1305 AEAD key for per-frame encryption
-- **AuthKey:** HMAC key for migration tokens and resume token validation
-- **IVKey:** Additional entropy for nonce generation
+- **IKM:** the shared secret (minimum 32 bytes)
+- **Info strings:** `"aether-enc-v1"`, `"aether-auth-v1"`, `"aether-iv-v1"`, each followed by the two identities, each identity preceded by its length as a uvarint, so no two identity pairs give one info string
+- **EncryptionKey:** ChaCha20-Poly1305 AEAD key sealing the frames this end sends (local to remote)
+- **OpenKey:** ChaCha20-Poly1305 AEAD key opening the frames this end receives (remote to local); it is the peer's EncryptionKey
+- **AuthKey:** HMAC key for migration tokens and resume token validation, derived over the two identities in byte order (`lower`, `higher`), so both ends hold the same key
+- **IVKey:** Additional entropy for nonce generation in the local-to-remote direction
 
-Implementation: `crypto/keyring.go:DeriveKeyring()`
+`Keyring.NewEncryptor` builds a `FrameEncryptor` that seals with EncryptionKey and opens with OpenKey (`NewDirectionalFrameEncryptor`, which refuses one key as both): a frame opens only at the end it was sent to, and each direction's nonces run under a key only one end seals with. `NewFrameEncryptor` seals and opens with one key; it is the form `NoiseSession.SetSessionKey` installs from its one 32-byte key, and both ends of a session keyed that way must install the same key.
+
+Implementation: `crypto/keyring.go:DeriveKeyring()`, `crypto/aead.go`
 
 ### 6.3 Nonce Generation
 
-- **Ordered streams:** Counter-based. 4 zero bytes + 8-byte big-endian counter. Monotonically increasing. Counter MUST NOT repeat for the same key.
+- **Ordered streams:** A 4-byte prefix drawn at random for each encryptor, then an 8-byte big-endian counter. The counter is monotonic within the encryptor and MUST NOT repeat for the same key; the prefix keeps apart the nonces of two encryptors sealing under one key (the two ends of a one-key session, or a key installed again).
 - **Unordered streams:** Random nonce via crypto/rand for replay safety under concurrent sends.
 
 ### 6.4 Additional Data

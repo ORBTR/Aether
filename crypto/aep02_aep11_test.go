@@ -214,7 +214,7 @@ func TestAEP11_DecryptWithNonceInvalidNonceSize(t *testing.T) {
 
 // aep11Nonce returns a fixed, correctly-sized nonce for the encryptor's AEAD.
 func aep11Nonce(e *FrameEncryptor) []byte {
-	nonce := make([]byte, e.aead.NonceSize())
+	nonce := make([]byte, e.seal.NonceSize())
 	for i := range nonce {
 		nonce[i] = byte(i + 1)
 	}
@@ -233,7 +233,7 @@ func aep11SealedFrame(e *FrameEncryptor, nonce, plaintext []byte) *aether.Frame 
 	}
 	f.Length = uint32(len(plaintext) + e.Overhead())
 	ad := f.HeaderBytes()
-	ciphertext := e.aead.Seal(nil, nonce, plaintext, ad)
+	ciphertext := e.seal.Seal(nil, nonce, plaintext, ad)
 	f.Payload = ciphertext
 	return f
 }
