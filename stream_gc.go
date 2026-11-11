@@ -31,14 +31,27 @@ type StreamGC struct {
 	// session's SessionLifetimeStreams. Written only by NewSessionStreamGC, before
 	// Start, so sweep reads it without the lock.
 	sessionLifetime map[uint64]struct{}
-	resetFn         func(streamID uint64) // callback to reset idle stream
-	stopCh          chan struct{}
-	stopOnce        sync.Once
+	// registrations holds, for each tracked ID a session registered with RegisterAs,
+	// the registration that tracks it; an ID tracked by Register or RecordActivity
+	// has none (zero). UnregisterRegistration and sweep read it so that the ended
+	// stream's release and the idle reset name one registration of the ID, not
+	// whichever stream holds the ID when they run. Guarded by mu with lastActivity,
+	// and holds no ID lastActivity does not.
+	registrations map[uint64]uint64
+	resetFn       func(streamID, registration uint64) // callback to reset idle stream
+	stopCh        chan struct{}
+	stopOnce      sync.Once
 }
 
 // NewStreamGC creates a stream garbage collector.
 // resetFn is called for each stream that exceeds the idle timeout.
 func NewStreamGC(idleTimeout time.Duration, resetFn func(streamID uint64)) *StreamGC {
+	return newStreamGC(idleTimeout, byStreamID(resetFn))
+}
+
+// newStreamGC is the stream GC under idleTimeout (DefaultStreamIdleTimeout when not
+// positive) that hands each idle stream's ID and registration to resetFn.
+func newStreamGC(idleTimeout time.Duration, resetFn func(streamID, registration uint64)) *StreamGC {
 	if idleTimeout <= 0 {
 		idleTimeout = DefaultStreamIdleTimeout
 	}
@@ -46,9 +59,19 @@ func NewStreamGC(idleTimeout time.Duration, resetFn func(streamID uint64)) *Stre
 		lastActivity:    make(map[uint64]time.Time),
 		idleTimeout:     idleTimeout,
 		sessionLifetime: make(map[uint64]struct{}),
+		registrations:   make(map[uint64]uint64),
 		resetFn:         resetFn,
 		stopCh:          make(chan struct{}),
 	}
+}
+
+// byStreamID is a reset callback that takes the stream ID alone as one that also takes
+// the registration, for the constructors whose callers reset by ID; nil stays nil.
+func byStreamID(resetFn func(streamID uint64)) func(streamID, registration uint64) {
+	if resetFn == nil {
+		return nil
+	}
+	return func(streamID, _ uint64) { resetFn(streamID) }
 }
 
 // NewSessionStreamGC is the stream GC a session runs under opts: streams idle for
@@ -57,7 +80,18 @@ func NewStreamGC(idleTimeout time.Duration, resetFn func(streamID uint64)) *Stre
 // as the session. The TCP-family and Noise adapters both build their GC here, so the
 // two read one rule for which streams outlive their idleness.
 func NewSessionStreamGC(opts SessionOptions, resetFn func(streamID uint64)) *StreamGC {
-	g := NewStreamGC(opts.StreamIdleTimeout, resetFn)
+	return NewSessionStreamGCByRegistration(opts, byStreamID(resetFn))
+}
+
+// NewSessionStreamGCByRegistration is NewSessionStreamGC for a session that tracks each
+// stream under its registration (RegisterAs): resetFn gets the idle stream's ID and the
+// registration that tracked it, zero for an ID tracked without one, so the session
+// resets the stream that registration names and leaves alone a later stream that took
+// the ID after the sweep let the entry go. The Noise adapter builds its GC here: its
+// stream exits run outside the session lock that publishes the ID's next stream, so an
+// ID alone does not tell an ended stream from its successor.
+func NewSessionStreamGCByRegistration(opts SessionOptions, resetFn func(streamID, registration uint64)) *StreamGC {
+	g := newStreamGC(opts.StreamIdleTimeout, resetFn)
 	for _, id := range opts.SessionLifetimeStreams {
 		g.sessionLifetime[id] = struct{}{}
 	}
@@ -91,18 +125,48 @@ func (g *StreamGC) RecordActivity(streamID uint64) {
 	g.lastActivity[streamID] = time.Now()
 }
 
-// Register adds a stream to the GC tracker.
+// Register adds a stream to the GC tracker, under no registration.
 func (g *StreamGC) Register(streamID uint64) {
+	g.RegisterAs(streamID, 0)
+}
+
+// RegisterAs adds a stream to the GC tracker under registration, the caller's name for
+// this registration of the ID (the Noise adapter passes the stream's
+// scheduler.Registration, which no other registration of the session shares). It
+// replaces whatever entry the ID had, so an ended stream's later
+// UnregisterRegistration leaves the new one tracked. Zero is Register.
+func (g *StreamGC) RegisterAs(streamID, registration uint64) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.lastActivity[streamID] = time.Now()
+	if registration == 0 {
+		delete(g.registrations, streamID)
+		return
+	}
+	g.registrations[streamID] = registration
 }
 
-// Unregister removes a stream from the GC tracker (already closed).
+// Unregister removes a stream from the GC tracker (already closed), whichever
+// registration tracks it.
 func (g *StreamGC) Unregister(streamID uint64) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	delete(g.lastActivity, streamID)
+	delete(g.registrations, streamID)
+}
+
+// UnregisterRegistration is Unregister for registration alone: the ID leaves the
+// tracker only while that registration tracks it, so the release of a stream whose ID
+// another stream has since registered (RegisterAs) leaves the other stream tracked for
+// its own idle timeout. A registration the sweep has already let go is a no-op.
+func (g *StreamGC) UnregisterRegistration(streamID, registration uint64) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if _, tracked := g.lastActivity[streamID]; !tracked || g.registrations[streamID] != registration {
+		return
+	}
+	delete(g.lastActivity, streamID)
+	delete(g.registrations, streamID)
 }
 
 // Start begins the periodic GC sweep. Call in a goroutine.
@@ -150,16 +214,19 @@ func (g *StreamGC) sweep() {
 			expired = append(expired, streamID)
 		}
 	}
-	for _, id := range expired {
+	regs := make([]uint64, len(expired))
+	for i, id := range expired {
+		regs[i] = g.registrations[id]
 		delete(g.lastActivity, id)
+		delete(g.registrations, id)
 	}
 	g.mu.Unlock()
 
 	// Reset expired streams outside the lock
-	for _, id := range expired {
+	for i, id := range expired {
 		dbgAether.Printf("Stream GC: resetting idle stream %d (timeout %v)", id, g.idleTimeout)
 		if g.resetFn != nil {
-			g.resetFn(id)
+			g.resetFn(id, regs[i])
 		}
 	}
 }

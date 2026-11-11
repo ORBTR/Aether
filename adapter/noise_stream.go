@@ -453,14 +453,17 @@ func (s *NoiseSession) createStream(streamID uint64, cfg aether.StreamConfig, en
 		class = aether.DefaultLatencyClass(streamID)
 	}
 	st.schedReg = s.sched.RegisterWithClass(streamID, cfg.Priority, cfg.Dependency, class)
+	// The stream GC tracks the stream for its idle timeout under the same registration,
+	// also before publication and under s.mu: releaseStream's UnregisterRegistration
+	// then removes only this stream's entry, so an ended stream's exit leaves the ID's
+	// next stream tracked, and resetIdleStream, which reads s.streams under s.mu, finds
+	// every published stream's entry already in place.
+	s.streamGC.RegisterAs(streamID, uint64(st.schedReg))
 	s.streams[streamID] = st
 	// A RESET for this ID from here on is this stream's, not the crossing of an
 	// earlier one (handleReset's resetGrants).
 	delete(s.resetGrants, streamID)
 	s.mu.Unlock()
-
-	// Register with stream GC for idle timeout tracking
-	s.streamGC.Register(streamID)
 	return st, nil
 }
 

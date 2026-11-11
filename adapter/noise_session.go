@@ -376,7 +376,10 @@ type NoiseSession struct {
 	// this tracker.
 	abuseTracker *aether.AbuseTracker
 
-	// Stream GC — resets idle streams after timeout (exempts well-known 0-3)
+	// Stream GC — resets idle streams after opts.StreamIdleTimeout, except IDs below
+	// aether.StreamGCExemptBelow and opts.SessionLifetimeStreams; each stream is
+	// tracked under its scheduler registration (createStream), reset by
+	// resetIdleStream and released by releaseStream.
 	streamGC *aether.StreamGC
 
 	// Stall-detection state is per stream (noiseStream.lastBaseACKSeen,
@@ -648,27 +651,7 @@ func newNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 
 	s.migrator = migration.NewMigrator()
 	// connID is owned by *BaseSession (initialised by NewBaseSession).
-	s.streamGC = aether.NewSessionStreamGC(opts, func(streamID uint64) {
-		dbgNoise.Printf("StreamGC: resetting idle stream %d", streamID)
-		s.mu.Lock()
-		st, ok := s.streams[streamID]
-		if ok {
-			delete(s.streams, streamID)
-		}
-		s.mu.Unlock()
-		if ok {
-			// Send RESET to the peer. st.Reset also calls sched.Unregister,
-			// but we then run releaseStream to idempotently clean up every
-			// session-side tracker (sched + streamGC). The streamGC sweep
-			// itself deletes this stream from its own map right after
-			// invoking this callback, so Unregister here is a no-op on
-			// that side but harmless.
-			_ = st.Reset(aether.ResetTimeout)
-			s.releaseStream(streamID, st.schedReg)
-			return
-		}
-		s.releaseStream(streamID, 0)
-	})
+	s.streamGC = aether.NewSessionStreamGCByRegistration(opts, s.resetIdleStream)
 
 	// PMTU prober sends PATH_PROBE frames to discover maximum segment size. size is
 	// the MSS under test, and MSSToMaxPayload's payload in a full frame, sealed, is
@@ -932,18 +915,19 @@ func (s *NoiseSession) GoAway(ctx context.Context, reason aether.GoAwayReason, m
 // termination path needs: unregister from the scheduler and from the
 // idle-stream GC. Callers must already have removed the stream from
 // s.streams under s.mu (and ended its receive side where appropriate) — this
-// helper intentionally does neither so it can be called from the GC
-// sweep (which cannot re-acquire s.mu) and the RESET/CLOSE handlers
-// (which run under different lock disciplines).
+// helper intentionally does neither, and takes no lock of the session's, so
+// resetIdleStream can call it with s.mu held and the RESET/CLOSE exits
+// (leaveSession, leaveSchedulerThenSettle) without it.
 //
 // All operations are idempotent: calling for a streamID that was
 // already unregistered is a no-op on both the scheduler and the GC.
 //
-// reg is the ending stream's scheduler registration (noiseStream.schedReg): only that
-// registration leaves the scheduler, so a stream the peer opened under the ID after the
-// ending stream left s.streams keeps its own (Scheduler.UnregisterRegistration). Zero
-// removes whatever registration the ID has, for the stream GC's call for an ID it found
-// no stream under.
+// reg is the ending stream's scheduler registration (noiseStream.schedReg), which also
+// names its stream-GC entry (createStream's RegisterAs): only that registration leaves
+// the scheduler and the GC, so a stream the peer opened under the ID after the ending
+// stream left s.streams keeps its own (Scheduler.UnregisterRegistration,
+// StreamGC.UnregisterRegistration). Zero removes whatever registration the ID has, for
+// resetIdleStream's call, under s.mu, for an ID it found no stream under.
 func (s *NoiseSession) releaseStream(streamID uint64, reg scheduler.Registration) {
 	// The frames Unregister hands back need no credit returned here: a RESET's
 	// exit has settled the connection window for all this stream had charged, these
@@ -954,9 +938,52 @@ func (s *NoiseSession) releaseStream(streamID uint64, reg scheduler.Registration
 	} else {
 		s.sched.Unregister(streamID)
 	}
-	if s.streamGC != nil {
+	if s.streamGC == nil {
+		return
+	}
+	if reg != 0 {
+		s.streamGC.UnregisterRegistration(streamID, uint64(reg))
+	} else {
 		s.streamGC.Unregister(streamID)
 	}
+}
+
+// resetIdleStream is the stream GC's reset of the stream it tracked under registration
+// (createStream's RegisterAs, the stream's scheduler.Registration) once that stream sat
+// idle past the session's StreamIdleTimeout. The sweep has let the entry go before it
+// calls this, so between the two the stream can end and the ID be opened again; the
+// stream s.streams holds under the ID is reset only when it is the one registration
+// names. A later stream under the ID registered after the sweep let the entry go, keeps
+// its own entry and is left alone.
+//
+// With no stream under the ID, the entry was an ID's activity with no stream left
+// (dispatchFrame's RecordActivity) or a stream whose exit has not yet released it, and
+// releaseStream with no registration clears what the scheduler and the GC still hold
+// for the ID. It runs under s.mu, the lock createStream registers a stream under before
+// publishing it, so it cannot reach a registration made after the check.
+func (s *NoiseSession) resetIdleStream(streamID, registration uint64) {
+	dbgNoise.Printf("StreamGC: resetting idle stream %d", streamID)
+	s.mu.Lock()
+	st, ok := s.streams[streamID]
+	if !ok {
+		s.releaseStream(streamID, 0)
+		s.mu.Unlock()
+		return
+	}
+	if uint64(st.schedReg) != registration {
+		s.mu.Unlock()
+		return
+	}
+	delete(s.streams, streamID)
+	s.mu.Unlock()
+	// Send RESET to the peer. st.Reset releases the stream under its own
+	// registration (leaveSchedulerThenSettle) when this is its first exit; when
+	// another exit has begun, Reset returns at once and releaseStream here releases
+	// it without waiting on that exit. Both name only this stream's registration,
+	// so a repeat is a no-op, and the GC side is one already, the sweep having let
+	// the entry go.
+	_ = st.Reset(aether.ResetTimeout)
+	s.releaseStream(streamID, st.schedReg)
 }
 
 // sweepEndedQueues is recvMemory.sweepEnded on the reliability tick every ten seconds.
