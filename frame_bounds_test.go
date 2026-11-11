@@ -109,6 +109,7 @@ func TestOneOverLimitPayloadRefusedBeforeAllocationOnEveryForm(t *testing.T) {
 		}},
 		{"0x87 encrypted DATA", shortDataHeader(ShortEncryptedIndicator, 1, over), func(t *testing.T, r io.Reader) (*Frame, error) {
 			rx := shortFormCompressor(t)
+			rx.AcceptEncryptedShort() // a session holding a frame key, the one that reads 0x87
 			f, _, _, err := ReadNextFrame(r, rx)
 			if _, _, ok := streamState(rx, 5); ok {
 				t.Fatalf("the refused frame created state for stream 5")
@@ -312,6 +313,7 @@ func TestSequenceWrapRefusedBeforeReadOrState(t *testing.T) {
 			t.Run(fm.name+" "+tc.name, func(t *testing.T) {
 				rx := shortFormCompressor(t)
 				primeCompressor(rx)
+				rx.AcceptEncryptedShort() // 0x87 is read only where a frame key can authenticate it
 				rx.RecordFullHeader(&Frame{SenderID: goldenSender, ReceiverID: goldenReceiver, StreamID: 5, Type: TypeDATA, SeqNo: tc.last})
 				seqBefore, framesBefore, _ := streamState(rx, 5)
 				hdr := fm.hdr(tc.low)

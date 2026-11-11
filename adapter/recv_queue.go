@@ -95,8 +95,9 @@ type recvQueue struct {
 	noCredit  bool
 	discarded bool
 	// granted is the credit of this stream's messages the receiver has returned
-	// or will return through connection grants: each credited pop, and what
-	// reassembly gave back (addGranted). peerEnded reads it at the moment the
+	// or will return through connection grants: each credited pop, what
+	// reassembly gave back (addGranted), and what releaseCharge and discard hand
+	// back for messages no consumer will read. peerEnded reads it at the moment the
 	// grants stop, which is what a RESET states as Consumed (aether.ResetPayload).
 	granted int64
 	// lastTake is the UnixNano of the last pop or of the stream's leaving the
@@ -307,15 +308,23 @@ func (q *recvQueue) peerEnded() (granted int64) {
 }
 
 // addGranted records credit of this stream's messages returned other than by a
-// pop: the bytes noiseStream.reassemble gives back when reassembly will not deliver
-// them. Nil-safe like peerEnded.
-func (q *recvQueue) addGranted(n int64) {
+// pop: the bytes noiseStream.reassemble and settleExpired give back when no Receive
+// will take them. It reports whether the caller is to grant them, which it is until
+// a RESET ends the stream (peerEnded): from then the RESET's statement is final, and
+// the sender's settlement returns what it does not count, so a grant as well would
+// return those bytes twice. A nil queue, a stream built outside createStream, counts
+// nothing and grants.
+func (q *recvQueue) addGranted(n int64) bool {
 	if q == nil {
-		return
+		return true
 	}
 	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.noCredit {
+		return false
+	}
 	q.granted += n
-	q.mu.Unlock()
+	return true
 }
 
 // releaseCharge takes the queue out of the session's charged count and returns
@@ -335,6 +344,10 @@ func (q *recvQueue) releaseCharge() (grant int64) {
 	}
 	q.noCredit = true
 	q.charged.Add(-q.credit)
+	// Counted as granted: a RESET of the peer's that ends the stream after this
+	// (a local Reset racing it finds the stream already left) states it in Consumed,
+	// so the peer does not also take it back.
+	q.granted += q.credit
 	return q.credit
 }
 
@@ -353,6 +366,7 @@ func (q *recvQueue) discard() (grant int64) {
 	if !q.noCredit {
 		grant = q.credit
 		q.charged.Add(-q.credit)
+		q.granted += grant // stated in Consumed by a later RESET, as in releaseCharge
 	}
 	q.ended = true
 	q.noCredit = true

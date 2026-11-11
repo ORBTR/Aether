@@ -245,8 +245,9 @@ func TestNoiseStream_AnEndedStreamsRetransmitStaysOffTheIDsNextStream(t *testing
 // TestNoiseStream_AChargeTheSettlementCountedIsNotReturnedAgain: a Send that recorded
 // its connection charge (commitConnCharge) before a RESET's settlement and then fails
 // gives nothing back itself (returnCharge): the settlement counted the charge and
-// returned it, and a second return would hand the connection window the charge of
-// another stream's unread message.
+// returned it on the peer's statement (the RESET's acknowledgment), and a second
+// return would hand the connection window the charge of another stream's unread
+// message.
 func TestNoiseStream_AChargeTheSettlementCountedIsNotReturnedAgain(t *testing.T) {
 	client, server := noisePairWithRealms(t, nil, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -275,9 +276,7 @@ func TestNoiseStream_AChargeTheSettlementCountedIsNotReturnedAgain(t *testing.T)
 	if err := cs.Reset(aether.ResetCancel); err != nil {
 		t.Fatalf("reset: %v", err)
 	}
-	if got := client.connWindow.Stats().Outstanding; got != held {
-		t.Fatalf("connection charge %d after the settlement, want %d", got, held)
-	}
+	waitFor(t, "the settlement on the acknowledgment", func() bool { return client.connWindow.Stats().Outstanding == held })
 	cs.returnCharge(n)
 	if got := client.connWindow.Stats().Outstanding; got != held {
 		t.Fatalf("connection charge %d after the failing Send's return, want %d", got, held)

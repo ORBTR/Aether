@@ -1,18 +1,18 @@
 /*
  * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
  * Queries: licensing@orbtr.io
- *
- * Short Header v2 Compression System
- *
- * Replaces the v1 delta-based short header (0xFF/0x80) which had 4 critical bugs:
- *   1. Non-DATA frames compressed → decoded as wrong type
- *   2. uint16 Length overflow → stream misalignment on payloads > 65535
- *   3. Cross-stream delta corruption → frames routed to wrong stream
- *   4. Per-session state → encoder/decoder desync on interleaved streams
- *
- * v2 uses per-stream state, explicit uint16 StreamID, and format-specific
- * indicators for each frame type. No backward compatibility with v1.
  */
+
+// The short forms of the full frame: one indicator byte per form (0x82-0x88), an
+// explicit uint16 StreamID, a uint32 or canonical varint Length and per-stream
+// sequence state, written and read only on a session that chose
+// WireVersionFrameShort (Compressor.UseWireVersions). Only DATA, the four control
+// types and ACK have a form, so no other frame type is ever read as one of them; a
+// Length too long for its field, a StreamID past MaxShortHeaderStreamID and a frame
+// whose reading needs a flag the forms do not carry keep the full header; and each
+// stream's state is its own, so interleaved streams never share a sequence
+// reference. NoiseSession and TCPSession hold one Compressor per direction.
+
 package aether
 
 import (
@@ -141,10 +141,15 @@ type SessionCompState struct {
 // only, so a session that has not finished negotiating, or chose no short
 // forms, can neither emit nor accept one. It is atomic because TCPSession sets
 // it from its read loop while its writers consult it.
+//
+// encryptedShort says the session holds a frame key (AcceptEncryptedShort), without
+// which a decoder refuses 0x87 (DecodeEncryptedDataShort). It is atomic because
+// NoiseSession.SetSessionKey sets it while the read loop runs.
 type Compressor struct {
-	Session    *SessionCompState
-	streams    sync.Map // map[uint64]*StreamCompState
-	shortForms atomic.Bool
+	Session        *SessionCompState
+	streams        sync.Map // map[uint64]*StreamCompState
+	shortForms     atomic.Bool
+	encryptedShort atomic.Bool
 }
 
 // NewCompressor creates a compressor for full frames only; UseWireVersions
@@ -167,6 +172,15 @@ func (c *Compressor) UseWireVersions(chosen NegotiatedWireVersions) {
 // ShortForms reports whether the session's grammar admits the short forms.
 func (c *Compressor) ShortForms() bool {
 	return c.shortForms.Load()
+}
+
+// AcceptEncryptedShort lets this decode-side Compressor read 0x87 on a session whose
+// grammar admits the short forms: the session holds the frame key that authenticates
+// its payload envelope. NoiseSession.SetSessionKey calls it on its decode Compressor.
+// No other session holds a frame key, so every other decoder refuses 0x87, whose
+// payload it could only hand on unauthenticated.
+func (c *Compressor) AcceptEncryptedShort() {
+	c.encryptedShort.Store(true)
 }
 
 // refuseShort returns the read-side refusal of a short form on a session
@@ -307,8 +321,16 @@ func (c *Compressor) ShouldCompressData(f *Frame) bool {
 		return false // periodic resync
 	}
 	seqDelta := int64(f.SeqNo) - int64(s.lastSeqNo)
-	return seqDelta >= 0 && seqDelta <= 65535
+	return seqDelta >= 0 && seqDelta <= maxShortSeqGap
 }
+
+// maxShortSeqGap is the most a short DATA form's SeqNo may be above the stream's last
+// encoded one. The receiver rebuilds the SeqNo from its low 16 bits as the closest
+// value to the one after its own last (reconstructSeqNo), which is exact only within
+// half the 16-bit space of that value: a frame further above it would be rebuilt
+// 65,536 low and delivered under another frame's number. ShouldCompressData keeps such
+// a frame, and any frame below the last, on the full header.
+const maxShortSeqGap = 0x7FFF
 
 // ShouldCompressControl returns true if a control frame can use 0x83.
 func (c *Compressor) ShouldCompressControl(f *Frame) bool {
@@ -399,7 +421,8 @@ func (c *Compressor) ShouldCompressACK(f *Frame) bool {
 // delta reconstructs the WRONG absolute seq and its payload is delivered
 // under a lost frame's sequence number (silent transposition), while the real
 // frame's retransmit is dropped as a duplicate. Absolute low bits with
-// closest-to-expected reconstruction tolerate any gap < 32768 with no chain.
+// closest-to-expected reconstruction tolerate any gap < 32768 with no chain, which
+// is the reach ShouldCompressData keeps the encoder to (maxShortSeqGap).
 func reconstructSeqNo(last uint32, low uint16) (uint32, error) {
 	// 64-bit arithmetic keeps expected and the candidate exact when last
 	// is near the top of the space, so the wrap is seen rather than taken.
@@ -597,10 +620,15 @@ func (c *Compressor) EncodeEncryptedDataShort(w io.Writer, f *Frame) (int, error
 
 // DecodeEncryptedDataShort reads a 9-byte encrypted data header (indicator consumed).
 // The returned Frame has the raw encrypted payload including Nonce prefix.
-// The caller must extract Nonce from payload[:12] before decryption.
+// The caller must extract Nonce from payload[:12] before decryption. A session with
+// no frame key (AcceptEncryptedShort) refuses the form before reading anything, as a
+// session that chose no short forms refuses every one of them.
 func (c *Compressor) DecodeEncryptedDataShort(r io.Reader) (*Frame, error) {
 	if !c.ShortForms() {
 		return nil, c.refuseShort(ShortEncryptedIndicator)
+	}
+	if !c.encryptedShort.Load() {
+		return nil, &FrameDiscriminatorError{Discriminator: ShortEncryptedIndicator, ShortForms: true}
 	}
 	// Same wire layout as 0x82 — reuse DecodeDataShort logic
 	return c.DecodeDataShort(r)

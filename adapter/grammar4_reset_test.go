@@ -32,11 +32,11 @@ func waitBooksAgree(t *testing.T, what string, sender, reader *NoiseSession) {
 }
 
 // TestNoiseStream_AGrantCrossingAResetIsNotReturnedTwice: the client's RESET crosses
-// the grant for a message the server's consumer has just read. The client takes back
-// all its stream had charged, that message's credit included, and the grant arrives
-// anyway. The server, told by the RESET how little of the charge grants had returned,
-// takes the difference off its later grants, so the client's outstanding credit on the
-// connection returns to what the server's queues hold charged.
+// the grant for a message the server's consumer has just read. The server's
+// acknowledgment states that message among what its consumer returned (Consumed), so
+// the client takes back only the rest of its stream's charge, and the grant, which
+// arrives anyway, returns the message's credit once: the client's outstanding credit
+// on the connection returns to what the server's queues hold charged.
 func TestNoiseStream_AGrantCrossingAResetIsNotReturnedTwice(t *testing.T) {
 	client, server, _, toClient := filteredPair(t, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -72,7 +72,7 @@ func TestNoiseStream_AGrantCrossingAResetIsNotReturnedTwice(t *testing.T) {
 	blocked.Store(false)
 
 	// Two messages stay charged on the other stream, and the one read grant has
-	// been returned already by the client's own release.
+	// returned the read message's credit, which the client's settlement left to it.
 	if r := <-receiveAsync(ctx, otherServer, 10*time.Second); r.err != nil {
 		t.Fatalf("read: %v", r.err)
 	}
@@ -91,8 +91,8 @@ func TestNoiseStream_AGrantCrossingAResetIsNotReturnedTwice(t *testing.T) {
 
 // TestNoiseStream_TheResetsReaderTakesBackOnlyWhatItsGrantsDoNotCover: the client's
 // consumer read one of the server's messages and its grants are on the path when the
-// client resets. The server, reading the RESET, takes back the rest of its charge and
-// leaves that message to the grant, which comes.
+// client resets. The server, reading the RESET's Consumed, takes back the rest of its
+// charge and leaves that message to the grant, which comes.
 func TestNoiseStream_TheResetsReaderTakesBackOnlyWhatItsGrantsDoNotCover(t *testing.T) {
 	client, server, toServer, _ := filteredPair(t, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -137,12 +137,12 @@ func TestNoiseStream_TheResetsReaderTakesBackOnlyWhatItsGrantsDoNotCover(t *test
 }
 
 // TestNoiseStream_CrossingResetsCorrectEachOther: both sides reset a stream and the
-// RESETs pass on the path. The client's arrives where the stream has gone, and the
-// count the server kept at its own RESET says what to take off its later grants. The
-// path holds the client's RESET and its copies, not the client's acknowledgment of the
-// server's RESET, which is a RESET flagged FlagACK on the same stream: handleReset
-// takes that as an acknowledgment (resetAcknowledged) and ends nothing, so handing it
-// to the server in place of the RESET would leave the count behind.
+// RESETs pass on the path. The client's arrives where the stream has gone, and its
+// Consumed settles the server's charge, for which the server's stream waits
+// (awaitingStatement); the client's acknowledgment of the server's RESET, which states
+// the same count, then settles nothing a second time. The path holds the client's RESET
+// and its copies; the server keeps what its own consumer returned (resetGrants), the
+// Consumed its acknowledgment of the client's RESET and of any copy of it states.
 func TestNoiseStream_CrossingResetsCorrectEachOther(t *testing.T) {
 	client, server, toServer, toClient := filteredPair(t, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -185,18 +185,24 @@ func TestNoiseStream_CrossingResetsCorrectEachOther(t *testing.T) {
 	if held.Load() == nil {
 		t.Fatal("the client's RESET was not on the path")
 	}
+	key := resetKey{id: 904, inc: resetsServer.incarnation}
 	server.mu.Lock()
-	_, noted := server.resetGrants[904]
+	_, noted := server.resetGrants[key]
+	_, awaiting := server.awaitingStatement[key]
 	server.mu.Unlock()
-	if !noted {
-		t.Fatal("the server kept no count at its own RESET")
+	if !noted || !awaiting {
+		t.Fatalf("at its own RESET the server noted its count %v and waits for the client's statement %v", noted, awaiting)
 	}
 	server.handleReset(held.Load())
 	server.mu.Lock()
-	_, noted = server.resetGrants[904]
+	_, noted = server.resetGrants[key]
+	_, awaiting = server.awaitingStatement[key]
 	server.mu.Unlock()
-	if noted {
-		t.Fatal("the crossing RESET left the count behind")
+	if !noted {
+		t.Fatal("the crossing RESET took the count the server's acknowledgments state")
+	}
+	if awaiting {
+		t.Fatal("the crossing RESET's Consumed did not settle the server's stream")
 	}
 	blocked.Store(false)
 	toServer.setRule(nil)
@@ -211,30 +217,51 @@ func TestNoiseStream_CrossingResetsCorrectEachOther(t *testing.T) {
 	waitBooksAgree(t, "nothing charged on both books", client, server)
 }
 
-// TestNoiseSession_AResetsStatementCannotOverdrawAnything: a release above the charge
-// cannot be true of any stream, so it is charged to the peer and takes nothing off the
-// grants. A statement of consumption past the charge leaves the reader's outstanding
-// credit to grants, the peer's to give.
+// TestNoiseSession_AResetsStatementCannotOverdrawAnything: a statement of consumption
+// past what the stream's Sends charged cannot be true of any stream, so it is charged
+// to the peer and returns nothing; a second statement after the first returns nothing
+// either, and a true one returns the charge less what it states.
 func TestNoiseSession_AResetsStatementCannotOverdrawAnything(t *testing.T) {
-	client, server, _, _ := filteredPair(t, func(o *aether.SessionOptions) { o.SessionWarmupGrace = -1 })
+	client, server, _, toClient := filteredPair(t, func(o *aether.SessionOptions) { o.SessionWarmupGrace = -1 })
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	// openWithCredit's message makes the server's peer a delivering one, whose
+	// openWithCredit's message makes each side's peer a delivering one, whose
 	// malformed frames reportAbuse's forensic tier records.
 	_, _ = openWithCredit(t, ctx, client, server, 905, 0)
-	before := server.ForensicSuppressedCount()
-	server.withholdGranted(4096, aether.ResetPayload{Charged: 10, Released: 11})
-	if got := server.ForensicSuppressedCount() - before; got != 1 {
-		t.Fatalf("an impossible statement charged %d times", got)
-	}
-	if got := chargeNotCovered(100, 40, 1<<63); got != 0 {
-		t.Fatalf("consumption past int64 took back %d", got)
-	}
-	if got := chargeNotCovered(100, 40, 90); got != 10 {
-		t.Fatalf("charged 100, consumed 90: took back %d", got)
-	}
-	if got := chargeNotCovered(100, 40, 10); got != 40 {
-		t.Fatalf("charged 100, consumed 10, outstanding 40: took back %d", got)
+	_, _ = openWithCredit(t, ctx, server, client, 909, 0)
+	// The server holds its grants back, so what the client's sends charge stays
+	// outstanding until the settlement below.
+	toClient.setRule(creditFrame)
+	for _, tc := range []struct {
+		name     string
+		consumed uint64
+		returned int64
+		abuse    uint64
+	}{
+		{name: "past the charge", consumed: 1 << 63, returned: 0, abuse: 1},
+		{name: "a true statement", consumed: uint64(messageCredit(100)), returned: messageCredit(100), abuse: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &noiseStream{streamID: 1, session: client, window: flow.NewStreamWindow(0)}
+			n := 2 * messageCredit(100)
+			if err := client.connWindow.Consume(ctx, n); err != nil {
+				t.Fatalf("consume: %v", err)
+			}
+			if !st.commitConnCharge(n) {
+				t.Fatal("the record refused a charge")
+			}
+			before, abused := connOutstanding(client), client.ForensicSuppressedCount()
+			st.settleCharges()
+			st.notePeerConsumed(tc.consumed)
+			st.notePeerConsumed(0)
+			if got := before - connOutstanding(client); got != tc.returned {
+				t.Fatalf("Consumed %d of %d charged returned %d, want %d", tc.consumed, n, got, tc.returned)
+			}
+			if got := client.ForensicSuppressedCount() - abused; got != tc.abuse {
+				t.Fatalf("charged to the peer %d times, want %d", got, tc.abuse)
+			}
+			client.connWindow.ReleaseUnsent(n - tc.returned)
+		})
 	}
 }
 
@@ -288,17 +315,19 @@ func TestNoiseStream_AResetStatesItsCounts(t *testing.T) {
 	}
 }
 
-// TestNoiseSession_ResetNotesAreBounded: a note waits out resetGrantLifetime, goes
-// when its ID is opened again, is not kept for a stream that granted nothing, and
-// stops at the stream cap.
+// TestNoiseSession_ResetNotesAreBounded: a note waits out resetGrantLifetime, is not
+// kept for a stream that granted nothing, stays when its ID is opened again (it names
+// the stream it was taken for, which the ID's next stream is not), and stops at the
+// stream cap.
 func TestNoiseSession_ResetNotesAreBounded(t *testing.T) {
 	client, server := noisePairWithRealms(t, nil, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	server.noteResetGrants(1000, 0, aether.StreamIncarnation{Generation: 1})
-	server.noteResetGrants(1001, 5, aether.StreamIncarnation{Generation: 1})
+	inc := aether.StreamIncarnation{Generation: 1}
+	server.noteResetGrants(1000, inc, 0)
+	server.noteResetGrants(1001, inc, 5)
 	server.mu.Lock()
-	if _, ok := server.resetGrants[1000]; ok {
+	if _, ok := server.resetGrants[resetKey{id: 1000, inc: inc}]; ok {
 		server.mu.Unlock()
 		t.Fatal("a stream that granted nothing kept a note")
 	}
@@ -307,26 +336,28 @@ func TestNoiseSession_ResetNotesAreBounded(t *testing.T) {
 	now := time.Now()
 	server.sweepResetGrants(now.Add(resetGrantLifetime - time.Second))
 	server.mu.Lock()
-	_, kept := server.resetGrants[1001]
+	_, kept := server.resetGrants[resetKey{id: 1001, inc: inc}]
 	server.mu.Unlock()
 	if !kept {
 		t.Fatal("the sweep dropped a young note")
 	}
 	server.sweepResetGrants(now.Add(resetGrantLifetime + time.Minute))
 	server.mu.Lock()
-	_, kept = server.resetGrants[1001]
+	_, kept = server.resetGrants[resetKey{id: 1001, inc: inc}]
 	server.mu.Unlock()
 	if kept {
 		t.Fatal("the sweep kept an old note")
 	}
 
-	server.noteResetGrants(906, 5, aether.StreamIncarnation{Generation: 1})
-	_, _ = openWithCredit(t, ctx, client, server, 906, 0)
+	earlier := aether.StreamIncarnation{Generation: 1 << 40}
+	server.noteResetGrants(906, earlier, 5)
+	_, ss := openWithCredit(t, ctx, client, server, 906, 0)
 	server.mu.Lock()
-	_, kept = server.resetGrants[906]
+	_, kept = server.resetGrants[resetKey{id: 906, inc: earlier}]
+	_, shared := server.resetGrants[resetKey{id: 906, inc: ss.incarnation}]
 	server.mu.Unlock()
-	if kept {
-		t.Fatal("a stream on the ID left the note for a later RESET to read")
+	if !kept || shared {
+		t.Fatalf("after the ID's next stream opened: the earlier stream's note kept %v, a note under the new stream %v", kept, shared)
 	}
 
 	limit := server.opts.MaxConcurrentStreams
@@ -334,7 +365,7 @@ func TestNoiseSession_ResetNotesAreBounded(t *testing.T) {
 		limit = aether.DefaultMaxConcurrentStreams
 	}
 	for i := 0; i < limit+10; i++ {
-		server.noteResetGrants(uint64(5000+i), 1, aether.StreamIncarnation{Generation: 1})
+		server.noteResetGrants(uint64(5000+i), inc, 1)
 	}
 	server.mu.Lock()
 	n := len(server.resetGrants)

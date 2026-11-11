@@ -78,19 +78,26 @@ func (s *NoiseSession) processIncomingFrame(frame *aether.Frame, indicator byte)
 	// Decrypt — two paths:
 	// 1. Encrypted short header (0x87): Nonce in first 12 bytes of payload
 	// 2. Full header (FlagENCRYPTED): Nonce in frame.Nonce field
+	//
+	// A 0x87 payload is a [Nonce][Ciphertext][Tag] envelope and has no plaintext
+	// reading, so one this session cannot decrypt, with no frame key (the decoder
+	// reads the form only after SetSessionKey, Compressor.AcceptEncryptedShort) or too
+	// short to hold its nonce, is refused as malformed and reaches no consumer.
 	if indicator == aether.ShortEncryptedIndicator {
-		if s.encryptor != nil && len(frame.Payload) >= 12 {
-			nonce := frame.Payload[:12]
-			frame.Payload = frame.Payload[12:]
-			frame.Length = uint32(len(frame.Payload))
-			if err := s.encryptor.DecryptWithNonce(frame, nonce); err != nil {
-				log.Printf("[AETHER-NOISE] Decrypt (short) error: %v", err)
-				// Decrypt failure is a strong abuse signal — either the peer is
-				// replaying stale ciphertexts, using a wrong key, or probing.
-				// Feed the abuse breaker (reportAbuse) so repeated bad decrypts trip GoAway.
-				s.reportAbuse(abuse.ReasonDecryptFail)
-				return
-			}
+		if s.encryptor == nil || len(frame.Payload) < 12 {
+			s.reportAbuse(abuse.ReasonMalformedFrame)
+			return
+		}
+		nonce := frame.Payload[:12]
+		frame.Payload = frame.Payload[12:]
+		frame.Length = uint32(len(frame.Payload))
+		if err := s.encryptor.DecryptWithNonce(frame, nonce); err != nil {
+			log.Printf("[AETHER-NOISE] Decrypt (short) error: %v", err)
+			// Decrypt failure is a strong abuse signal — either the peer is
+			// replaying stale ciphertexts, using a wrong key, or probing.
+			// Feed the abuse breaker (reportAbuse) so repeated bad decrypts trip GoAway.
+			s.reportAbuse(abuse.ReasonDecryptFail)
+			return
 		}
 	} else if frame.Flags.Has(aether.FlagENCRYPTED) && s.encryptor != nil {
 		if err := s.encryptor.Decrypt(frame); err != nil {
@@ -882,15 +889,10 @@ func (st *noiseStream) supersededBy(generation uint64) bool {
 }
 
 // endSuperseded ends a stream a later OPEN of the peer's has replaced (handleOpen)
-// as the peer's RESET of it would have, had one arrived. The RESET's counts are
-// unknown. The peer wrote it at least the ID's quiet time ago, so the grants it sent
-// before it have had several round trips to arrive: of this
-// side's charge, all that no grant has returned is taken back (Consumed 0), and of
-// this side's grants on the stream, the peer's RESET took back at most the stream's
-// credit, which comes off this side's later grants (Charged the grants, Released at
-// most the reservation, supersededReset). The error left is credit this side holds
-// back, at most the stream's credit, and a grant still on the path, which returns
-// what this side has taken back already.
+// as the peer's RESET of it would have, had one arrived. That RESET's Consumed is
+// unknown, so the part of this side's connection charge on the stream that the peer's
+// consumer never returned stays charged (noiseStream.notePeerConsumed): at most the
+// stream's credit, on a session whose peer had its stream cap of RESETs waiting.
 func (s *NoiseSession) endSuperseded(st *noiseStream) {
 	s.mu.Lock()
 	cur, ok := s.streams[st.streamID]
@@ -964,55 +966,63 @@ func (s *NoiseSession) endReceive(st *noiseStream) {
 
 // handleReset takes the peer's RESET, which ends both halves of the stream it names
 // (aether.StreamIncarnation). Every RESET is acknowledged (acknowledgeReset), what
-// it finds or not, so the peer stops writing it again and may open the ID; a RESET
-// flagged FlagACK is that acknowledgment of one of this side's (resetAcknowledged)
-// and changes nothing else. A RESET naming another stream than the one under the
-// ID, a copy of an earlier stream's late on the path, ends nothing, and leaves the
-// stream's header compression alone. A RESET for a stream this side has itself reset crossed this
-// side's on the path, and each side's corrects the other's settlement from the count
-// this side kept (noteResetGrants). A RESET for any other stream this side does not
-// hold has nothing to end: this side kept no grants for it, or a copy of it has
-// already been read here.
+// it finds or not, so the peer stops writing it again and may open the ID, and the
+// acknowledgment states what this side's consumer had returned of the peer's sends
+// on the stream, which the peer's settlement reads: the stream's own count when the
+// RESET ends it here, the note a RESET of either side's left when it ended the
+// stream earlier (noteResetGrants), and 0 for a stream this side never held. A
+// RESET flagged FlagACK is that acknowledgment of one of this side's
+// (resetAcknowledged). A RESET naming another stream than the one under the ID, a
+// copy of an earlier stream's late on the path, ends nothing, and leaves the
+// stream's header compression alone. A RESET of a stream this side has itself reset
+// crossed this side's on the path: its Consumed is the peer's statement that
+// settles this side's charge (awaitingStatement), as the acknowledgment of this
+// side's RESET would have.
 func (s *NoiseSession) handleReset(frame *aether.Frame) {
 	payload := aether.DecodeResetPayload(frame.Payload)
 	if frame.Flags.Has(aether.FlagACK) {
-		s.resetAcknowledged(frame.StreamID, payload.Incarnation)
+		s.resetAcknowledged(frame.StreamID, payload.Incarnation, payload.Consumed)
 		return
 	}
-	s.acknowledgeReset(frame.StreamID, payload)
+	key := peerNamed(frame.StreamID, payload.Incarnation)
 	s.mu.Lock()
 	st, ok := s.streams[frame.StreamID]
 	stale := ok && !st.namedBy(payload.Incarnation)
 	if ok && !stale {
 		delete(s.streams, frame.StreamID)
 	}
-	crossed, wasReset := s.resetGrants[frame.StreamID]
-	wasReset = wasReset && crossed.inc.Generation == payload.Incarnation.Generation &&
-		crossed.inc.WriterOpened != payload.Incarnation.WriterOpened
-	if wasReset {
-		delete(s.resetGrants, frame.StreamID)
-	}
+	crossed := s.awaitingStatement[key]
+	delete(s.awaitingStatement, key)
+	noted := s.resetGrants[key]
 	s.mu.Unlock()
+	if crossed != nil {
+		crossed.notePeerConsumed(payload.Consumed)
+	}
+	if ok && !stale {
+		// The queue's grants stop here, so the count the acknowledgment states is
+		// final; it goes out before the stream's teardown, which the peer's reopening
+		// of the ID waits on through the acknowledgment.
+		noted.granted = st.recvQ.peerEnded()
+	}
+	s.acknowledgeReset(frame.StreamID, payload, noted.granted)
 	if stale {
 		return
 	}
 	s.txCompressor.RemoveStream(frame.StreamID)
 	s.rxCompressor.RemoveStream(frame.StreamID)
-	if !ok {
-		if wasReset {
-			s.withholdGranted(crossed.granted, payload)
-		}
-		return
+	if ok {
+		s.endByPeerReset(st, payload, false)
 	}
-	s.endByPeerReset(st, payload, false)
 }
 
 // acknowledgeReset answers the peer's RESET under streamID with a RESET flagged
-// FlagACK that names the stream as the RESET did, stating the same reason and no
-// counts (aether.ResetPayload). It is written once: a lost acknowledgment is answered
-// again at the RESET's next copy.
-func (s *NoiseSession) acknowledgeReset(streamID uint64, p aether.ResetPayload) {
-	payload := aether.EncodeResetPayload(aether.ResetPayload{Reason: p.Reason, Incarnation: p.Incarnation})
+// FlagACK that names the stream as the RESET did, states the same reason and, as
+// Consumed, granted, what this side's consumer had returned of the peer's sends on
+// the stream through connection grants (aether.ResetPayload); Charged and Released
+// are zero. It is written once: a lost acknowledgment is answered again at the
+// RESET's next copy, from the note (handleReset).
+func (s *NoiseSession) acknowledgeReset(streamID uint64, p aether.ResetPayload, granted int64) {
+	payload := aether.EncodeResetPayload(aether.ResetPayload{Reason: p.Reason, Consumed: uint64(max(granted, 0)), Incarnation: p.Incarnation})
 	_ = s.writeFrame(&aether.Frame{
 		SenderID:   s.LocalPeerID(),
 		ReceiverID: s.RemotePeerID(),
@@ -1024,24 +1034,12 @@ func (s *NoiseSession) acknowledgeReset(streamID uint64, p aether.ResetPayload) 
 	})
 }
 
-// supersededReset states the counts of the RESET that never arrived for a stream
-// endSuperseded ends: Consumed 0, taking the grants the peer sent before that RESET
-// to have arrived; Charged what this side granted on the stream and Released at most the
-// stream's reservation, so withholdGranted takes off this side's later grants
-// min(granted, reserved), what the peer's RESET can have taken back.
-func supersededReset(p aether.ResetPayload, granted, reserved int64) aether.ResetPayload {
-	p.Consumed = 0
-	p.Charged = uint64(max(granted, 0))
-	p.Released = uint64(max(min(granted, reserved), 0))
-	return p
-}
-
 // endByPeerReset ends a stream the peer's RESET ended, which the caller has taken out
 // of s.streams: handleReset with the RESET, and endSuperseded, for a RESET that never
-// arrived, with superseded set, whose counts it states here from the grants and the
-// stream's reservation.
-func (s *NoiseSession) endByPeerReset(st *noiseStream, payload aether.ResetPayload, superseded bool) {
-	reserved := st.reserved.Load()
+// arrived, with superseded set, which states nothing (settlePeerReset). It returns what
+// this side's consumer had returned of the peer's sends on the stream, final from here
+// on, for the acknowledgment, and notes it for copies of the RESET (noteResetGrants).
+func (s *NoiseSession) endByPeerReset(st *noiseStream, payload aether.ResetPayload, superseded bool) int64 {
 	// A refusal (createStream's cap or credit reservation on the peer) and
 	// an overrun (the peer's enqueueDelivery) are recorded first, so Send
 	// and Receive name them once the stream ends.
@@ -1059,10 +1057,8 @@ func (s *NoiseSession) endByPeerReset(st *noiseStream, payload aether.ResetPaylo
 	st.teardown()
 	granted := st.recvQ.peerEnded()
 	st.closeRecvOnce()
-	if superseded {
-		payload = supersededReset(payload, granted, reserved)
-	}
-	st.settlePeerReset(payload, granted)
+	st.settlePeerReset(payload, superseded)
+	s.noteResetGrants(st.streamID, st.incarnation, granted)
 	// Out of s.streams, so no ACK reaches this stream again: once it is out of
 	// the scheduler too, what its send window holds goes back to the session's
 	// in-flight counter, and a stream charge a Send made after the settlement
@@ -1071,32 +1067,18 @@ func (s *NoiseSession) endByPeerReset(st *noiseStream, payload aether.ResetPaylo
 	st.leaveSchedulerThenSettle()
 	st.releaseReservation()
 	s.trackEnded(st.recvQ)
+	return granted
 }
 
-// withholdGranted takes off this session's later connection grants what it granted
-// on a stream past what the peer's RESET says its grants had returned there
-// (aether.ResetPayload, Charged minus Released): the peer took those bytes back at
-// its RESET. A release above the charge cannot be true of any stream, so the
-// statement is charged to the peer and withholds nothing.
-func (s *NoiseSession) withholdGranted(granted int64, p aether.ResetPayload) {
-	if p.Released > p.Charged {
-		s.reportAbuse(abuse.ReasonMalformedFrame)
-		return
-	}
-	returned := p.Charged - p.Released
-	if uint64(granted) > returned {
-		s.connWindow.Withhold(granted - int64(returned))
-	}
-}
-
-// noteResetGrants keeps what a stream this side has reset granted, for a RESET of
-// the peer's that crosses this side's on the path and so finds the stream gone
-// (handleReset), with the stream as this side's RESET names it (inc), which the
-// crossing RESET names too. A count of zero needs no note, nothing can have been
-// granted twice; the map is bounded by the session's stream cap, past which a note
-// is dropped and a crossing costs the sender only the credit it held twice, and by
-// sweepResetGrants' lifetime. createStream drops the note when the ID is reused.
-func (s *NoiseSession) noteResetGrants(streamID uint64, granted int64, inc aether.StreamIncarnation) {
+// noteResetGrants keeps what this side's consumer had returned of the peer's sends
+// on a stream a RESET has ended here (granted), under the stream as this side names
+// it (inc), for the acknowledgment of a copy of the peer's RESET that finds the
+// stream gone (handleReset). A count of zero needs no note: a RESET that finds no
+// note is acknowledged with 0. The map is bounded by the session's stream cap, past
+// which a note is dropped, and by sweepResetGrants' lifetime (resetGrantLifetime
+// says what a copy that finds no note costs). Each key names one stream, so a note
+// outlives the ID's reuse by a later stream.
+func (s *NoiseSession) noteResetGrants(streamID uint64, inc aether.StreamIncarnation, granted int64) {
 	if granted <= 0 {
 		return
 	}
@@ -1107,22 +1089,23 @@ func (s *NoiseSession) noteResetGrants(streamID uint64, granted int64, inc aethe
 		limit = aether.DefaultMaxConcurrentStreams
 	}
 	if s.resetGrants == nil {
-		s.resetGrants = make(map[uint64]resetGrant)
+		s.resetGrants = make(map[resetKey]resetGrant)
 	}
-	if len(s.resetGrants) >= limit {
+	key := resetKey{id: streamID, inc: inc}
+	if _, replaced := s.resetGrants[key]; !replaced && len(s.resetGrants) >= limit {
 		return
 	}
-	s.resetGrants[streamID] = resetGrant{granted: granted, at: time.Now(), inc: inc}
+	s.resetGrants[key] = resetGrant{granted: granted, at: time.Now()}
 }
 
-// sweepResetGrants drops notes older than resetGrantLifetime: the peer's RESET was
-// not crossing this side's.
+// sweepResetGrants drops notes older than resetGrantLifetime. The reliability tick
+// calls it.
 func (s *NoiseSession) sweepResetGrants(now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for id, g := range s.resetGrants {
+	for key, g := range s.resetGrants {
 		if now.Sub(g.at) > resetGrantLifetime {
-			delete(s.resetGrants, id)
+			delete(s.resetGrants, key)
 		}
 	}
 }
