@@ -5,9 +5,9 @@
 
 // Package crypto implements per-frame AEAD encryption for Aether.
 // Uses ChaCha20-Poly1305 matching the existing Noise cipher suite.
-// Per-frame encryption is only used when the transport doesn't provide
-// native encryption (e.g., plain WebSocket, or relay scenarios where
-// the relay node must not read payload data).
+// A session holds a frame key only once adapter.NoiseSession.SetSessionKey has
+// installed one; a session holding none refuses a frame flagged ENCRYPTED, and
+// every TCP-family session holds none, its transport (TLS, wss) encrypting.
 package crypto
 
 import (
@@ -27,20 +27,30 @@ import (
 // The AEAD additional data is the frame header bytes (first 38 bytes before nonce),
 // authenticating the header without encrypting it so routers can inspect
 // SenderID/ReceiverID for forwarding.
+//
+// seal encrypts the frames this end sends and open decrypts the frames it
+// receives. NewDirectionalFrameEncryptor gives each its own key, the peer's
+// encryptor holding the two keys the other way round (Keyring.NewEncryptor);
+// NewFrameEncryptor gives both one key, the form NoiseSession.SetSessionKey
+// installs from its one key.
 type FrameEncryptor struct {
-	aead    cipher.AEAD
+	seal    cipher.AEAD
+	open    cipher.AEAD
 	counter uint64 // atomic counter for ordered nonces
 	random  bool   // true for unordered streams (use random nonces)
 
 	// noncePrefix is the per-encryptor random 32-bit nonce prefix (nonce[0:4])
 	// for ordered mode. The counter alone restarts at 0 for every encryptor,
-	// so two encryptors sharing a key — both directions of a session, or a
-	// re-installed/resumed key — would emit identical (key,nonce) pairs.
+	// so two encryptors sealing under one key — the two ends of a session keyed
+	// through NewFrameEncryptor, or a re-installed/resumed key — would emit
+	// identical (key,nonce) pairs.
 	// A fresh random prefix per instance makes those nonce spaces disjoint.
 	noncePrefix [4]byte
 }
 
-// NewFrameEncryptor creates an encryptor with the given 256-bit key.
+// NewFrameEncryptor creates an encryptor that seals and opens with the one
+// given 256-bit key. Both ends of a session holding it seal under one key, so
+// the per-instance nonce prefix is what keeps their ordered nonces apart.
 // Set ordered=true for reliable-ordered streams (counter-based nonces),
 // ordered=false for unordered streams (random nonces for replay safety).
 func NewFrameEncryptor(key [32]byte, ordered bool) (*FrameEncryptor, error) {
@@ -48,12 +58,41 @@ func NewFrameEncryptor(key [32]byte, ordered bool) (*FrameEncryptor, error) {
 	if err != nil {
 		return nil, fmt.Errorf("aether crypto: create AEAD: %w", err)
 	}
+	return newFrameEncryptor(aead, aead, ordered)
+}
+
+// NewDirectionalFrameEncryptor creates an encryptor that seals with sealKey and
+// opens with openKey: one end of a session holds its sending direction's key as
+// sealKey and its receiving direction's as openKey, and the peer holds the two
+// the other way round, so a frame opens only at the end it was sent to and each
+// direction's nonces run under a key only one end seals with. One key given as
+// both is refused: it would open a frame at the end that sealed it.
+func NewDirectionalFrameEncryptor(sealKey, openKey [32]byte, ordered bool) (*FrameEncryptor, error) {
+	if sealKey == openKey {
+		return nil, fmt.Errorf("aether crypto: sealing and opening keys are one key")
+	}
+	seal, err := chacha20poly1305.New(sealKey[:])
+	if err != nil {
+		return nil, fmt.Errorf("aether crypto: create sealing AEAD: %w", err)
+	}
+	open, err := chacha20poly1305.New(openKey[:])
+	if err != nil {
+		return nil, fmt.Errorf("aether crypto: create opening AEAD: %w", err)
+	}
+	return newFrameEncryptor(seal, open, ordered)
+}
+
+// newFrameEncryptor holds the two AEADs NewFrameEncryptor and
+// NewDirectionalFrameEncryptor built and seeds the ordered-mode nonce prefix.
+func newFrameEncryptor(seal, open cipher.AEAD, ordered bool) (*FrameEncryptor, error) {
 	fe := &FrameEncryptor{
-		aead:   aead,
+		seal:   seal,
+		open:   open,
 		random: !ordered,
 	}
-	// Seed the ordered-mode nonce prefix so encryptors sharing a key
-	// (both directions, or a re-installed/resumed key) never collide.
+	// Seed the ordered-mode nonce prefix so encryptors sealing under one key
+	// (the two ends of a one-key session, or a re-installed/resumed key) never
+	// collide.
 	if _, err := rand.Read(fe.noncePrefix[:]); err != nil {
 		return nil, fmt.Errorf("aether crypto: seed nonce prefix: %w", err)
 	}
@@ -75,13 +114,13 @@ func (e *FrameEncryptor) Encrypt(frame *aether.Frame) error {
 	// Set Length to ciphertext size BEFORE computing AD
 	// so the AD matches during both encrypt and decrypt.
 	plaintextLen := frame.Length
-	frame.Length = plaintextLen + uint32(e.aead.Overhead())
+	frame.Length = plaintextLen + uint32(e.seal.Overhead())
 
 	// AEAD additional data = header bytes (authenticates SenderID, ReceiverID, etc.)
 	ad := frame.HeaderBytes()
 
 	// Encrypt: ciphertext = plaintext + 16-byte auth tag
-	ciphertext := e.aead.Seal(nil, nonce[:], frame.Payload[:plaintextLen], ad)
+	ciphertext := e.seal.Seal(nil, nonce[:], frame.Payload[:plaintextLen], ad)
 	frame.Payload = ciphertext
 
 	return nil
@@ -102,7 +141,7 @@ func (e *FrameEncryptor) Decrypt(frame *aether.Frame) error {
 	// We need the header as it was BEFORE we clear the ENCRYPTED flag.
 	ad := frame.HeaderBytes()
 
-	plaintext, err := e.aead.Open(nil, frame.Nonce[:], frame.Payload, ad)
+	plaintext, err := e.open.Open(nil, frame.Nonce[:], frame.Payload, ad)
 	if err != nil {
 		return fmt.Errorf("aether crypto: decrypt failed (auth tag mismatch): %w", err)
 	}
@@ -122,8 +161,8 @@ func (e *FrameEncryptor) DecryptWithNonce(frame *aether.Frame, nonce []byte) err
 	if frame.Payload == nil || frame.Length == 0 {
 		return nil
 	}
-	if len(nonce) != e.aead.NonceSize() {
-		return fmt.Errorf("aether crypto: invalid nonce size %d (need %d)", len(nonce), e.aead.NonceSize())
+	if len(nonce) != e.open.NonceSize() {
+		return fmt.Errorf("aether crypto: invalid nonce size %d (need %d)", len(nonce), e.open.NonceSize())
 	}
 
 	// Authenticate the reconstructed frame header with the same
@@ -140,7 +179,7 @@ func (e *FrameEncryptor) DecryptWithNonce(frame *aether.Frame, nonce []byte) err
 	// encrypt-side AAD (including the Flags byte / FlagENCRYPTED state) match
 	// what HeaderBytes() reconstructs here, or Seal(header-AAD) and this
 	// Open(header-AAD) will disagree on the Flags byte.
-	plaintext, err := e.aead.Open(nil, nonce, frame.Payload, frame.HeaderBytes())
+	plaintext, err := e.open.Open(nil, nonce, frame.Payload, frame.HeaderBytes())
 	if err != nil {
 		return fmt.Errorf("aether crypto: decrypt with nonce failed: %w", err)
 	}
@@ -152,7 +191,7 @@ func (e *FrameEncryptor) DecryptWithNonce(frame *aether.Frame, nonce []byte) err
 
 // Overhead returns the encryption overhead per frame (16 bytes for Poly1305 auth tag).
 func (e *FrameEncryptor) Overhead() int {
-	return e.aead.Overhead()
+	return e.seal.Overhead()
 }
 
 // nextNonce generates the next nonce.
@@ -175,11 +214,12 @@ func (e *FrameEncryptor) nextNonce() aether.Nonce {
 	}
 	// nonce = per-encryptor random prefix (nonce[0:4]) || monotonic
 	// counter (nonce[4:12]). The prefix separates nonce spaces across every
-	// encryptor instance that shares a key — a NoiseSession's one encryptor
-	// (its frameKey) encrypts AND decrypts, so interop forces one key across
-	// both directions, and a
-	// re-installed/resumed key restarts the counter at 0 — while the counter
-	// still guarantees uniqueness within an instance for up to 2^64 frames.
+	// encryptor instance that seals under one key — the two ends of a session
+	// keyed through NewFrameEncryptor (NoiseSession.SetSessionKey's one key
+	// seals both directions), and a re-installed/resumed key whose counter
+	// restarts at 0 — while the counter still guarantees uniqueness within an
+	// instance for up to 2^64 frames. A directional encryptor's sealing key is
+	// its own direction's, so no other end's counter runs under it.
 	// The prefix is carried on the wire in frame.Nonce, so decrypt is
 	// unaffected and no caller coordination is required.
 	copy(nonce[0:4], e.noncePrefix[:])
