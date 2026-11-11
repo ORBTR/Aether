@@ -565,7 +565,7 @@ func DecodePriority(data []byte) PriorityPayload {
 
 // EncodeOpenPayload encodes an OPEN frame payload:
 // [1 reliability][1 priority][8 dependency, big-endian][4 initial credit, big-endian][1 FEC level]
-// [8 generation, big-endian].
+// [8 generation, big-endian][8 prior generation, big-endian][8 prior consumed, big-endian].
 func EncodeOpenPayload(o OpenPayload) []byte {
 	data := make([]byte, OpenPayloadSize)
 	data[0] = byte(o.Reliability)
@@ -574,6 +574,8 @@ func EncodeOpenPayload(o OpenPayload) []byte {
 	binary.BigEndian.PutUint32(data[10:14], o.InitialCredit)
 	data[14] = o.FECLevel
 	binary.BigEndian.PutUint64(data[15:23], o.Generation)
+	binary.BigEndian.PutUint64(data[23:31], o.PriorGeneration)
+	binary.BigEndian.PutUint64(data[31:39], o.PriorConsumed)
 	return data
 }
 
@@ -585,12 +587,14 @@ func DecodeOpenPayload(data []byte) OpenPayload {
 		return OpenPayload{}
 	}
 	return OpenPayload{
-		Reliability:   Reliability(data[0]),
-		Priority:      data[1],
-		Dependency:    binary.BigEndian.Uint64(data[2:10]),
-		InitialCredit: binary.BigEndian.Uint32(data[10:14]),
-		FECLevel:      data[14],
-		Generation:    binary.BigEndian.Uint64(data[15:23]),
+		Reliability:     Reliability(data[0]),
+		Priority:        data[1],
+		Dependency:      binary.BigEndian.Uint64(data[2:10]),
+		InitialCredit:   binary.BigEndian.Uint32(data[10:14]),
+		FECLevel:        data[14],
+		Generation:      binary.BigEndian.Uint64(data[15:23]),
+		PriorGeneration: binary.BigEndian.Uint64(data[23:31]),
+		PriorConsumed:   binary.BigEndian.Uint64(data[31:39]),
 	}
 }
 

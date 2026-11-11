@@ -778,8 +778,17 @@ func (s *TCPSession) readLoop() {
 	}
 }
 
-// dispatchFrame routes an incoming frame to the appropriate stream.
+// dispatchFrame routes an incoming frame to the appropriate stream. A frame flagged
+// aether.FlagENCRYPTED is refused first, as malformed: its payload is ciphertext and
+// tag, and no TCP-family session holds a frame key to open it (SessionKey is nil), so
+// handing it on would give a consumer the ciphertext as its message. The readLoop
+// calls it for every frame and every batch sub-frame; a short form carries no flag.
 func (s *TCPSession) dispatchFrame(frame *aether.Frame) {
+	if frame.Flags.Has(aether.FlagENCRYPTED) {
+		dbgTCP.Printf("dispatchFrame: refused an encrypted frame on stream %d: no frame key", frame.StreamID)
+		s.reportAbuse(abuse.ReasonMalformedFrame)
+		return
+	}
 	// Record stream activity for GC — any frame type counts as
 	// activity on its stream (OPEN/DATA/CLOSE/RESET/etc.). This
 	// keeps the idle-timeout reset even on control-only flows like

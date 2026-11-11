@@ -243,11 +243,14 @@ func (s *Scheduler) dropQueuedLocked(ss *scheduledStream) (droppedFrames []*aeth
 // caller that accounts for frames that will never reach the wire.
 // TCPSession.releaseStream gives each dropped frame's room back to its stream's
 // Send (releaseSendRoom). NoiseSession.releaseStream discards the return: the credit
-// a dropped frame carries was charged by the stream's Send before it called Enqueue,
-// NoiseSession settles a reset stream's whole outstanding connection credit at the
-// RESET (noiseStream.settleLocalReset, settlePeerReset, through settleCharges, from
-// the connection charges the stream's Sends recorded before it), which covers these
-// frames, and a stream that leaves on both CLOSEs has no frame left here.
+// a dropped frame carries was charged by the stream's Send, which recorded the
+// connection charge on the stream (noiseStream.commitConnCharge) before it called
+// Enqueue. A reset stream's settlement counts every charge so recorded, these frames'
+// included: the RESET closes the record (settleCharges, from settleLocalReset and
+// settlePeerReset), and the peer's statement of what its consumer returned, its RESET
+// of the stream or its acknowledgment of this side's (Consumed), returns the rest
+// (returnUnconsumed), so nothing here is returned twice or left out. A stream that
+// leaves on both CLOSEs has no frame left here.
 func (s *Scheduler) Unregister(streamID uint64) (droppedFrames []*aether.Frame, droppedProbe *aether.Frame) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -612,12 +615,10 @@ func (s *Scheduler) dequeueFromClass(targetClass aether.LatencyClass, order []ui
 	}
 	ss.deficit += cost / float64(ss.weight)
 
-	// Clear the retransmit flag after consuming it. The flag is documented
-	// as single-shot ("next enqueue for a stream as a retransmit") but was
-	// only ever set true and never cleared — so any stream that ever lost
-	// a packet kept the 2x WFQ cost penalty applied to every subsequent
-	// non-retransmit frame for the rest of the stream's lifetime,
-	// permanently de-prioritising it against healthy peers. Clear here,
+	// Clear the retransmit flag once it has priced this frame: MarkRetransmit
+	// marks only the next frame of the stream as a retransmit, and a flag left
+	// set would charge the 2x cost to every later frame of a stream that once
+	// retransmitted, de-prioritising it against healthy streams. Cleared here,
 	// inside the same s.mu critical section that owns ss.isRetransmit.
 	ss.isRetransmit = false
 

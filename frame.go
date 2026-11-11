@@ -638,7 +638,7 @@ const GoAwayPayloadMinSize = 4 // reason code only
 // OpenPayloadSize is the wire size of an OPEN frame payload in frame grammar
 // WireVersionFrameCurrent. Validate refuses an uncompressed OPEN frame shorter
 // than this (minPayloadSizes) before either session's handleOpen runs.
-const OpenPayloadSize = 23
+const OpenPayloadSize = 39
 
 // MaxOpenCredit is the largest initial credit an OPEN payload can state: the
 // field is four bytes. adapter.NoiseSession's OpenStream refuses a stream
@@ -676,13 +676,26 @@ const MaxOpenCredit int64 = 1<<32 - 1
 // state an OPEN stating zero or a number above MaxStreamGeneration. The QUIC
 // stream adapter states zero and does not read it: each of its streams is a QUIC
 // stream of its own, which QUIC never hands out twice.
+//
+// PriorGeneration and PriorConsumed are the opener's statement of its earlier stream
+// under the ID, one it opened and a RESET ended: that stream's generation, and what
+// the opener's consumer returned of the receiver's sends on it through connection
+// grants (ResetPayload.Consumed, as its RESET of that stream stated it). A
+// NoiseSession that still holds that stream, the opener's RESET of it never having
+// arrived, ends it at this OPEN (it is superseded) and settles its connection charge
+// on PriorConsumed exactly as that RESET would have, and acknowledges that RESET.
+// Zero PriorGeneration states no earlier stream: an ID's first stream, a stream that
+// ended on both CLOSEs, or a statement the opener no longer keeps (its note lifetime).
+// The TCP-family session and the QUIC stream adapter state zero and do not read them.
 type OpenPayload struct {
-	Reliability   Reliability // 1 byte: delivery guarantee
-	Priority      uint8       // 1 byte: initial weight (1-255)
-	Dependency    uint64      // 8 bytes: parent stream ID
-	InitialCredit uint32      // 4 bytes: the opener's initial stream credit
-	FECLevel      uint8       // 1 byte: the stream's FEC level
-	Generation    uint64      // 8 bytes: the opener's generation of the stream
+	Reliability     Reliability // 1 byte: delivery guarantee
+	Priority        uint8       // 1 byte: initial weight (1-255)
+	Dependency      uint64      // 8 bytes: parent stream ID
+	InitialCredit   uint32      // 4 bytes: the opener's initial stream credit
+	FECLevel        uint8       // 1 byte: the stream's FEC level
+	Generation      uint64      // 8 bytes: the opener's generation of the stream
+	PriorGeneration uint64      // 8 bytes: the opener's earlier stream under the ID, 0 for none
+	PriorConsumed   uint64      // 8 bytes: what the opener's consumer returned on that stream
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -739,7 +752,9 @@ const ResetPayloadSize = 36
 //
 // Each side settles the connection charge of its own sends on the stream on the
 // peer's statement of Consumed and on nothing else: the peer's RESET of the stream,
-// or the peer's acknowledgment of this side's RESET, whichever comes first. It gives
+// or the peer's acknowledgment of this side's RESET, whichever comes first, or, for a
+// stream the peer's later OPEN supersedes, that OPEN's statement
+// (OpenPayload.PriorConsumed). It gives
 // back what its sends charged less Consumed, since the grants for Consumed still
 // arrive and nothing returns the rest, and it withholds none of its own grants.
 // Charged and Released are stated for the stream window's own accounting and no
@@ -754,8 +769,9 @@ const ResetPayloadSize = 36
 // RESET stated it, the same reason, Charged and Released zero, and as Consumed
 // what the acknowledging side's consumer had returned of the RESET writer's sends
 // on the stream (zero for a stream it never held), and its reader settles on that
-// Consumed and answers nothing. A NoiseSession writes each RESET again until its
-// acknowledgment comes (adapter.NoiseSession's pending RESETs), because a RESET
+// Consumed and answers nothing. A NoiseSession writes each RESET of a stream again
+// until its own acknowledgment comes (adapter.NoiseSession's pending RESETs, one per
+// stream it names), because a RESET
 // lost on a datagram path would leave the peer's stream live under an ID this
 // side may open again. A TCP-family session writes its acknowledgment once with
 // zero counts and no second copy of a RESET, its transport delivering every frame

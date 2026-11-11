@@ -105,12 +105,27 @@ type NoiseSession struct {
 	resetGrants       map[resetKey]resetGrant
 	awaitingStatement map[resetKey]*noiseStream
 
-	// pendingResets holds, per stream ID, the RESET this side wrote last under the
-	// ID and has had no acknowledgment of (writeReset, resetAcknowledged), which
-	// retransmitResets writes again on the reliability tick. pendingResetCount is
-	// its size, read lock-free so a tick with nothing pending takes no lock. Both
-	// guarded by mu (the count is written under it).
-	pendingResets     map[uint64]*pendingReset
+	// priorOpened holds, per stream ID, the last stream this side opened under the ID
+	// that a RESET of either side ended (noteResetGrants): its generation and what this
+	// side's consumer returned of the peer's sends on it, which the ID's next OPEN
+	// states (OpenStream, aether.OpenPayload.PriorGeneration) for a peer that still
+	// holds that stream. Bounded and swept as resetGrants is. Guarded by mu.
+	priorOpened map[uint64]priorStream
+
+	// pendingResets holds every RESET this side wrote and has had no acknowledgment
+	// of, keyed by the stream it names (writeReset, resetAcknowledged), which
+	// retransmitResets writes again on the reliability tick; pendingByID counts them
+	// per stream ID, for resetPendingLocked. pendingStreams is how many of them end a
+	// stream (not a refusal): each keeps its stream's place under the session's stream
+	// cap (createStream) until its acknowledgment, so no stream's RESET is ever left
+	// without a place to wait for its statement. pendingRefusals is the rest, at most
+	// the stream cap. pendingResetCount is the map's size, read lock-free so a tick
+	// with nothing pending takes no lock. All guarded by mu (the count is written
+	// under it).
+	pendingResets     map[resetKey]*pendingReset
+	pendingByID       map[uint64]int
+	pendingStreams    int
+	pendingRefusals   int
 	pendingResetCount atomic.Int64
 
 	// PMTU discovery (UDP only)
@@ -409,10 +424,13 @@ type NoiseSession struct {
 	txCompressor *aether.Compressor
 	rxCompressor *aether.Compressor
 
-	// Per-frame encryption (optional — Noise already encrypts the transport layer)
-	// Set via SetSessionKey when per-frame AEAD is needed (e.g., relay scenarios)
-	encryptor  *aethercrypto.FrameEncryptor
-	sessionKey []byte
+	// frameKey is the per-frame AEAD key and its encryptor, nil until SetSessionKey
+	// installs them once on a session that may already be running. Every frame path
+	// reads it with one Load and uses what that Load returned: the write side under
+	// writeMu (wireSizeLocked, emitFrameLocked), the read loop's decrypt
+	// (processIncomingFrame) and SessionKey, none of which takes a lock SetSessionKey
+	// could share with the read loop.
+	frameKey atomic.Pointer[sessionFrameKey]
 
 	// throttle holds the explicit-CONGESTION signal state from the peer.
 	// Zero value is "no throttle"; handleCongestion updates it on incoming
@@ -794,18 +812,24 @@ func (s *NoiseSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) 
 	// the FEC level the stream runs here, none on a session with FEC disabled,
 	// which the peer builds its own state from, and the stream's generation, by
 	// which the peer tells this stream's CLOSE and RESET from those of another
-	// stream under the ID.
+	// stream under the ID. It states the last stream this side opened under the ID
+	// that a RESET ended, and what this side's consumer returned on it (priorOpened):
+	// a peer whose copy of that stream outlived this side's RESET settles it on that
+	// statement when this OPEN supersedes it (handleOpen's endSuperseded).
 	var fecLevel reliability.FECLevel
 	if st.fec != nil {
 		fecLevel = st.fec.Level()
 	}
+	prior := s.takePriorOpened(cfg.StreamID)
 	openPayload := aether.EncodeOpenPayload(aether.OpenPayload{
-		Reliability:   cfg.Reliability,
-		Priority:      cfg.Priority,
-		Dependency:    cfg.Dependency,
-		InitialCredit: uint32(st.window.CurrentWindow()),
-		FECLevel:      uint8(fecLevel),
-		Generation:    st.incarnation.Generation,
+		Reliability:     cfg.Reliability,
+		Priority:        cfg.Priority,
+		Dependency:      cfg.Dependency,
+		InitialCredit:   uint32(st.window.CurrentWindow()),
+		FECLevel:        uint8(fecLevel),
+		Generation:      st.incarnation.Generation,
+		PriorGeneration: prior.generation,
+		PriorConsumed:   uint64(max(prior.granted, 0)),
 	})
 	frame := &aether.Frame{
 		SenderID:   s.LocalPeerID(),
@@ -1071,6 +1095,27 @@ type resetGrant struct {
 	at      time.Time
 }
 
+// priorStream is priorOpened's entry: the generation of the last stream this side
+// opened under an ID that a RESET ended, what this side's consumer had returned of the
+// peer's sends on it (final at that RESET, recvQueue.peerEnded), and when.
+type priorStream struct {
+	generation uint64
+	granted    int64
+	at         time.Time
+}
+
+// takePriorOpened returns and forgets the ID's priorOpened entry, the zero value
+// (generation 0, no earlier stream) when there is none. OpenStream calls it once
+// createStream has published the stream under the ID, so no RESET of another stream
+// under the ID can replace the entry in between.
+func (s *NoiseSession) takePriorOpened(id uint64) priorStream {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.priorOpened[id]
+	delete(s.priorOpened, id)
+	return p
+}
+
 // resetGrantLifetime is how long a note answers copies of the peer's RESET. The peer
 // writes its RESET again at most resetRetransmitMaxWait apart until an acknowledgment
 // reaches it (retransmitResets), and it settles on the first acknowledgment or on
@@ -1090,12 +1135,13 @@ const resetRetransmitMaxWait = 2 * time.Second
 
 // pendingReset is a RESET writeReset wrote that has had no acknowledgment: the
 // frame, written again as it is (writeFrame resends its encrypted bytes), the stream
-// as it names it, which the acknowledgment must name too, the RTO of the stream it
-// ended, from which the quiet time after it is measured, the wait before its next
-// copy and when that copy is due.
+// it ends (nil for a refusal, which ends none), the RTO of that stream, from which
+// the quiet time after it is measured, the wait before its next copy and when that
+// copy is due. pendingResets keys it by the stream the RESET names, which the
+// acknowledgment names too.
 type pendingReset struct {
 	frame *aether.Frame
-	inc   aether.StreamIncarnation
+	st    *noiseStream
 	rto   time.Duration
 	wait  time.Duration
 	next  time.Time
@@ -1106,19 +1152,21 @@ type pendingReset struct {
 // (retransmitResets): a RESET lost on the datagram path would leave the peer's stream
 // live under an ID this side opens again, whose frames would then reach the old
 // stream's consumer. createStream refuses a local OpenStream of the ID while the
-// RESET waits. rto is the RTO of the stream the RESET ends, or of a fresh estimator
-// for a refusal, which holds no stream. Past the session's stream cap of waiting
-// RESETs, which only a peer that acknowledges none of them reaches, a RESET is written
-// once with the ID's quiet time started, so such a peer cannot grow the map; an OPEN
-// of the ID reaching that peer's copy of a stream it opened replaces the stream there
-// by its higher generation (handleOpen). Reset and sendRefused call it.
+// RESET waits. rto is the RTO of the stream it ends, or of a fresh estimator for a
+// refusal, which holds no stream. Reset and sendRefused call it.
 //
-// st is the stream the RESET ends, nil for a refusal, which holds none: it waits in
-// awaitingStatement for the peer's statement of what it consumed of st's sends
-// (noiseStream.notePeerConsumed), under the same bound. Past it st keeps the part of
-// its connection charge the peer never consumed: only a peer that answers none of
-// this side's RESETs fills the map, and its session holds credit nothing returns
-// until its idle timeout ends it.
+// st is the stream the RESET ends, nil for a refusal. In one step under s.mu st leaves
+// s.streams, its RESET joins pendingResets and st waits in awaitingStatement for the
+// peer's statement of what it consumed of st's sends (noiseStream.notePeerConsumed),
+// so the stream moves from one count createStream checks against the stream cap
+// (s.streams) to the other (pendingStreams) with nothing in between: a stream's RESET
+// always has its place to wait, an open past the cap being refused instead
+// (createStream), and every RESET of a stream is written again until its own
+// acknowledgment. Each RESET is kept under the stream it names, so a later RESET under
+// the ID leaves an earlier one waiting. A refusal past the stream cap of waiting
+// refusals, which only a peer that acknowledges none of them reaches, is written once
+// with the ID's quiet time started, so such a peer cannot grow the map; a refusal ends
+// no stream here and settles no credit.
 func (s *NoiseSession) writeReset(streamID uint64, p aether.ResetPayload, rto time.Duration, st *noiseStream) error {
 	payload := aether.EncodeResetPayload(p)
 	frame := &aether.Frame{
@@ -1130,62 +1178,89 @@ func (s *NoiseSession) writeReset(streamID uint64, p aether.ResetPayload, rto ti
 		Payload:    payload,
 	}
 	now := time.Now()
-	limit := s.opts.MaxConcurrentStreams
-	if limit <= 0 {
-		limit = aether.DefaultMaxConcurrentStreams
-	}
+	key := resetKey{id: streamID, inc: p.Incarnation}
 	s.mu.Lock()
 	if s.pendingResets == nil {
-		s.pendingResets = make(map[uint64]*pendingReset)
+		s.pendingResets = make(map[resetKey]*pendingReset)
+		s.pendingByID = make(map[uint64]int)
 	}
-	if _, replaced := s.pendingResets[streamID]; replaced || len(s.pendingResets) < limit {
-		if !replaced {
-			s.pendingResetCount.Add(1)
+	if st != nil {
+		if cur, ok := s.streams[streamID]; ok && cur == st {
+			delete(s.streams, streamID)
 		}
-		s.pendingResets[streamID] = &pendingReset{
-			frame: frame,
-			inc:   p.Incarnation,
-			rto:   rto,
-			wait:  rto,
-			next:  now.Add(rto),
-		}
-	} else {
-		s.startQuietLocked(streamID, now, rto)
-	}
-	if st != nil && len(s.awaitingStatement) < limit {
 		if s.awaitingStatement == nil {
 			s.awaitingStatement = make(map[resetKey]*noiseStream)
 		}
-		s.awaitingStatement[resetKey{id: streamID, inc: p.Incarnation}] = st
+		s.awaitingStatement[key] = st
+	}
+	_, replaced := s.pendingResets[key]
+	if replaced || st != nil || s.pendingRefusals < s.streamCapLocked() {
+		s.dropPendingLocked(key)
+		s.pendingResets[key] = &pendingReset{frame: frame, st: st, rto: rto, wait: rto, next: now.Add(rto)}
+		s.pendingByID[streamID]++
+		if st != nil {
+			s.pendingStreams++
+		} else {
+			s.pendingRefusals++
+		}
+		s.pendingResetCount.Add(1)
+	} else {
+		s.startQuietLocked(streamID, now, rto)
 	}
 	s.mu.Unlock()
 	return s.writeFrame(frame)
+}
+
+// dropPendingLocked takes the RESET kept under key out of pendingResets and its
+// counts, and returns it, nil for none. Caller holds s.mu.
+func (s *NoiseSession) dropPendingLocked(key resetKey) *pendingReset {
+	p, ok := s.pendingResets[key]
+	if !ok {
+		return nil
+	}
+	delete(s.pendingResets, key)
+	if s.pendingByID[key.id]--; s.pendingByID[key.id] <= 0 {
+		delete(s.pendingByID, key.id)
+	}
+	if p.st != nil {
+		s.pendingStreams--
+	} else {
+		s.pendingRefusals--
+	}
+	s.pendingResetCount.Add(-1)
+	return p
+}
+
+// streamCapLocked is the session's MaxConcurrentStreams, the default when the options
+// leave it unset: createStream's bound on its streams together with the streams whose
+// RESET waits (pendingStreams), and writeReset's on waiting refusals.
+func (s *NoiseSession) streamCapLocked() int {
+	if limit := s.opts.MaxConcurrentStreams; limit > 0 {
+		return limit
+	}
+	return aether.DefaultMaxConcurrentStreams
 }
 
 // resetPendingLocked reports whether a RESET this side wrote under id waits for its
 // acknowledgment (writeReset). createStream, under s.mu, refuses a local OpenStream
 // of such an ID: the peer may still hold the stream that RESET ends.
 func (s *NoiseSession) resetPendingLocked(id uint64) bool {
-	_, ok := s.pendingResets[id]
-	return ok
+	return s.pendingByID[id] > 0
 }
 
 // resetAcknowledged takes the peer's acknowledgment of a RESET under streamID, which
 // names the stream as that RESET did (inc) and states what the peer's consumer had
 // returned of this side's sends on it (consumed): the stream waiting for that
 // statement (awaitingStatement) settles its connection charge on it, unless the
-// peer's crossing RESET settled it first. When it names the stream the waiting RESET
-// names, the RESET stops and the ID's quiet time starts. An acknowledgment of an
-// earlier RESET under the ID, which a later one replaced, stops nothing, and still
-// settles the stream it names. handleReset calls it for a RESET flagged FlagACK.
+// peer's crossing RESET settled it first. The RESET it names stops being written,
+// gives its stream's place under the stream cap back (pendingStreams), and starts the
+// ID's quiet time. handleReset calls it for a RESET flagged FlagACK.
 func (s *NoiseSession) resetAcknowledged(streamID uint64, inc aether.StreamIncarnation, consumed uint64) {
 	key := resetKey{id: streamID, inc: inc}
 	s.mu.Lock()
 	st := s.awaitingStatement[key]
 	delete(s.awaitingStatement, key)
-	if p, ok := s.pendingResets[streamID]; ok && p.inc == inc {
-		delete(s.pendingResets, streamID)
-		s.pendingResetCount.Add(-1)
+	if p := s.dropPendingLocked(key); p != nil {
 		s.startQuietLocked(streamID, time.Now(), p.rto)
 	}
 	s.mu.Unlock()
@@ -1445,28 +1520,40 @@ func (s *NoiseSession) dumpFlowDiagOnStall(reason string) {
 
 func (s *NoiseSession) MSS() int { return s.pmtuProber.MSS() }
 
+// sessionFrameKey is a session's per-frame AEAD key and the encryptor built on it,
+// installed together by SetSessionKey so a reader that loads one sees the other.
+type sessionFrameKey struct {
+	enc *aethercrypto.FrameEncryptor
+	key []byte
+}
+
 // SetSessionKey sets the per-frame encryption key and enables AEAD encryption.
 // The key should be derived from the Noise handshake shared secret.
 // When set, all outbound frames are encrypted and inbound frames are decrypted, and
 // the session's decoder reads the encrypted short form 0x87, which it refuses before
-// a key is set.
+// a key is set. It may be called on a running session (a mesh connection keys the
+// session it has already started): the key and encryptor go in with one
+// CompareAndSwap, which the frame paths' one Load each pairs with.
 func (s *NoiseSession) SetSessionKey(key [32]byte) error {
 	// Reject a second install so a key is never silently re-installed into
 	// a fresh FrameEncryptor whose ordered nonce counter restarts at 0.
 	// The encryptor's per-instance random nonce prefix already makes reinstall
 	// nonce-safe, but a re-key mid-session is a caller bug (both directions
-	// share the single s.encryptor); fail loud instead of masking it.
-	if s.encryptor != nil {
+	// share the one encryptor); fail loud instead of masking it. The
+	// CompareAndSwap makes this hold for two installs racing each other too.
+	if s.frameKey.Load() != nil {
 		return fmt.Errorf("aether: session key already set")
 	}
 	enc, err := aethercrypto.NewFrameEncryptor(key, true)
 	if err != nil {
 		return err
 	}
-	s.encryptor = enc
-	s.sessionKey = key[:]
+	if !s.frameKey.CompareAndSwap(nil, &sessionFrameKey{enc: enc, key: append([]byte(nil), key[:]...)}) {
+		return fmt.Errorf("aether: session key already set")
+	}
 	// The frame key is what authenticates a 0x87 frame's payload, so the decoder
-	// reads that form from here on (processIncomingFrame decrypts it).
+	// reads that form from here on (processIncomingFrame decrypts it). The key is
+	// stored first, so a decoder that reads the form finds the key in place.
 	s.rxCompressor.AcceptEncryptedShort()
 	return nil
 }
@@ -1482,7 +1569,15 @@ func (s *NoiseSession) SetCongestionController(cc congestion.Controller) {
 
 // ConnectionID / Health / Protocol all come from the embedded *BaseSession.
 
-func (s *NoiseSession) SessionKey() []byte      { return s.sessionKey }
+// SessionKey returns the per-frame key SetSessionKey installed, nil before it.
+// handleHandshake reads it to check an address migration's HMAC.
+func (s *NoiseSession) SessionKey() []byte {
+	if fk := s.frameKey.Load(); fk != nil {
+		return fk.key
+	}
+	return nil
+}
+
 func (s *NoiseSession) CongestionWindow() int64 { return s.congestion().CWND() }
 
 // noiseConnStats is the optional observability surface exposed by the
