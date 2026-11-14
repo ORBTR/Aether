@@ -39,15 +39,15 @@ message RPCRequest {
   string handler = 2;
   bytes payload = 3;
   map<string, string> context = 4;
-  int64 timeout_ns = 5;          // nanoseconds (Duration)
-  string session_id = 6;
-  string trace_id = 7;
+  int64 timeoutNs = 5;           // nanoseconds (Duration)
+  string sessionId = 6;
+  string traceId = 7;
   int32 hops = 8;                // forwarding hop counter, max 6
 
   // Intelligent routing fields
-  string target_node_id = 9;     // ultimate destination node
-  repeated string route_list = 10; // ordered remaining hops [next, ..., target]
-  string request_nonce = 11;     // unique per parallel probe (dedup key)
+  string targetNodeId = 9;       // ultimate destination node
+  repeated string routeList = 10;  // ordered remaining hops [next, ..., target]
+  string requestNonce = 11;      // unique per parallel probe (dedup key)
   int64 deadline = 12;           // absolute deadline (unix nanos)
   AuthenticatedPrincipal principal = 13;
 }
@@ -58,6 +58,6 @@ message RPCResponse {
   bool success = 2;
   bytes payload = 3;
   string error = 4;
-  int64 latency_ns = 5;         // nanoseconds (Duration)
+  int64 latencyNs = 5;          // nanoseconds (Duration)
   map<string, string> metadata = 6;
 }
