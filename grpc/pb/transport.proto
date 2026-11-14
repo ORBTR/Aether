@@ -15,10 +15,10 @@ service TransportService {
 
 // Frame represents a single transport frame.
 message Frame {
-  uint64 frame_id = 1;
+  uint64 frameId = 1;
   bytes data = 2;
   FrameType type = 3;
-  repeated uint64 acked_frames = 4;
+  repeated uint64 ackedFrames = 4;
 }
 
 enum FrameType {
@@ -31,18 +31,18 @@ enum FrameType {
 }
 
 message PingRequest {
-  int64 timestamp_ns = 1;
-  string node_id = 2;
+  int64 timestampNs = 1;
+  string nodeId = 2;
 }
 
 message PingResponse {
-  int64 client_timestamp_ns = 1;
-  int64 server_timestamp_ns = 2;
-  string node_id = 3;
+  int64 clientTimestampNs = 1;
+  int64 serverTimestampNs = 2;
+  string nodeId = 3;
 }
 
 message Handshake {
-  bytes public_key = 1;
+  bytes publicKey = 1;
   bytes signature = 2;
   bytes challenge = 3;
   uint32 version = 4;
