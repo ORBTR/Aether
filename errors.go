@@ -104,6 +104,16 @@ var (
 	// Use errors.Is(err, aether.ErrStreamRefused) to detect.
 	ErrStreamRefused = errors.New("transport: stream refused by peer")
 
+	// ErrStreamTimedOut signals that the peer reset this stream with
+	// RESET(ResetTimeout): its stream GC found the stream carrying no frame for its
+	// StreamIdleTimeout and ended it, so the peer's consumer may never have read what
+	// this side sent. Send and Receive on such a stream return it, Receive once it has
+	// returned every message queued before the RESET, so a caller tells an idle reap
+	// from the peer's CLOSE after reading, which ends the stream as io.EOF. The
+	// session stays up.
+	// Use errors.Is(err, aether.ErrStreamTimedOut) to detect.
+	ErrStreamTimedOut = errors.New("transport: stream reset by peer for idleness")
+
 	// ErrFECRepairMalformed signals an FEC_REPAIR payload that cannot be read or
 	// does not fit the stream it arrived on: DecodeFECHeader and
 	// reliability.StreamFEC return it, and adapter.NoiseSession's handleFECRepair

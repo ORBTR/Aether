@@ -113,7 +113,7 @@ All multi-byte fields are **big-endian** (network byte order).
 |------|------|---------|-------------|
 | 0x02 | OPEN | `[Reliability:1][Priority:1][Dependency:8][InitialCredit:4][FECLevel:1][Generation:8][PriorGeneration:8][PriorConsumed:8]` | Opens a new stream with specified QoS parameters. `InitialCredit` (big-endian) is the credit the opener reserved for the stream; a Noise (Full profile) receiver builds its window and reservation for the stream from it and refuses (RESET Refused) a value below 1024 or above its stream ceiling. Zero states no aether stream credit: TCP-family and QUIC openers write it and their receivers do not read it. `Generation` (big-endian, 1 to 2^63-1) is the opener's number for the stream, rising with every stream its session creates; with the side that opened it, it is the stream's incarnation, which the stream's CLOSE and RESET name. Noise and byte-stream receivers refuse (RESET Refused) a generation of 0 or above 2^63-1; QUIC writes 0 and does not read it, each stream being a QUIC stream of its own. `PriorGeneration` and `PriorConsumed` (big-endian) are the opener's statement of its earlier stream under the ID, one it opened and a RESET ended: that stream's generation, and what the opener's consumer returned of the receiver's sends on it through connection grants, the `Consumed` its RESET stated; a Noise opener keeps the statement 30 s (as its notes, §8.2) and an ID's first stream, a stream that ended on both CLOSEs, or a statement past that time states generation 0, no earlier stream. TCP-family and QUIC openers write zero and their receivers do not read them. On a Noise session an OPEN of a live stream the peer opened, at a higher generation, ends that stream as its RESET would have (the peer has left it and that RESET never arrived) and opens the next: when `PriorGeneration` names that stream the receiver settles the stream's connection charge on `PriorConsumed` as on that RESET's `Consumed` (§8.2), and otherwise keeps the part of the charge the peer never consumed; either way it acknowledges that RESET (a RESET flagged ACK naming the stream as the opener's RESET would have, stating as `Consumed` what its consumer returned of the opener's sends there), on which the opener's stream, if it waits for a statement, settles. A Noise opener of this build opens an ID again only once its RESET there is acknowledged, so it supersedes no stream. Frame grammar 6 (§15). |
 | 0x03 | CLOSE | `[Incarnation:8]` | Graceful stream close (FIN). Sender will send no more data; it follows all the stream's DATA, and the receiver's `Receive` returns what it holds and then the end without a local close. The receiver may go on sending until its own CLOSE. `Incarnation` (big-endian) names the stream: the top bit is set when the CLOSE's writer opened the stream, the rest is the generation the stream's OPEN stated. A CLOSE that names another stream than the one the receiver holds under the ID ends nothing and is not answered. On a Noise (Full profile) session it takes the stream's next SeqNo, is written once every DATA frame is acknowledged, is retransmitted until acknowledged like DATA, and ends the receive side in sequence; its sender leaves only on its ACK and the peer's CLOSE. A CLOSE for a stream the receiver no longer holds is answered with a cumulative ACK up to it. A byte-stream session's CLOSE follows its DATA through the scheduler and its SeqNo is not read. Frame grammar 6 (§15). |
-| 0x04 | RESET | `[ReasonCode:4][Charged:8][Released:8][Consumed:8][Incarnation:8]` | Immediate stream abort. Both sides receive error on next Send/Receive. Reason codes: Cancel(0), Refused(1), Internal(2), FlowCtrl(3), Timeout(4). On a Noise (Full profile) session `Consumed` settles the stream's connection credit once (§8.2): it is the credit of the peer's messages on the stream the writer's consumer has returned through connection grants, which stop at this RESET. `Charged` is all the writer's sends charged to its stream window and `Released` what that window still held at this RESET; no reader settles on them. A refusal and a byte-stream or QUIC session state zero counts, and those sessions do not read them. `Incarnation` names the stream as on CLOSE (a refusal names the OPEN it refuses, opened by the peer); a RESET naming another stream than the one the receiver holds under the ID ends nothing. On a Noise session every RESET is acknowledged by a RESET flagged ACK (0x04) that names the same stream with the same reason, `Charged` and `Released` zero and, as `Consumed`, what the acknowledging side's consumer had returned of the RESET writer's sends on the stream (0 for a stream it never held), whatever the RESET found; the RESET's writer settles on that `Consumed` unless the peer's own RESET of the stream reached it first, and its writer writes it again, waiting one RTO of the stream and doubling up to 2 s, until its own acknowledgment comes or the session ends, each RESET kept under the stream it names, so a later RESET under the ID leaves an earlier one waiting; a stream whose RESET waits keeps its place under the session's stream cap (`MaxConcurrentStreams`), so with the cap's worth of streams and waiting RESETs an open is refused (a local `OpenStream` with `ErrStreamCapExhausted`, a peer's OPEN with RESET Refused) and no stream's RESET is left without its place to wait for its statement; a refusal past the stream cap of waiting refusals is written once; a local `OpenStream` of the ID is refused with `ErrDuplicateStreamID` while a RESET under it waits and for three RTOs after. A byte-stream session (TCP, WebSocket, gRPC; reliability profile 3) acknowledges every RESET the same way, once, after the stream it ends has left its scheduler, so the acknowledgment follows every frame of that stream on the byte stream; its writer refuses a local `OpenStream` of the ID with `ErrDuplicateStreamID` until the acknowledgment comes and then opens it at once, nothing of the old stream being able to follow (with as many RESETs waiting as the session's stream cap, a further one is written with no hold). Frame grammar 6 (§15). |
+| 0x04 | RESET | `[ReasonCode:4][Charged:8][Released:8][Consumed:8][Incarnation:8]` | Immediate stream abort. Reason codes: Cancel(0), Refused(1), Internal(2), FlowCtrl(3), Timeout(4). It ends the stream's Send and Receive on both sides, Receive once it has returned every message queued before the RESET; at the RESET's reader the reason names the end: Refused is `ErrStreamRefused`, FlowCtrl `ErrStreamOverrun`, Timeout, which the writer's stream GC writes for a stream that carried no frame for its `StreamIdleTimeout` (§19.1), `ErrStreamTimedOut`, and Cancel and Internal end the stream as `io.EOF`, the end a CLOSE gives, on every session that reads the reason (Noise, TCP, WebSocket, gRPC). On a Noise (Full profile) session `Consumed` settles the stream's connection credit once (§8.2): it is the credit of the peer's messages on the stream the writer's consumer has returned through connection grants, which stop at this RESET. `Charged` is all the writer's sends charged to its stream window and `Released` what that window still held at this RESET; no reader settles on them. A refusal and a byte-stream or QUIC session state zero counts, and those sessions do not read them. `Incarnation` names the stream as on CLOSE (a refusal names the OPEN it refuses, opened by the peer); a RESET naming another stream than the one the receiver holds under the ID ends nothing. On a Noise session every RESET is acknowledged by a RESET flagged ACK (0x04) that names the same stream with the same reason, `Charged` and `Released` zero and, as `Consumed`, what the acknowledging side's consumer had returned of the RESET writer's sends on the stream (0 for a stream it never held), whatever the RESET found; the RESET's writer settles on that `Consumed` unless the peer's own RESET of the stream reached it first, and its writer writes it again, waiting one RTO of the stream and doubling up to 2 s, until its own acknowledgment comes or the session ends, each RESET kept under the stream it names, so a later RESET under the ID leaves an earlier one waiting; a stream whose RESET waits keeps its place under the session's stream cap (`MaxConcurrentStreams`), so with the cap's worth of streams and waiting RESETs an open is refused (a local `OpenStream` with `ErrStreamCapExhausted`, a peer's OPEN with RESET Refused) and no stream's RESET is left without its place to wait for its statement; a refusal past the stream cap of waiting refusals is written once; a local `OpenStream` of the ID is refused with `ErrDuplicateStreamID` while a RESET under it waits and for three RTOs after. A byte-stream session (TCP, WebSocket, gRPC; reliability profile 3) acknowledges every RESET the same way, once, after the stream it ends has left its scheduler, so the acknowledgment follows every frame of that stream on the byte stream; its writer refuses a local `OpenStream` of the ID with `ErrDuplicateStreamID` until the acknowledgment comes and then opens it at once, nothing of the old stream being able to follow (with as many RESETs waiting as the session's stream cap, a further one is written with no hold). Frame grammar 6 (§15). |
 
 ### 2.3 Reliability
 
@@ -208,6 +208,7 @@ ACKs are not sent after every packet. The ACK engine uses:
 4. Extended ranges: ACK all in range
 5. Dropped ranges: permanently remove (scope validated to (BaseACK, largestSent])
 6. Stall detection: no progress for 2xSRTT -> probe retransmit oldest unacked
+7. Oldest unacknowledged frame: once its last write is one RTO old it is written again outside the congestion window, ahead of any frame the window holds back (§12.3)
 
 ---
 
@@ -220,7 +221,7 @@ ACKs are not sent after every packet. The ACK engine uses:
 | 0x04 | ACK | Acknowledgment piggyback. AckNo field is meaningful (cumulative ACK for peer's data). Reduces standalone ACK frames. |
 | 0x08 | PRIORITY | Priority field present in payload (for DATA frames carrying inline priority hints). |
 | 0x10 | ENCRYPTED | Payload is encrypted with ChaCha20-Poly1305. Nonce field is meaningful. Header bytes 0-37 are AEAD additional data (authenticated but not encrypted). |
-| 0x20 | COMPRESSED | Payload is DEFLATE compressed. Applied before encryption (compress then encrypt). |
+| 0x20 | COMPRESSED | Payload is DEFLATE compressed. Applied before encryption (compress then encrypt). A Noise session writes it on a payload over 64 bytes that DEFLATE shortens while its compression is on (`SessionOptions.Compression`, `CompressionCapable`); a byte-stream session (TCP, WebSocket, gRPC) writes none. Every session that reads it inflates the payload, opened first when it is also ENCRYPTED, to at most `MaxPayloadSize`, before any handler reads it, and validates the frame again at its inflated size; a payload that does not inflate within that bound is refused as malformed. |
 | 0x40 | ANTIREPLAY | SeqNo serves as anti-replay counter. **Only applies to DATA frames (TypeDATA).** Control frames (WINDOW, ACK, PING, PONG, GOAWAY, CLOSE, RESET, PRIORITY) have SeqNo=0 and bypass anti-replay checking entirely. Receiver maintains a 64-packet sliding window and silently drops DATA frames with duplicate or out-of-window SeqNo. Per-stream scope. |
 | 0x80 | COMPOSITE_ACK | Payload uses Composite ACK format (bitmap + extensions). Set on all TypeACK frames. |
 
@@ -684,7 +685,8 @@ RTT samples from retransmitted frames are NOT used for SRTT/RTTVAR computation (
 
 - On send: start timer = RTO
 - On ACK: cancel timer, update SRTT
-- On timeout: retransmit, double RTO (exponential backoff), cap at 60s
+- On timeout: retransmit, double RTO (exponential backoff, once per RTO interval), cap at 60s
+- Oldest unacknowledged frame: once its last write is one RTO old it is written again outside the congestion window, as a loss probe is, ahead of any frame the window holds back. The bytes in flight can all be frames the path lost or the receiver could not buffer past it, so no ACK opens the window until it arrives, and the loss probe repeats the highest frame, which such a receiver drops. The clock is the frame's last write, not a retransmit only queued
 - On bitmap gap detection: fast retransmit if (largestAcked - missingSeqNo) >= 3 (reorder threshold)
 
 ### 12.4 Composite ACK Integration
@@ -910,9 +912,9 @@ Relay nodes can inspect `SenderID` and `ReceiverID` for routing decisions withou
 | Error | Response |
 |-------|----------|
 | Unknown StreamID in DATA frame | Drop silently (unless SYN flag set -> the frame opens the stream) |
-| RESET received | Close stream, deliver error to application |
+| RESET received | Close stream; Receive returns what was queued before it, then the end the reason names (row 0x04): `ErrStreamRefused`, `ErrStreamOverrun`, `ErrStreamTimedOut`, or `io.EOF` for Cancel and Internal |
 | Flow control violation (send without credit) | Send RESET with reason FlowCtrl(3) |
-| Stream idle timeout | Send RESET with reason Timeout(4) |
+| Stream idle timeout | Send RESET with reason Timeout(4); the peer's Send and Receive end with `ErrStreamTimedOut`, which a caller tells from the `io.EOF` of a CLOSE after reading |
 
 ### 19.2 Connection Errors
 
@@ -1069,7 +1071,7 @@ Total: 11 bytes
 ```
 [0x88:1][StreamID:2][Length:2][CompositeACK payload:Length]
 ```
-Total: 5 + CompositeACK payload size. Lite and full have distinct indicators, so the decoder never infers the layout from payload bytes; a payload longer than 65,535 bytes is refused (`ErrShortFormOverflow`) and the ACK goes as a full frame.
+Total: 5 + CompositeACK payload size. Lite and full have distinct indicators, so the decoder never infers the layout from payload bytes; a payload longer than 65,535 bytes is refused (`ErrShortFormOverflow`) and the ACK goes as a full frame. Neither form carries flags (the decoder sets `COMPOSITE_ACK` only), so an ACK flagged ENCRYPTED, which a Noise session writes for every ACK once it holds a frame key, or COMPRESSED goes as a full frame (§23A step 3).
 
 - Composite ACK payload format is identical to section 2.8
 - StreamID identifies which stream is being acknowledged
@@ -1153,7 +1155,7 @@ The full 50-byte header remains the canonical format for:
 - **HANDSHAKE** frames (Type 0x10)
 - **NETWORK_CONFIG** frames (Type 0x0F)
 - **Streams with ID > 65535** (short header StreamID is uint16)
-- **Frames requiring explicit flags** (COMPRESSED, ANTIREPLAY, PRIORITY)
+- **Frames requiring explicit flags** (ENCRYPTED, COMPRESSED, ANTIREPLAY, PRIORITY)
 - **Any frame where the sender needs piggyback AckNo**
 
 ---
@@ -1363,7 +1365,7 @@ Consumers derive their own quality models from these capabilities.
 | Aether-FULL | `ProfileFull` (`"A-FULL"`) | Noise-UDP | All: codec, mux, reliability, flow, congestion, FEC, anti-replay, scheduler, pacing, PMTU, FEC, resume, migration, abuse scoring |
 | Aether-LITE | `ProfileLite` (`"A-LITE"`) | QUIC, TCP, WS, gRPC | Stream lifecycle, scheduler, abuse scoring, idle eviction, stream GC, control plane, observability |
 
-Same session-API semantics across profiles — `Stream.Send()` / `Stream.Receive()` / `Session.OpenStream()` behave identically regardless of which profile the underlying adapter is running. The agnostic interfaces (`AbuseScoreCapable`, `IdleEvictable`, `CompressionCapable`) work uniformly on either profile.
+Same session-API semantics across profiles — `Stream.Send()` / `Stream.Receive()` / `Session.OpenStream()` behave identically regardless of which profile the underlying adapter is running. The agnostic interfaces `AbuseScoreCapable` and `IdleEvictable` work uniformly on either profile; `CompressionCapable` is the Noise session's, the one that writes COMPRESSED, and a byte-stream session inflates a COMPRESSED frame it reads (§3).
 
 ## 29. Path MTU Discovery
 
@@ -1739,7 +1741,7 @@ Every adapter constructor takes `aether.SessionOptions`:
 ```go
 type SessionOptions struct {
     FEC                  bool          // master switch; default true
-    Compression          bool          // DEFLATE threshold-gated; default true
+    Compression          bool          // DEFLATE threshold-gated, written by Noise only; default true
     Encryption           bool          // per-frame AEAD above Noise; default true (inert until SetSessionKey)
     Scheduler            bool          // WFQ; default true
     HeaderComp           bool          // v2 short headers; default true

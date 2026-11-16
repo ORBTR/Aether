@@ -594,6 +594,28 @@ func (s *NoiseSession) reliabilityTick() {
 						s.congestion().OnLossWithPipe(pipe)
 					}
 
+					// The oldest unacknowledged frame, once its last write is an
+					// RTO old, is written again (RFC 6298 §5.4) outside the
+					// congestion window, through the probe slot, which the write
+					// loop takes ahead of its held frame and past its CanSend gate.
+					// The bytes the window counts in flight can all be frames the
+					// path lost or the receiver could not buffer past this one
+					// (SendWindow.OldestWritten), and then no ACK comes until this
+					// frame arrives: its retransmits from the RTO and RACK paths
+					// above wait behind the gate with their XmitTime moved, so
+					// RACK declares nothing more, and the TLP below repeats the
+					// highest frame, which such a receiver drops. The clock is the
+					// frame's last write (WrittenAt), which a queued retransmit
+					// does not move, and the RTO, which the RTO path above backs
+					// off once per interval. headSent keeps the TLP from replacing
+					// the frame in the probe slot this tick.
+					headSent := false
+					if head, headSeq, lastWrite := st.sendWindow.OldestWritten(); head != nil &&
+						tickNow.Sub(lastWrite) >= st.rtt.RTO() && st.queueProbe(head) {
+						st.sendWindow.BumpXmitTime(headSeq, tickNow)
+						headSent = true
+					}
+
 					// TLP — fire one probe outside cwnd if PTO elapsed
 					// without an ACK. The probe is the highest in-flight
 					// seq's frame (RFC 8985 §7.4: probe with the latest
@@ -606,8 +628,8 @@ func (s *NoiseSession) reliabilityTick() {
 					// Probes go into the per-stream probe slot in the
 					// scheduler (at most one in flight, replaced on
 					// re-arm), separate from the regular WFQ queue.
-					probeFired := false
-					if st.tlp.ShouldProbe(tickNow) {
+					probeFired := headSent
+					if !headSent && st.tlp.ShouldProbe(tickNow) {
 						// Probe the highest REMAINING written seq, not strictly
 						// Next()-1: that entry may be selectively ACKed, evicted,
 						// or still queued behind the CanSend gate, and with no

@@ -214,7 +214,8 @@ type tcpStream struct {
 	// endErr is the reason the stream ended, when it is not an ordinary end:
 	// aether.ErrStreamOverrun after either side's delivery queue overran
 	// (overrun here, the peer's RESET(ResetFlowCtrl) in handleReset), or
-	// aether.ErrStreamRefused after the peer's RESET(ResetRefused). Receive
+	// aether.ErrStreamRefused after the peer's RESET(ResetRefused), or
+	// aether.ErrStreamTimedOut after the peer's RESET(ResetTimeout). Receive
 	// returns it, once recvQ is drained, where it would return io.EOF, and
 	// Send returns it for a stream that can no longer send. setEnd keeps the
 	// first reason; nil means io.EOF.
@@ -500,7 +501,10 @@ func (st *tcpStream) leaveForReset(reason aether.ResetReason) *aether.Frame {
 // following honour opts end-to-end on TCP/WS/gRPC, matching the Noise
 // adapter's behaviour:
 //
-//   - `FrameLogging` / `Compression` / `HeaderComp` — per-frame gated
+//   - `FrameLogging` / `HeaderComp` — per-frame gated
+//   - `Compression` — not read: this session writes no frame flagged
+//     FlagCOMPRESSED (encodeFrameLocked deflates nothing), and inflates one
+//     its peer writes (dispatchFrame) whatever the option says
 //   - `MaxConcurrentStreams` — RESET(Refused) + `reportAbuse` on excess
 //   - `SessionIdleTimeout` — background tick closes idle sessions
 //   - `AbuseScoreCapable` — per-peer misbehaviour scoring + circuit
@@ -781,13 +785,36 @@ func (s *TCPSession) readLoop() {
 // dispatchFrame routes an incoming frame to the appropriate stream. A frame flagged
 // aether.FlagENCRYPTED is refused first, as malformed: its payload is ciphertext and
 // tag, and no TCP-family session holds a frame key to open it (SessionKey is nil), so
-// handing it on would give a consumer the ciphertext as its message. The readLoop
+// handing it on would give a consumer the ciphertext as its message. A frame flagged
+// aether.FlagCOMPRESSED has a DEFLATE payload, which is inflated next, under
+// decompressPayload's MaxPayloadSize cap, and validated again at its inflated size,
+// since Validate leaves a frame's per-type minimum to that size while the flag is set;
+// NoiseSession's processIncomingFrame does the same once a sealed frame is open. A
+// payload that does not inflate within the cap is refused as malformed. Without the
+// inflate, enqueueDelivery would hand the consumer the DEFLATE bytes as its message
+// and handleOpen and handleReset would read them as their payloads. The readLoop
 // calls it for every frame and every batch sub-frame; a short form carries no flag.
 func (s *TCPSession) dispatchFrame(frame *aether.Frame) {
 	if frame.Flags.Has(aether.FlagENCRYPTED) {
 		dbgTCP.Printf("dispatchFrame: refused an encrypted frame on stream %d: no frame key", frame.StreamID)
 		s.reportAbuse(abuse.ReasonMalformedFrame)
 		return
+	}
+	if frame.Flags.Has(aether.FlagCOMPRESSED) {
+		inflated, err := decompressPayload(frame.Payload)
+		if err != nil {
+			dbgTCP.Printf("dispatchFrame: refused a compressed frame on stream %d: %v", frame.StreamID, err)
+			s.reportAbuse(abuse.ReasonMalformedFrame)
+			return
+		}
+		frame.Payload = inflated
+		frame.Length = uint32(len(inflated))
+		frame.Flags = frame.Flags.Clear(aether.FlagCOMPRESSED)
+		if err := frame.Validate(); err != nil {
+			dbgTCP.Printf("dispatchFrame: refused a compressed frame on stream %d once inflated: %v", frame.StreamID, err)
+			s.reportAbuse(abuse.ReasonMalformedFrame)
+			return
+		}
 	}
 	// Record stream activity for GC — any frame type counts as
 	// activity on its stream (OPEN/DATA/CLOSE/RESET/etc.). This
@@ -1271,12 +1298,15 @@ func (s *TCPSession) handleReset(frame *aether.Frame) {
 		// it, which then reads CanSend and endErr (Receive after the messages recvQ
 		// holds, and Send, name it). A refusal (the peer's registerStream cap) is
 		// aether.ErrStreamRefused, the peer's full delivery queue (overrun)
-		// aether.ErrStreamOverrun. Every other reason ends the stream as io.EOF.
+		// aether.ErrStreamOverrun, the peer's stream GC reaping the stream as idle
+		// aether.ErrStreamTimedOut. Every other reason ends the stream as io.EOF.
 		switch payload.Reason {
 		case aether.ResetRefused:
 			st.setEnd(aether.ErrStreamRefused)
 		case aether.ResetFlowCtrl:
 			st.setEnd(aether.ErrStreamOverrun)
+		case aether.ResetTimeout:
+			st.setEnd(aether.ErrStreamTimedOut)
 		}
 		st.state.Transition(aether.EventRecvReset)
 		st.endSend()
@@ -2094,7 +2124,8 @@ func (st *tcpStream) Send(ctx context.Context, data []byte) error {
 // (enqueueDelivery). What recvQ holds comes first, one message per call, whatever
 // has ended: after closeRecvOnce has closed recvDone it returns the stream's end
 // once recvQ is empty, io.EOF or the typed reason endErr records
-// (aether.ErrStreamOverrun, aether.ErrStreamRefused; aether.ErrStreamOverrun too for
+// (aether.ErrStreamOverrun, aether.ErrStreamRefused, aether.ErrStreamTimedOut;
+// aether.ErrStreamOverrun too for
 // a consumer returning to messages recvMemory discarded), and after the session
 // closed it returns that close once recvQ is empty, so a message delivered before
 // either end is not lost behind it.

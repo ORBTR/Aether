@@ -381,6 +381,15 @@ func (c *Compressor) ShouldCompressACK(f *Frame) bool {
 	if f.Flags.Has(FlagCOMPRESSED) {
 		return false
 	}
+	// A sealed ACK is read only with FlagENCRYPTED, which tells the receiving
+	// NoiseSession to open it before DecodeCompositeACK reads the bitmap; the short
+	// forms drop the flag, so the receiver would read ciphertext as the ACK and
+	// refuse it. NoiseSession seals every frame with a payload once it holds a frame
+	// key, so on a keyed session with the short forms every ACK reaches here sealed,
+	// and each takes the full header.
+	if f.Flags.Has(FlagENCRYPTED) {
+		return false
+	}
 	// uint16 short-header StreamID — a stream above it needs the full header.
 	if f.StreamID > MaxShortHeaderStreamID {
 		return false

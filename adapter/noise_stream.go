@@ -86,14 +86,19 @@ type noiseStream struct {
 	// no RESET, which would reach whatever stream the peer now has on this ID.
 	left atomic.Bool
 
-	// refusedByPeer is set by handleReset when the peer's RESET carries
-	// ResetRefused, so Send and Receive return aether.ErrStreamRefused.
+	// refusedByPeer is set by handleReset (notePeerResetReason) when the peer's
+	// RESET carries ResetRefused, so Send and Receive return aether.ErrStreamRefused.
 	refusedByPeer atomic.Bool
 
 	// overrun is set by enqueueDelivery when this side resets a sender past its
-	// ceilings, and by handleReset when the peer's RESET carries ResetFlowCtrl,
-	// so Send and Receive return aether.ErrStreamOverrun.
+	// ceilings, and by handleReset (notePeerResetReason) when the peer's RESET
+	// carries ResetFlowCtrl, so Send and Receive return aether.ErrStreamOverrun.
 	overrun atomic.Bool
+
+	// timedOutByPeer is set by handleReset (notePeerResetReason) when the peer's
+	// RESET carries ResetTimeout, its stream GC's reap of an idle stream, so Send and
+	// Receive return aether.ErrStreamTimedOut.
+	timedOutByPeer atomic.Bool
 
 	// lastRTOBackoffAt is the last time reliabilityTick applied an RTO
 	// backoff for this stream, which bounds the backoff to once per RTO
@@ -1434,15 +1439,35 @@ func (st *noiseStream) returnUnconsumed() {
 // not an ordinary one: aether.ErrStreamRefused when the peer refused the stream
 // (refusedByPeer), aether.ErrStreamOverrun when a RESET ended it for a sender
 // past the receiver's ceilings (overrun) or this side threw unread messages away
-// (recvQueue.discard). nil otherwise.
+// (recvQueue.discard), aether.ErrStreamTimedOut when the peer's stream GC reset it
+// as idle (timedOutByPeer). nil otherwise.
 func (st *noiseStream) typedEnd() error {
 	switch {
 	case st.refusedByPeer.Load():
 		return fmt.Errorf("stream %d: %w", st.streamID, aether.ErrStreamRefused)
 	case st.overrun.Load(), st.recvQ != nil && st.recvQ.discardedMessages():
 		return fmt.Errorf("stream %d: %w", st.streamID, aether.ErrStreamOverrun)
+	case st.timedOutByPeer.Load():
+		return fmt.Errorf("stream %d: %w", st.streamID, aether.ErrStreamTimedOut)
 	}
 	return nil
+}
+
+// notePeerResetReason records the end the peer's RESET reason names for typedEnd: a
+// refusal (createStream's cap or credit reservation on the peer), an overrun (the
+// peer's enqueueDelivery) or an idle reap (the peer's stream GC, resetIdleStream);
+// Cancel and Internal record nothing and end the stream as io.EOF. handleReset calls
+// it before the stream leaves s.streams, and endByPeerReset again, for endSuperseded's
+// end, which states Cancel; a second call stores what the first did.
+func (st *noiseStream) notePeerResetReason(reason aether.ResetReason) {
+	switch reason {
+	case aether.ResetRefused:
+		st.refusedByPeer.Store(true)
+	case aether.ResetFlowCtrl:
+		st.overrun.Store(true)
+	case aether.ResetTimeout:
+		st.timedOutByPeer.Store(true)
+	}
 }
 
 // cannotSend is Send's error for a stream whose state refuses sends: its

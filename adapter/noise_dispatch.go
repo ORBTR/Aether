@@ -1014,6 +1014,10 @@ func (s *NoiseSession) handleReset(frame *aether.Frame) {
 	st, ok := s.streams[frame.StreamID]
 	stale := ok && !st.namedBy(payload.Incarnation)
 	if ok && !stale {
+		// The reason goes on the stream before it leaves s.streams: a Send past its
+		// state check that then finds the stream gone (queueFrame) answers the
+		// stream's typed end (cannotSend), which has to name it already.
+		st.notePeerResetReason(payload.Reason)
 		delete(s.streams, frame.StreamID)
 	}
 	crossed := s.awaitingStatement[key]
@@ -1066,15 +1070,9 @@ func (s *NoiseSession) acknowledgeReset(streamID uint64, p aether.ResetPayload, 
 // this side's consumer had returned of the peer's sends on the stream, final from here
 // on, for the acknowledgment, and notes it for copies of the RESET (noteResetGrants).
 func (s *NoiseSession) endByPeerReset(st *noiseStream, payload aether.ResetPayload, unstated bool) int64 {
-	// A refusal (createStream's cap or credit reservation on the peer) and
-	// an overrun (the peer's enqueueDelivery) are recorded first, so Send
-	// and Receive name them once the stream ends.
-	switch payload.Reason {
-	case aether.ResetRefused:
-		st.refusedByPeer.Store(true)
-	case aether.ResetFlowCtrl:
-		st.overrun.Store(true)
-	}
+	// The reason is recorded first, so Send and Receive name it once the stream
+	// ends; handleReset has recorded it already, before the stream left s.streams.
+	st.notePeerResetReason(payload.Reason)
 	st.left.Store(true)
 	st.state.Transition(aether.EventRecvReset)
 	// The peer's RESET ends the send side too: no CLOSE follows it.

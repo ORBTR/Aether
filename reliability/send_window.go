@@ -68,6 +68,14 @@ type SendEntry struct {
 	// retransmitted frame as lost again on the very first tick.
 	XmitTime time.Time
 
+	// WrittenAt is the time of the entry's most recent write, set by MarkWritten
+	// at every write and by nothing else, so unlike XmitTime it does not move when
+	// a retransmit is only queued. OldestWritten returns it for the adapter's
+	// retransmission timeout of the oldest unacknowledged frame, which asks how
+	// long that frame has gone without a write, and a retransmit queued behind the
+	// congestion window has not been written.
+	WrittenAt time.Time
+
 	// BBRv2 per-packet delivery-rate sample. Stamped by MarkWritten at the
 	// frame's first write from the sample the adapter passes
 	// (congestion.BBRController.StampSample), read back by the adapter when the
@@ -282,6 +290,7 @@ func (w *SendWindow) MarkWritten(frame *aether.Frame, wireBytes int64, now time.
 		return 0, 0, false
 	}
 	entry.XmitTime = now
+	entry.WrittenAt = now
 	if entry.Written {
 		return entry.InFlightBytes, entry.PayloadBytes, false
 	}
@@ -344,6 +353,26 @@ func (w *SendWindow) HighestWritten() (*aether.Frame, uint32) {
 			return nil, 0
 		}
 	}
+}
+
+// OldestWritten returns the lowest-sequence written frame still in the window, the
+// oldest unacknowledged one, with its sequence number and the time of its most
+// recent write (WrittenAt), or a nil frame when none is written. The adapter's
+// reliability tick writes that frame again outside the congestion window once its
+// last write is a retransmission timeout old: the receiver's RecvWindow delivers
+// nothing past its first missing frame and buffers only so many beyond it, so
+// while this frame is missing the receiver's ACKs take nothing more out of flight,
+// and a retransmit of it queued behind the congestion window would wait for an ACK
+// only its own arrival can bring.
+func (w *SendWindow) OldestWritten() (*aether.Frame, uint32, time.Time) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for seq := w.base; seq != w.next; seq++ {
+		if entry, ok := w.entries[seq]; ok && entry.Written {
+			return entry.Frame, seq, entry.WrittenAt
+		}
+	}
+	return nil, 0, time.Time{}
 }
 
 // ReleaseInFlight takes every entry out of the window and gives its
