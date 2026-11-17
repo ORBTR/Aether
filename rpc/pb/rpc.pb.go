@@ -95,7 +95,7 @@ type AuthenticatedPrincipal struct {
 	Subject       string                 `protobuf:"bytes,1,opt,name=subject,proto3" json:"subject,omitempty"`
 	Axes          []*ScopeAxis           `protobuf:"bytes,2,rep,name=axes,proto3" json:"axes,omitempty"`
 	Scopes        []string               `protobuf:"bytes,3,rep,name=scopes,proto3" json:"scopes,omitempty"`
-	Partition     string                 `protobuf:"bytes,4,opt,name=partition,proto3" json:"partition,omitempty"`
+	PartitionId   string                 `protobuf:"bytes,4,opt,name=partitionId,proto3" json:"partitionId,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -151,9 +151,9 @@ func (x *AuthenticatedPrincipal) GetScopes() []string {
 	return nil
 }
 
-func (x *AuthenticatedPrincipal) GetPartition() string {
+func (x *AuthenticatedPrincipal) GetPartitionId() string {
 	if x != nil {
-		return x.Partition
+		return x.PartitionId
 	}
 	return ""
 }
@@ -392,12 +392,12 @@ const file_rpc_pb_rpc_proto_rawDesc = "" +
 	"\x10rpc/pb/rpc.proto\x12\raether.rpc.v1\"5\n" +
 	"\tScopeAxis\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value\"\x96\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value\"\x9a\x01\n" +
 	"\x16AuthenticatedPrincipal\x12\x18\n" +
 	"\asubject\x18\x01 \x01(\tR\asubject\x12,\n" +
 	"\x04axes\x18\x02 \x03(\v2\x18.aether.rpc.v1.ScopeAxisR\x04axes\x12\x16\n" +
-	"\x06scopes\x18\x03 \x03(\tR\x06scopes\x12\x1c\n" +
-	"\tpartition\x18\x04 \x01(\tR\tpartition\"\xff\x03\n" +
+	"\x06scopes\x18\x03 \x03(\tR\x06scopes\x12 \n" +
+	"\vpartitionId\x18\x04 \x01(\tR\vpartitionId\"\xff\x03\n" +
 	"\n" +
 	"RPCRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x18\n" +

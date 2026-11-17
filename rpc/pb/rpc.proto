@@ -30,7 +30,7 @@ message AuthenticatedPrincipal {
   string subject = 1;
   repeated ScopeAxis axes = 2;
   repeated string scopes = 3;
-  string partition = 4;
+  string partitionId = 4;
 }
 
 // RPCRequest represents a direct RPC call over the mesh network.

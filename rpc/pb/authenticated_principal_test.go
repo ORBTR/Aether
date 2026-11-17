@@ -24,8 +24,8 @@ func TestAuthenticatedPrincipalRoundTripIsSeparateFromMutableContext(t *testing.
 				{Name: "platform_tenant", Value: "orbtr"},
 				{Name: "customer_org", Value: "org-A"},
 			},
-			Scopes:    []string{"org.read", "org.write"},
-			Partition: "org-A",
+			Scopes:      []string{"org.read", "org.write"},
+			PartitionId: "org-A",
 		},
 	}
 
@@ -41,7 +41,7 @@ func TestAuthenticatedPrincipalRoundTripIsSeparateFromMutableContext(t *testing.
 	if !proto.Equal(request.Principal, decoded.Principal) {
 		t.Fatalf("principal changed in transit: got %#v want %#v", decoded.Principal, request.Principal)
 	}
-	if got := decoded.Principal.GetPartition(); got != "org-A" {
+	if got := decoded.Principal.GetPartitionId(); got != "org-A" {
 		t.Fatalf("partition = %q after the round trip, want org-A", got)
 	}
 	if got := decoded.Context["orgId"]; got != "org-B" {
