@@ -20,7 +20,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GO_VERSION: '1.25.0'
+  GO_VERSION: '1.27.4'
   MODULE_PATH: github.com/ORBTR/aether
 
 jobs:
