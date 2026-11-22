@@ -1598,7 +1598,7 @@ Additional attack-surface fixes shipped after S1–S9:
 - **Resume prefix collision fix** — resume wire prefixes moved to 0xFA/0xF9/0xF8 (was colliding with dialNoncePrefix=0xFD)
 - **TicketStore bounded** — `DefaultTicketCacheSize=4096` with FIFO eviction, lazy-expire on lookup
 
-Full audit trail: `docs/_SECURITY.md` + `docs/_implementation_plan.md`.
+The threat model and the defence each attack class meets are in §34.4.
 
 ### 34.2 Retry Token Wire Format (S3)
 
@@ -1668,6 +1668,35 @@ Multi-tenant deployments use a pre-handshake preamble to route incoming datagram
 When no `TenantKeyResolver` is configured (single-tenant mode), the listener rejects TP-preambled packets and uses the transport's static `NetworkKeys` list. Preamble is optional — single-tenant deployments don't send one.
 
 Implementation: `noise/preamble.go`, `noise/session.go` (`ClassifyPacket` + dispatch).
+
+### 34.4 Threat Model and Attack Classes
+
+**Adversary.** The attacker is assumed able to inject arbitrary packets (spoofed UDP, abuse of a relay), establish legitimate sessions as a malicious peer, replay captured traffic, delay, reorder and drop packets, exploit parsers and state machines, abuse NAT traversal and relay infrastructure, and push CPU and memory through protocol features. The attacker is not assumed able to break ChaCha20-Poly1305 or the Noise handshake, or to compromise the host.
+
+**Attack surface.**
+
+| Area | Surface |
+|------|---------|
+| Pre-authentication (highest risk) | the Noise handshake, preamble routing, STUN and NAT probing, session tickets, the QUIC and TCP accept paths |
+| Post-authentication | frame decoding, Composite ACK parsing, the reliability engine, flow control, the scheduler, the FEC decoder, the stream lifecycle |
+| Control plane | WHOIS, RENDEZVOUS, NETWORK_CONFIG, HANDSHAKE, GOAWAY and RESET |
+| Relay | cross-tenant routing, scope isolation, rate limiting |
+
+**Attack classes and the defence each meets.**
+
+| Class | Vector | Defence |
+|-------|--------|---------|
+| Handshake amplification | small spoofed packets drawing large handshake replies | the stateless retry cookie (S3, §34.2), and the per-source token bucket in front of all inbound UDP before any crypto work (S6) |
+| Composite ACK abuse | a crafted ACK bitmap or range forcing long send-window scans | `MaxACKCumulativeJump` (65536) on the cumulative jump, `MaxACKRangeSize` (1024) on each ExtRange and DroppedRange block, a bitmap length of 0, 4, 8, 16 or 32 bytes; a refused ACK counts toward the peer's abuse score (S1, S7) |
+| Replay-window exploitation | sequence-number wraparound read as a forward jump | a forward jump larger than 2^31 is refused in the per-stream and per-connection windows and counted (`WrapsDetectedCount`) (S8); DATA frames always carry FlagANTIREPLAY (§34.1) |
+| Flow-control manipulation | credit games that starve or oscillate a window | window credit is cumulative, so a stale or repeated grant is dropped; an OPEN whose initial credit is below `MinGuaranteedWindow` or above the receiver's stream ceiling is refused with RESET(Refused) and an abuse charge |
+| FEC compute amplification | partial FEC groups and decode churn | every decoder is pruned on a 1 Hz tick by count (`DefaultMaxFECGroups`, 256) and by age (S2) |
+| Scheduler starvation | priority abuse within a session | strict class priority REALTIME > INTERACTIVE > BULK with weighted fair queueing inside a class, REALTIME capped at 10% of bandwidth (`RealtimeCapPercent`), and a scheduler per session |
+| Compression desync | drift of v2 short-header state | a full header on a stream's first frame and on every 64th (`ShortHeaderFullInterval`) |
+| Relay abuse | many low-rate flows degrading other tenants | cross-scope weighted fair queueing with preemption, a global `MaxTotalPairs` cap and per-scope weights (S9) |
+| Adaptive-controller exploit | forcing CPU pressure so a session sheds features | the controller never touches encryption; above 70% estimated CPU it turns compression off; its FEC (80%) and scheduler (90%) rungs are recorded but not yet applied at run time |
+| Migration token replay | reusing a migration token from another address | the token's HMAC binds the ConnectionID, the payload, a nonce and a timestamp, and seen nonces are kept in a bounded cache (S4) |
+| Resource exhaustion | many streams or partial data | `MaxConcurrentStreams` (1024 Noise, 256 TCP family), with a refused OPEN answered RESET(Refused) and reported to the abuse score (S5); the fragment-buffer caps and idle-session eviction of §34.1 |
 
 ## 35. Agnostic Capability Interfaces
 

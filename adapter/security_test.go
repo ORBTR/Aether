@@ -17,8 +17,8 @@ import (
 )
 
 // ─── S5 — MaxConcurrentStreams admission ──────────────────────────────
-// Addresses _SECURITY.md §3.12. A peer must not be able to fill memory
-// by opening unbounded streams against the local session.
+// A peer must not be able to fill memory by opening unbounded streams
+// against the local session (docs/protocol-spec.md §34.4, resource exhaustion).
 
 // TestS5_TCPSessionRefusesOverCap opens the TCPSession stream cap +1
 // streams from a client and verifies the server refuses the last one.

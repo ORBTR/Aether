@@ -12,8 +12,8 @@ import (
 )
 
 // ─── S1 — Composite ACK unbounded-scan protection ─────────────────────
-// Addresses _SECURITY.md §3.2. Crafted ACKs must not be able to force
-// CPU-exhausting loops in ProcessCompositeACK.
+// Crafted ACKs must not be able to force CPU-exhausting loops in
+// ProcessCompositeACK (docs/protocol-spec.md §34.4, Composite ACK abuse).
 
 func TestS1_CumulativeJumpRejected(t *testing.T) {
 	w := NewSendWindow(64)
@@ -85,9 +85,9 @@ func TestS1_OversizedExtRangeRejected(t *testing.T) {
 }
 
 // ─── S8 — SeqNo wraparound rejection ──────────────────────────────────
-// Addresses _SECURITY.md §3.3. An attacker observing topSeq near uint32 max
-// must not be able to reset the window by claiming a "forward" jump that
-// is actually a wraparound.
+// An attacker observing topSeq near uint32 max must not be able to reset
+// the window by claiming a "forward" jump that is actually a wraparound
+// (docs/protocol-spec.md §34.4, replay-window exploitation).
 
 func TestS8_WraparoundRejected(t *testing.T) {
 	w := NewReplayWindow()

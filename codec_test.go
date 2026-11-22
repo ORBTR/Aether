@@ -116,8 +116,9 @@ func TestDecodeFrame_RejectsOversizedPayload(t *testing.T) {
 }
 
 // TestEncodeDecodeCompositeACK_RoundTrip covers the ACK v2 format with
-// all extension bits: the caps defense (see _SECURITY.md §3.2), ECN,
-// and the window-credit piggyback extension.
+// all extension bits: the caps defense against Composite ACK abuse
+// (docs/protocol-spec.md §34.4), ECN, and the window-credit piggyback
+// extension.
 func TestEncodeDecodeCompositeACK_RoundTrip(t *testing.T) {
 	ack := &CompositeACK{
 		BaseACK:  1000,

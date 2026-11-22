@@ -3,7 +3,7 @@
 > *Write your networking stack once, run it everywhere — without giving up transport-level control.*
 
 [![Go](https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go)](https://go.dev)
-[![License: ELv2](https://img.shields.io/badge/License-ELv2-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A protocol and wire format that standardises communication between application and transport layers, allowing systems to operate across layers 7 to 4 with minimal translation overhead and without losing core capabilities.
 
@@ -76,6 +76,20 @@ Each transport declares native capabilities, and Aether activates its own layers
 | Ordering | **Aether provides** | Transport-native | Transport-native | Transport-native |
 | Identity | Transport-native (Ed25519) | Transport-native | Transport-native | Transport-native |
 | FEC | **Aether provides** | N/A | N/A | N/A |
+
+### Stream Lifecycle
+
+A stream (`stream_state.go`) starts Idle and opens on the first OPEN or DATA in either direction; a RESET from either side closes it from any state. Sending FIN half-closes it: the local side sends no more, and the stream closes when the peer's FIN arrives. A peer FIN that arrives first leaves the stream open for sending until the local FIN closes it. `CanSend` and `CanReceive` answer from the state and the two FIN flags. `StreamGC` resets a stream idle past `DefaultStreamIdleTimeout`; well-known streams, IDs below `StreamGCExemptBelow`, are exempt.
+
+### Where the Reliability Engine Lives
+
+| Package | Holds |
+|---------|-------|
+| `reliability` | RTT estimation, send and receive windows, Composite ACK processing, retransmission, the FEC encoders and decoders (XOR, interleaved, Reed-Solomon), anti-replay windows, the observe engine |
+| `congestion` | CUBIC, BBR, the pacer, RACK and tail-loss probes, the controller interface |
+| `flow` | stream and connection credit windows and the session bounds profile |
+
+The wire behaviour of each is specified in the [protocol specification](docs/protocol-spec.md); its §34 covers the security model.
 
 ---
 
@@ -204,6 +218,6 @@ layout := aether.StreamLayout{
 
 ## License
 
-[Elastic License 2.0 (ELv2)](LICENSE)
+[MIT](LICENSE)
 
-**Patent Pledge**: I, Brandon Miller-Mumford, sole copyright holder of Aether, commit to not assert any patents I hold or acquire covering Aether against users complying with ELv2 terms.
+**Patent Pledge**: I, Brandon Miller-Mumford, sole copyright holder of Aether, commit to not assert any patents I hold or acquire covering Aether against users complying with the licence's terms.
