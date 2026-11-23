@@ -145,11 +145,39 @@ type SessionCompState struct {
 // encryptedShort says the session holds a frame key (AcceptEncryptedShort), without
 // which a decoder refuses 0x87 (DecodeEncryptedDataShort). It is atomic because
 // NoiseSession.SetSessionKey sets it while the read loop runs.
+//
+// streamCount is how many entries streams holds. A decoder records a stream's
+// state from the peer's frames (RecordFullHeader, recordShortData) for any
+// stream ID the peer writes, before the frame is checked, so streamBound caps
+// the entries those two create; an encoder's GetOrCreateStream is bounded by the
+// session's own streams instead.
 type Compressor struct {
 	Session        *SessionCompState
 	streams        sync.Map // map[uint64]*StreamCompState
+	streamCount    atomic.Int64
+	streamBound    atomic.Int64
 	shortForms     atomic.Bool
 	encryptedShort atomic.Bool
+}
+
+// DefaultCompressorStreamBound is the most stream entries a decoder records from
+// a peer's frames when its session sets no bound (BoundStreams): two for each
+// stream DefaultMaxConcurrentStreams admits, since the IDs live on a session
+// are its own streams and the peer's, both within that cap.
+const DefaultCompressorStreamBound = 2 * DefaultMaxConcurrentStreams
+
+// BoundStreams caps the stream entries this decoder records from a peer's
+// frames at n (n <= 0 restores DefaultCompressorStreamBound). A session sets it
+// from its stream cap. A frame for a new stream ID past the cap decodes as
+// before but records no state, so a peer cycling stream IDs cannot grow the
+// map: such an ID's short DATA frames then decode against sequence 0.
+func (c *Compressor) BoundStreams(n int) {
+	c.streamBound.Store(int64(n))
+}
+
+// StreamEntries reports how many streams the compressor holds state for.
+func (c *Compressor) StreamEntries() int {
+	return int(c.streamCount.Load())
 }
 
 // NewCompressor creates a compressor for full frames only; UseWireVersions
@@ -194,14 +222,47 @@ func (c *Compressor) GetOrCreateStream(streamID uint64) *StreamCompState {
 	if v, ok := c.streams.Load(streamID); ok {
 		return v.(*StreamCompState)
 	}
-	s := &StreamCompState{}
-	actual, _ := c.streams.LoadOrStore(streamID, s)
+	return c.storeStream(streamID)
+}
+
+// storeStream creates streamID's state unless another caller already has,
+// counting each entry it adds.
+func (c *Compressor) storeStream(streamID uint64) *StreamCompState {
+	actual, loaded := c.streams.LoadOrStore(streamID, &StreamCompState{})
+	if !loaded {
+		c.streamCount.Add(1)
+	}
 	return actual.(*StreamCompState)
+}
+
+// recordedStream returns streamID's state for a decoder recording a peer's
+// frame, creating it only while the compressor holds fewer entries than its
+// bound (BoundStreams), and nil past it.
+func (c *Compressor) recordedStream(streamID uint64) *StreamCompState {
+	if v, ok := c.streams.Load(streamID); ok {
+		return v.(*StreamCompState)
+	}
+	bound := c.streamBound.Load()
+	if bound <= 0 {
+		bound = DefaultCompressorStreamBound
+	}
+	if c.streamCount.Load() >= bound {
+		return nil
+	}
+	return c.storeStream(streamID)
+}
+
+// HasStream reports whether the compressor holds state for streamID.
+func (c *Compressor) HasStream(streamID uint64) bool {
+	_, ok := c.streams.Load(streamID)
+	return ok
 }
 
 // RemoveStream cleans up state for a closed stream.
 func (c *Compressor) RemoveStream(streamID uint64) {
-	c.streams.Delete(streamID)
+	if _, ok := c.streams.LoadAndDelete(streamID); ok {
+		c.streamCount.Add(-1)
+	}
 }
 
 // recordedSeqNo returns the last sequence recorded on streamID, 0 for a stream
@@ -219,9 +280,12 @@ func (c *Compressor) recordedSeqNo(streamID uint64) uint32 {
 }
 
 // recordShortData records a decoded short DATA frame's sequence on its stream,
-// creating the stream's state on its first admitted frame.
+// creating the stream's state on its first admitted frame within the bound.
 func (c *Compressor) recordShortData(streamID uint64, seqNo uint32) {
-	s := c.GetOrCreateStream(streamID)
+	s := c.recordedStream(streamID)
+	if s == nil {
+		return
+	}
 	s.mu.Lock()
 	s.lastSeqNo = seqNo
 	s.frameCount++
@@ -229,6 +293,8 @@ func (c *Compressor) recordShortData(streamID uint64, seqNo uint32) {
 }
 
 // RecordFullHeader updates both session and stream state after a full header.
+// A stream new to the compressor gets state only within its bound
+// (BoundStreams).
 func (c *Compressor) RecordFullHeader(f *Frame) {
 	c.Session.mu.Lock()
 	c.Session.lastSender = f.SenderID
@@ -237,7 +303,10 @@ func (c *Compressor) RecordFullHeader(f *Frame) {
 	c.Session.identitySet = true
 	c.Session.mu.Unlock()
 
-	s := c.GetOrCreateStream(f.StreamID)
+	s := c.recordedStream(f.StreamID)
+	if s == nil {
+		return
+	}
 	s.mu.Lock()
 	s.lastSeqNo = f.SeqNo
 	s.frameCount++

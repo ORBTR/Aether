@@ -558,6 +558,9 @@ func newTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 		return aether.KeepalivePlanFor(s).ProbeTimeout
 	})
 	s.control = make(chan controlWrite, s.streamCap())
+	// The live stream IDs are this side's streams and the peer's, each within the
+	// stream cap, so the receive compressor records no more than twice it.
+	s.rxCompressor.BoundStreams(2 * s.streamCap())
 	s.joinPeerMemory(remoteNodeID, sharedPeer)
 	s.wireOffer, s.wireOfferErr = aether.LocalWireVersions(opts.WireVersions)
 	// Per-peer abuse tracker — per-session registry by default,
@@ -743,42 +746,74 @@ func (s *TCPSession) readLoop() {
 			}
 			return
 		}
-		if batch != nil {
-			for _, f := range batch {
-				// Batched sub-frames are decoded by the short-header
-				// decoders (codec_short.go), which skip
-				// Frame.Validate() — the same gap the single-frame path
-				// guards below. Without a per-sub-frame gate a peer could
-				// smuggle unknown Type bytes, oversize Length, or
-				// payload/length mismatches into dispatchFrame inside a
-				// 0x85 batch AND evade the ReasonMalformedFrame abuse
-				// signal. Cross-adapter parity with the Noise adapter's
-				// processIncomingFrame batch loop.
-				if err := f.Validate(); err != nil {
-					dbgTCP.Printf("readLoop: batch sub-frame validate failed: %v", err)
-					s.reportAbuse(abuse.ReasonMalformedFrame)
-					continue
-				}
-				s.Health().RecordActivity()
-				s.dispatchFrame(f)
+		s.handleRead(frame, batch)
+	}
+}
+
+// handleRead validates and dispatches what one ReadNextFrame returned, a frame
+// or a batch's frames, and then releases the receive compressor's state for each
+// of their stream IDs that has no open stream (releaseUnopenedStream).
+func (s *TCPSession) handleRead(frame *aether.Frame, batch []*aether.Frame) {
+	if batch != nil {
+		for _, f := range batch {
+			defer s.releaseUnopenedStream(f.StreamID)
+		}
+	} else {
+		defer s.releaseUnopenedStream(frame.StreamID)
+	}
+	if batch != nil {
+		for _, f := range batch {
+			// Batched sub-frames are decoded by the short-header
+			// decoders (codec_short.go), which skip
+			// Frame.Validate() — the same gap the single-frame path
+			// guards below. Without a per-sub-frame gate a peer could
+			// smuggle unknown Type bytes, oversize Length, or
+			// payload/length mismatches into dispatchFrame inside a
+			// 0x85 batch AND evade the ReasonMalformedFrame abuse
+			// signal. Cross-adapter parity with the Noise adapter's
+			// processIncomingFrame batch loop.
+			if err := f.Validate(); err != nil {
+				dbgTCP.Printf("readLoop: batch sub-frame validate failed: %v", err)
+				s.reportAbuse(abuse.ReasonMalformedFrame)
+				continue
 			}
-			continue
+			s.Health().RecordActivity()
+			s.dispatchFrame(f)
 		}
+		return
+	}
 
-		// Structural validation gate — short-header decoders skip
-		// Frame.Validate(), so without this check a peer could slip
-		// frames with unknown Type bytes or oversize Length straight
-		// into the dispatch switch. Cross-adapter parity with the
-		// Noise adapter's processIncomingFrame.
-		if err := frame.Validate(); err != nil {
-			dbgTCP.Printf("readLoop: frame validate failed: %v", err)
-			s.reportAbuse(abuse.ReasonMalformedFrame)
-			continue
-		}
+	// Structural validation gate — short-header decoders skip
+	// Frame.Validate(), so without this check a peer could slip
+	// frames with unknown Type bytes or oversize Length straight
+	// into the dispatch switch. Cross-adapter parity with the
+	// Noise adapter's processIncomingFrame.
+	if err := frame.Validate(); err != nil {
+		dbgTCP.Printf("readLoop: frame validate failed: %v", err)
+		s.reportAbuse(abuse.ReasonMalformedFrame)
+		return
+	}
 
-		s.Health().RecordActivity()
-		dbgTCP.Printf("readLoop: RX type=%d stream=%d len=%d flags=0x%02x", frame.Type, frame.StreamID, frame.Length, frame.Flags)
-		s.dispatchFrame(frame)
+	s.Health().RecordActivity()
+	dbgTCP.Printf("readLoop: RX type=%d stream=%d len=%d flags=0x%02x", frame.Type, frame.StreamID, frame.Length, frame.Flags)
+	s.dispatchFrame(frame)
+}
+
+// releaseUnopenedStream drops the receive compressor's state for streamID once a
+// frame on it has been handled, when no stream is open under that ID.
+// ReadNextFrame records a full header's stream state before the frame is
+// checked, so without this every frame the session refuses, drops or finds no
+// stream for would leave an entry for the session's life. The control stream,
+// 0, keeps its state.
+func (s *TCPSession) releaseUnopenedStream(streamID uint64) {
+	if streamID == 0 || !s.rxCompressor.HasStream(streamID) {
+		return
+	}
+	s.mu.Lock()
+	_, open := s.streams[streamID]
+	s.mu.Unlock()
+	if !open {
+		s.rxCompressor.RemoveStream(streamID)
 	}
 }
 

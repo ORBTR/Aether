@@ -593,6 +593,13 @@ func newNoiseSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, opt
 	}
 	s.admitted = newCreditLedger("session", sessionCeiling, peerLedger)
 	s.joinPeerMemory(remoteNodeID, sharedPeer)
+	// The live stream IDs are this side's streams and the peer's, each within the
+	// stream cap, so the receive compressor records no more than twice it.
+	streamCap := opts.MaxConcurrentStreams
+	if streamCap <= 0 {
+		streamCap = aether.DefaultMaxConcurrentStreams
+	}
+	s.rxCompressor.BoundStreams(2 * streamCap)
 	// Lift the peer's advertised max_ack_delay off the underlying
 	// noiseConn (when the substrate supports the handshake-capability
 	// surface). createStream uses this to seed each stream's TLP PTO

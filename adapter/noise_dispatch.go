@@ -51,10 +51,30 @@ func (s *NoiseSession) readLoop() {
 		if batch != nil {
 			for _, f := range batch {
 				s.processIncomingFrame(f, indicator)
+				s.releaseUnopenedStream(f.StreamID)
 			}
 			continue
 		}
 		s.processIncomingFrame(frame, indicator)
+		s.releaseUnopenedStream(frame.StreamID)
+	}
+}
+
+// releaseUnopenedStream drops the receive compressor's state for streamID once
+// a frame on it has been handled, when no stream is open under that ID.
+// ReadNextFrame records a full header's stream state before the frame is
+// checked, so without this every frame the session refuses, drops or finds no
+// stream for would leave an entry for the session's life. The control stream,
+// 0, keeps its state.
+func (s *NoiseSession) releaseUnopenedStream(streamID uint64) {
+	if streamID == 0 || !s.rxCompressor.HasStream(streamID) {
+		return
+	}
+	s.mu.Lock()
+	_, open := s.streams[streamID]
+	s.mu.Unlock()
+	if !open {
+		s.rxCompressor.RemoveStream(streamID)
 	}
 }
 
