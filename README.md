@@ -1,11 +1,11 @@
-# Aether
+# aether
 
-> *Write your networking stack once, run it everywhere — without giving up transport-level control.*
-
-[![Go](https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go)](https://go.dev)
-[![License: ELv2](https://img.shields.io/badge/License-ELv2-blue.svg)](LICENSE)
-
-A protocol and wire format that standardises communication between application and transport layers, allowing systems to operate across layers 7 to 4 with minimal translation overhead and without losing core capabilities.
+aether is a transport and session protocol for Go. It puts one programmable
+session interface over Noise/UDP, TCP, QUIC, gRPC and WebSocket (including the
+browser), so an application opens the same streams, with the same reliability,
+priority, flow control, congestion control and encryption, whichever transport
+carries them, and keeps NAT traversal, relays, multipath and connection
+migration underneath.
 
 ```bash
 go get github.com/ORBTR/aether
@@ -142,8 +142,8 @@ The wire behaviour of each is specified in the [protocol specification](docs/pro
 ```go
 import "github.com/ORBTR/aether"
 
-// Create a Noise-UDP session
-session, err := adapter.NewNoiseSession(conn, opts)
+// A Noise session over an established connection (UDP, TCP, ...)
+session := adapter.NewNoiseSession(conn, localNodeID, remoteNodeID, aether.SessionOptions{})
 
 // Open a reliable ordered stream with INTERACTIVE priority
 stream, err := session.OpenStream(ctx, aether.StreamConfig{
@@ -216,8 +216,56 @@ layout := aether.StreamLayout{
 
 ---
 
-## License
+## Dependencies
 
-[Elastic License 2.0](LICENSE)
+- No other package of this estate.
+- `github.com/flynn/noise` (the Noise handshakes), `github.com/quic-go/quic-go`,
+  `google.golang.org/grpc` and `github.com/gobwas/ws` (the QUIC, gRPC and
+  WebSocket transports), `github.com/pion/stun` (NAT discovery),
+  `github.com/klauspost/reedsolomon` (forward error correction),
+  `filippo.io/edwards25519`, `golang.org/x/crypto`, `golang.org/x/net`,
+  `golang.org/x/sync`, `golang.org/x/sys` and `google.golang.org/protobuf`.
+
+## Used by
+
+Importers in the ORBTR estate:
+
+- `github.com/bbmumford/loom` (`node`, `directory`, `grade`, `pkg/dispatch`,
+  `core/transport/manager`, `core/streams`, `core/directory/gossip` and
+  others): the platform mesh runs on aether sessions.
+- `github.com/bbmumford/minerva` (`sdk`, `discovery`, `relay`, `wasm/cmd`),
+  `github.com/bbmumford/mercury/runtime/mesh`, `github.com/bbmumford/reach`
+  (`NewNodeID`) and `github.com/bbmumford/atlas`.
+- `github.com/ORBTR/Library/endpoint`, `mesh/wire` and
+  `domain/enrollmenthost`; `github.com/ORBTR/cortex/coordination/workeraccept`
+  (and its producers); `github.com/ORBTR/worker` (`features/workerruntime`,
+  `internal/meshwire`, `internal/coord`, `internal/dispatch`,
+  `internal/changefeed`) and the `worker.orbtr.ai` endpoint.
+- `github.com/ORBTR/agent` (`internal/core/wire`, `internal/core/identity`,
+  `internal/core/remote`, `internal/adapters/orbtr` and more), the
+  `help`, `node` and `relay.orbtr.io` endpoints,
+  `github.com/ORBTR/app.orbtr.io/wasm/aether` (the browser) and
+  `github.com/ORBTR/constellation/domain/networking/remote_access/store`.
+- `github.com/ORBTR/orb/internal/mesh`: the local inference cluster's links.
+
+## Platforms and build
+
+Pure Go, no cgo. The UDP, QUIC, gRPC, NAT, relay, resume, migration and
+multipath packages and the Noise and TCP adapters build everywhere but js; in
+the browser (js/wasm) aether runs over the `websocket` package's `syscall/js`
+WebSocket transport. The module's `go` directive is 1.25.0. Releases are cut
+by release-please from conventional commits, and each tag publishes the API
+reference to GitHub Pages.
+
+## Licence
+
+[Elastic License 2.0](LICENSE). Copyright 2026 ORBTR Pty Ltd.
 
 **Patent Pledge**: ORBTR Pty Ltd, the copyright holder of Aether, commits not to assert any patents it holds or acquires covering Aether against users complying with the licence's terms.
+
+## Contributing
+
+[AGENTS.md](AGENTS.md) holds the repository's two rules, for people and coding
+agents alike: no temporary documents in the repository, and conventional commit
+messages that stand on their own. [CLAUDE.md](CLAUDE.md) imports it for Claude
+Code.
