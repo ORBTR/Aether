@@ -31,6 +31,11 @@ message AuthenticatedPrincipal {
   repeated ScopeAxis axes = 2;
   repeated string scopes = 3;
   string partitionId = 4;
+
+  // Names no field of this message takes: each is the JSON name protojson reads
+  // for a meaning this message carries in no field, so a field given one would be
+  // read with that meaning from a sender that writes it.
+  reserved "platformTenantId", "customerOrgId", "userId", "partition";
 }
 
 // RPCRequest represents a direct RPC call over the mesh network.
