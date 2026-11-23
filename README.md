@@ -3,7 +3,7 @@
 > *Write your networking stack once, run it everywhere — without giving up transport-level control.*
 
 [![Go](https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go)](https://go.dev)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: ELv2](https://img.shields.io/badge/License-ELv2-blue.svg)](LICENSE)
 
 A protocol and wire format that standardises communication between application and transport layers, allowing systems to operate across layers 7 to 4 with minimal translation overhead and without losing core capabilities.
 
@@ -218,6 +218,6 @@ layout := aether.StreamLayout{
 
 ## License
 
-[MIT](LICENSE)
+[Elastic License 2.0](LICENSE)
 
-**Patent Pledge**: I, Brandon Miller-Mumford, sole copyright holder of Aether, commit to not assert any patents I hold or acquire covering Aether against users complying with the licence's terms.
+**Patent Pledge**: ORBTR Pty Ltd, the copyright holder of Aether, commits not to assert any patents it holds or acquires covering Aether against users complying with the licence's terms.
