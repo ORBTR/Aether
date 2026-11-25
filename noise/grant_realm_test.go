@@ -82,7 +82,7 @@ func TestGrantRealm_PrologueBindsEachField(t *testing.T) {
 // grantPair runs one DialOverConn with ticket and dialRealm against an
 // AcceptOverConn under cfg over a net.Pipe, closing the dialer's end on a
 // failed dial so the accepter returns, and reports both ends.
-func grantPair(t *testing.T, cfg AcceptConnConfig, priv, pub, ticket []byte, dialRealm func([]byte) (GrantRealm, error)) (dialed, accepted aether.Connection, dialErr, acceptErr error, dialWrites int) {
+func grantPair(t *testing.T, cfg AcceptConnConfig, priv, pub, ticket []byte, dialRealm func([]byte) (GrantRealm, error)) (dialed, accepted aether.Connection, dialWrites int, dialErr, acceptErr error) {
 	t.Helper()
 	clientConn, serverConn := net.Pipe()
 	t.Cleanup(func() { _ = clientConn.Close(); _ = serverConn.Close() })
@@ -107,7 +107,7 @@ func grantPair(t *testing.T, cfg AcceptConnConfig, priv, pub, ticket []byte, dia
 		_ = clientConn.Close()
 	}
 	wg.Wait()
-	return dialed, accepted, dialErr, acceptErr, counted.count()
+	return dialed, accepted, counted.count(), dialErr, acceptErr
 }
 
 // TestOverConn_GrantRealmBoundOnBothEnds: with a grant on the dial and a
@@ -121,12 +121,20 @@ func TestOverConn_GrantRealmBoundOnBothEnds(t *testing.T) {
 	cfg := bindingAcceptConfig(t, signerPub, NewTicketNonceCache(16))
 	browserPriv, browserPub := newTestKeypair(t)
 	ticket := grantTicket(t, signerPriv, browserPub, []byte("nonce-0123456789"), time.Now().Add(time.Minute))
-	dialed, accepted, dialErr, acceptErr, _ := grantPair(t, cfg, browserPriv, browserPub, ticket, realmFromGrant)
+	dialed, accepted, _, dialErr, acceptErr := grantPair(t, cfg, browserPriv, browserPub, ticket, realmFromGrant)
 	if dialErr != nil || acceptErr != nil {
 		t.Fatalf("dial %v accept %v", dialErr, acceptErr)
 	}
-	defer dialed.Close()
-	defer accepted.Close()
+	defer func() {
+		if err := dialed.Close(); err != nil {
+			t.Errorf("dialed.Close: %v", err)
+		}
+	}()
+	defer func() {
+		if err := accepted.Close(); err != nil {
+			t.Errorf("accepted.Close: %v", err)
+		}
+	}()
 	want, err := GrantRealm{Partition: "partition-A", Target: "vl1_bob"}.ID()
 	if err != nil {
 		t.Fatalf("realm id: %v", err)
@@ -158,7 +166,7 @@ func TestOverConn_GrantRealmMismatchFailsBeforeAnyStream(t *testing.T) {
 		g.Target = "vl1_someone_else"
 		return g, err
 	}
-	dialed, accepted, dialErr, acceptErr, writes := grantPair(t, cfg, browserPriv, browserPub, ticket, otherTarget)
+	dialed, accepted, writes, dialErr, acceptErr := grantPair(t, cfg, browserPriv, browserPub, ticket, otherTarget)
 	if dialed != nil || accepted != nil {
 		t.Fatalf("a connection exists after a realm mismatch (dialed=%v accepted=%v)", dialed != nil, accepted != nil)
 	}
@@ -172,7 +180,7 @@ func TestOverConn_GrantRealmMismatchFailsBeforeAnyStream(t *testing.T) {
 		t.Fatalf("dialer wrote %d frames, want only msg1 (no msg3 after a refused msg2)", writes)
 	}
 	// The grant was not spent by the mismatched dial.
-	if _, accepted, dialErr, acceptErr, _ := grantPair(t, cfg, browserPriv, browserPub, ticket, realmFromGrant); dialErr != nil || acceptErr != nil {
+	if _, accepted, _, dialErr, acceptErr := grantPair(t, cfg, browserPriv, browserPub, ticket, realmFromGrant); dialErr != nil || acceptErr != nil {
 		t.Fatalf("the grant after a mismatched dial: dial %v accept %v", dialErr, acceptErr)
 	} else {
 		_ = accepted.Close()
@@ -230,8 +238,16 @@ func TestOverConn_AccepterRefusesAGrantItReadsNoRealmFrom(t *testing.T) {
 			cfg.GrantRealmFn = reader
 			ticket := grantTicket(t, signerPriv, browserPub, []byte("nonce-0123456789"), time.Now().Add(time.Minute))
 			clientConn, serverConn := net.Pipe()
-			defer clientConn.Close()
-			defer serverConn.Close()
+			defer func() {
+				if err := clientConn.Close(); err != nil {
+					t.Errorf("clientConn.Close: %v", err)
+				}
+			}()
+			defer func() {
+				if err := serverConn.Close(); err != nil {
+					t.Errorf("serverConn.Close: %v", err)
+				}
+			}()
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 			counted := &writeCountConn{Conn: serverConn}

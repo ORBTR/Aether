@@ -411,3 +411,12 @@ func (g *sendGate) acquire(ctx context.Context) error {
 
 // release frees the gate acquire took.
 func (g *sendGate) release() { <-g.slot }
+
+// recordStreamEvent applies a lifecycle event to a stream's state. Transition
+// refuses an event that does not fit the state it finds and leaves the state
+// as it was: the state already records a later point in the stream's life
+// (a second Close after the first, a peer CLOSE after a RESET), which is what
+// CanSend, CanReceive, IsOpen and State go on reporting to Send and to the
+// adapters' own checks. The refusal reports no failure of the caller's work,
+// so it is dropped.
+func recordStreamEvent(sm *aether.StreamStateMachine, ev aether.StreamEvent) { _ = sm.Transition(ev) }

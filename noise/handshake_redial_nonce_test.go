@@ -73,7 +73,11 @@ func TestRedialAfterLostMsg2_ResponseCarriesCurrentNonce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("responder listen: %v", err)
 	}
-	defer respListener.Close()
+	defer func() {
+		if err := respListener.Close(); err != nil {
+			t.Errorf("respListener.Close: %v", err)
+		}
+	}()
 	respAddr := respListener.Addr().(*net.UDPAddr)
 
 	// Raw-socket initiator: full control over the dial nonce per attempt.
@@ -81,7 +85,11 @@ func TestRedialAfterLostMsg2_ResponseCarriesCurrentNonce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client listen: %v", err)
 	}
-	defer cli.Close()
+	defer func() {
+		if err := cli.Close(); err != nil {
+			t.Errorf("cli.Close: %v", err)
+		}
+	}()
 
 	km, err := transportCrypto.NewNetworkKeyManager([]string{testNetKey})
 	if err != nil {

@@ -493,8 +493,7 @@ func TestV1BackwardCompatUnmarshal(t *testing.T) {
 	// Manually build a v1-sized payload (strip scopeID from marshal output)
 	v1Data := make([]byte, ticketMinSizeV1)
 	copy(v1Data[:TicketNonceSize], original.Nonce[:])
-	var expBuf [8]byte
-	expBuf = [8]byte{}
+	expBuf := [8]byte{}
 	_ = expBuf
 	fullData := original.Marshal()
 	// Copy nonce + expiry + nodeID + targetID from full marshal

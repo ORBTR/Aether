@@ -42,10 +42,15 @@ func (s *QuicSession) Send(ctx context.Context, payload []byte) error {
 	if err != nil {
 		return err
 	}
-	defer stream.Close()
 
-	_, err = stream.Write(payload)
-	return err
+	if _, err := stream.Write(payload); err != nil {
+		// The write's error is the send's; the close only releases the stream.
+		_ = stream.Close()
+		return err
+	}
+	// Close sends the stream's FIN, which ends the payload for the peer's
+	// Receive, so its error is the send's too.
+	return stream.Close()
 }
 
 // Receive waits for a payload by accepting a unidirectional stream.

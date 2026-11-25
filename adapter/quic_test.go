@@ -81,7 +81,7 @@ func registerAEH01Stream(sess *QUICSession, id uint64, qs quic.Stream) *quicStre
 		state:      aether.NewStreamStateMachine(),
 		session:    sess,
 	}
-	st.state.Transition(aether.EventSendOpen)
+	recordStreamEvent(st.state, aether.EventSendOpen)
 	sess.mu.Lock()
 	sess.streams[id] = st
 	sess.mu.Unlock()

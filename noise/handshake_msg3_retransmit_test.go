@@ -206,7 +206,11 @@ func TestHandshakeMsg3Retransmit_SurvivesLoss(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client listen: %v", err)
 	}
-	defer cliListener.Close()
+	defer func() {
+		if err := cliListener.Close(); err != nil {
+			t.Errorf("cliListener.Close: %v", err)
+		}
+	}()
 
 	dialCtx, dialCancel := context.WithTimeout(ctx, 8*time.Second)
 	defer dialCancel()
@@ -218,7 +222,11 @@ func TestHandshakeMsg3Retransmit_SurvivesLoss(t *testing.T) {
 		t.Fatalf("dial did not complete (shim answers msg1+msg2, so the handshake "+
 			"should reach msg3): %v", derr)
 	}
-	defer sess.Close()
+	defer func() {
+		if err := sess.Close(); err != nil {
+			t.Errorf("sess.Close: %v", err)
+		}
+	}()
 
 	// The initiator believes it is connected. The responder never saw msg3, so
 	// unless msg3 is retransmitted this session is half-open and will be reaped

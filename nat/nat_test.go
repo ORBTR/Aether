@@ -5,6 +5,7 @@
 package nat
 
 import (
+	"context"
 	"crypto/ed25519"
 	"net"
 	"testing"
@@ -114,13 +115,13 @@ func TestPredictPorts(t *testing.T) {
 
 func TestNullPortMapper_AlwaysFails(t *testing.T) {
 	pm := NullPortMapper{}
-	if _, err := pm.Discover(nil); err != ErrNoGateway {
+	if _, err := pm.Discover(context.Background()); err != ErrNoGateway {
 		t.Errorf("Discover: %v, want ErrNoGateway", err)
 	}
-	if _, err := pm.RequestMapping(nil, MappingRequest{}); err != ErrNoGateway {
+	if _, err := pm.RequestMapping(context.Background(), MappingRequest{}); err != ErrNoGateway {
 		t.Errorf("RequestMapping: %v, want ErrNoGateway", err)
 	}
-	if err := pm.ReleaseMapping(nil, nil); err != nil {
+	if err := pm.ReleaseMapping(context.Background(), nil); err != nil {
 		t.Errorf("ReleaseMapping: %v, want nil", err)
 	}
 }

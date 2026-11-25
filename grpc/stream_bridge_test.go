@@ -69,7 +69,11 @@ func TestGrpcServer_StreamBridgeDeadlines(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("no incoming session within 3s")
 	}
-	defer conn.Close()
+	defer func(check func() error) {
+		if err := check(); err != nil {
+			t.Errorf("conn.Close: %v", err)
+		}
+	}(conn.Close)
 
 	buf := make([]byte, 64)
 	if n, err := conn.Read(buf); err != nil || string(buf[:n]) != "hello" {
@@ -183,7 +187,11 @@ func TestGrpcServer_StreamBridgeHalfClose(t *testing.T) {
 	defer cleanup()
 	stream, cancel, conn := openBridge(t, serverT, cc, serverNodeID)
 	defer cancel()
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			t.Errorf("conn.Close: %v", err)
+		}
+	}()
 
 	// Set before CloseSend, while both halves are open, so the Read below
 	// is bounded whichever way the half-close races this call.
@@ -242,7 +250,11 @@ func TestGrpcServer_StreamBridgeWriteDeadlineAfterHalfClose(t *testing.T) {
 	defer cleanup()
 	stream, cancel, conn := openBridge(t, serverT, cc, serverNodeID)
 	defer cancel()
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			t.Errorf("conn.Close: %v", err)
+		}
+	}()
 
 	if err := conn.SetReadDeadline(time.Now().Add(bridgeHangBound)); err != nil {
 		t.Fatalf("SetReadDeadline on the open bridge: %v", err)
@@ -364,7 +376,11 @@ func TestGrpcServer_StreamBridgeEndsBothDirectionsOnStreamError(t *testing.T) {
 	cc, cleanup := newBufconnServer(t, serverT)
 	defer cleanup()
 	_, cancel, conn := openBridge(t, serverT, cc, serverNodeID)
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			t.Errorf("conn.Close: %v", err)
+		}
+	}()
 
 	// Set before the cancel, while both halves are open, so the Read below
 	// is bounded whichever way the stream's end races this call.

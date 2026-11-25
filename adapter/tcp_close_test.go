@@ -451,10 +451,22 @@ func TestTCPSession_RunsNoAetherCredit(t *testing.T) {
 		Throttle() *aether.CongestionThrottle
 	}
 	wsClient, wsServer := net.Pipe()
-	defer wsClient.Close()
-	defer wsServer.Close()
+	defer func() {
+		if err := wsClient.Close(); err != nil {
+			t.Errorf("wsClient.Close: %v", err)
+		}
+	}()
+	defer func() {
+		if err := wsServer.Close(); err != nil {
+			t.Errorf("wsServer.Close: %v", err)
+		}
+	}()
 	ws := NewWebSocketSession(wsClient, "vl1_lite_a", "vl1_lite_b", aether.DefaultSessionOptions())
-	defer ws.Close()
+	defer func() {
+		if err := ws.Close(); err != nil {
+			t.Errorf("ws.Close: %v", err)
+		}
+	}()
 	for name, sess := range map[string]any{"tcp": p.sess, "websocket": ws} {
 		if _, ok := sess.(throttled); ok {
 			t.Errorf("%s session exposes Throttle", name)

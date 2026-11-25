@@ -8,6 +8,7 @@ package noise
 
 import (
 	"context"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -45,12 +46,20 @@ func TestNoiseConn_ReportsTheRealmItsHandshakeBound(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer c.Close()
+	defer func() {
+		if err := c.Close(); err != nil {
+			t.Errorf("c.Close: %v", err)
+		}
+	}()
 	s, ok := <-accepted
 	if !ok {
 		t.Fatalf("server accepted nothing")
 	}
-	defer s.Close()
+	defer func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("s.Close: %v", err)
+		}
+	}()
 	want := transportCrypto.CRC32Hash([]byte(wvTestNetKey))
 	for name, conn := range map[string]aether.Connection{"dialer": c, "accepter": s} {
 		id, bound := realmOn(t, conn)
@@ -68,8 +77,16 @@ func TestOverConn_WithoutGrantBindsNoRealm(t *testing.T) {
 	if dialErr != nil || acceptErr != nil {
 		t.Fatalf("over-conn pair: dial %v accept %v", dialErr, acceptErr)
 	}
-	defer dialed.Close()
-	defer accepted.Close()
+	defer func() {
+		if err := dialed.Close(); err != nil {
+			t.Errorf("dialed.Close: %v", err)
+		}
+	}()
+	defer func() {
+		if err := accepted.Close(); err != nil {
+			t.Errorf("accepted.Close: %v", err)
+		}
+	}()
 	for name, conn := range map[string]aether.Connection{"dialer": dialed, "accepter": accepted} {
 		if id, bound := realmOn(t, conn); bound {
 			t.Fatalf("%s over-conn without a grant reports realm %08x", name, id)
@@ -152,12 +169,21 @@ func TestResume_InitiatorResumedConnBindsTheMaterialsRealm(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer respSock.Close()
+	defer func() {
+		if err := respSock.Close(); err != nil {
+			t.Errorf("respSock.Close: %v", err)
+		}
+	}()
 	iniSock, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer iniSock.Close()
+	defer func() {
+		// A socket closed already (net.ErrClosed) is the end this test wants.
+		if err := iniSock.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("iniSock.Close: %v", err)
+		}
+	}()
 	l := &noiseListener{
 		transport: resp,
 		conn:      respSock,
@@ -177,13 +203,21 @@ func TestResume_InitiatorResumedConnBindsTheMaterialsRealm(t *testing.T) {
 	if err != nil || nc == nil {
 		t.Fatalf("resume: conn %v, %v", nc != nil, err)
 	}
-	defer nc.Close()
+	defer func() {
+		if err := nc.Close(); err != nil {
+			t.Errorf("nc.Close: %v", err)
+		}
+	}()
 	if id, bound := nc.RealmID(); !bound || id != key.id {
 		t.Fatalf("resumed initiator conn reports realm %08x, %v; want %08x", id, bound, key.id)
 	}
 	select {
 	case in := <-l.incoming:
-		defer in.Session.Close()
+		defer func() {
+			if err := in.Session.Close(); err != nil {
+				t.Errorf("in.Session.Close: %v", err)
+			}
+		}()
 		if id, bound := realmOn(t, in.Session); !bound || id != key.id {
 			t.Fatalf("resumed responder conn reports realm %08x, %v; want %08x", id, bound, key.id)
 		}

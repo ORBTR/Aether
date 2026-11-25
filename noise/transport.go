@@ -13,12 +13,12 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	aether "github.com/ORBTR/aether"
-	vl1 "github.com/ORBTR/aether"
 	transportCrypto "github.com/ORBTR/aether/crypto/identity"
 	"github.com/ORBTR/aether/relay"
 )
@@ -364,7 +364,7 @@ func NewNoiseTransport(cfg NoiseTransportConfig) (*NoiseTransport, error) {
 	}
 	inboxSize := cfg.InboxSize
 	if inboxSize <= 0 {
-		inboxSize = vl1.DefaultInboxSize
+		inboxSize = aether.DefaultInboxSize
 	}
 
 	t := &NoiseTransport{
@@ -489,7 +489,7 @@ func (t *NoiseTransport) Dial(ctx context.Context, target aether.Target) (aether
 		return nil, fmt.Errorf("noise: listener not started (call Listen before Dial)")
 	}
 
-	path := vl1.Path{
+	path := aether.Path{
 		Address: addr,
 		NodeID:  target.NodeID,
 	}
@@ -547,7 +547,11 @@ func (t *NoiseTransport) Listen(ctx context.Context) (aether.Listener, error) {
 		_, portStr, _ := net.SplitHostPort(addrStr)
 		port := 0
 		if portStr != "" {
-			fmt.Sscanf(portStr, "%d", &port)
+			p, err := strconv.Atoi(portStr)
+			if err != nil {
+				return nil, fmt.Errorf("listen address %s: port: %w", addrStr, err)
+			}
+			port = p
 		}
 		ipv4Addr, ipv6Addr = t.bindResolver.ResolveUDPBindDualStack(port)
 		if ipv4Addr == "" && ipv6Addr == "" {
@@ -608,7 +612,7 @@ func (t *NoiseTransport) Listen(ctx context.Context) (aether.Listener, error) {
 	if ipv6Addr != "" {
 		ipv6UDPAddr, err := net.ResolveUDPAddr("udp6", ipv6Addr)
 		if err != nil {
-			primaryConn.Close()
+			closeAbandoned(primaryConn)
 			return nil, fmt.Errorf("resolve IPv6 bind %s: %w", ipv6Addr, err)
 		}
 		ipv6Conn, err := net.ListenUDP("udp6", ipv6UDPAddr)

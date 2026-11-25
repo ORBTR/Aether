@@ -35,7 +35,11 @@ func TestDialResponseNotSwallowedByStaleSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer lconn.Close()
+	defer func() {
+		if err := lconn.Close(); err != nil {
+			t.Errorf("lconn.Close: %v", err)
+		}
+	}()
 
 	tr := newTestTransport()
 	tr.maxPacket = 2048
@@ -51,7 +55,11 @@ func TestDialResponseNotSwallowedByStaleSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sender listen: %v", err)
 	}
-	defer sconn.Close()
+	defer func() {
+		if err := sconn.Close(); err != nil {
+			t.Errorf("sconn.Close: %v", err)
+		}
+	}()
 	senderKey := sconn.LocalAddr().String()
 
 	// Session mapped at the sender's addr carrying REAL cipher state, so

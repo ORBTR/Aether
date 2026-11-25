@@ -1063,7 +1063,7 @@ func (st *noiseStream) recordReceive(n int64) {
 // It returns an error only for a session that has closed, and nil when the CLOSE
 // is queued or waits on an ACK or a Send in progress.
 func (st *noiseStream) Close() error {
-	st.state.Transition(aether.EventSendFIN)
+	recordStreamEvent(st.state, aether.EventSendFIN)
 	st.closeWanted.Store(true)
 	return st.finishSend()
 }
@@ -1308,7 +1308,7 @@ func (st *noiseStream) Reset(reason aether.ResetReason) error {
 		st.session.grantConnCredit(st.recvQ.releaseCharge())
 		return nil
 	}
-	st.state.Transition(aether.EventSendReset)
+	recordStreamEvent(st.state, aether.EventSendReset)
 	// The RESET ends the send side: no CLOSE follows it (finishSend).
 	st.closeSent.Store(true)
 	st.closeDone.Store(true)

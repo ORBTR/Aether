@@ -54,7 +54,11 @@ func TestPunchProbe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("peer socket: %v", err)
 	}
-	defer peer.Close()
+	defer func() {
+		if err := peer.Close(); err != nil {
+			t.Errorf("peer.Close: %v", err)
+		}
+	}()
 	peerAddr := peer.LocalAddr().(*net.UDPAddr)
 
 	if err := tr.PunchProbe(ctx, peerAddr); err != nil {

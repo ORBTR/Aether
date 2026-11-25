@@ -138,7 +138,8 @@ func (c *CUBICController) OnAckWithPipe(ackedBytes int64, rtt time.Duration, pip
 		}
 		t := time.Since(c.tEpoch).Seconds()
 		k := math.Cbrt((c.wMax / mss) * (1 - cubicBeta) / cubicC)
-		wCubic := mss*cubicC*math.Pow(t-k, 3) + c.wMax
+		d := t - k
+		wCubic := mss*cubicC*d*d*d + c.wMax
 
 		// TCP-friendly estimate: per-ACK additive increase (RFC 8312 §4.2).
 		// W_est increases by alpha_aimd·MSS·ackedBytes/cwnd per ACK. Without

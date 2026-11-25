@@ -55,7 +55,7 @@ func (ft *frameTally) read(conn net.Conn, rx *aether.Compressor, until time.Time
 		ft.mu.Lock()
 		if err != nil {
 			var ne net.Error
-			if !(errors.As(err, &ne) && ne.Timeout()) {
+			if !errors.As(err, &ne) || !ne.Timeout() {
 				ft.err = err
 			}
 			ft.mu.Unlock()

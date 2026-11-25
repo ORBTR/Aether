@@ -340,7 +340,9 @@ func (t *NoiseTransport) tryResumeDial(ctx interface{}, target aether.Target, ud
 	if err := udp.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		return nil, err
 	}
-	defer udp.SetReadDeadline(time.Time{})
+	// SetReadDeadline fails only on a closed socket, which no later read can
+	// use, so the clear's error is dropped.
+	defer func() { _ = udp.SetReadDeadline(time.Time{}) }()
 	n, src, err := udp.ReadFromUDP(readBuf)
 	if err != nil {
 		return nil, fmt.Errorf("resume: read: %w", err)
@@ -576,7 +578,7 @@ func (l *noiseListener) handleResumePacket(ctx context.Context, conn *net.UDPCon
 	// Deliver to the incoming-session channel so the application layer
 	// sees the resumed session just like any XK/XX-established one.
 	s := aether.NewConnection(l.transport.localNode, ticket.PeerID, nc, aether.ProtoNoise)
-	s.OnClose(func() { nc.Close() })
+	s.OnClose(func() { closeAbandoned(nc) })
 	// The hand-off to Accept runs off this read loop (handOffSession): a wait
 	// on a full Accept queue here would hold every datagram of the socket.
 	go l.handOffSession(ctx.Done(), s, nc)

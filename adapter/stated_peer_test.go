@@ -176,7 +176,7 @@ func TestNewSessionForStatedPeer_EveryAdapterKeepsItsPeerLedgersToItself(t *test
 			peer := aether.NodeID("vl1_stated_factory_" + proto.String())
 			build := func(f func(net.Conn, aether.Protocol, aether.NodeID, aether.NodeID, aether.SessionOptions) (aether.Session, error)) aether.Session {
 				c, s := net.Pipe()
-				var conn net.Conn = c
+				conn := c
 				if proto == aether.ProtoNoise {
 					conn = realmConn{Conn: c, chosen: chosen}
 				}

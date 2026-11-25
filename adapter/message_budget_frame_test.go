@@ -74,7 +74,7 @@ func TestRAWBudgetIsStrictlySmallestAndForcesFragmentation(t *testing.T) {
 	raw := MaxAppMessageBudget(aether.ClassRAW)
 	proxy := MaxAppMessageBudget(aether.ClassPROXY)
 	stream := MaxAppMessageBudget(aether.ClassSTREAM)
-	if !(raw < proxy && proxy < stream) {
+	if raw >= proxy || proxy >= stream {
 		t.Fatalf("class budgets not strictly ordered RAW<PROXY<STREAM: %d, %d, %d", raw, proxy, stream)
 	}
 	// A STREAM-budget-sized payload must fragment when carved to the RAW frame.

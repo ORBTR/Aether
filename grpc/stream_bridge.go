@@ -71,7 +71,8 @@ func (s *transportServer) Stream(stream pb.TransportService_StreamServer) error 
 	// Pump: outPump → gRPC stream send (so the session's writes reach remote)
 	go func() {
 		defer close(conn.sendDone)
-		defer outPump.Close()
+		// outPump is a net.Pipe end, whose Close answers nil.
+		defer func() { _ = outPump.Close() }()
 		buf := make([]byte, 65536)
 		for {
 			n, err := outPump.Read(buf)
@@ -85,7 +86,9 @@ func (s *transportServer) Stream(stream pb.TransportService_StreamServer) error 
 	}()
 
 	session := aether.NewConnection(s.transport.localNode, nodeID, conn, aether.ProtoGRPC)
-	session.OnClose(func() { conn.Close() })
+	// The session has ended when OnClose runs, and the bridge conn's close has
+	// no caller left to report to, so its error is dropped.
+	session.OnClose(func() { _ = conn.Close() })
 
 	select {
 	case s.transport.incoming <- aether.IncomingSession{Session: session}:

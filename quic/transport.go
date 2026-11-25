@@ -262,17 +262,19 @@ func (l *QuicListener) Accept(ctx context.Context) (aether.Connection, error) {
 	// Extract NodeID from peer certificate
 	cs := conn.ConnectionState().TLS
 	if len(cs.PeerCertificates) == 0 {
-		conn.CloseWithError(0, "no certificate")
+		// quic-go's CloseWithError answers nil; the refused connection is
+		// dropped and Accept goes on to the next.
+		_ = conn.CloseWithError(0, "no certificate")
 		return l.Accept(ctx) // Try next
 	}
 	pubKey, ok := cs.PeerCertificates[0].PublicKey.(ed25519.PublicKey)
 	if !ok {
-		conn.CloseWithError(0, "invalid key type")
+		_ = conn.CloseWithError(0, "invalid key type")
 		return l.Accept(ctx)
 	}
 	remoteNodeID, err := aether.NewNodeID(pubKey)
 	if err != nil {
-		conn.CloseWithError(0, "invalid node id")
+		_ = conn.CloseWithError(0, "invalid node id")
 		return l.Accept(ctx)
 	}
 

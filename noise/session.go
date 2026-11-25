@@ -16,19 +16,18 @@ import (
 	"time"
 
 	aether "github.com/ORBTR/aether"
-	vl1 "github.com/ORBTR/aether"
 	transportHealth "github.com/ORBTR/aether/health"
 	"github.com/flynn/noise"
 )
 
 func newNoiseConnDial(conn *net.UDPConn, remote *net.UDPAddr, remoteNode aether.NodeID, send, recv *noise.CipherState, maxPacket int, nt *NoiseTransport) *noiseConn {
-	cfg := vl1.DefaultSessionConfig()
+	cfg := aether.DefaultSessionConfig()
 	inboxSize := cfg.InboxSize
 	if nt != nil && nt.inboxSize > 0 {
 		inboxSize = nt.inboxSize
 	}
 	if inboxSize <= 0 {
-		inboxSize = vl1.DefaultInboxSize
+		inboxSize = aether.DefaultInboxSize
 	}
 	nc := &noiseConn{
 		conn:       conn,
@@ -53,13 +52,13 @@ func newNoiseConnDial(conn *net.UDPConn, remote *net.UDPAddr, remoteNode aether.
 
 func newNoiseConnListener(ptr *noiseListener, send, recv *noise.CipherState, remote *net.UDPAddr, remoteNode aether.NodeID, remoteIdentity ed25519.PublicKey) *noiseConn {
 	udpConn := ptr.connFor(remote)
-	cfg := vl1.DefaultSessionConfig()
+	cfg := aether.DefaultSessionConfig()
 	inboxSize := cfg.InboxSize
 	if ptr.transport != nil && ptr.transport.inboxSize > 0 {
 		inboxSize = ptr.transport.inboxSize
 	}
 	if inboxSize <= 0 {
-		inboxSize = vl1.DefaultInboxSize
+		inboxSize = aether.DefaultInboxSize
 	}
 	nc := &noiseConn{
 		conn:           udpConn,
@@ -172,13 +171,21 @@ func (l *noiseListener) handOffSession(cancel <-chan struct{}, s aether.Connecti
 	select {
 	case l.incoming <- aether.IncomingSession{Session: s, Reader: nc, Writer: nc}:
 	case <-l.closed:
-		nc.Close()
+		closeAbandoned(nc)
 	case <-cancel:
-		nc.Close()
+		closeAbandoned(nc)
 	case <-time.After(acceptHandoffTimeout):
-		nc.Close()
+		closeAbandoned(nc)
 	}
 }
+
+// closeAbandoned closes a connection this package gives up on: a dial or an
+// inbound that lost the simultaneous-dial tie-break, an existing session it
+// displaced, a hand-off nobody took (handOffSession), a listener whose second
+// socket failed to open, or a session's conn once the session has ended
+// (OnClose). The caller has chosen the outcome already and returns or logs the
+// error that decided it, so the close error has nothing to change.
+func closeAbandoned(c io.Closer) { _ = c.Close() }
 
 // Close stops listening.
 func (l *noiseListener) Close() error {
@@ -497,11 +504,10 @@ func (l *noiseListener) dispatchToPendingDial(msg []byte) bool {
 	if len(msg) < 1+dialNonceLen || msg[0] != dialNoncePrefix {
 		return false
 	}
-	nonceKey := string(msg[1 : 1+dialNonceLen])
 	payload := msg[1+dialNonceLen:]
 
 	l.mu.Lock()
-	ch := l.pendingDials[nonceKey]
+	ch := l.pendingDials[string(msg[1:1+dialNonceLen])]
 	l.mu.Unlock()
 	if ch == nil {
 		return false

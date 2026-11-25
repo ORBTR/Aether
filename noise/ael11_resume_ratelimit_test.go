@@ -59,7 +59,11 @@ func TestAEL11_ResumePathIsRateLimited(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer lc.Close()
+	defer func() {
+		if err := lc.Close(); err != nil {
+			t.Errorf("lc.Close: %v", err)
+		}
+	}()
 	srvAddr := lc.LocalAddr().(*net.UDPAddr)
 
 	l := &noiseListener{transport: tr, conn: lc}
@@ -72,7 +76,11 @@ func TestAEL11_ResumePathIsRateLimited(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer client.Close()
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Errorf("client.Close: %v", err)
+		}
+	}()
 
 	// 0xFA prefix + junk. Junk fails any ticket decode -> no session created.
 	garbage := make([]byte, 33)

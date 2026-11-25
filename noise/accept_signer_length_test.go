@@ -26,8 +26,16 @@ func TestAcceptOverConn_RefusesATicketSignerOfTheWrongLength(t *testing.T) {
 			priv, pub := newTestKeypair(t)
 			dPriv, dPub := newTestKeypair(t)
 			clientConn, serverConn := net.Pipe()
-			defer clientConn.Close()
-			defer serverConn.Close()
+			defer func() {
+				if err := clientConn.Close(); err != nil {
+					t.Errorf("clientConn.Close: %v", err)
+				}
+			}()
+			defer func() {
+				if err := serverConn.Close(); err != nil {
+					t.Errorf("serverConn.Close: %v", err)
+				}
+			}()
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 

@@ -96,7 +96,7 @@ func (t *NoiseTransport) performInitiatorHandshakeSharedAttempt(ctx context.Cont
 	// Build packet: [CRC32 fingerprint][pattern flag][noise msg1]
 	fpBuf := make([]byte, 4)
 	binary.BigEndian.PutUint32(fpBuf, fingerprint)
-	var patFlag byte = patternFlagXX
+	var patFlag = patternFlagXX
 	if cachedPeerKey != nil {
 		patFlag = patternFlagXK
 	}
@@ -388,7 +388,7 @@ recvLoop:
 			// Close this outbound loser.
 			dbgHandshake.Printf("simultaneous-dial: closing outbound to %s (local %s >= remote, existing alive)",
 				remoteNode.Short(), t.localNode.Short())
-			nc.Close()
+			closeAbandoned(nc)
 			return nil, aether.WrapOp("dial", aether.ProtoNoise, remoteNode,
 				fmt.Errorf("simultaneous-dial: local NodeID is the preferred responder; existing inbound wins"))
 		}
@@ -396,7 +396,7 @@ recvLoop:
 		// this outbound wins. Close the displaced/dead existing asynchronously.
 		dbgHandshake.Printf("simultaneous-dial: displacing existing inbound for %s (dead=%v, local %s)",
 			remoteNode.Short(), existingDead, t.localNode.Short())
-		go existing.Close()
+		go closeAbandoned(existing)
 	}
 
 	// Register in listener's session map so subsequent packets are dispatched correctly
@@ -404,7 +404,7 @@ recvLoop:
 
 	// No separate runReader — the listener's run() loop handles all incoming packets
 	s := aether.NewConnection(t.localNode, remoteNode, nc, aether.ProtoNoise)
-	s.OnClose(func() { nc.Close() })
+	s.OnClose(func() { closeAbandoned(nc) })
 	return s, nil
 }
 
@@ -910,7 +910,7 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 				remoteNode.Short(), l.transport.localNode.Short())
 			delete(l.handshakes, key)
 			l.mu.Unlock()
-			nc.Close()
+			closeAbandoned(nc)
 			return
 		}
 		// Either the existing session is dead, or we are the higher NodeID:
@@ -918,7 +918,7 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 		// so it doesn't block our Put.
 		dbgHandshake.Printf("simultaneous-dial: displacing existing for %s (dead=%v, local %s)",
 			remoteNode.Short(), existingDead, l.transport.localNode.Short())
-		go existing.Close()
+		go closeAbandoned(existing)
 	}
 	l.sessions.Put(remoteNode, key, scopeID, &noiseConnSession{conn: nc, nodeID: remoteNode})
 	delete(l.handshakes, key)
@@ -980,7 +980,7 @@ func (l *noiseListener) handleHandshake(ctx context.Context, key string, addr *n
 
 	l.mu.Unlock()
 	s := aether.NewConnection(l.transport.localNode, remoteNode, nc, aether.ProtoNoise)
-	s.OnClose(func() { nc.Close() })
+	s.OnClose(func() { closeAbandoned(nc) })
 	// The hand-off to Accept runs off this read loop (handOffSession, which
 	// bounds the wait by acceptHandoffTimeout and closes the session when the
 	// listener ends or ctx ends): inline here, a full Accept queue would hold

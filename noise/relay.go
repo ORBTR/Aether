@@ -328,7 +328,7 @@ func (l *noiseListener) handleRelayedHandshake(relayConn *noiseConn, sourceNodeI
 	l.mu.Unlock()
 
 	s := aether.NewConnection(l.transport.localNode, remoteNode, nc, aether.ProtoNoise)
-	s.OnClose(func() { nc.Close() })
+	s.OnClose(func() { closeAbandoned(nc) })
 
 	// The hand-off to Accept runs off the relay conn's reader (handOffSession,
 	// which bounds the wait by acceptHandoffTimeout and closes the session when

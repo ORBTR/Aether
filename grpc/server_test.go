@@ -19,8 +19,10 @@ import (
 	"github.com/ORBTR/aether"
 	pb "github.com/ORBTR/aether/grpc/pb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 )
 
@@ -65,16 +67,21 @@ func newBufconnServer(t *testing.T, srv *GrpcTransport, extra ...grpc.DialOption
 	opts := append([]grpc.DialOption{
 		grpc.WithContextDialer(dialer),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
 	}, extra...)
-	cc, err := grpc.DialContext(context.Background(), "bufnet", opts...)
+	cc, err := grpc.NewClient("passthrough:///bufnet", opts...)
 	if err != nil {
 		t.Fatalf("dial bufconn: %v", err)
 	}
 	return cc, func() {
-		cc.Close()
+		// A test that ends the connection itself has closed cc already, and a
+		// second Close answers codes.Canceled.
+		if err := cc.Close(); err != nil && status.Code(err) != codes.Canceled {
+			t.Errorf("cc.Close: %v", err)
+		}
 		gs.Stop()
-		lis.Close()
+		if err := lis.Close(); err != nil {
+			t.Errorf("lis.Close: %v", err)
+		}
 	}
 }
 

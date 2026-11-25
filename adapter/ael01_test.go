@@ -30,13 +30,29 @@ import (
 // the rollback's delete.
 func TestAEL01_DuplicateStreamIDReturnsError(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
-	defer clientConn.Close()
-	defer serverConn.Close()
+	defer func() {
+		if err := clientConn.Close(); err != nil {
+			t.Errorf("clientConn.Close: %v", err)
+		}
+	}()
+	defer func() {
+		if err := serverConn.Close(); err != nil {
+			t.Errorf("serverConn.Close: %v", err)
+		}
+	}()
 
 	client := NewTCPSession(clientConn, "vl1_client", "vl1_server", aether.ProtoTCP, aether.DefaultSessionOptions())
 	server := NewTCPSession(serverConn, "vl1_server", "vl1_client", aether.ProtoTCP, aether.DefaultSessionOptions())
-	defer client.Close()
-	defer server.Close()
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Errorf("client.Close: %v", err)
+		}
+	}()
+	defer func() {
+		if err := server.Close(); err != nil {
+			t.Errorf("server.Close: %v", err)
+		}
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

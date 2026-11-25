@@ -75,7 +75,9 @@ func TestFrameEncryptor_TamperedPayload(t *testing.T) {
 		Payload: []byte("hello"),
 	}
 
-	enc.Encrypt(frame)
+	if err := enc.Encrypt(frame); err != nil {
+		t.Fatalf("enc.Encrypt: %v", err)
+	}
 
 	// Tamper with ciphertext
 	if len(frame.Payload) > 0 {
@@ -99,7 +101,9 @@ func TestFrameEncryptor_TamperedHeader(t *testing.T) {
 		Payload:  []byte("hello"),
 	}
 
-	enc.Encrypt(frame)
+	if err := enc.Encrypt(frame); err != nil {
+		t.Fatalf("enc.Encrypt: %v", err)
+	}
 
 	// Tamper with header (SenderID) — should fail AEAD auth
 	frame.SenderID[0] = 0x00
@@ -138,7 +142,9 @@ func TestFrameEncryptor_UniqueNonces(t *testing.T) {
 			Length:  1,
 			Payload: []byte{byte(i)},
 		}
-		enc.Encrypt(frame)
+		if err := enc.Encrypt(frame); err != nil {
+			t.Fatalf("enc.Encrypt: %v", err)
+		}
 		if nonces[frame.Nonce] {
 			t.Fatalf("duplicate nonce at iteration %d", i)
 		}

@@ -158,7 +158,9 @@ func TestPartitionRelayLimiter_Cleanup(t *testing.T) {
 
 	// Create state for two partitions
 	limiter.TrackRelayPair("scope-1", "A→B")
-	limiter.AllowRelay("scope-2") // creates state via getOrCreate
+	if err := limiter.AllowRelay("scope-2"); err != nil {
+		t.Fatalf("limiter.AllowRelay: %v", err)
+	} // creates state via getOrCreate
 
 	// scope-2 has no pairs, scope-1 has one
 	limiter.Cleanup()
@@ -276,11 +278,15 @@ func TestPartitionRelayLimiter_WFQRespectsWeights(t *testing.T) {
 	// "tiny" has 2 pairs (ratio 2/1 = 2.0 — 2× over its fair share).
 	// Total = 5 = cap. Next admission should evict from "tiny".
 	for _, k := range []string{"b1", "b2", "b3"} {
-		l.CheckRelayPair("big", k)
+		if err := l.CheckRelayPair("big", k); err != nil {
+			t.Fatalf("l.CheckRelayPair: %v", err)
+		}
 		l.TrackRelayPair("big", k)
 	}
 	for _, k := range []string{"t1", "t2"} {
-		l.CheckRelayPair("tiny", k)
+		if err := l.CheckRelayPair("tiny", k); err != nil {
+			t.Fatalf("l.CheckRelayPair: %v", err)
+		}
 		l.TrackRelayPair("tiny", k)
 	}
 

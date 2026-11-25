@@ -10,6 +10,8 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
+	"net"
 	"runtime"
 	"testing"
 	"time"
@@ -78,7 +80,9 @@ func TestNoiseRoundTrip(t *testing.T) {
 				if ctx.Err() == nil {
 					t.Logf("Server: Receive error: %v", err)
 				}
-				serverSession.Close()
+				if err := serverSession.Close(); err != nil {
+					t.Errorf("serverSession.Close: %v", err)
+				}
 				return
 			}
 			t.Logf("Server: received %d bytes: %q", len(data), data)
@@ -86,7 +90,9 @@ func TestNoiseRoundTrip(t *testing.T) {
 				if ctx.Err() == nil {
 					t.Logf("Server: Send error: %v", err)
 				}
-				serverSession.Close()
+				if err := serverSession.Close(); err != nil {
+					t.Errorf("serverSession.Close: %v", err)
+				}
 				return
 			}
 			t.Logf("Server: response sent to %s", serverSession.RemoteAddr())
@@ -108,7 +114,12 @@ func TestNoiseRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Client Listen failed: %v", err)
 	}
-	defer clientListener.Close()
+	defer func() {
+		// A socket closed already (net.ErrClosed) is the end this test wants.
+		if err := clientListener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("clientListener.Close: %v", err)
+		}
+	}()
 
 	// Allow listener goroutines to start processing before dialing.
 	// On Windows, UDP goroutine scheduling can be delayed.
@@ -134,7 +145,11 @@ func TestNoiseRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial failed after 3 attempts: %v", err)
 	}
-	defer clientSession.Close()
+	defer func(check func() error) {
+		if err := check(); err != nil {
+			t.Errorf("clientSession.Close: %v", err)
+		}
+	}(clientSession.Close)
 	t.Logf("Client: dial complete, local addr: %s", clientSession.(*aether.BaseConnection).Conn.LocalAddr())
 
 	// Wait for server to be ready
@@ -167,6 +182,8 @@ func TestNoiseRoundTrip(t *testing.T) {
 
 	// Clean shutdown: cancel context and wait for server goroutine
 	cancel()
-	listener.Close()
+	if err := listener.Close(); err != nil {
+		t.Fatalf("listener.Close: %v", err)
+	}
 	<-serverDone
 }

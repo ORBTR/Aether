@@ -44,7 +44,11 @@ func TestNoiseResponder_RefusesAnInitiatorOfferingOnlyTheEarlierFrameGrammar(t *
 			if err != nil {
 				t.Fatalf("listen: %v", err)
 			}
-			defer ln.Close()
+			defer func() {
+				if err := ln.Close(); err != nil {
+					t.Errorf("ln.Close: %v", err)
+				}
+			}()
 			h := newHandInitiator(t)
 			dst := ln.Addr().(*net.UDPAddr)
 			if err := h.run(dst, nodeInfoWithout(t, h.id, tc.offer)); err != nil {

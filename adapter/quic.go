@@ -137,7 +137,11 @@ func (s *QUICSession) exchangeWireVersions() {
 	chosen, err := s.readPreface()
 	if err != nil {
 		select {
-		case <-written:
+		case werr := <-written:
+			// The read's failure is the refusal; the write is awaited only so the
+			// peer can read this side's preface before the close, and its own
+			// failure changes nothing the refusal says.
+			_ = werr
 		case <-s.CloseSignal():
 		case <-time.After(s.prefaceTimeout):
 		}
@@ -148,7 +152,13 @@ func (s *QUICSession) exchangeWireVersions() {
 	// peer's readPreface takes the first one this side opens, so the preface's stream
 	// is opened before the exchange ends.
 	select {
-	case <-written:
+	case werr := <-written:
+		// A preface this side could not write is one the peer cannot read: the
+		// exchange refuses, as a failed read does above.
+		if werr != nil {
+			s.refuseWire(fmt.Errorf("wire versions preface: %w", werr))
+			return
+		}
 	case <-s.CloseSignal():
 		return
 	}
@@ -257,7 +267,7 @@ func (s *QUICSession) acceptLoop() {
 			state:   aether.NewStreamStateMachine(),
 			session: s,
 		}
-		st.state.Transition(aether.EventRecvOpen)
+		recordStreamEvent(st.state, aether.EventRecvOpen)
 
 		// An aether StreamID must be unique per live session. A second
 		// QUIC stream presenting an already-registered StreamID is a
@@ -352,7 +362,7 @@ func (s *QUICSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (
 	}
 
 	st.quicStream = qs
-	st.state.Transition(aether.EventSendOpen)
+	recordStreamEvent(st.state, aether.EventSendOpen)
 	return st, nil
 }
 
@@ -497,8 +507,7 @@ func (s *QUICSession) Close() error {
 	if s.acceptor != nil {
 		_ = s.acceptor.Close()
 	}
-	s.conn.CloseWithError(0, "session closed")
-	return nil
+	return s.conn.CloseWithError(0, "session closed")
 }
 
 func (s *QUICSession) SessionKey() []byte      { return nil } // QUIC handles encryption
@@ -700,14 +709,14 @@ func (st *quicStream) dropStream() {
 }
 
 func (st *quicStream) Close() error {
-	st.state.Transition(aether.EventSendFIN)
+	recordStreamEvent(st.state, aether.EventSendFIN)
 	err := st.quicStream.Close()
 	st.dropStream()
 	return err
 }
 
 func (st *quicStream) Reset(reason aether.ResetReason) error {
-	st.state.Transition(aether.EventSendReset)
+	recordStreamEvent(st.state, aether.EventSendReset)
 	st.quicStream.CancelRead(quic.StreamErrorCode(reason))
 	st.quicStream.CancelWrite(quic.StreamErrorCode(reason))
 	st.dropStream()

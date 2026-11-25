@@ -474,10 +474,7 @@ func (s *Scheduler) DequeueFrom() (*aether.Frame, bool, Registration) {
 	}
 
 	// 2. Determine if REALTIME is over its bandwidth cap
-	realtimeCapped := false
-	if s.totalBytes > 0 && s.realtimeBytes*100/s.totalBytes > int64(RealtimeCapPercent) {
-		realtimeCapped = true
-	}
+	realtimeCapped := s.totalBytes > 0 && s.realtimeBytes*100/s.totalBytes > int64(RealtimeCapPercent)
 	// Decay counters periodically to avoid unbounded growth
 	if s.totalBytes > 1024*1024 { // reset after 1MB window
 		s.realtimeBytes /= 2
@@ -552,7 +549,7 @@ const bulkStarvationLimit = 16
 // bandwidth counter correctly, and the Registration names the registration it came
 // from (DequeueFrom).
 func (s *Scheduler) dequeueFromClass(targetClass aether.LatencyClass, order []uint64, includeRealtime bool) (*aether.Frame, bool, Registration) {
-	var bestIdx int = -1
+	var bestIdx = -1
 	var bestFinish float64
 
 	for i, streamID := range order {
@@ -562,7 +559,7 @@ func (s *Scheduler) dequeueFromClass(targetClass aether.LatencyClass, order []ui
 		}
 		// Serve the target class, plus REALTIME streams when a capped REALTIME
 		// class is being demoted into this round.
-		if ss.latencyClass != targetClass && !(includeRealtime && ss.latencyClass == aether.ClassREALTIME) {
+		if ss.latencyClass != targetClass && (!includeRealtime || ss.latencyClass != aether.ClassREALTIME) {
 			continue
 		}
 

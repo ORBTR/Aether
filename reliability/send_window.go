@@ -610,7 +610,7 @@ func (w *SendWindow) ProcessCompositeACK(ack *aether.CompositeACK, reorderThresh
 	// 2. Bitmap scan
 	if len(ack.Bitmap) > 0 {
 		windowBits := len(ack.Bitmap) * 8
-		var largestAcked uint32 = ack.BaseACK
+		var largestAcked = ack.BaseACK
 
 		// First pass: find largestAcked for reorder threshold
 		for i := 0; i < windowBits; i++ {

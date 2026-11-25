@@ -301,7 +301,7 @@ func TestFragmentMessageIDReuse(t *testing.T) {
 		wantRefusal(t, "fragment of a discarded message", err, FragmentMessageID)
 	}
 
-	msg, frags := fxMessage(t, fxBinding(), 6, 700)
+	_, frags = fxMessage(t, fxBinding(), 6, 700)
 	if _, _, err := fb.Add(r, 7, frags[0]); err != nil {
 		t.Fatalf("first: %v", err)
 	}
@@ -319,7 +319,7 @@ func TestFragmentMessageIDReuse(t *testing.T) {
 		t.Fatalf("a poisoned message completed")
 	}
 
-	msg, frags = fxMessage(t, fxBinding(), 7, 700)
+	msg, frags := fxMessage(t, fxBinding(), 7, 700)
 	var got []byte
 	for _, f := range frags {
 		if out, _, err := fb.Add(r, 7, f); err != nil {

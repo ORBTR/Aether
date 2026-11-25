@@ -314,6 +314,8 @@ func BenchmarkNonceDecrypt(b *testing.B) {
 	b.ResetTimer()
 	b.SetBytes(1420)
 	for i := 0; i < b.N; i++ {
-		dec.Decrypt(nil, nil, cts[i])
+		if _, err := dec.Decrypt(nil, nil, cts[i]); err != nil {
+			b.Fatalf("dec.Decrypt: %v", err)
+		}
 	}
 }

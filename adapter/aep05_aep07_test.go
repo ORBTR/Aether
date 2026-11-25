@@ -25,10 +25,18 @@ func aep0507NewPair(t *testing.T) (client, server *TCPSession, cleanup func()) {
 	client = NewTCPSession(clientConn, "vl1_aep0507_client_node_abcdef", "vl1_aep0507_server_node_ghijkl", aether.ProtoTCP, aether.DefaultSessionOptions())
 	server = NewTCPSession(serverConn, "vl1_aep0507_server_node_ghijkl", "vl1_aep0507_client_node_abcdef", aether.ProtoTCP, aether.DefaultSessionOptions())
 	cleanup = func() {
-		client.Close()
-		server.Close()
-		clientConn.Close()
-		serverConn.Close()
+		if err := client.Close(); err != nil {
+			t.Errorf("client.Close: %v", err)
+		}
+		if err := server.Close(); err != nil {
+			t.Errorf("server.Close: %v", err)
+		}
+		if err := clientConn.Close(); err != nil {
+			t.Errorf("clientConn.Close: %v", err)
+		}
+		if err := serverConn.Close(); err != nil {
+			t.Errorf("serverConn.Close: %v", err)
+		}
 	}
 	return client, server, cleanup
 }

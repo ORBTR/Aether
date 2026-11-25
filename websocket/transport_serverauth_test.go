@@ -80,7 +80,9 @@ func aep26MaliciousWSServer(t *testing.T, claimID aether.NodeID, emitPub ed25519
 		h.Set(SignatureHeader, base64.StdEncoding.EncodeToString(sig))
 		conn, _, _, err := ws.HTTPUpgrader{Header: h}.Upgrade(r, w)
 		if err == nil {
-			conn.Close()
+			if err := conn.Close(); err != nil {
+				t.Errorf("conn.Close: %v", err)
+			}
 		}
 	}))
 	t.Cleanup(srv.Close)
@@ -98,7 +100,9 @@ func aep26DialWS(t *testing.T, target aether.Target) error {
 	defer cancel()
 	conn, err := clientTr.Dial(ctx, target)
 	if conn != nil {
-		conn.Close()
+		if err := conn.Close(); err != nil {
+			t.Fatalf("conn.Close: %v", err)
+		}
 	}
 	return err
 }
@@ -115,7 +119,11 @@ func TestAEP26_WSHonestRoundTripAccepted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
-	defer ln.Close()
+	defer func() {
+		if err := ln.Close(); err != nil {
+			t.Errorf("ln.Close: %v", err)
+		}
+	}()
 
 	client := aep26Transport(t, cliID, cliPriv, "")
 	target := aether.Target{NodeID: srvID, Address: "ws://" + ln.Addr().String() + "/"}
@@ -126,7 +134,11 @@ func TestAEP26_WSHonestRoundTripAccepted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("honest dial rejected: %v", err)
 	}
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			t.Errorf("conn.Close: %v", err)
+		}
+	}()
 	if conn.RemoteNodeID() != srvID {
 		t.Fatalf("client RemoteNodeID = %s, want %s", conn.RemoteNodeID(), srvID)
 	}
@@ -137,7 +149,11 @@ func TestAEP26_WSHonestRoundTripAccepted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("server Accept: %v", err)
 	}
-	defer srvConn.Close()
+	defer func() {
+		if err := srvConn.Close(); err != nil {
+			t.Errorf("srvConn.Close: %v", err)
+		}
+	}()
 	if srvConn.RemoteNodeID() != cliID {
 		t.Fatalf("server RemoteNodeID = %s, want %s", srvConn.RemoteNodeID(), cliID)
 	}
@@ -201,7 +217,9 @@ func TestAEP26_WSMissingIdentityRejected(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, _, _, err := ws.UpgradeHTTP(r, w)
 		if err == nil {
-			conn.Close()
+			if err := conn.Close(); err != nil {
+				t.Errorf("conn.Close: %v", err)
+			}
 		}
 	}))
 	defer srv.Close()
@@ -253,7 +271,11 @@ func TestAEP26_HijackServerEmitsBoundAccept(t *testing.T) {
 	if err != nil {
 		t.Fatalf("net.Dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			t.Errorf("conn.Close: %v", err)
+		}
+	}()
 
 	req, err := http.NewRequest("POST", ts.URL+HijackPath, nil)
 	if err != nil {
@@ -275,7 +297,11 @@ func TestAEP26_HijackServerEmitsBoundAccept(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadResponse: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Errorf("resp.Body.Close: %v", err)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		t.Fatalf("status = %d, want 101", resp.StatusCode)
@@ -331,7 +357,11 @@ func TestAEP26_HijackKeylessServerNoPanic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("net.Dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			t.Errorf("conn.Close: %v", err)
+		}
+	}()
 
 	req, err := http.NewRequest("POST", ts.URL+HijackPath, nil)
 	if err != nil {
@@ -353,7 +383,11 @@ func TestAEP26_HijackKeylessServerNoPanic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadResponse: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Errorf("resp.Body.Close: %v", err)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		t.Fatalf("status = %d, want 101 (keyless server should still hijack)", resp.StatusCode)

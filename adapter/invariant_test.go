@@ -42,12 +42,28 @@ func TestInvariant_StreamSendReceive(t *testing.T) {
 	for _, adapter := range adapters {
 		t.Run(adapter.name, func(t *testing.T) {
 			clientConn, serverConn := net.Pipe()
-			defer clientConn.Close()
-			defer serverConn.Close()
+			defer func() {
+				if err := clientConn.Close(); err != nil {
+					t.Errorf("clientConn.Close: %v", err)
+				}
+			}()
+			defer func() {
+				if err := serverConn.Close(); err != nil {
+					t.Errorf("serverConn.Close: %v", err)
+				}
+			}()
 
 			clientSession, serverSession := adapter.create(clientConn, serverConn)
-			defer clientSession.Close()
-			defer serverSession.Close()
+			defer func() {
+				if err := clientSession.Close(); err != nil {
+					t.Errorf("clientSession.Close: %v", err)
+				}
+			}()
+			defer func() {
+				if err := serverSession.Close(); err != nil {
+					t.Errorf("serverSession.Close: %v", err)
+				}
+			}()
 
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -111,8 +127,16 @@ func TestInvariant_StreamSendReceive(t *testing.T) {
 // TestInvariant_Metrics verifies that Metrics() returns valid data for all adapters.
 func TestInvariant_Metrics(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
-	defer clientConn.Close()
-	defer serverConn.Close()
+	defer func() {
+		if err := clientConn.Close(); err != nil {
+			t.Errorf("clientConn.Close: %v", err)
+		}
+	}()
+	defer func() {
+		if err := serverConn.Close(); err != nil {
+			t.Errorf("serverConn.Close: %v", err)
+		}
+	}()
 
 	sessions := []struct {
 		name    string
@@ -123,7 +147,11 @@ func TestInvariant_Metrics(t *testing.T) {
 
 	for _, s := range sessions {
 		t.Run(s.name, func(t *testing.T) {
-			defer s.session.Close()
+			defer func() {
+				if err := s.session.Close(); err != nil {
+					t.Errorf("s.session.Close: %v", err)
+				}
+			}()
 
 			metrics := s.session.Metrics()
 			// Invariant: ActiveStreams starts at 0

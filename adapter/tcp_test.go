@@ -17,13 +17,29 @@ import (
 
 func TestTCPSession_OpenStreamAndSendReceive(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
-	defer clientConn.Close()
-	defer serverConn.Close()
+	defer func() {
+		if err := clientConn.Close(); err != nil {
+			t.Errorf("clientConn.Close: %v", err)
+		}
+	}()
+	defer func() {
+		if err := serverConn.Close(); err != nil {
+			t.Errorf("serverConn.Close: %v", err)
+		}
+	}()
 
 	clientSession := NewTCPSession(clientConn, "vl1_client_test_node_id_abcdef", "vl1_server_test_node_id_ghijkl", aether.ProtoTCP, aether.DefaultSessionOptions())
 	serverSession := NewTCPSession(serverConn, "vl1_server_test_node_id_ghijkl", "vl1_client_test_node_id_abcdef", aether.ProtoTCP, aether.DefaultSessionOptions())
-	defer clientSession.Close()
-	defer serverSession.Close()
+	defer func() {
+		if err := clientSession.Close(); err != nil {
+			t.Errorf("clientSession.Close: %v", err)
+		}
+	}()
+	defer func() {
+		if err := serverSession.Close(); err != nil {
+			t.Errorf("serverSession.Close: %v", err)
+		}
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -66,11 +82,23 @@ func TestTCPSession_OpenStreamAndSendReceive(t *testing.T) {
 
 func TestTCPSession_InterfaceCompliance(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
-	defer clientConn.Close()
-	defer serverConn.Close()
+	defer func() {
+		if err := clientConn.Close(); err != nil {
+			t.Errorf("clientConn.Close: %v", err)
+		}
+	}()
+	defer func() {
+		if err := serverConn.Close(); err != nil {
+			t.Errorf("serverConn.Close: %v", err)
+		}
+	}()
 
 	session := NewTCPSession(clientConn, "vl1_test", "vl1_remote", aether.ProtoTCP, aether.DefaultSessionOptions())
-	defer session.Close()
+	defer func() {
+		if err := session.Close(); err != nil {
+			t.Errorf("session.Close: %v", err)
+		}
+	}()
 
 	if session.LocalNodeID() != "vl1_test" {
 		t.Errorf("LocalNodeID: got %s", session.LocalNodeID())
@@ -94,10 +122,16 @@ func TestTCPSession_InterfaceCompliance(t *testing.T) {
 
 func TestTCPSession_Close(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
-	defer serverConn.Close()
+	defer func() {
+		if err := serverConn.Close(); err != nil {
+			t.Errorf("serverConn.Close: %v", err)
+		}
+	}()
 
 	session := NewTCPSession(clientConn, "vl1_test", "vl1_remote", aether.ProtoTCP, aether.DefaultSessionOptions())
-	session.Close()
+	if err := session.Close(); err != nil {
+		t.Fatalf("session.Close: %v", err)
+	}
 
 	if !session.IsClosed() {
 		t.Error("should be closed after Close()")
@@ -106,13 +140,29 @@ func TestTCPSession_Close(t *testing.T) {
 
 func TestTCPSession_ObserveMetrics(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
-	defer clientConn.Close()
-	defer serverConn.Close()
+	defer func() {
+		if err := clientConn.Close(); err != nil {
+			t.Errorf("clientConn.Close: %v", err)
+		}
+	}()
+	defer func() {
+		if err := serverConn.Close(); err != nil {
+			t.Errorf("serverConn.Close: %v", err)
+		}
+	}()
 
 	clientSession := NewTCPSession(clientConn, "vl1_client_test_node_id_abcdef", "vl1_server_test_node_id_ghijkl", aether.ProtoTCP, aether.DefaultSessionOptions())
 	serverSession := NewTCPSession(serverConn, "vl1_server_test_node_id_ghijkl", "vl1_client_test_node_id_abcdef", aether.ProtoTCP, aether.DefaultSessionOptions())
-	defer clientSession.Close()
-	defer serverSession.Close()
+	defer func() {
+		if err := clientSession.Close(); err != nil {
+			t.Errorf("clientSession.Close: %v", err)
+		}
+	}()
+	defer func() {
+		if err := serverSession.Close(); err != nil {
+			t.Errorf("serverSession.Close: %v", err)
+		}
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -168,13 +218,29 @@ func TestTCPSession_ObserveMetrics(t *testing.T) {
 
 func TestStreamConn_ReadWrite(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
-	defer clientConn.Close()
-	defer serverConn.Close()
+	defer func() {
+		if err := clientConn.Close(); err != nil {
+			t.Errorf("clientConn.Close: %v", err)
+		}
+	}()
+	defer func() {
+		if err := serverConn.Close(); err != nil {
+			t.Errorf("serverConn.Close: %v", err)
+		}
+	}()
 
 	clientSession := NewTCPSession(clientConn, "vl1_client", "vl1_server", aether.ProtoTCP, aether.DefaultSessionOptions())
 	serverSession := NewTCPSession(serverConn, "vl1_server", "vl1_client", aether.ProtoTCP, aether.DefaultSessionOptions())
-	defer clientSession.Close()
-	defer serverSession.Close()
+	defer func() {
+		if err := clientSession.Close(); err != nil {
+			t.Errorf("clientSession.Close: %v", err)
+		}
+	}()
+	defer func() {
+		if err := serverSession.Close(); err != nil {
+			t.Errorf("serverSession.Close: %v", err)
+		}
+	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -187,8 +253,16 @@ func TestStreamConn_ReadWrite(t *testing.T) {
 	// Wrap in StreamConn for net.Conn compatibility
 	clientSC := NewStreamConn(clientStream)
 	serverSC := NewStreamConn(serverStream)
-	defer clientSC.Close()
-	defer serverSC.Close()
+	defer func() {
+		if err := clientSC.Close(); err != nil {
+			t.Errorf("clientSC.Close: %v", err)
+		}
+	}()
+	defer func() {
+		if err := serverSC.Close(); err != nil {
+			t.Errorf("serverSC.Close: %v", err)
+		}
+	}()
 
 	// Write via StreamConn
 	_, err := clientSC.Write([]byte("via StreamConn"))

@@ -303,8 +303,16 @@ func TestTCPSession_APermanentWriteErrorEndsTheSessionTyped(t *testing.T) {
 // stops being retried when the session has closed, and the writer counts as failed.
 func TestSessionWriter_AClosedSessionStopsTheRetry(t *testing.T) {
 	c, s := net.Pipe()
-	defer c.Close()
-	defer s.Close()
+	defer func() {
+		if err := c.Close(); err != nil {
+			t.Errorf("c.Close: %v", err)
+		}
+	}()
+	defer func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("s.Close: %v", err)
+		}
+	}()
 	closed := make(chan struct{})
 	w := newSessionWriter(&flakyConn{Conn: c, failAfter: 0, every: 1}, closed, nil)
 	go func() { _, _ = io.Copy(io.Discard, s) }()

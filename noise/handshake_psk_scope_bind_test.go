@@ -125,7 +125,11 @@ func TestHandshakePSKtoScopeIDBind(t *testing.T) {
 	if err != nil {
 		t.Fatalf("responder listen: %v", err)
 	}
-	defer respLn.Close()
+	defer func() {
+		if err := respLn.Close(); err != nil {
+			t.Errorf("respLn.Close: %v", err)
+		}
+	}()
 	respAddr := respLn.Addr().String()
 
 	nl, ok := respLn.(*noiseListener)

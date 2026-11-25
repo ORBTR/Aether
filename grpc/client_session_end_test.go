@@ -74,7 +74,11 @@ func TestGrpcSession_ReceiveEndsWhenTheServerEndsTheRPC(t *testing.T) {
 	defer cleanup()
 
 	s := dialClientSession(t, cc, serverNodeID)
-	defer s.Close()
+	defer func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("s.Close: %v", err)
+		}
+	}()
 	if err := s.Send(context.Background(), []byte("hello")); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
@@ -116,7 +120,11 @@ func TestGrpcSession_ReceiveReportsAStreamTheServerEndedWithAnError(t *testing.T
 	defer cleanup()
 
 	s := dialClientSession(t, cc, serverNodeID)
-	defer s.Close()
+	defer func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("s.Close: %v", err)
+		}
+	}()
 
 	_, err := receiveWithin(t, s, "after the server refused the stream")
 	if err == nil {

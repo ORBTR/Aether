@@ -247,7 +247,9 @@ func TestTCPStream_AResetStreamQueuesNothingUnderTheIDsNextStream(t *testing.T) 
 	if f := p.next(); f.Type != aether.TypeRESET {
 		t.Fatalf("frame after Reset: %+v", f)
 	}
-	<-resetDone
+	if err := <-resetDone; err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
 	writeFrames(t, p.conn, ackOf(id, aether.ResetCancel, old.incarnation), pingFrame())
 	p.readUntilPong()
 	p.open(ctx, id)

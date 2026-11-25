@@ -89,8 +89,16 @@ func TestOverConn_CompatibleWireVersionsChosenOnBothEnds(t *testing.T) {
 	if dialErr != nil || acceptErr != nil {
 		t.Fatalf("dial=%v accept=%v", dialErr, acceptErr)
 	}
-	defer dialed.Close()
-	defer accepted.Close()
+	defer func() {
+		if err := dialed.Close(); err != nil {
+			t.Errorf("dialed.Close: %v", err)
+		}
+	}()
+	defer func() {
+		if err := accepted.Close(); err != nil {
+			t.Errorf("accepted.Close: %v", err)
+		}
+	}()
 	a, b := chosenOn(t, dialed), chosenOn(t, accepted)
 	if !a.Equal(b) {
 		t.Fatalf("ends disagree: dialer %v accepter %v", a, b)
@@ -209,8 +217,16 @@ func TestAcceptOverConn_RefusesDialerOffers(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			clientConn, serverConn := net.Pipe()
-			defer clientConn.Close()
-			defer serverConn.Close()
+			defer func() {
+				if err := clientConn.Close(); err != nil {
+					t.Errorf("clientConn.Close: %v", err)
+				}
+			}()
+			defer func() {
+				if err := serverConn.Close(); err != nil {
+					t.Errorf("serverConn.Close: %v", err)
+				}
+			}()
 			bPriv, bPub := newTestKeypair(t)
 			go handDialer(t, clientConn, tc.payload)
 			c, err := AcceptOverConn(context.Background(), AcceptConnConfig{
@@ -235,8 +251,16 @@ func TestAcceptOverConn_RefusesDialerOffers(t *testing.T) {
 // payload carries no versions field.
 func TestDialOverConn_RefusesAccepterWithoutVersions(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
-	defer clientConn.Close()
-	defer serverConn.Close()
+	defer func() {
+		if err := clientConn.Close(); err != nil {
+			t.Errorf("clientConn.Close: %v", err)
+		}
+	}()
+	defer func() {
+		if err := serverConn.Close(); err != nil {
+			t.Errorf("serverConn.Close: %v", err)
+		}
+	}()
 	msg3Seen := make(chan bool, 1)
 	go func() {
 		bPriv, bPub := newTestKeypair(t)

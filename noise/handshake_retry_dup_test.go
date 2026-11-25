@@ -229,7 +229,11 @@ func TestHandshakeDuplicateRetryToken_NotReadAsMsg2(t *testing.T) {
 	if err != nil {
 		t.Fatalf("initiator listen: %v", err)
 	}
-	defer cliListener.Close()
+	defer func() {
+		if err := cliListener.Close(); err != nil {
+			t.Errorf("cliListener.Close: %v", err)
+		}
+	}()
 
 	dialCtx, dialCancel := context.WithTimeout(ctx, 8*time.Second)
 	defer dialCancel()
@@ -254,7 +258,11 @@ func TestHandshakeDuplicateRetryToken_NotReadAsMsg2(t *testing.T) {
 	if session == nil {
 		t.Fatal("Dial returned nil session with nil error")
 	}
-	defer session.Close()
+	defer func() {
+		if err := session.Close(); err != nil {
+			t.Errorf("session.Close: %v", err)
+		}
+	}()
 
 	// --- Prove the fixed path was actually exercised ---
 	rs := atomic.LoadInt64(&retriesSent)

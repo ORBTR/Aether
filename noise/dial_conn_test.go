@@ -367,8 +367,9 @@ func bindingAcceptConfig(t *testing.T, signerPub ed25519.PublicKey, cache *Ticke
 // returns the accept side's error.
 func acceptWithDialer(cfg AcceptConnConfig, priv, pub, ticket []byte) error {
 	clientConn, serverConn := net.Pipe()
-	defer clientConn.Close()
-	defer serverConn.Close()
+	// net.Pipe's ends answer nil from Close.
+	defer func() { _ = clientConn.Close() }()
+	defer func() { _ = serverConn.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
@@ -585,8 +586,16 @@ func TestAcceptOverConn_ReplayedNonceRefusedBeforeHandshake(t *testing.T) {
 	// an accept on serverConn, wrapped by wrap, returned.
 	present := func(wrap func(net.Conn) net.Conn) error {
 		clientConn, serverConn := net.Pipe()
-		defer clientConn.Close()
-		defer serverConn.Close()
+		defer func() {
+			if err := clientConn.Close(); err != nil {
+				t.Errorf("clientConn.Close: %v", err)
+			}
+		}()
+		defer func() {
+			if err := serverConn.Close(); err != nil {
+				t.Errorf("serverConn.Close: %v", err)
+			}
+		}()
 		go func() {
 			c, err := DialOverConn(ctx, DialConnConfig{
 				LocalNodeID:      "vl1_alice",

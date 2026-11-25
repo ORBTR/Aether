@@ -808,7 +808,7 @@ func (s *NoiseSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) 
 		}
 		return nil, fmt.Errorf("OpenStream stream=%d: %w", cfg.StreamID, err)
 	}
-	st.state.Transition(aether.EventSendOpen)
+	recordStreamEvent(st.state, aether.EventSendOpen)
 
 	// Send OPEN frame. It states the credit createStream reserved for the
 	// stream, the window's size after flow.NewStreamWindowWithCap resolved the
@@ -1412,8 +1412,20 @@ func (s *NoiseSession) CloseWithError(err error) error {
 			_ = st.Reset(aether.ResetCancel)
 		}
 	}
-	s.conn.Close()
+	// The session has ended for every caller (SignalClose above). A conn the
+	// peer or the listener has closed already answers an error here that
+	// leaves the caller nothing to do, so the close error is dropped and
+	// CloseWithError answers nil for every session it ends.
+	_ = s.conn.Close()
 	return nil
+}
+
+// endWith closes the session for a cause found inside it: a stalled or idle
+// peer, a failed write, a refused or timed-out preface, the read loop's end.
+// CloseWithError answers nil for every session it ends, so there is no result
+// for these callers to act on.
+func (s *NoiseSession) endWith(cause error) {
+	_ = s.CloseWithError(cause)
 }
 
 // dumpFlowDiagOnStall emits a single high-detail [FLOW-DIAG] line capturing

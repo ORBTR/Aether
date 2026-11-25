@@ -156,7 +156,11 @@ func TestCrossOriginForwarder_HairpinRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("originator Listen: %v", err)
 	}
-	defer origListener.Close()
+	defer func() {
+		if err := origListener.Close(); err != nil {
+			t.Errorf("origListener.Close: %v", err)
+		}
+	}()
 
 	// Give all the listener read loops time to start.
 	time.Sleep(80 * time.Millisecond)
@@ -185,7 +189,11 @@ func TestCrossOriginForwarder_HairpinRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("originator Dial via M_r → M_t: %v", err)
 	}
-	defer origSession.Close()
+	defer func(check func() error) {
+		if err := check(); err != nil {
+			t.Errorf("origSession.Close: %v", err)
+		}
+	}(origSession.Close)
 
 	// Wait for M_t's Accept to fire — proves the handshake completed
 	// end-to-end on the responder side, not just the initiator side.

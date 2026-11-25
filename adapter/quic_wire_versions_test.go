@@ -20,8 +20,16 @@ import (
 // through the preface, each reports it, and a stream opens over the grammar it chose.
 func TestQUICSession_ExchangesTheWireVersionPreface(t *testing.T) {
 	client, server := quicLoopback(t)
-	defer client.Close()
-	defer server.Close()
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Errorf("client.Close: %v", err)
+		}
+	}()
+	defer func() {
+		if err := server.Close(); err != nil {
+			t.Errorf("server.Close: %v", err)
+		}
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	st, err := client.OpenStream(ctx, aether.StreamConfig{StreamID: 10, Reliability: aether.ReliableOrdered})
@@ -122,8 +130,16 @@ func TestQUICSession_APeerSilentOnThePrefaceIsRefusedAtTheDeadline(t *testing.T)
 // late Close after a later stream took the ID leaves that later stream's entry alone.
 func TestQUICSession_ALocalOpenOfALiveIDIsRefusedBeforeTheWire(t *testing.T) {
 	client, server := quicLoopback(t)
-	defer client.Close()
-	defer server.Close()
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Errorf("client.Close: %v", err)
+		}
+	}()
+	defer func() {
+		if err := server.Close(); err != nil {
+			t.Errorf("server.Close: %v", err)
+		}
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	cfg := aether.StreamConfig{StreamID: 10, Reliability: aether.ReliableOrdered}

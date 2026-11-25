@@ -73,7 +73,11 @@ func TestNoiseSession_AClosedSessionAnswersTyped(t *testing.T) {
 // closed answers aether.ErrSessionClosed.
 func TestQUICSession_AClosedSessionAnswersTyped(t *testing.T) {
 	client, server := quicLoopback(t)
-	defer server.Close()
+	defer func() {
+		if err := server.Close(); err != nil {
+			t.Errorf("server.Close: %v", err)
+		}
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if _, err := client.OpenStream(ctx, aether.StreamConfig{StreamID: 10, Reliability: aether.ReliableOrdered}); err != nil {

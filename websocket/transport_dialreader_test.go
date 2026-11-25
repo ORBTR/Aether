@@ -48,7 +48,11 @@ func TestDial_ReadsTheFrameTheServerSendsWithItsUpgradeResponse(t *testing.T) {
 			t.Errorf("upgrade: %v", err)
 			return
 		}
-		defer conn.Close()
+		defer func() {
+			if err := conn.Close(); err != nil {
+				t.Errorf("conn.Close: %v", err)
+			}
+		}()
 		if err := ws.WriteFrame(&held, ws.NewBinaryFrame(want)); err != nil {
 			t.Errorf("frame: %v", err)
 			return
@@ -68,7 +72,11 @@ func TestDial_ReadsTheFrameTheServerSendsWithItsUpgradeResponse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			t.Errorf("conn.Close: %v", err)
+		}
+	}()
 	got, err := conn.Receive(ctx)
 	if err != nil {
 		t.Fatalf("receive: %v (the frame written with the 101 was not read)", err)

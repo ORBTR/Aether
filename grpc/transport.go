@@ -15,6 +15,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"strconv"
 	"sync"
@@ -23,6 +24,7 @@ import (
 	"github.com/ORBTR/aether"
 	pb "github.com/ORBTR/aether/grpc/pb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
@@ -160,11 +162,15 @@ func (t *GrpcTransport) Dial(ctx context.Context, target aether.Target) (aether.
 		MetadataTimestamp, tsStr,
 	)
 
-	conn, err := grpc.DialContext(ctx, target.Address,
-		t.dialCredentials(),
-		grpc.WithBlock(),
-	)
+	// passthrough hands the address to the dialer as it is, as DialContext did,
+	// instead of NewClient's default dns resolution.
+	conn, err := grpc.NewClient("passthrough:///"+target.Address, t.dialCredentials())
 	if err != nil {
+		return nil, aether.WrapOp("dial", aether.ProtoGRPC, target.NodeID, err)
+	}
+	if err := waitReady(ctx, conn); err != nil {
+		// The dial has failed with err; the unused client's close adds nothing to it.
+		_ = conn.Close()
 		return nil, aether.WrapOp("dial", aether.ProtoGRPC, target.NodeID, err)
 	}
 
@@ -186,6 +192,23 @@ func (t *GrpcTransport) Dial(ctx context.Context, target aether.Target) (aether.
 	go session.runClientStream(streamCtx)
 
 	return session, nil
+}
+
+// waitReady connects conn and waits until it is ready or ctx ends, so Dial
+// returns a connection that reached the peer, or the reason it did not: the
+// identity metadata rides the first stream (runClientStream), which needs a
+// connected client to start.
+func waitReady(ctx context.Context, conn *grpc.ClientConn) error {
+	conn.Connect()
+	for {
+		state := conn.GetState()
+		if state == connectivity.Ready {
+			return nil
+		}
+		if !conn.WaitForStateChange(ctx, state) {
+			return ctx.Err()
+		}
+	}
 }
 
 // Listen starts accepting gRPC connections.
@@ -215,8 +238,10 @@ func (t *GrpcTransport) Listen(ctx context.Context) (aether.Listener, error) {
 	RegisterTransportService(server, t)
 
 	go func() {
+		// Serve answers nil once Stop or GracefulStop ends it; any other end is
+		// a listener that has stopped accepting, which nothing else reports.
 		if err := server.Serve(lis); err != nil {
-			// Server stopped
+			log.Printf("[GRPC] serve on %s ended: %v", lis.Addr(), err)
 		}
 	}()
 

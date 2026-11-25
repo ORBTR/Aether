@@ -47,8 +47,16 @@ func TestWSConnReadRejectsOversizedFrame(t *testing.T) {
 	// The size guard must reject it before any allocation.
 	t.Run("oversized_rejected", func(t *testing.T) {
 		clientConn, serverConn := net.Pipe()
-		defer clientConn.Close()
-		defer serverConn.Close()
+		defer func() {
+			if err := clientConn.Close(); err != nil {
+				t.Errorf("clientConn.Close: %v", err)
+			}
+		}()
+		defer func() {
+			if err := serverConn.Close(); err != nil {
+				t.Errorf("serverConn.Close: %v", err)
+			}
+		}()
 		wc := NewWSConn(serverConn, true, "peer", 0)
 
 		go func() {
@@ -75,8 +83,16 @@ func TestWSConnReadRejectsOversizedFrame(t *testing.T) {
 	// be delivered intact — the cap must not break normal framing.
 	t.Run("valid_small_frame_delivered", func(t *testing.T) {
 		clientConn, serverConn := net.Pipe()
-		defer clientConn.Close()
-		defer serverConn.Close()
+		defer func() {
+			if err := clientConn.Close(); err != nil {
+				t.Errorf("clientConn.Close: %v", err)
+			}
+		}()
+		defer func() {
+			if err := serverConn.Close(); err != nil {
+				t.Errorf("serverConn.Close: %v", err)
+			}
+		}()
 		wc := NewWSConn(serverConn, true, "peer", 0)
 
 		payload := []byte("hello")
@@ -111,7 +127,11 @@ func TestWSConnReadRejectsOversizedFrame(t *testing.T) {
 	// read error — proving the guard did not reject the boundary value.
 	t.Run("boundary_at_cap_not_rejected", func(t *testing.T) {
 		clientConn, serverConn := net.Pipe()
-		defer serverConn.Close()
+		defer func() {
+			if err := serverConn.Close(); err != nil {
+				t.Errorf("serverConn.Close: %v", err)
+			}
+		}()
 		wc := NewWSConn(serverConn, true, "peer", 0)
 
 		go func() {
@@ -124,7 +144,9 @@ func TestWSConnReadRejectsOversizedFrame(t *testing.T) {
 			})
 			// No payload — close so the server's io.ReadFull ends with a read
 			// error rather than the size guard.
-			clientConn.Close()
+			if err := clientConn.Close(); err != nil {
+				t.Errorf("clientConn.Close: %v", err)
+			}
 		}()
 
 		buf := make([]byte, 4096)

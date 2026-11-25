@@ -43,8 +43,16 @@ func quicPrefaceOnly(t *testing.T, sc quic.Connection) {
 // session's RTT estimator, the measurement aether.KeepalivePlanFor derives its plan from.
 func TestQUICSession_PingIsARoundTripTheEstimatorLearnsFrom(t *testing.T) {
 	client, server := quicLoopback(t)
-	defer client.Close()
-	defer server.Close()
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Errorf("client.Close: %v", err)
+		}
+	}()
+	defer func() {
+		if err := server.Close(); err != nil {
+			t.Errorf("server.Close: %v", err)
+		}
+	}()
 	for name, s := range map[string]*QUICSession{"client": client, "server": server} {
 		for i := uint64(1); i <= 3; i++ {
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -72,7 +80,11 @@ func TestQUICSession_PingIsARoundTripTheEstimatorLearnsFrom(t *testing.T) {
 func TestQUICSession_PingOfASilentPeerFails(t *testing.T) {
 	cc, sc := quicLoopbackConns(t)
 	s := NewQuicSession(cc, aether.NodeID("quic-client"), aether.NodeID("quic-server"))
-	defer s.Close()
+	defer func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("s.Close: %v", err)
+		}
+	}()
 	quicPrefaceOnly(t, sc)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -95,8 +107,16 @@ func TestQUICSession_PingOfASilentPeerFails(t *testing.T) {
 // answers ErrSessionClosed at once, though nothing has closed the session above it.
 func TestQUICSession_PingOfADeadConnectionIsSessionClosed(t *testing.T) {
 	client, server := quicLoopback(t)
-	defer client.Close()
-	defer server.Close()
+	defer func() {
+		if err := client.Close(); err != nil {
+			t.Errorf("client.Close: %v", err)
+		}
+	}()
+	defer func() {
+		if err := server.Close(); err != nil {
+			t.Errorf("server.Close: %v", err)
+		}
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if _, err := client.Ping(ctx); err != nil {
@@ -116,7 +136,11 @@ func TestQUICSession_PingOfADeadConnectionIsSessionClosed(t *testing.T) {
 func TestQUICSession_AnotherFrameEndsTheProbeStream(t *testing.T) {
 	cc, sc := quicLoopbackConns(t)
 	s := NewQuicSession(cc, aether.NodeID("quic-client"), aether.NodeID("quic-server"))
-	defer s.Close()
+	defer func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("s.Close: %v", err)
+		}
+	}()
 	quicPrefaceOnly(t, sc)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

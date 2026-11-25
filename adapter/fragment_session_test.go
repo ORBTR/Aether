@@ -53,7 +53,11 @@ func loopbackPair(t *testing.T) (net.Conn, net.Conn) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer func() {
+		if err := ln.Close(); err != nil {
+			t.Errorf("ln.Close: %v", err)
+		}
+	}()
 	accepted := make(chan net.Conn, 1)
 	go func() {
 		c, err := ln.Accept()

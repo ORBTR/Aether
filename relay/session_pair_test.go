@@ -7,6 +7,7 @@ package relay
 
 import (
 	"context"
+	"errors"
 	"net"
 	"sync"
 	"testing"
@@ -107,7 +108,10 @@ func TestPairSessions_ForwardsBothDirections(t *testing.T) {
 
 	cancel()
 	select {
-	case <-done:
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("PairSessions after cancel: %v, want context.Canceled", err)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("PairSessions didn't return after cancel")
 	}
@@ -129,7 +133,10 @@ func TestPairSessions_CloseOneClosesBoth(t *testing.T) {
 	_ = a.Close()
 
 	select {
-	case <-done:
+	case err := <-done:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Errorf("PairSessions after A closed: %v, want net.ErrClosed", err)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("PairSessions didn't return after closing A")
 	}

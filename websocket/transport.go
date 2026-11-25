@@ -203,36 +203,36 @@ func (t *WebsocketTransport) Dial(ctx context.Context, target aether.Target) (ae
 	// NodeID answered on shared infra.
 	srvNodeID := aether.NodeID(srvNodeIDHdr)
 	if srvNodeID == "" || srvPubHex == "" || srvSigB64 == "" {
-		rawConn.Close()
+		closeAbandoned(rawConn)
 		return nil, aether.WrapOp("dial-serverauth", aether.ProtoWebSocket, target.NodeID,
 			errors.New("server did not present a signed identity"))
 	}
 	srvPub, err := hex.DecodeString(srvPubHex)
 	if err != nil || len(srvPub) != ed25519.PublicKeySize {
-		rawConn.Close()
+		closeAbandoned(rawConn)
 		return nil, aether.WrapOp("dial-serverauth", aether.ProtoWebSocket, target.NodeID,
 			errors.New("server public key invalid"))
 	}
 	derivedSrv, err := aether.NewNodeID(ed25519.PublicKey(srvPub))
 	if err != nil || derivedSrv != srvNodeID {
-		rawConn.Close()
+		closeAbandoned(rawConn)
 		return nil, aether.WrapOp("dial-serverauth", aether.ProtoWebSocket, target.NodeID,
 			errors.New("server public key does not match its NodeID"))
 	}
 	srvSig, err := base64.StdEncoding.DecodeString(srvSigB64)
 	if err != nil {
-		rawConn.Close()
+		closeAbandoned(rawConn)
 		return nil, aether.WrapOp("dial-serverauth", aether.ProtoWebSocket, target.NodeID,
 			errors.New("server signature encoding invalid"))
 	}
 	acceptMsg := []byte(fmt.Sprintf("ws-accept:%s:%s:%s", srvNodeID, nonceStr, tsStr))
 	if !ed25519.Verify(ed25519.PublicKey(srvPub), acceptMsg, srvSig) {
-		rawConn.Close()
+		closeAbandoned(rawConn)
 		return nil, aether.WrapOp("dial-serverauth", aether.ProtoWebSocket, target.NodeID,
 			errors.New("server identity signature invalid"))
 	}
 	if srvNodeID != target.NodeID {
-		rawConn.Close()
+		closeAbandoned(rawConn)
 		return nil, aether.WrapOp("dial-serverauth", aether.ProtoWebSocket, target.NodeID,
 			fmt.Errorf("server NodeID %s does not match dialed target %s", srvNodeID.Short(), target.NodeID.Short()))
 	}
@@ -242,9 +242,16 @@ func (t *WebsocketTransport) Dial(ctx context.Context, target aether.Target) (ae
 
 	session := aether.NewConnection(t.localNode, target.NodeID, wsConn, aether.ProtoWebSocket)
 	session.SetInitialRTT(dialRTT)
-	session.OnClose(func() { wsConn.Close() })
+	session.OnClose(func() { closeAbandoned(wsConn) })
 	return session, nil
 }
+
+// closeAbandoned closes a connection a dial or an accept has given up on: a
+// failed TLS handshake or upgrade, a server whose identity proof fails, a
+// session the full accept channel cannot take, or a session's conn once the
+// session has ended (OnClose). The error the caller returns or logs is the one
+// that decided the outcome, so the close error has nothing to change.
+func closeAbandoned(c io.Closer) { _ = c.Close() }
 
 // bufferedReadConn is a dialled conn whose reads drain the handshake reader
 // first. Dial builds it when gobwas returns buffered frame bytes; WSConn.Read
@@ -423,13 +430,13 @@ func (t *WebsocketTransport) Listen(ctx context.Context) (aether.Listener, error
 		wsConn := NewWSConn(rawConn, true, string(remoteNodeID), pingInterval)
 
 		session := aether.NewConnection(t.localNode, remoteNodeID, wsConn, aether.ProtoWebSocket)
-		session.OnClose(func() { wsConn.Close() })
+		session.OnClose(func() { closeAbandoned(wsConn) })
 
 		select {
 		case ch <- aether.IncomingSession{Session: session}:
 		default:
 			// Channel full — close
-			wsConn.Close()
+			closeAbandoned(wsConn)
 		}
 	})
 
@@ -443,7 +450,13 @@ func (t *WebsocketTransport) Listen(ctx context.Context) (aether.Listener, error
 	}
 	t.server = server
 
-	go server.Serve(ln)
+	// Serve answers http.ErrServerClosed once Close ends it; any other end is
+	// a listener that has stopped accepting, which nothing else reports.
+	go func() {
+		if err := server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("[WS] serve on %s ended: %v", ln.Addr(), err)
+		}
+	}()
 
 	return &WebsocketListener{
 		ch:     ch,
@@ -507,12 +520,8 @@ const (
 func (t *WebsocketTransport) DialHijack(ctx context.Context, target aether.Target) (aether.Connection, error) {
 	// Build the target URL — strip any existing scheme
 	host := target.Address
-	if strings.HasPrefix(host, "wss://") {
-		host = strings.TrimPrefix(host, "wss://")
-	}
-	if strings.HasPrefix(host, "https://") {
-		host = strings.TrimPrefix(host, "https://")
-	}
+	host = strings.TrimPrefix(host, "wss://")
+	host = strings.TrimPrefix(host, "https://")
 	// Strip path if present (we add our own)
 	if idx := strings.Index(host, "/"); idx >= 0 {
 		host = host[:idx]
@@ -546,7 +555,7 @@ func (t *WebsocketTransport) DialHijack(ctx context.Context, target aether.Targe
 	}
 	tlsConn := tls.Client(rawConn, &tls.Config{ServerName: tlsHost})
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
-		rawConn.Close()
+		closeAbandoned(rawConn)
 		return nil, aether.WrapOp("dial-hijack-tls", aether.ProtoWebSocket, target.NodeID, err)
 	}
 
@@ -554,7 +563,7 @@ func (t *WebsocketTransport) DialHijack(ctx context.Context, target aether.Targe
 	reqURL := fmt.Sprintf("https://%s%s", host, HijackPath)
 	req, err := http.NewRequestWithContext(ctx, "POST", reqURL, nil)
 	if err != nil {
-		tlsConn.Close()
+		closeAbandoned(tlsConn)
 		return nil, aether.WrapOp("dial-hijack-req", aether.ProtoWebSocket, target.NodeID, err)
 	}
 	req.Header.Set("Connection", "Upgrade")
@@ -565,7 +574,7 @@ func (t *WebsocketTransport) DialHijack(ctx context.Context, target aether.Targe
 	// signature so a captured header set cannot be replayed.
 	nonce := make([]byte, 16)
 	if _, err := rand.Read(nonce); err != nil {
-		tlsConn.Close()
+		closeAbandoned(tlsConn)
 		return nil, aether.WrapOp("dial-hijack", aether.ProtoWebSocket, target.NodeID, err)
 	}
 	nonceStr := base64.RawStdEncoding.EncodeToString(nonce)
@@ -590,7 +599,7 @@ func (t *WebsocketTransport) DialHijack(ctx context.Context, target aether.Targe
 
 	// Write the request manually (we own the TLS conn, no http.Client needed)
 	if err := req.Write(tlsConn); err != nil {
-		tlsConn.Close()
+		closeAbandoned(tlsConn)
 		return nil, aether.WrapOp("dial-hijack-write", aether.ProtoWebSocket, target.NodeID, err)
 	}
 
@@ -598,12 +607,12 @@ func (t *WebsocketTransport) DialHijack(ctx context.Context, target aether.Targe
 	br := bufio.NewReader(tlsConn)
 	resp, err := http.ReadResponse(br, req)
 	if err != nil {
-		tlsConn.Close()
+		closeAbandoned(tlsConn)
 		return nil, aether.WrapOp("dial-hijack-resp", aether.ProtoWebSocket, target.NodeID, err)
 	}
 	if resp.StatusCode != http.StatusSwitchingProtocols {
-		resp.Body.Close()
-		tlsConn.Close()
+		closeAbandoned(resp.Body)
+		closeAbandoned(tlsConn)
 		return nil, aether.WrapOp("dial-hijack-status", aether.ProtoWebSocket, target.NodeID,
 			fmt.Errorf("expected 101, got %d", resp.StatusCode))
 	}
@@ -625,42 +634,42 @@ func (t *WebsocketTransport) DialHijack(ctx context.Context, target aether.Targe
 	srvPubHex := resp.Header.Get(PubKeyHeader)
 	srvSigB64 := resp.Header.Get(SignatureHeader)
 	if srvNodeID == "" || srvPubHex == "" || srvSigB64 == "" {
-		resp.Body.Close()
-		tlsConn.Close()
+		closeAbandoned(resp.Body)
+		closeAbandoned(tlsConn)
 		return nil, aether.WrapOp("dial-hijack-serverauth", aether.ProtoWebSocket, target.NodeID,
 			errors.New("server did not present a signed identity"))
 	}
 	srvPub, err := hex.DecodeString(srvPubHex)
 	if err != nil || len(srvPub) != ed25519.PublicKeySize {
-		resp.Body.Close()
-		tlsConn.Close()
+		closeAbandoned(resp.Body)
+		closeAbandoned(tlsConn)
 		return nil, aether.WrapOp("dial-hijack-serverauth", aether.ProtoWebSocket, target.NodeID,
 			errors.New("server public key invalid"))
 	}
 	derivedSrv, err := aether.NewNodeID(ed25519.PublicKey(srvPub))
 	if err != nil || derivedSrv != srvNodeID {
-		resp.Body.Close()
-		tlsConn.Close()
+		closeAbandoned(resp.Body)
+		closeAbandoned(tlsConn)
 		return nil, aether.WrapOp("dial-hijack-serverauth", aether.ProtoWebSocket, target.NodeID,
 			errors.New("server public key does not match its NodeID"))
 	}
 	srvSig, err := base64.StdEncoding.DecodeString(srvSigB64)
 	if err != nil {
-		resp.Body.Close()
-		tlsConn.Close()
+		closeAbandoned(resp.Body)
+		closeAbandoned(tlsConn)
 		return nil, aether.WrapOp("dial-hijack-serverauth", aether.ProtoWebSocket, target.NodeID,
 			errors.New("server signature encoding invalid"))
 	}
 	acceptMsg := []byte(fmt.Sprintf("hijack-accept:%s:%s:%s", srvNodeID, nonceStr, tsStr))
 	if !ed25519.Verify(ed25519.PublicKey(srvPub), acceptMsg, srvSig) {
-		resp.Body.Close()
-		tlsConn.Close()
+		closeAbandoned(resp.Body)
+		closeAbandoned(tlsConn)
 		return nil, aether.WrapOp("dial-hijack-serverauth", aether.ProtoWebSocket, target.NodeID,
 			errors.New("server identity signature invalid"))
 	}
 	if srvNodeID != target.NodeID {
-		resp.Body.Close()
-		tlsConn.Close()
+		closeAbandoned(resp.Body)
+		closeAbandoned(tlsConn)
 		return nil, aether.WrapOp("dial-hijack-serverauth", aether.ProtoWebSocket, target.NodeID,
 			fmt.Errorf("server NodeID %s does not match dialed target %s", srvNodeID.Short(), target.NodeID.Short()))
 	}
@@ -673,7 +682,7 @@ func (t *WebsocketTransport) DialHijack(ctx context.Context, target aether.Targe
 
 	session := aether.NewConnection(t.localNode, target.NodeID, hjConn, aether.ProtoWebSocket)
 	session.SetInitialRTT(dialRTT)
-	session.OnClose(func() { hjConn.Close() })
+	session.OnClose(func() { closeAbandoned(hjConn) })
 	return session, nil
 }
 
@@ -741,7 +750,7 @@ func (t *WebsocketTransport) HijackHandler() (http.HandlerFunc, <-chan HijackSes
 		_, _ = rw.WriteString("\r\n")
 		if err := rw.Flush(); err != nil {
 			log.Printf("[WS-HIJACK] Flush failed for %s: %v", r.RemoteAddr, err)
-			conn.Close()
+			closeAbandoned(conn)
 			return
 		}
 
@@ -751,7 +760,7 @@ func (t *WebsocketTransport) HijackHandler() (http.HandlerFunc, <-chan HijackSes
 		case ch <- HijackSession{Conn: hjConn, RemoteNodeID: remoteNodeID}:
 		default:
 			log.Printf("[WS-HIJACK] Session channel full, dropping connection from %s", remoteNodeID)
-			hjConn.Close()
+			closeAbandoned(hjConn)
 		}
 	}
 

@@ -92,9 +92,11 @@ func TestConnWriteErrorDoesNotDeadlockWriteMu(t *testing.T) {
 	}()
 
 	select {
-	case <-done:
-		// Returned — no self-deadlock. (writeFrame surfaces the write error;
-		// we assert only that it returned, not the specific error value.)
+	case err := <-done:
+		// Returned — no self-deadlock, with the conn's write error.
+		if !errors.Is(err, conn.writeErr) {
+			t.Errorf("writeFrame over a failing conn: %v, want its write error %v", err, conn.writeErr)
+		}
 	case <-time.After(deadline):
 		t.Fatal("AE-H-02 regression: writeFrame deadlocked on write-error teardown — " +
 			"connWrite must dispatch CloseWithError on its own goroutine")
@@ -114,7 +116,7 @@ func TestConnWriteErrorDoesNotDeadlockWriteMu(t *testing.T) {
 	relocked := make(chan struct{})
 	go func() {
 		s.writeMu.Lock()
-		s.writeMu.Unlock()
+		defer s.writeMu.Unlock()
 		close(relocked)
 	}()
 	select {

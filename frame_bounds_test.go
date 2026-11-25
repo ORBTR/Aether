@@ -77,7 +77,8 @@ func shortVarHeader(seqLow uint16, length uint32) []byte {
 	hdr := []byte{ShortDataVarIndicator, 0, 5, 0, 0}
 	binary.BigEndian.PutUint16(hdr[3:5], seqLow)
 	var v bytes.Buffer
-	EncodeVarLength(&v, length)
+	// A bytes.Buffer write never fails, so EncodeVarLength has no error to give.
+	_, _ = EncodeVarLength(&v, length)
 	return append(hdr, v.Bytes()...)
 }
 

@@ -159,7 +159,11 @@ func aep06MapLen(sess *QUICSession) int {
 func TestAEP06_DuplicateStreamIDRefused(t *testing.T) {
 	const dupID = uint64(0x4242)
 	sess, streams := runAEP06AcceptLoop(t, dupID, dupID)
-	defer sess.Close()
+	defer func() {
+		if err := sess.Close(); err != nil {
+			t.Errorf("sess.Close: %v", err)
+		}
+	}()
 
 	if got := aep06MapLen(sess); got != 1 {
 		t.Fatalf("streams map len = %d, want 1 (duplicate StreamID must not overwrite/add a 2nd entry)", got)
@@ -198,7 +202,11 @@ func TestAEP06_DuplicateStreamIDRefused(t *testing.T) {
 // only rejects true duplicates.
 func TestAEP06_DistinctStreamIDsBothAccepted(t *testing.T) {
 	sess, streams := runAEP06AcceptLoop(t, 0x01, 0x02)
-	defer sess.Close()
+	defer func() {
+		if err := sess.Close(); err != nil {
+			t.Errorf("sess.Close: %v", err)
+		}
+	}()
 
 	if got := aep06MapLen(sess); got != 2 {
 		t.Fatalf("streams map len = %d, want 2 (distinct IDs must both register)", got)

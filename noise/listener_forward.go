@@ -229,7 +229,7 @@ func (l *noiseListener) onInnerRelay(fwd *IntraOriginForwarder, buf []byte, addr
 	// limiters — would let an off-path attacker inject an OpForward carrying a
 	// victim 5-tuple, poisoning the relay table to redirect/black-hole the
 	// victim's session and deliver its ciphertext to the attacker.
-	if addr == nil || addr.IP == nil || !(addr.IP.IsPrivate() || addr.IP.IsLoopback()) {
+	if addr == nil || addr.IP == nil || (!addr.IP.IsPrivate() && !addr.IP.IsLoopback()) {
 		fwd.recordDrop(dropInnerRelayUntrustedSrc)
 		dbgNoise.Printf("forwarder: dropping inner-relay frame from untrusted (non-private) source %s", addr)
 		return nil, nil, true

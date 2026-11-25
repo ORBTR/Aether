@@ -39,7 +39,7 @@ func (s *NoiseSession) isAckImmediateStream(streamID uint64) bool {
 // (decrypt → decompress → anti-replay → dispatch) stays here in
 // processIncomingFrame because each step is Noise-specific.
 func (s *NoiseSession) readLoop() {
-	defer s.CloseWithError(fmt.Errorf("readLoop exited"))
+	defer s.endWith(fmt.Errorf("readLoop exited"))
 	for {
 		frame, indicator, batch, err := aether.ReadNextFrame(s.conn, s.rxCompressor)
 		if err != nil {
@@ -907,7 +907,7 @@ func (s *NoiseSession) handleOpen(frame *aether.Frame) {
 		// local OpenStream of the ID took it first, whose OPEN the peer will meet.
 		return
 	}
-	st.state.Transition(aether.EventRecvOpen)
+	recordStreamEvent(st.state, aether.EventRecvOpen)
 
 	// Route via the ByID dispatcher first so a pinned consumer
 	// (AcceptStreamByID) claims its stream regardless of wire order;
@@ -991,7 +991,7 @@ func (s *NoiseSession) handleClose(frame *aether.Frame) {
 // (recvQueue.leftSession). A retransmit of the CLOSE whose ACK was lost meets the
 // replay window in admitSequenced, which acknowledges it at once.
 func (s *NoiseSession) endReceive(st *noiseStream) {
-	st.state.Transition(aether.EventRecvFIN)
+	recordStreamEvent(st.state, aether.EventRecvFIN)
 	if st.peerClosed.Swap(true) {
 		return // a repeated CLOSE ends nothing more
 	}
@@ -1094,7 +1094,7 @@ func (s *NoiseSession) endByPeerReset(st *noiseStream, payload aether.ResetPaylo
 	// ends; handleReset has recorded it already, before the stream left s.streams.
 	st.notePeerResetReason(payload.Reason)
 	st.left.Store(true)
-	st.state.Transition(aether.EventRecvReset)
+	recordStreamEvent(st.state, aether.EventRecvReset)
 	// The peer's RESET ends the send side too: no CLOSE follows it.
 	st.closeSent.Store(true)
 	st.closeDone.Store(true)
@@ -1274,7 +1274,10 @@ func (s *NoiseSession) handlePathProbe(frame *aether.Frame) {
 			Length:     frame.Length,
 			Payload:    frame.Payload,
 		}
-		s.writeFrame(resp)
+		// An echo that is not written is a probe the path did not carry, as on a
+		// lost datagram: the prober meets no answer and the size fails. A conn
+		// write that fails has closed the session (connWrite).
+		_ = s.writeFrame(resp)
 	}
 }
 
@@ -1318,7 +1321,10 @@ func (s *NoiseSession) sendCompositeACK(streamID uint64, cack *aether.CompositeA
 		Length:     uint32(len(payload)),
 		Payload:    payload,
 	}
-	s.writeFrame(frame)
+	// An ACK that is not written is one the peer does not get, as on a lost
+	// datagram: the next ACK carries the cumulative state again. A conn write
+	// that fails has closed the session (connWrite).
+	_ = s.writeFrame(frame)
 }
 
 // RecordCEBytes takes n bytes of inbound packets whose IP/IPv6 TOS field
@@ -1340,7 +1346,10 @@ func (s *NoiseSession) RecordCEBytes(n int) {
 
 // sendWindowUpdate sends a WINDOW_UPDATE frame granting additional credit to the sender.
 func (s *NoiseSession) sendWindowUpdate(streamID uint64, credit uint64) {
-	s.writeFrame(aether.BuildWindowUpdateFrame(s.LocalPeerID(), s.RemotePeerID(), streamID, credit))
+	// The flow windows call this through their WindowUpdater callback, which
+	// returns nothing, so the write's error has no caller to reach; a conn write
+	// that fails has closed the session (connWrite).
+	_ = s.writeFrame(aether.BuildWindowUpdateFrame(s.LocalPeerID(), s.RemotePeerID(), streamID, credit))
 }
 
 // sendWindowUpdateAgnostic adapts sendWindowUpdate to the WindowUpdater signature.

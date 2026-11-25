@@ -21,7 +21,11 @@ import (
 func TestNoiseStream_AnExpiredFrameReturnsItsCreditAndTheCloseStillEnds(t *testing.T) {
 	sess := NewNoiseSession(newDiscardConn(), aether.NodeID("vl1_local_expired_aaaaaaaaaaaaaa"),
 		aether.NodeID("vl1_remote_expired_bbbbbbbbbbbbb"), aether.DefaultSessionOptions())
-	defer sess.Close()
+	defer func() {
+		if err := sess.Close(); err != nil {
+			t.Errorf("sess.Close: %v", err)
+		}
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cs, err := sess.OpenStream(ctx, aether.StreamConfig{StreamID: 900, Reliability: aether.ReliableOrdered})

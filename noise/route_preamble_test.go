@@ -144,7 +144,11 @@ func TestDialPrependsTheRoutingPreambleOnlyUnderTheCrossOriginKey(t *testing.T) 
 			if err != nil {
 				t.Fatalf("ListenUDP: %v", err)
 			}
-			defer sink.Close()
+			defer func() {
+				if err := sink.Close(); err != nil {
+					t.Errorf("sink.Close: %v", err)
+				}
+			}()
 
 			dialCtx, cancelDial := context.WithTimeout(context.Background(), 500*time.Millisecond)
 			defer cancelDial()

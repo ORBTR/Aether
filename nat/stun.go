@@ -151,7 +151,9 @@ func (c *STUNClient) querySTUNServer(ctx context.Context, localAddr *net.UDPAddr
 	if err != nil {
 		return nil, fmt.Errorf("dial STUN server: %w", err)
 	}
-	defer conn.Close()
+	// By the time this runs the response is read or the query has failed; the
+	// UDP socket's close error changes neither, so it is dropped.
+	defer func() { _ = conn.Close() }()
 
 	// Set timeout
 	deadline := time.Now().Add(c.config.Timeout)

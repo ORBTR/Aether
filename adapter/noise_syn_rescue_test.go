@@ -60,7 +60,11 @@ func (c *discardConn) SetWriteDeadline(time.Time) error { return nil }
 // and delivers nothing, since the payload is no message.
 func TestUnknownStream_SYNCreatesTheStream(t *testing.T) {
 	conn := newDiscardConn()
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			t.Errorf("conn.Close: %v", err)
+		}
+	}()
 
 	s := NewNoiseSession(
 		conn,
@@ -68,7 +72,11 @@ func TestUnknownStream_SYNCreatesTheStream(t *testing.T) {
 		aether.NodeID("vl1_remote_syn_rescue_probe_bbb"),
 		aether.DefaultSessionOptions(),
 	)
-	defer s.Close()
+	defer func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("s.Close: %v", err)
+		}
+	}()
 
 	const probeStream = 100
 
@@ -109,7 +117,11 @@ func TestUnknownStream_SYNCreatesTheStream(t *testing.T) {
 func TestNoiseSession_ASYNPayloadIsNeverAMessage(t *testing.T) {
 	s := NewNoiseSession(newDiscardConn(), aether.NodeID("vl1_local_syn_meaning_aaaaaaaaaa"),
 		aether.NodeID("vl1_remote_syn_meaning_bbbbbbbbb"), aether.DefaultSessionOptions())
-	defer s.Close()
+	defer func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("s.Close: %v", err)
+		}
+	}()
 
 	syn := func(id uint64, payload []byte) *aether.Frame {
 		return &aether.Frame{StreamID: id, Type: aether.TypeDATA, Flags: aether.FlagSYN, Length: uint32(len(payload)), Payload: payload}
@@ -154,7 +166,11 @@ func TestNoiseSession_ASYNPayloadIsNeverAMessage(t *testing.T) {
 // a stream whose OPEN was lost without a receiver.
 func TestUnknownStream_NoSYNIsDroppedSilently(t *testing.T) {
 	conn := newDiscardConn()
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			t.Errorf("conn.Close: %v", err)
+		}
+	}()
 
 	s := NewNoiseSession(
 		conn,
@@ -162,7 +178,11 @@ func TestUnknownStream_NoSYNIsDroppedSilently(t *testing.T) {
 		aether.NodeID("vl1_remote_syn_control_probe_dd"),
 		aether.DefaultSessionOptions(),
 	)
-	defer s.Close()
+	defer func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("s.Close: %v", err)
+		}
+	}()
 
 	const probeStream = 100
 

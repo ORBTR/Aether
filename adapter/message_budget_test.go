@@ -64,7 +64,7 @@ func TestClassRAWBudgetBoundaryIsInclusive(t *testing.T) {
 	if budget != 1333 {
 		t.Fatalf("ClassRAW budget = %d, want 1333", budget)
 	}
-	if !(1333 <= budget) {
+	if budget < 1333 {
 		t.Error("a 1333-byte encoded message must be admissible at the ClassRAW budget")
 	}
 	if 1334 <= budget {

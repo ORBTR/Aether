@@ -126,12 +126,20 @@ func TestNoiseHandshake_CompatibleWireVersionsChosenOnBothEnds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer c.Close()
+	defer func() {
+		if err := c.Close(); err != nil {
+			t.Errorf("c.Close: %v", err)
+		}
+	}()
 	s, ok := <-accepted
 	if !ok {
 		t.Fatalf("server accepted nothing")
 	}
-	defer s.Close()
+	defer func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("s.Close: %v", err)
+		}
+	}()
 	a, b := chosenOn(t, c), chosenOn(t, s)
 	if !a.Equal(b) {
 		t.Fatalf("ends disagree: dialer %v accepter %v", a, b)
@@ -273,7 +281,11 @@ func TestNoiseResponder_RefusesNodeInfoWithoutVersions(t *testing.T) {
 			if err != nil {
 				t.Fatalf("listen: %v", err)
 			}
-			defer ln.Close()
+			defer func() {
+				if err := ln.Close(); err != nil {
+					t.Errorf("ln.Close: %v", err)
+				}
+			}()
 			h := newHandInitiator(t)
 			dst := ln.Addr().(*net.UDPAddr)
 			if err := h.run(dst, nodeInfoWithout(t, h.id, local, tc.drop...)); err != nil {
@@ -327,7 +339,11 @@ func TestNoiseInitiator_RefusesResponderWithoutVersions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("shim: %v", err)
 	}
-	defer shim.Close()
+	defer func() {
+		if err := shim.Close(); err != nil {
+			t.Errorf("shim.Close: %v", err)
+		}
+	}()
 	var afterMsg2 int64
 	go func() {
 		buf := make([]byte, 4096)
@@ -376,7 +392,11 @@ func TestNoiseInitiator_RefusesResponderWithoutVersions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer func() {
+		if err := ln.Close(); err != nil {
+			t.Errorf("ln.Close: %v", err)
+		}
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	c, err := cli.Dial(ctx, aether.Target{Address: shim.LocalAddr().String(), NodeID: respID.NodeID})
@@ -449,12 +469,20 @@ func TestResume_ResponderRefusesTicketWhoseSetThisBuildWouldNotChoose(t *testing
 			if err != nil {
 				t.Fatalf("listen: %v", err)
 			}
-			defer conn.Close()
+			defer func() {
+				if err := conn.Close(); err != nil {
+					t.Errorf("conn.Close: %v", err)
+				}
+			}()
 			ini, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 			if err != nil {
 				t.Fatalf("listen: %v", err)
 			}
-			defer ini.Close()
+			defer func() {
+				if err := ini.Close(); err != nil {
+					t.Errorf("ini.Close: %v", err)
+				}
+			}()
 			l := &noiseListener{
 				transport: resp,
 				conn:      conn,
@@ -529,12 +557,20 @@ func TestResume_InitiatorSkipsMaterialWhoseSetThisBuildWouldNotChoose(t *testing
 			if err != nil {
 				t.Fatalf("listen: %v", err)
 			}
-			defer respSock.Close()
+			defer func() {
+				if err := respSock.Close(); err != nil {
+					t.Errorf("respSock.Close: %v", err)
+				}
+			}()
 			iniSock, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 			if err != nil {
 				t.Fatalf("listen: %v", err)
 			}
-			defer iniSock.Close()
+			defer func() {
+				if err := iniSock.Close(); err != nil {
+					t.Errorf("iniSock.Close: %v", err)
+				}
+			}()
 			got := make(chan byte, 1)
 			go func() {
 				buf := make([]byte, 512)
@@ -669,7 +705,11 @@ func TestNoiseInitiator_CachesNoPeerKeyForARefusedResponder(t *testing.T) {
 			if err != nil {
 				t.Fatalf("dial: %v", err)
 			}
-			defer c.Close()
+			defer func() {
+				if err := c.Close(); err != nil {
+					t.Errorf("c.Close: %v", err)
+				}
+			}()
 			if key := p.client.lookupPeerKey(p.server.localNode); !bytes.Equal(key, p.server.staticPub) {
 				t.Fatalf("after an admitted handshake the initiator holds %x for the responder, want its static key %x", key, p.server.staticPub)
 			}
@@ -699,7 +739,11 @@ func TestNoiseResponder_CachesNoPeerKeyForARefusedInitiator(t *testing.T) {
 			if err != nil {
 				t.Fatalf("listen: %v", err)
 			}
-			defer ln.Close()
+			defer func() {
+				if err := ln.Close(); err != nil {
+					t.Errorf("ln.Close: %v", err)
+				}
+			}()
 			h := newHandInitiator(t)
 			offer, err := aether.LocalWireVersions(tc.app)
 			if err != nil {

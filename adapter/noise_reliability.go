@@ -813,7 +813,7 @@ func (s *NoiseSession) reliabilityTick() {
 				log.Printf("[STALL-DETECT] confirmed-stuck peer=%s age=%v warmup=%v effThresh=%s probesFailed=%d lastErr=%v — closing for fallback",
 					s.RemoteNodeID().Short(), sessionAge, warmupActive, effectiveThreshold, probe.attempts, probe.err)
 				s.dumpFlowDiagOnStall("confirmed-stuck")
-				s.CloseWithError(aether.ErrSessionStuck)
+				s.endWith(aether.ErrSessionStuck)
 				return
 			}
 
@@ -899,7 +899,7 @@ func (s *NoiseSession) reliabilityTick() {
 				idleTimeout = aether.DefaultSessionIdleTimeout
 			}
 			if time.Since(s.Health().LastActivity()) > idleTimeout {
-				s.CloseWithError(fmt.Errorf("session idle timeout (%s)", idleTimeout))
+				s.endWith(fmt.Errorf("session idle timeout (%s)", idleTimeout))
 				return
 			}
 
@@ -1013,7 +1013,7 @@ func (s *NoiseSession) connWrite(b []byte) error {
 	// the duration is meaningless (the session is being torn down).
 	start := time.Now()
 	if _, err := s.conn.Write(b); err != nil {
-		go s.CloseWithError(fmt.Errorf("aether: frame write failed: %w", err))
+		go s.endWith(fmt.Errorf("aether: frame write failed: %w", err))
 		return err
 	}
 	s.writeSyscallHist.Record(time.Since(start))
@@ -1208,7 +1208,9 @@ func (s *NoiseSession) emitFrameLocked(frame *aether.Frame, st *noiseStream) (in
 	// deadline never leaks into the next writer's window.
 	if dl, ok := s.conn.(writeDeadlineConn); ok {
 		_ = dl.SetWriteDeadline(time.Now().Add(writeFrameDeadline))
-		defer dl.SetWriteDeadline(time.Time{})
+		// A failed clear leaves the deadline on a conn whose next writer sets
+		// its own before writing (above), so its error is dropped.
+		defer func() { _ = dl.SetWriteDeadline(time.Time{}) }()
 	}
 
 	var buf bytes.Buffer
@@ -1233,28 +1235,28 @@ func (s *NoiseSession) encodeFrameLocked(buf *bytes.Buffer, frame *aether.Frame)
 	if s.opts.HeaderComp {
 		// Control frames with no payload (PING, PONG) → 0x83, 8 bytes
 		if s.txCompressor.ShouldCompressControl(frame) {
-			s.txCompressor.EncodeControlShort(buf, frame)
-			return nil
+			_, err := s.txCompressor.EncodeControlShort(buf, frame)
+			return err
 		}
 		// ACK frames → 0x84, 11 bytes (no gaps), or 0x88, 5 bytes + the CompositeACK payload
 		if s.txCompressor.ShouldCompressACK(frame) {
-			s.txCompressor.EncodeACKShort(buf, frame)
-			return nil
+			_, err := s.txCompressor.EncodeACKShort(buf, frame)
+			return err
 		}
 		// Encrypted DATA → 0x87. No frame reaches it: ShouldCompressData refuses every
 		// frame flagged FlagENCRYPTED, so an encrypted frame takes the full header.
 		if frame.Flags.Has(aether.FlagENCRYPTED) && s.txCompressor.ShouldCompressData(frame) {
-			s.txCompressor.EncodeEncryptedDataShort(buf, frame)
-			return nil
+			_, err := s.txCompressor.EncodeEncryptedDataShort(buf, frame)
+			return err
 		}
 		// Unencrypted DATA → 0x86, 6 bytes, up to ShortDataVarMaxLength; 0x82, 9 bytes, above
 		if s.txCompressor.ShouldCompressData(frame) {
 			if frame.Length <= aether.ShortDataVarMaxLength {
-				s.txCompressor.EncodeDataShortVar(buf, frame)
-			} else {
-				s.txCompressor.EncodeDataShort(buf, frame)
+				_, err := s.txCompressor.EncodeDataShortVar(buf, frame)
+				return err
 			}
-			return nil
+			_, err := s.txCompressor.EncodeDataShort(buf, frame)
+			return err
 		}
 	}
 
@@ -1329,7 +1331,8 @@ func compressPayload(data []byte) []byte {
 func decompressPayload(data []byte) ([]byte, error) {
 	r := flateReaderPool.Get().(io.ReadCloser)
 	if resetter, ok := r.(flate.Resetter); ok {
-		resetter.Reset(bytes.NewReader(data), nil)
+		// compress/flate's reader answers nil from Reset whatever the source.
+		_ = resetter.Reset(bytes.NewReader(data), nil)
 	}
 	limited := io.LimitReader(r, int64(aether.MaxPayloadSize)+1)
 	result, err := io.ReadAll(limited)

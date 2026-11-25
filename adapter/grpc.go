@@ -263,7 +263,7 @@ func (s *GrpcStreamAdapter) Receive(ctx context.Context) ([]byte, error) {
 }
 
 func (s *GrpcStreamAdapter) Close() error {
-	s.state.Transition(aether.EventSendFIN)
+	recordStreamEvent(s.state, aether.EventSendFIN)
 	if s.closeFn != nil {
 		return s.closeFn()
 	}
@@ -271,7 +271,7 @@ func (s *GrpcStreamAdapter) Close() error {
 }
 
 func (s *GrpcStreamAdapter) Reset(reason aether.ResetReason) error {
-	s.state.Transition(aether.EventSendReset)
+	recordStreamEvent(s.state, aether.EventSendReset)
 	return s.Close()
 }
 

@@ -319,8 +319,16 @@ func TestTCPSession_ACloseOnAConnThatTakesNothingReturns(t *testing.T) {
 // the writer's failure.
 func TestSessionWriter_AFailedWriterWritesNothingMore(t *testing.T) {
 	c, s := net.Pipe()
-	defer c.Close()
-	defer s.Close()
+	defer func() {
+		if err := c.Close(); err != nil {
+			t.Errorf("c.Close: %v", err)
+		}
+	}()
+	defer func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("s.Close: %v", err)
+		}
+	}()
 	boom := errors.New("the conn broke")
 	w := newSessionWriter(&flakyConn{Conn: c, failAfter: 1, fatal: boom}, make(chan struct{}), nil)
 	read := make(chan int, 1)

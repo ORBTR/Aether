@@ -467,7 +467,7 @@ func (st *tcpStream) leaveForReset(reason aether.ResetReason) *aether.Frame {
 		s.mu.Unlock()
 		return nil
 	}
-	st.state.Transition(aether.EventSendReset)
+	recordStreamEvent(st.state, aether.EventSendReset)
 	st.endSend()
 	delete(s.streams, st.streamID)
 	s.releaseStream(st.streamID)
@@ -630,7 +630,7 @@ func newTCPSession(conn net.Conn, localNodeID, remoteNodeID aether.NodeID, proto
 	s.writeTurn <- struct{}{}
 	s.wireTimer.Store(time.AfterFunc(s.prefaceTimeout, func() {
 		if s.finishWireVersions(aether.NegotiatedWireVersions{}, errWireVersionsPrefaceTimeout) {
-			s.CloseWithError(errWireVersionsPrefaceTimeout)
+			s.endWith(errWireVersionsPrefaceTimeout)
 		}
 	}))
 	go s.writePreface()
@@ -657,7 +657,7 @@ func (s *TCPSession) writePreface() {
 	close(s.prefaceWritten)
 	if err != nil {
 		s.finishWireVersions(aether.NegotiatedWireVersions{}, err)
-		s.CloseWithError(err)
+		s.endWith(err)
 	}
 }
 
@@ -722,7 +722,7 @@ func (s *TCPSession) readLoop() {
 	// closed for a reason (failWrite) keeps it, and the conn's close is what ended
 	// this read.
 	var exitErr error
-	defer func() { s.CloseWithError(exitErr) }()
+	defer func() { s.endWith(exitErr) }()
 	if err := s.readPreface(); err != nil {
 		dbgTCP.Printf("readLoop: preface refused err=%v remote=%s", err, s.RemoteNodeID().Short())
 		s.finishWireVersions(aether.NegotiatedWireVersions{}, err)
@@ -1186,7 +1186,7 @@ func (s *TCPSession) handleOpen(frame *aether.Frame) {
 	if st != candidate {
 		return
 	}
-	st.state.Transition(aether.EventRecvOpen)
+	recordStreamEvent(st.state, aether.EventRecvOpen)
 
 	s.sched.Register(frame.StreamID, payload.Priority, payload.Dependency)
 
@@ -1251,7 +1251,7 @@ func (s *TCPSession) handleClose(frame *aether.Frame) {
 		s.mu.Unlock()
 		return
 	}
-	st.state.Transition(aether.EventRecvFIN)
+	recordStreamEvent(st.state, aether.EventRecvFIN)
 	left := s.leaveIfEndedLocked(st)
 	s.mu.Unlock()
 
@@ -1343,7 +1343,7 @@ func (s *TCPSession) handleReset(frame *aether.Frame) {
 		case aether.ResetTimeout:
 			st.setEnd(aether.ErrStreamTimedOut)
 		}
-		st.state.Transition(aether.EventRecvReset)
+		recordStreamEvent(st.state, aether.EventRecvReset)
 		st.endSend()
 		delete(s.streams, frame.StreamID)
 		s.releaseStream(frame.StreamID)
@@ -1734,7 +1734,7 @@ func (s *TCPSession) encodeFrameLocked(frame *aether.Frame) error {
 // was accepted and it is lost. CloseWithError writes through writeFrame in turn, which
 // its own once-only gate leaves harmless.
 func (s *TCPSession) failWrite(err error) {
-	s.CloseWithError(fmt.Errorf("%w: %w", aether.ErrSessionWriteFailed, err))
+	s.endWith(fmt.Errorf("%w: %w", aether.ErrSessionWriteFailed, err))
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1772,7 +1772,7 @@ func (s *TCPSession) OpenStream(ctx context.Context, cfg aether.StreamConfig) (a
 			WriterOpened: true,
 		},
 	}
-	st.state.Transition(aether.EventSendOpen)
+	recordStreamEvent(st.state, aether.EventSendOpen)
 
 	// Locally-initiated open. registerStream(false) enforces the
 	// MaxConcurrentStreams cap but skips the peer-side RESET. Surface
@@ -1970,8 +1970,20 @@ func (s *TCPSession) CloseWithError(err error) error {
 			_ = st.Reset(aether.ResetCancel)
 		}
 	}
-	s.conn.Close()
+	// The session has ended for every caller (SignalClose above). A conn the
+	// peer or the listener has closed already answers an error here that
+	// leaves the caller nothing to do, so the close error is dropped and
+	// CloseWithError answers nil for every session it ends.
+	_ = s.conn.Close()
 	return nil
+}
+
+// endWith closes the session for a cause found inside it: a stalled or idle
+// peer, a failed write, a refused or timed-out preface, the read loop's end.
+// CloseWithError answers nil for every session it ends, so there is no result
+// for these callers to act on.
+func (s *TCPSession) endWith(cause error) {
+	_ = s.CloseWithError(cause)
 }
 
 // housekeepingTick runs the protocol-agnostic periodic maintenance
@@ -2005,7 +2017,7 @@ func (s *TCPSession) housekeepingTick() {
 			}
 			if time.Since(s.Health().LastActivity()) > idle {
 				dbgTCP.Printf("session idle timeout (%s) — closing", idle)
-				s.CloseWithError(fmt.Errorf("session idle timeout (%s)", idle))
+				s.endWith(fmt.Errorf("session idle timeout (%s)", idle))
 				return
 			}
 			s.sweepEnded(time.Now(), nil)

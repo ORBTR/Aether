@@ -192,8 +192,16 @@ func TestStreamConn_ReadAndWriteDeadlinesAreSeparate(t *testing.T) {
 // setters fail with os.ErrNoDeadline instead of reporting success.
 func TestGrpcConnWrapper_BlockedWriteReturnsAtDeadline(t *testing.T) {
 	local, remote := net.Pipe()
-	defer local.Close()
-	defer remote.Close()
+	defer func() {
+		if err := local.Close(); err != nil {
+			t.Errorf("local.Close: %v", err)
+		}
+	}()
+	defer func() {
+		if err := remote.Close(); err != nil {
+			t.Errorf("remote.Close: %v", err)
+		}
+	}()
 	w := &grpcConnWrapper{conn: local}
 
 	deadline := time.Now().Add(100 * time.Millisecond)

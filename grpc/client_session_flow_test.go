@@ -41,13 +41,23 @@ func scriptedServer(t *testing.T, stream func(pb.TransportService_StreamServer) 
 	gs := grpc.NewServer()
 	pb.RegisterTransportServiceServer(gs, &scriptedTransport{stream: stream})
 	go func() { _ = gs.Serve(lis) }()
-	cc, err := grpc.DialContext(context.Background(), "bufnet",
+	cc, err := grpc.NewClient("passthrough:///bufnet",
 		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return lis.Dial() }),
-		grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	t.Cleanup(func() { cc.Close(); gs.Stop(); lis.Close() })
+	t.Cleanup(func() {
+		// A test that ends the connection itself has closed cc already, and a
+		// second Close answers codes.Canceled.
+		if err := cc.Close(); err != nil && status.Code(err) != codes.Canceled {
+			t.Errorf("cc.Close: %v", err)
+		}
+		gs.Stop()
+		if err := lis.Close(); err != nil {
+			t.Errorf("lis.Close: %v", err)
+		}
+	})
 	return cc
 }
 
@@ -152,7 +162,9 @@ func TestGrpcSession_SendIsRefusedOnceTheStreamHasEnded(t *testing.T) {
 // finished.
 func TestGrpcSession_AStreamThatCannotOpenReportsWhy(t *testing.T) {
 	cc := scriptedServer(t, func(pb.TransportService_StreamServer) error { return nil })
-	cc.Close()
+	if err := cc.Close(); err != nil {
+		t.Fatalf("cc.Close: %v", err)
+	}
 	s := clientSession(t, cc)
 	_, end := receiveAll(s)
 	if end == nil || errors.Is(end, io.EOF) {
