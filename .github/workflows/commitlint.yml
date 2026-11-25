@@ -2,6 +2,16 @@ name: Commitlint
 on:
   pull_request:
     types: [opened, edited, synchronize]
+    # release-please.yml opens and updates the release pull request with the
+    # workflow token, so GitHub holds each run that pull request would start
+    # here for a maintainer's approval and fails the held run when the pull
+    # request merges. The release pull request changes only the files below,
+    # and its commit is titled by pull-request-title-pattern in
+    # .github/release-please-config.json, so it starts no run; a pull request
+    # that changes any other file is linted.
+    paths-ignore:
+      - CHANGELOG.md
+      - .github/.release-please-manifest.json
 
 jobs:
   commitlint:
