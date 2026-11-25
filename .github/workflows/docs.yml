@@ -65,9 +65,11 @@ jobs:
             --reject-regex '.*(search|fetch|mod/.*\?).*' \
             --directory-prefix=docs-build \
             "http://127.0.0.1:8080/${MODULE_PATH}" || true
+          # wget saves the module's page as ${MODULE_PATH}.html (--adjust-extension)
+          # beside the directory of its packages, so the front page points there.
           cat > docs-build/index.html <<HTML
           <!doctype html><meta charset=utf-8>
-          <meta http-equiv="refresh" content="0; url=${MODULE_PATH}/">
+          <meta http-equiv="refresh" content="0; url=${MODULE_PATH}.html">
           <title>Aether docs</title>
           HTML
 
