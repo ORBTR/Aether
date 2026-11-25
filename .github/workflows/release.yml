@@ -27,7 +27,8 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.11.2
+          # v2.11 cannot read the export data of the Go release above; v2.15 can.
+          version: v2.15.0
 
       - name: go vet
         run: go vet ./...
