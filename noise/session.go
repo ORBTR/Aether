@@ -179,14 +179,6 @@ func (l *noiseListener) handOffSession(cancel <-chan struct{}, s aether.Connecti
 	}
 }
 
-// closeAbandoned closes a connection this package gives up on: a dial or an
-// inbound that lost the simultaneous-dial tie-break, an existing session it
-// displaced, a hand-off nobody took (handOffSession), a listener whose second
-// socket failed to open, or a session's conn once the session has ended
-// (OnClose). The caller has chosen the outcome already and returns or logs the
-// error that decided it, so the close error has nothing to change.
-func closeAbandoned(c io.Closer) { _ = c.Close() }
-
 // Close stops listening.
 func (l *noiseListener) Close() error {
 	return l.conn.Close()
