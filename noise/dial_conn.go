@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@orbtr.io
+ * Queries: licensing@orbtr.com.au
  */
 
 // Build-tag agnostic: these functions run the Noise XX handshake over

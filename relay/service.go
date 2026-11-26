@@ -2,7 +2,7 @@
 
 /*
  * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@orbtr.io
+ * Queries: licensing@orbtr.com.au
  *
  * RelayService provides protocol-agnostic relay forwarding. It looks up
  * target sessions via a SessionIndex interface (injected by the transport

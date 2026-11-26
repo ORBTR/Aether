@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@orbtr.io
+ * Queries: licensing@orbtr.com.au
  *
  * Packet-type constants — build-tag agnostic (bare integer literals) so the
  * noise package's agnostic noiseConn can reference relay.PacketType* under

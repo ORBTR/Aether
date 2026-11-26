@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@orbtr.io
+ * Queries: licensing@orbtr.com.au
  *
  * HealthMonitor tracks per-session health metrics: activity timestamps,
  * ping/pong RTT, missed pings, and EMA-smoothed latency. Extracted from

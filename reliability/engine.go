@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@orbtr.io
+ * Queries: licensing@orbtr.com.au
  */
 
 // Engine composes all per-stream reliability components into a single

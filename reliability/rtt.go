@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@orbtr.io
+ * Queries: licensing@orbtr.com.au
  */
 
 // Package reliability implements per-stream reliability for the Aether wire protocol.

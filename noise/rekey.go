@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@orbtr.io
+ * Queries: licensing@orbtr.com.au
  *
  * RekeyTracker manages cipher state ratcheting thresholds. Extracted from
  * noiseConn to be a composable unit reusable by any encrypted session.

@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@orbtr.io
+ * Queries: licensing@orbtr.com.au
  *
  * Regression coverage for health.Monitor: constructor alpha selection,
  * ping/pong seq correlation, RTT/RTO delegation to rtt.Estimator, and

@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@orbtr.io
+ * Queries: licensing@orbtr.com.au
  *
  * AE-P-31 regression tests: short-header DATA decoders must not commit a
  * full declared-size heap allocation before the peer has proven it is

@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@orbtr.io
+ * Queries: licensing@orbtr.com.au
  *
  * noiseConn is the per-connection Noise session. It was split out of
  * session.go (which retains the UDP noiseListener) so that it can build for

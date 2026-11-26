@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@orbtr.io
+ * Queries: licensing@orbtr.com.au
  *
  * Regression tests for AE-L-06: PeerKeyCache grew without bound because Put()
  * had no size cap, Get() only masked expired entries (left them in the map),

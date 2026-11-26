@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@orbtr.io
+ * Queries: licensing@orbtr.com.au
  *
  * PeerKeyCache stores Curve25519 static public keys for known peers.
  * After a successful Noise XX handshake, the peer's static key is cached

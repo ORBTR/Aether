@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@orbtr.io
+ * Queries: licensing@orbtr.com.au
  *
  * Build-tag agnostic (pure encoding/binary + sync + flynn/noise cipher):
  * noiseConn's explicit-nonce replay window is needed under GOOS=js for the

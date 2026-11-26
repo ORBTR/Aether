@@ -2,7 +2,7 @@
 
 /*
  * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@orbtr.io
+ * Queries: licensing@orbtr.com.au
  */
 
 // Package multipath manages multiple transport paths to a single peer.

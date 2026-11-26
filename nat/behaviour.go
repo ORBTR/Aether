@@ -2,7 +2,7 @@
 
 /*
  * Copyright (c) 2026 ORBTR Pty Ltd. All Rights Reserved.
- * Queries: licensing@orbtr.io
+ * Queries: licensing@orbtr.com.au
  */
 
 // RFC 5780 NAT behaviour discovery.
