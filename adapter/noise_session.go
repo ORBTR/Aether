@@ -69,7 +69,6 @@ type NoiseSession struct {
 
 	// Shared infrastructure
 	writeMu    sync.Mutex
-	healthMon  *health.Monitor
 	sched      *scheduler.Scheduler
 	connWindow *flow.ConnWindow
 	// connGrantDebouncer coalesces conn-level WINDOW_UPDATE emissions
@@ -411,9 +410,6 @@ type NoiseSession struct {
 	// FEC prune scheduling — rate-limit each stream decoder's age prune to ~1/sec.
 	// reliabilityTick reads and advances this.
 	lastFECPrune time.Time
-
-	// Connection identity
-	connID aether.ConnectionID
 
 	// Short header compression, per-stream state: separate encode (tx) and
 	// decode (rx) compressors, as TCPSession's. One shared instance would let
@@ -2099,7 +2095,8 @@ func (s *NoiseSession) refreshWindowGrants() {
 // the stream's admitted credit (noiseStream.autoTune). Called from
 // reliabilityTick at 10s cadence. Disabled when AETHER_AUTOTUNE=off.
 // Uses per-stream reliability-engine SRTT (more accurate than session RTT
-// for Noise); falls back to healthMon RTT if the stream has no samples yet.
+// for Noise); falls back to the session health monitor's RTT (s.Health()) if
+// the stream has no samples yet.
 func (s *NoiseSession) autoTuneWindows() {
 	if aether.AutoTuneDisabled() {
 		return

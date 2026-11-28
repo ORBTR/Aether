@@ -97,20 +97,6 @@ func (a *AdaptiveController) Unregister(s CompressionCapable) {
 	delete(a.sessions, s)
 }
 
-// setEnabled toggles adaptive degradation on/off.
-func (a *AdaptiveController) setEnabled(enabled bool) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.enabled = enabled
-}
-
-// cpuPercent returns the last measured CPU utilization (0-100).
-func (a *AdaptiveController) cpuPercent() float64 {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	return a.lastCPUPercent
-}
-
 // check measures CPU and applies degradation rules.
 // Encryption is intentionally excluded — applyDegradation has no rung
 // that touches it.

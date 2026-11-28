@@ -482,9 +482,6 @@ func (l *noiseListener) dispatchToSession(key string, msg []byte, ceMarked bool)
 	return true
 }
 
-// dropCount exposes the listener's per-reason drop tally. See drops.go.
-func (l *noiseListener) dropCount(r DropReason) uint64 { return l.drops[r].Load() }
-
 // dialNoncePrefix marks a packet as part of a nonce-tagged dial handshake.
 // This byte won't conflict with STUN (0x00-0x3F), preamble, or fingerprint packets.
 const dialNoncePrefix byte = 0xFD
@@ -540,11 +537,6 @@ func (l *noiseListener) unregisterPendingDial(nonce []byte) {
 func (l *noiseListener) registerDialSession(addr *net.UDPAddr, nc *noiseConn, nodeID aether.NodeID) {
 	key := addr.String()
 	l.sessions.Put(nodeID, key, nc.scopeID, &noiseConnSession{conn: nc, nodeID: nodeID})
-}
-
-func (l *noiseListener) removeSession(addr *net.UDPAddr) {
-	key := addr.String()
-	l.sessions.RemoveByAddr(key)
 }
 
 // removeSessionForConn removes ONLY map entries whose stored connection

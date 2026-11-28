@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -36,9 +35,6 @@ type GrpcSession struct {
 	// session closed. Send reads it to refuse a payload nothing will send.
 	sendDone chan struct{}
 
-	stream     grpc.ServerStream // For server-side sessions
-	frameID    uint64
-	mu         sync.Mutex
 	closed     int32
 	remoteAddr net.Addr
 

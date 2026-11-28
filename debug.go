@@ -56,7 +56,7 @@ func CaptureCallerChain(skip, depth int) string {
 
 // DebugLogger provides conditional debug logging, enabled by the DEBUG
 // environment variable. All Aether namespaces are prefixed "aether.*"
-// (e.g. "aether", "aether.gossip", "aether.transport", "aether.flow")
+// (e.g. "aether", "aether.noise", "aether.multipath", "aether.flow")
 // so they coexist with the consuming debug system, which reads the same
 // DEBUG var.
 //
@@ -65,7 +65,7 @@ func CaptureCallerChain(skip, depth int) string {
 //	DEBUG=*                           — enable every namespace
 //	DEBUG=aether                      — enable aether + all aether.* descendants
 //	DEBUG=aether.flow                 — enable aether.flow + aether.flow.* descendants
-//	DEBUG=aether.flow,aether.gossip   — enable both explicitly
+//	DEBUG=aether.flow,aether.noise    — enable both explicitly
 //
 // An entry matches a namespace when the namespace equals the entry or
 // starts with "entry." (matchesAnyDebugEntry): the prefix test runs from
@@ -138,12 +138,8 @@ func (d *DebugLogger) Printf(format string, args ...interface{}) {
 // Enabled returns whether this logger is active.
 func (d *DebugLogger) Enabled() bool { return d.enabled }
 
-// Root package debug loggers (used by files merged from aether/ and transport/).
-var (
-	dbgAether    = NewDebugLogger("aether")
-	dbgGossip    = NewDebugLogger("aether.gossip")
-	dbgTransport = NewDebugLogger("aether.transport")
-)
+// dbgAether is the root package's debug logger.
+var dbgAether = NewDebugLogger("aether")
 
 // autoTuneDisabled caches the AETHER_AUTOTUNE kill switch read at init so
 // every session tick doesn't re-parse the env. Set AETHER_AUTOTUNE=off

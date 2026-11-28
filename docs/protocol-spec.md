@@ -1724,7 +1724,7 @@ type IdleEvictable interface {
 }
 ```
 
-Consumers can query idle state + configured threshold without poking at adapter internals. Backed by `healthMon.LastActivity()` and `SessionOptions.SessionIdleTimeout`.
+Consumers can query idle state + configured threshold without poking at adapter internals. Backed by the session health monitor's `LastActivity()` (`Health()`) and `SessionOptions.SessionIdleTimeout`.
 
 ### 35.3 `aether.CompressionCapable`
 

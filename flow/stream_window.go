@@ -255,20 +255,12 @@ type StreamWindow struct {
 	// and never swapped after — concurrent reads of an immutable
 	// pointer are safe without atomic protection.
 	//
-	// Samples below grantStarveFloor are skipped (uncontended fast
-	// path); recording every-Consume-success would dominate the
-	// distribution with sub-microsecond samples and bury the actual
-	// starvation signal.
+	// Only a Consume whose non-blocking TryAcquire failed is recorded
+	// (ConsumeUntil's contended path); recording every uncontended
+	// success would dominate the distribution with sub-microsecond
+	// samples and bury the actual starvation signal.
 	grantStarveHist *metrics.DurationHist
 }
-
-// grantStarveFloor is the minimum Consume duration that gets recorded
-// into the grantStarveHist. Below this we treat the call as uncontended
-// (semaphore acquired without blocking) and skip the record. 100µs is
-// well above the typical microbenchmark for an uncontended
-// semaphore.Acquire call but well below any latency we care about
-// surfacing.
-const grantStarveFloor = 100 * time.Microsecond
 
 // CreditAbuseRatio is the (grantsEmitted - consumed) / grantsEmitted
 // threshold above which a stream is considered to be hoarding credit
@@ -352,8 +344,9 @@ func NewStreamWindowWithCap(initialCredit, maxCredit int64) *StreamWindow {
 
 // SetGrantStarveHist wires the session-shared grant-starvation histogram
 // into this stream window. Consume records the wall-clock it spent blocked
-// on the credit semaphore into the histogram, skipping samples below
-// grantStarveFloor (the uncontended fast path); the owning noise session
+// on the credit semaphore into the histogram, skipping every call whose
+// non-blocking acquire succeeds (the uncontended fast path); the owning
+// noise session
 // reads its percentiles into SessionMetrics.GrantStarveP50Us/P99Us. Pass
 // nil to disable recording (default for windows constructed via
 // NewStreamWindow).
