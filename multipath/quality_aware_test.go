@@ -166,6 +166,53 @@ func TestPickByQuality_RegionAffinityForOpDefault(t *testing.T) {
 	}
 }
 
+// A session's own reported loss lowers its path's score: of two same-region
+// paths with equal RTT, the one whose session reports 10% loss scores low on
+// loss and PickByQuality takes the lossless one, though the lossy path was
+// added first and so would win a tie.
+func TestPickByQuality_ScoresTheLossASessionReports(t *testing.T) {
+	tracker := quality.NewTracker()
+	m := NewManager()
+	lossy := newFakeSession(aether.ProtoWebSocket, 5*time.Millisecond, time.Millisecond)
+	lossless := newFakeSession(aether.ProtoNoise, 5*time.Millisecond, time.Millisecond)
+	lossy.setMetrics(aether.SessionMetrics{LossPercent: 10})
+
+	if err := m.EnsureK(context.Background(), QualityConfig{
+		Tracker:     tracker,
+		LocalRegion: "syd",
+		PeerID:      "peer1",
+		Weights:     quality.DefaultWeights,
+	}, 0); err != nil {
+		t.Fatalf("EnsureK: %v", err)
+	}
+
+	m.AddPathQA(lossy, aether.ProtoWebSocket, "syd")
+	m.AddPathQA(lossless, aether.ProtoNoise, "syd")
+
+	// A path's age is read from CreatedAt, and a path younger than the age
+	// grace scores zero, so both are made two minutes old: the pick is then
+	// decided by the scores, not by the order the paths were added.
+	for _, p := range m.paths {
+		p.CreatedAt = time.Now().Add(-2 * time.Minute)
+		p.LastSuccess = p.CreatedAt
+	}
+
+	got, ok := m.PickByQuality(quality.OpDefault)
+	if !ok {
+		t.Fatal("PickByQuality should return a session")
+	}
+	scores := m.PathScores()
+	if loss := scores[aether.ProtoWebSocket].Components.Loss; loss >= 0.5 {
+		t.Errorf("loss component of the path reporting 10%% loss = %.3f, want below 0.5", loss)
+	}
+	if loss := scores[aether.ProtoNoise].Components.Loss; loss != 1 {
+		t.Errorf("loss component of the lossless path = %.3f, want 1", loss)
+	}
+	if got != lossless {
+		t.Errorf("PickByQuality took the path reporting 10%% loss, want the lossless one")
+	}
+}
+
 func TestEnsureK_DialsUntilTargetReached(t *testing.T) {
 	tracker := quality.NewTracker()
 	m := NewManager()
